@@ -9,7 +9,12 @@ import unittest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
-from run_experiment import write_solution  # noqa: E402
+from run_experiment import (  # noqa: E402
+    CompetitionTimeout,
+    code2_time_limit,
+    effective_process_timeout,
+    write_solution,
+)
 
 
 class SolutionWriterTests(unittest.TestCase):
@@ -84,6 +89,20 @@ class SolutionWriterTests(unittest.TestCase):
         text = self.render({"type": "branch", "idx": 1})
         self.assertNotIn("1, 2, 1, 1", text)
         self.assertIn("1, 2, T1, 1, -2", text)
+
+
+class CompetitionTimingTests(unittest.TestCase):
+    def test_code2_budget_uses_contingency_count(self):
+        self.assertEqual(code2_time_limit(105, 2.0), 210.0)
+        self.assertEqual(code2_time_limit(0, 2.0), 0.0)
+
+    def test_process_timeout_is_bounded_by_stage_deadline(self):
+        self.assertEqual(effective_process_timeout(300.0, 120.0, now=100.0), 20.0)
+        self.assertEqual(effective_process_timeout(5.0, 120.0, now=100.0), 5.0)
+
+    def test_expired_stage_is_rejected_before_launch(self):
+        with self.assertRaises(CompetitionTimeout):
+            effective_process_timeout(5.0, 100.0, now=100.0)
 
 
 if __name__ == "__main__":

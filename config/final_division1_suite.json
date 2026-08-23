@@ -1,0 +1,27 @@
+{
+  "event": "GO Competition Challenge 2 Final Event",
+  "division": 1,
+  "code1_time_limit_seconds": 300,
+  "code2_seconds_per_contingency": 2,
+  "timing_semantics": "Code1 and Code2 are separately timed wall-clock stages",
+  "network_models": {
+    "C2FEN00617": [
+      "005",
+      "017",
+      "024",
+      "062",
+      "073"
+    ],
+    "C2FEN02020": [
+      "025",
+      "121",
+      "134",
+      "260",
+      "262"
+    ]
+  },
+  "sources": {
+    "scoring": "https://data.openei.org/files/6197/Challenge_2_Scoring.pdf",
+    "dataset": "https://data.openei.org/submissions/6197"
+  }
+}

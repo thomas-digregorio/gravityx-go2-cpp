@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -31,6 +32,31 @@ DEFAULT_EVALUATOR = Path(
     r"C:\Users\thoma\Documents\goc2-dc-scopf-cpu\vendor\C2DataUtilities\data_utilities\evaluation.py"
 )
 WSL_LIBRARY_PATH = "/home/thomasdigregorio/.local/share/gravityx-go2-cpp/env/lib"
+
+
+class CompetitionTimeout(RuntimeError):
+    """Raised when a GO Competition stage exhausts its wall-clock allowance."""
+
+
+def code2_time_limit(contingency_count: int, seconds_per_contingency: float) -> float:
+    if contingency_count < 0:
+        raise ValueError("contingency count cannot be negative")
+    if seconds_per_contingency <= 0:
+        raise ValueError("seconds per contingency must be positive")
+    return contingency_count * seconds_per_contingency
+
+
+def effective_process_timeout(
+    per_process_timeout: float,
+    stage_deadline: float,
+    now: float | None = None,
+) -> float:
+    if per_process_timeout <= 0:
+        raise ValueError("per-process timeout must be positive")
+    remaining = stage_deadline - (time.perf_counter() if now is None else now)
+    if remaining <= 0:
+        raise CompetitionTimeout("competition stage deadline has expired")
+    return min(per_process_timeout, remaining)
 
 
 def reject_onedrive(path: Path) -> None:
@@ -179,6 +205,10 @@ def run_cpp(
     log_path: Path,
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0:
+        raise ValueError("C++ subprocess timeout must be positive")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    inner_timeout = max(timeout, 0.001)
     command = [
         "wsl",
         "-d",
@@ -188,6 +218,10 @@ def run_cpp(
         f"LD_LIBRARY_PATH={WSL_LIBRARY_PATH}",
         "OMP_NUM_THREADS=1",
         "OPENBLAS_NUM_THREADS=1",
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=5s",
+        f"{inner_timeout:.3f}s",
         to_wsl(executable),
         *arguments,
     ]
@@ -199,17 +233,23 @@ def run_cpp(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
+            timeout=inner_timeout + 10.0,
         )
     except subprocess.TimeoutExpired as error:
         output = error.stdout or ""
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
-        log_path.write_text(output + "\nTIMEOUT\n", encoding="utf-8")
-        raise RuntimeError(f"C++ subprocess timed out after {timeout}s: {arguments}") from error
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(completed.stdout, encoding="utf-8")
+        log_path.write_text(output + "\nOUTER_TIMEOUT\n", encoding="utf-8")
+        raise CompetitionTimeout(
+            f"C++ subprocess exceeded its {inner_timeout:.3f}s inner deadline: {arguments}"
+        ) from error
+    output = completed.stdout or ""
+    timed_out = completed.returncode == 124
+    if timed_out:
+        output += "\nTIMEOUT\n"
+    log_path.write_text(output, encoding="utf-8")
     completed.wall_seconds = time.perf_counter() - started  # type: ignore[attr-defined]
+    completed.timed_out = timed_out  # type: ignore[attr-defined]
     return completed
 
 
@@ -240,6 +280,8 @@ def main() -> int:
     parser.add_argument("--distro", default="Ubuntu-24.04")
     parser.add_argument("--base-timeout", type=float, default=900.0)
     parser.add_argument("--contingency-timeout", type=float, default=300.0)
+    parser.add_argument("--code1-time-limit", type=float, default=300.0)
+    parser.add_argument("--code2-seconds-per-contingency", type=float, default=2.0)
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--skip-evaluation", action="store_true")
@@ -249,42 +291,118 @@ def main() -> int:
         reject_onedrive(path)
     if args.workers < 1:
         raise ValueError("workers must be positive")
+    if args.code1_time_limit <= 0:
+        raise ValueError("Code1 time limit must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError(f"cold-run output directory is not empty: {args.output_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     case = read_json(args.case_json)
+    contingencies = contingency_records(case)
+    code2_limit = code2_time_limit(
+        len(contingencies), args.code2_seconds_per_contingency
+    )
     started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     wall_start = time.perf_counter()
     internal = args.output_dir / "internal"
     base_json = internal / "base.json"
+    records: list[dict[str, Any]] = []
+    run_status: dict[str, Any] = {
+        "success": False,
+        "stage": "initializing",
+        "started_at_utc": started_utc,
+        "git_revision": git_revision(),
+        "competition_timing": {
+            "division": 1,
+            "code1_time_limit_seconds": args.code1_time_limit,
+            "code2_seconds_per_contingency": args.code2_seconds_per_contingency,
+            "code2_time_limit_seconds": code2_limit,
+            "contingency_count": len(contingencies),
+            "timing_semantics": "Code1 and Code2 are separate wall-clock stages",
+        },
+        "completed_contingency_count": 0,
+    }
+
+    def checkpoint() -> None:
+        write_json(args.output_dir / "run_status.json", run_status)
+
+    checkpoint()
 
     base_start = time.perf_counter()
-    base_process = run_cpp(
-        args.executable,
-        args.distro,
-        ["run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"],
-        internal / "base.console.log",
-        args.base_timeout,
-    )
+    try:
+        base_process = run_cpp(
+            args.executable,
+            args.distro,
+            ["run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"],
+            internal / "base.console.log",
+            min(args.base_timeout, args.code1_time_limit),
+        )
+    except Exception as error:
+        run_status.update(
+            {
+                "stage": "code1",
+                "base_process_wall_seconds": time.perf_counter() - base_start,
+                "code1_within_limit": False,
+                "error": str(error),
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        raise
     base_wall = time.perf_counter() - base_start
+    run_status.update(
+        {
+            "stage": "code1",
+            "base_process_wall_seconds": base_wall,
+            "code1_within_limit": base_wall <= args.code1_time_limit,
+        }
+    )
     if base_process.returncode != 0:
-        raise RuntimeError("cold C++ base/IBR solve failed; see internal/base.console.log")
+        run_status["error"] = (
+            "Code1 reached its competition deadline"
+            if getattr(base_process, "timed_out", False)
+            else "cold C++ base/IBR solve failed"
+        )
+        checkpoint()
+        if getattr(base_process, "timed_out", False):
+            raise CompetitionTimeout(run_status["error"])
+        raise RuntimeError(f"{run_status['error']}; see internal/base.console.log")
+    if base_wall > args.code1_time_limit:
+        run_status["error"] = "Code1 completed after its competition deadline"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
     base = read_json(base_json)
     if not base.get("success", False):
+        run_status["error"] = "cold C++ base/IBR result was not successful"
+        checkpoint()
         raise RuntimeError("cold C++ base/IBR result was not successful")
     commitment = [int(value) for value in base["commitment"]]
     base_state = base["selected_state"]
     write_solution(args.output_dir / "solution_BASECASE.txt", case, base_state, commitment)
+    run_status.update(
+        {
+            "stage": "code2",
+            "base_success": True,
+            "base_algorithm_wall_seconds": base["wall_seconds"],
+        }
+    )
+    checkpoint()
 
-    contingencies = contingency_records(case)
     contingency_start = time.perf_counter()
+    contingency_deadline = contingency_start + code2_limit
+    abort_contingencies = threading.Event()
 
     def solve_one(item: dict[str, Any]) -> dict[str, Any]:
+        if abort_contingencies.is_set():
+            raise CompetitionTimeout("Code2 was cancelled after another task failed")
         label = str(item["label"])
         stem = safe_label(label)
         result_path = internal / "contingencies" / f"{stem}.json"
         log_path = internal / "logs" / f"{stem}.log"
+        task_timeout = effective_process_timeout(
+            args.contingency_timeout, contingency_deadline
+        )
         process = run_cpp(
             args.executable,
             args.distro,
@@ -297,9 +415,13 @@ def main() -> int:
                 "0",
             ],
             log_path,
-            args.contingency_timeout,
+            task_timeout,
         )
         if process.returncode != 0:
+            if getattr(process, "timed_out", False):
+                raise CompetitionTimeout(
+                    f"contingency {label} reached the Code2 competition deadline"
+                )
             raise RuntimeError(f"contingency {label} failed; see {log_path}")
         result = read_json(result_path)
         if not result.get("success", False):
@@ -311,6 +433,10 @@ def main() -> int:
             commitment,
             item,
         )
+        if time.perf_counter() > contingency_deadline:
+            raise CompetitionTimeout(
+                f"contingency {label} finished after the Code2 competition deadline"
+            )
         return {
             "label": label,
             "type": item["type"],
@@ -321,14 +447,49 @@ def main() -> int:
             "max_residual": result["validation"]["max_residual"],
         }
 
-    records: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+    futures: dict[concurrent.futures.Future[dict[str, Any]], dict[str, Any]] = {}
+    try:
         futures = {pool.submit(solve_one, item): item for item in contingencies}
         for future in concurrent.futures.as_completed(futures):
             records.append(future.result())
+            run_status["completed_contingency_count"] = len(records)
+            run_status["last_completed_contingency"] = records[-1]["label"]
+            checkpoint()
             print(f"completed {len(records)}/{len(contingencies)}: {records[-1]['label']}", flush=True)
+    except Exception as error:
+        abort_contingencies.set()
+        for future in futures:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+        contingency_wall = time.perf_counter() - contingency_start
+        run_status.update(
+            {
+                "stage": "code2",
+                "code2_within_limit": contingency_wall <= code2_limit,
+                "contingency_parallel_wall_seconds": contingency_wall,
+                "error": str(error),
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        raise
+    else:
+        pool.shutdown(wait=True)
     records.sort(key=lambda item: item["label"])
     contingency_wall = time.perf_counter() - contingency_start
+    run_status.update(
+        {
+            "code2_within_limit": contingency_wall <= code2_limit,
+            "contingency_parallel_wall_seconds": contingency_wall,
+        }
+    )
+    if contingency_wall > code2_limit:
+        run_status["error"] = "Code2 completed after its competition deadline"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    checkpoint()
 
     evaluation_wall = 0.0
     evaluation_summary: dict[str, Any] | None = None
@@ -346,8 +507,39 @@ def main() -> int:
         evaluation_wall = time.perf_counter() - evaluation_start
         (internal / "evaluation.console.log").write_text(completed.stdout, encoding="utf-8")
         if completed.returncode != 0:
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": "official evaluator failed",
+                    "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
             raise RuntimeError("official evaluator failed; see internal/evaluation.console.log")
         evaluation_summary = read_json(args.output_dir / "eval_summary.json")
+        infeasible_cases = [
+            label
+            for label, infeasible in evaluation_summary.get("infeas_all_cases", {}).items()
+            if bool(infeasible)
+        ]
+        if (
+            not bool(evaluation_summary.get("solutions_exist", False))
+            or float(evaluation_summary.get("infeas", 1.0)) != 0.0
+            or infeasible_cases
+        ):
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": "official evaluator did not certify every case feasible",
+                    "official_infeasibility": evaluation_summary.get("infeas"),
+                    "official_infeasible_cases": infeasible_cases,
+                    "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
+            raise RuntimeError(run_status["error"])
 
     total_wall = time.perf_counter() - wall_start
     max_residual = max((item["max_residual"] for item in records), default=0.0)
@@ -365,6 +557,11 @@ def main() -> int:
             "json_sha256": sha256(args.case_dir / "case.json"),
         },
         "workers": args.workers,
+        "competition_timing": {
+            **run_status["competition_timing"],
+            "code1_within_limit": True,
+            "code2_within_limit": True,
+        },
         "base_process_wall_seconds": base_wall,
         "base_algorithm_wall_seconds": base["wall_seconds"],
         "contingency_parallel_wall_seconds": contingency_wall,
@@ -378,6 +575,18 @@ def main() -> int:
         "official_evaluation": evaluation_summary,
     }
     write_json(args.output_dir / "run_summary.json", summary)
+    run_status.update(
+        {
+            "success": True,
+            "stage": "complete",
+            "finished_at_utc": summary["finished_at_utc"],
+            "total_wall_seconds": total_wall,
+            "official_objective": evaluation_summary.get("obj") if evaluation_summary else None,
+            "official_infeasibility": evaluation_summary.get("infeas") if evaluation_summary else None,
+            "completed_contingency_count": len(records),
+        }
+    )
+    checkpoint()
     print(
         json.dumps(
             {

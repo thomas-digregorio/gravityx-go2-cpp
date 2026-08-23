@@ -54,3 +54,9 @@ solve starts a new process, and every corrective contingency starts in its own
 new process from the selected base state.  Contingencies are independent and
 may run concurrently.  Each process is limited to one BLAS thread to avoid
 oversubscription.
+
+For Final-event Division 1 experiments, the runner enforces the historical
+timing stages separately: Code1 has a 300-second wall limit and Code2 receives
+two seconds per source contingency.  A failed or timed-out run leaves a
+machine-readable `run_status.json`; a run is successful only after the official
+evaluator confirms every submitted case is feasible.

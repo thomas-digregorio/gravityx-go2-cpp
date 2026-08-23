@@ -430,14 +430,37 @@ def main() -> int:
         else "Code2 competition deadline"
     )
     abort_contingencies = threading.Event()
+    worker_count = min(args.workers, len(contingencies))
+    batches: list[list[dict[str, Any]]] = [[] for _ in range(worker_count)]
+    for position, item in enumerate(contingencies):
+        batches[position % worker_count].append(item)
+    worker_records: list[dict[str, Any]] = []
 
-    def solve_one(item: dict[str, Any]) -> dict[str, Any]:
+    def solve_batch(
+        worker_id: int,
+        batch: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         if abort_contingencies.is_set():
-            raise CompetitionTimeout("Code2 was cancelled after another task failed")
-        label = str(item["label"])
-        stem = safe_label(label)
-        result_path = internal / "contingencies" / f"{stem}.json"
-        log_path = internal / "logs" / f"{stem}.log"
+            raise CompetitionTimeout("Code2 was cancelled after another worker failed")
+        manifest_path = internal / "worker_manifests" / f"worker_{worker_id:03d}.json"
+        log_path = internal / "worker_logs" / f"worker_{worker_id:03d}.log"
+        tasks: list[dict[str, str]] = []
+        for item in batch:
+            label = str(item["label"])
+            result_path = internal / "contingencies" / f"{safe_label(label)}.json"
+            tasks.append(
+                {
+                    "label": label,
+                    "output_path": to_wsl(result_path),
+                }
+            )
+        write_json(
+            manifest_path,
+            {
+                "worker_id": worker_id,
+                "tasks": tasks,
+            },
+        )
         task_timeout = effective_process_timeout(
             args.contingency_timeout, contingency_deadline
         )
@@ -445,11 +468,10 @@ def main() -> int:
             args.executable,
             args.distro,
             [
-                "solve-contingency",
+                "solve-contingency-batch",
                 to_wsl(args.case_json),
                 to_wsl(base_json),
-                label,
-                to_wsl(result_path),
+                to_wsl(manifest_path),
                 "0",
             ],
             log_path,
@@ -458,48 +480,80 @@ def main() -> int:
         if process.returncode != 0:
             if getattr(process, "timed_out", False):
                 raise CompetitionTimeout(
-                    f"contingency {label} reached the {contingency_deadline_name}"
+                    f"contingency worker {worker_id} reached the {contingency_deadline_name}"
                 )
-            raise RuntimeError(f"contingency {label} failed; see {log_path}")
-        result = read_json(result_path)
-        if not result.get("success", False):
-            raise RuntimeError(f"contingency {label} did not pass independent validation")
-        write_solution(
-            args.output_dir / f"solution_{label}.txt",
-            case,
-            result["solve"]["state"],
-            commitment,
-            item,
-        )
+            raise RuntimeError(f"contingency worker {worker_id} failed; see {log_path}")
         if time.perf_counter() > contingency_deadline:
             raise CompetitionTimeout(
-                f"contingency {label} finished after the {contingency_deadline_name}"
+                f"contingency worker {worker_id} finished after the {contingency_deadline_name}"
+            )
+        batch_records: list[dict[str, Any]] = []
+        for item in batch:
+            label = str(item["label"])
+            result_path = internal / "contingencies" / f"{safe_label(label)}.json"
+            result = read_json(result_path)
+            if not result.get("success", False):
+                raise RuntimeError(
+                    f"contingency {label} did not pass independent validation"
+                )
+            write_solution(
+                args.output_dir / f"solution_{label}.txt",
+                case,
+                result["solve"]["state"],
+                commitment,
+                item,
+            )
+            batch_records.append(
+                {
+                    "label": label,
+                    "type": item["type"],
+                    "source_index": int(item["idx"]),
+                    "worker_id": worker_id,
+                    "solver_wall_seconds": result["solve"]["wall_seconds"],
+                    "objective": result["solve"]["objective"],
+                    "max_residual": result["validation"]["max_residual"],
+                    "solver_status": result["solve"]["status"],
+                    "solver_status_success": result.get(
+                        "solver_status_success", False
+                    ),
+                    "accepted_feasible_nonconverged": result.get(
+                        "accepted_feasible_nonconverged", False
+                    ),
+                }
             )
         return {
-            "label": label,
-            "type": item["type"],
-            "source_index": int(item["idx"]),
+            "worker_id": worker_id,
+            "task_count": len(batch),
             "process_wall_seconds": process.wall_seconds,  # type: ignore[attr-defined]
-            "solver_wall_seconds": result["solve"]["wall_seconds"],
-            "objective": result["solve"]["objective"],
-            "max_residual": result["validation"]["max_residual"],
-            "solver_status": result["solve"]["status"],
-            "solver_status_success": result.get("solver_status_success", False),
-            "accepted_feasible_nonconverged": result.get(
-                "accepted_feasible_nonconverged", False
-            ),
+            "records": batch_records,
         }
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
-    futures: dict[concurrent.futures.Future[dict[str, Any]], dict[str, Any]] = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+    futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
     try:
-        futures = {pool.submit(solve_one, item): item for item in contingencies}
+        futures = {
+            pool.submit(solve_batch, worker_id, batch): worker_id
+            for worker_id, batch in enumerate(batches)
+        }
         for future in concurrent.futures.as_completed(futures):
-            records.append(future.result())
+            worker = future.result()
+            worker_records.append(
+                {
+                    "worker_id": worker["worker_id"],
+                    "task_count": worker["task_count"],
+                    "process_wall_seconds": worker["process_wall_seconds"],
+                }
+            )
+            records.extend(worker["records"])
             run_status["completed_contingency_count"] = len(records)
-            run_status["last_completed_contingency"] = records[-1]["label"]
+            run_status["completed_worker_count"] = len(worker_records)
+            run_status["last_completed_worker"] = worker["worker_id"]
             checkpoint()
-            print(f"completed {len(records)}/{len(contingencies)}: {records[-1]['label']}", flush=True)
+            print(
+                f"completed {len(records)}/{len(contingencies)}: "
+                f"worker {worker['worker_id']} ({worker['task_count']} contingencies)",
+                flush=True,
+            )
     except Exception as error:
         abort_contingencies.set()
         for future in futures:
@@ -522,6 +576,7 @@ def main() -> int:
     else:
         pool.shutdown(wait=True)
     records.sort(key=lambda item: item["label"])
+    worker_records.sort(key=lambda item: item["worker_id"])
     contingency_wall = time.perf_counter() - contingency_start
     run_status.update(
         {
@@ -649,7 +704,9 @@ def main() -> int:
             "con_sha256": sha256(args.case_dir / "case.con"),
             "json_sha256": sha256(args.case_dir / "case.json"),
         },
-        "workers": args.workers,
+        "workers": worker_count,
+        "requested_workers": args.workers,
+        "contingency_execution_mode": "persistent isolated process batches",
         "competition_timing": {
             **run_status["competition_timing"],
             "code1_within_limit": True,
@@ -662,6 +719,9 @@ def main() -> int:
         "base_process_wall_seconds": base_wall,
         "base_algorithm_wall_seconds": base["wall_seconds"],
         "contingency_parallel_wall_seconds": contingency_wall,
+        "contingency_worker_process_seconds_sum": sum(
+            item["process_wall_seconds"] for item in worker_records
+        ),
         "contingency_solver_seconds_sum": sum(item["solver_wall_seconds"] for item in records),
         "evaluation_wall_seconds": evaluation_wall,
         "total_wall_seconds": total_wall,
@@ -671,6 +731,7 @@ def main() -> int:
         ),
         "max_independent_contingency_residual": max_residual,
         "base": base,
+        "contingency_workers": worker_records,
         "contingencies": records,
         "official_evaluation": evaluation_summary,
     }

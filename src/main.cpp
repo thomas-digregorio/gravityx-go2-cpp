@@ -346,16 +346,12 @@ int run_ibr_json(const std::string& path, const std::string& output_path, int pr
     return result.success ? 0 : 1;
 }
 
-int solve_contingency(
-    const std::string& case_path,
-    const std::string& base_result_path,
-    const std::string& label,
-    const std::string& output_path,
-    int print_level) {
-    reject_onedrive(case_path);
-    reject_onedrive(base_result_path);
-    reject_onedrive(output_path);
-    const auto data = gravityx::CaseData::load(case_path);
+struct BasePoint {
+    std::vector<int> commitment;
+    gravityx::AcState state;
+};
+
+BasePoint load_base_point(const std::string& base_result_path) {
     const auto base_json = read_json_file(base_result_path);
     if (!base_json.value("success", false)) {
         throw std::runtime_error("base IBR result was not successful");
@@ -363,9 +359,19 @@ int solve_contingency(
     if (!base_json.contains("commitment") || !base_json.contains("selected_state")) {
         throw std::runtime_error("base IBR result lacks commitment or selected_state");
     }
-    const auto fixed_status = base_json.at("commitment").get<std::vector<int>>();
-    const auto base_state = gravityx::ac_state_from_json(base_json.at("selected_state"));
+    return {
+        base_json.at("commitment").get<std::vector<int>>(),
+        gravityx::ac_state_from_json(base_json.at("selected_state")),
+    };
+}
 
+bool solve_loaded_contingency(
+    const gravityx::CaseData& data,
+    const BasePoint& base,
+    const std::string& label,
+    const std::string& output_path,
+    int print_level) {
+    reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
         [&label](const gravityx::Contingency& item) { return item.label == label; });
@@ -373,7 +379,7 @@ int solve_contingency(
         throw std::runtime_error("unknown contingency label: " + label);
     }
     gravityx::ContingencyContext context;
-    context.base_state = base_state;
+    context.base_state = base.state;
     if (match->type == gravityx::ContingencyType::Generator) {
         context.outaged_generator = match->component;
     } else {
@@ -381,11 +387,11 @@ int solve_contingency(
     }
 
     gravityx::AcModel model(
-        data, gravityx::ModelMode::ContingencySoft, fixed_status, context);
+        data, gravityx::ModelMode::ContingencySoft, base.commitment, context);
     const auto solve = model.solve(print_level, 1e-6);
     const auto validation = gravityx::validate_state(
         data, gravityx::ModelMode::ContingencySoft,
-        solve.state, fixed_status, context);
+        solve.state, base.commitment, context);
     const bool solver_status_success = solve.status == 0 || solve.status == 1;
     const bool success = gravityx::validated_candidate_is_feasible(
         solve, validation, 1e-5);
@@ -413,7 +419,54 @@ int solve_contingency(
         {"wall_seconds", solve.wall_seconds},
         {"max_residual", validation.max_residual},
     }).dump(2) << '\n';
-    return success ? 0 : 1;
+    return success;
+}
+
+int solve_contingency(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& label,
+    const std::string& output_path,
+    int print_level) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto base = load_base_point(base_result_path);
+    return solve_loaded_contingency(
+        data, base, label, output_path, print_level) ? 0 : 1;
+}
+
+int solve_contingency_batch(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& manifest_path,
+    int print_level) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(manifest_path);
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto base = load_base_point(base_result_path);
+    const auto manifest = read_json_file(manifest_path);
+    if (!manifest.contains("tasks") || !manifest.at("tasks").is_array() ||
+        manifest.at("tasks").empty()) {
+        throw std::runtime_error("contingency batch manifest has no tasks");
+    }
+    int completed = 0;
+    for (const auto& task : manifest.at("tasks")) {
+        const auto label = task.at("label").get<std::string>();
+        const auto output_path = task.at("output_path").get<std::string>();
+        if (!solve_loaded_contingency(
+                data, base, label, output_path, print_level)) {
+            return 1;
+        }
+        ++completed;
+        std::cout << nlohmann::json({
+            {"batch_completed", completed},
+            {"batch_size", manifest.at("tasks").size()},
+            {"label", label},
+        }).dump() << '\n';
+    }
+    return 0;
 }
 
 }  // namespace
@@ -449,6 +502,11 @@ int main(int argc, char** argv) {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
             return solve_contingency(argv[2], argv[3], argv[4], argv[5], print_level);
         }
+        if ((argc == 5 || argc == 6) &&
+            std::string(argv[1]) == "solve-contingency-batch") {
+            const int print_level = argc == 6 ? std::stoi(argv[5]) : 0;
+            return solve_contingency_batch(argv[2], argv[3], argv[4], print_level);
+        }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"
                   << "  gravityx_go2 component-tests\n"
@@ -458,7 +516,8 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 solve-relax CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
-                  << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n";
+                  << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
+                  << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n";
         return 2;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

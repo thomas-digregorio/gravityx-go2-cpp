@@ -5,7 +5,7 @@
   "code2_seconds_per_contingency": 2,
   "experiment_end_to_end_time_limit_seconds": 300,
   "evaluation_reserve_seconds": 7,
-  "contingency_execution_mode": "22 persistent isolated process workers with a canonical-label dynamic queue",
+  "contingency_execution_mode": "8 persistent isolated process workers with a canonical-label dynamic queue",
   "timing_semantics": "Code1 and Code2 retain their historical stage clocks; this experiment additionally imposes a stricter 300-second end-to-end cap",
   "network_models": {
     "C2FEN00617": [

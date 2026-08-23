@@ -300,7 +300,7 @@ def main() -> int:
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--executable", type=Path, default=DEFAULT_EXE)
-    parser.add_argument("--workers", type=int, default=22)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--distro", default="Ubuntu-24.04")
     parser.add_argument("--base-timeout", type=float, default=900.0)
     parser.add_argument("--contingency-timeout", type=float, default=300.0)

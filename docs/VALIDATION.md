@@ -64,6 +64,13 @@ worker assignment is recorded.  Workers run concurrently and are limited to
 one BLAS thread each to avoid oversubscription.  No contingency solution or
 optimizer state is reused by a different contingency.
 
+The registered laptop configuration uses eight persistent workers.  On the
+24-core hybrid laptop, 22 simultaneous Ipopt/MUMPS sparse factorizations
+increased isolated corrective solves from roughly 10 seconds to as much as
+80 seconds through cache and memory-bandwidth contention.  Reducing the worker
+count changes only process scheduling, not the mathematical model or the cold
+start supplied to any contingency.
+
 Each corrective model starts from the verified base state with the outaged
 component removed.  Its active- and reactive-balance slack variables are
 initialized from the independently recomputed nodal mismatch of that adjusted

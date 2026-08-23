@@ -81,7 +81,7 @@ The registered Final-617 settings are in `config/final_617_005.json`.
   --case-json .data\final_617_005\model.json `
   --case-dir CASE_DIR `
   --output-dir OUTPUT_DIR `
-  --workers 22
+  --workers 8
 ```
 
 See `docs/VALIDATION.md` for the independent checks and tiny-case equivalence

@@ -1,0 +1,18 @@
+{
+  "case_id": "C2FEN00617",
+  "scenario_id": "005",
+  "model": "AC polar GO Challenge 2",
+  "gravity_revision": "f5af33ed9572829d96c6f54b1a3ad30f53677fe7",
+  "ipopt_linear_solver": "mumps",
+  "ipopt_tolerance": 1e-6,
+  "independent_validation_tolerance": 1e-5,
+  "ibr_batch_count": 4,
+  "ibr_rounding_threshold": 0.5,
+  "ibr_tie_rule": "source commitment",
+  "ibr_order": "descending absolute distance from 0.5, then source index",
+  "parallel_contingency_workers": 22,
+  "base_process_timeout_seconds": 900,
+  "per_contingency_process_timeout_seconds": 300,
+  "blas_threads_per_process": 1,
+  "official_scoring_method": 1
+}

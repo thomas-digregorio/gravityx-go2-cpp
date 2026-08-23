@@ -1,0 +1,12 @@
+.deps/
+.build*/
+.data/
+.toolchain/
+runs/
+results/*.json
+results/*.csv
+*.log
+*.sol
+*.nl
+__pycache__/
+*.pyc

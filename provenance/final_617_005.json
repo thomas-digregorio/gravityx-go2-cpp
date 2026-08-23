@@ -1,0 +1,23 @@
+{
+  "case_id": "C2FEN00617",
+  "scenario_id": "005",
+  "source_files": {
+    "case.raw": "bdadd320f4ed425e46ccc1c19242c08b079af447e478fcb095379770524b5adf",
+    "case.con": "1e9e4c7ff07561eeb0a77b28f938a3abdf1148896bf3f453ab5c99eb1c57cd83",
+    "case.json": "77c12c6218ca6aa228c6e04a862bd406740ca1a8d7d1146f9c930a950380261b"
+  },
+  "normalized_model_sha256": "5f0fa87430e8246ffaad8b8296a44e7108fb1b780b0d27cd81d0a927e9f4fa67",
+  "counts": {
+    "buses": 617,
+    "generators": 94,
+    "loads": 404,
+    "shunts": 50,
+    "branches": 853,
+    "transformers": 130,
+    "generator_contingencies": 51,
+    "branch_contingencies": 54,
+    "total_contingencies": 105
+  },
+  "raw_case_distribution": "GO Competition Challenge 2 Final event public data",
+  "raw_case_files_tracked": false
+}

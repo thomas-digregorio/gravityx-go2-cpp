@@ -1,0 +1,21 @@
+{
+  "gravity": {
+    "repository": "https://github.com/coin-or/Gravity.git",
+    "revision": "f5af33ed9572829d96c6f54b1a3ad30f53677fe7",
+    "branch_context": "ACOPF",
+    "reason": "Public Gravity power-model branch expected by OPOMO; includes ACOPF/ACUC APIs and challenge-era lineage."
+  },
+  "ipopt": {
+    "version": "3.14.19",
+    "distribution": "conda-forge",
+    "linear_solver": "MUMPS"
+  },
+  "official_go2_parser": {
+    "repository": "https://github.com/lanl-ansi/PowerModelsSecurityConstrained.jl.git",
+    "revision": "5239af613f6bee3bcb0e86a78449115711c8cb87"
+  },
+  "official_go2_evaluator": {
+    "repository": "https://github.com/GOCompetition/C2DataUtilities.git",
+    "revision": "9a61ac1c84cab527e2f3ab85cbd4a09dea3972db"
+  }
+}

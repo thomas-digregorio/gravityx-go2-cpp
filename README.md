@@ -25,6 +25,10 @@ with every reproduction-specific choice recorded in the run manifest.
 See `docs/METHOD_SCOPE.md` for the exact fidelity boundary and
 `provenance/dependencies.json` for pinned revisions.
 
+The completed cold Final-617 experiment and its apples-to-apples comparison
+with the earlier Julia/PowerModels reproduction are recorded in
+`results/FINAL_617_GRAVITY_CPP_COMPARISON.md`.
+
 ## What is implemented
 
 - The base soft ACOPF, continuous AC unit-commitment relaxation, and every

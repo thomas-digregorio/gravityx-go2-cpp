@@ -43,6 +43,7 @@ struct SolveResult {
     double wall_seconds{};
     int iterations{-1};
     bool resident_reoptimization{};
+    bool acceptable_termination_enabled{};
     AcState state;
 };
 
@@ -70,7 +71,8 @@ public:
         ModelMode mode,
         std::vector<int> fixed_status = {},
         std::optional<ContingencyContext> contingency = std::nullopt,
-        bool reusable_contingencies = false);
+        bool reusable_contingencies = false,
+        bool acceptable_termination = false);
 
     SolveResult solve(int print_level = 0, double tolerance = 1e-6);
     void initialize_from(const AcState& state);
@@ -85,6 +87,7 @@ private:
     std::vector<int> fixed_status_;
     std::optional<ContingencyContext> contingency_;
     bool reusable_contingencies_{};
+    bool acceptable_termination_{};
     gravity::Model model_;
 
     std::unique_ptr<gravity::param<double>> generator_available_;

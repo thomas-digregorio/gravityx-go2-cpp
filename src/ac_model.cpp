@@ -259,12 +259,14 @@ AcModel::AcModel(
     ModelMode mode,
     std::vector<int> fixed_status,
     std::optional<ContingencyContext> contingency,
-    bool reusable_contingencies)
+    bool reusable_contingencies,
+    bool acceptable_termination)
     : data_(data),
       mode_(mode),
       fixed_status_(std::move(fixed_status)),
       contingency_(std::move(contingency)),
       reusable_contingencies_(reusable_contingencies),
+      acceptable_termination_(acceptable_termination),
       model_(mode == ModelMode::BaseSoft ? "GO2 AC OPF soft" :
              mode == ModelMode::UnitCommitmentRelaxation ? "GO2 AC UC relaxation" :
              "GO2 corrective AC OPF soft") {
@@ -282,6 +284,10 @@ AcModel::AcModel(
     }
     if (reusable_contingencies_ && mode_ != ModelMode::ContingencySoft) {
         throw std::runtime_error("only a contingency model can be reusable");
+    }
+    if (acceptable_termination_ && !reusable_contingencies_) {
+        throw std::runtime_error(
+            "acceptable termination requires a reusable contingency model");
     }
     if (contingency_) {
         const auto& state = contingency_->base_state;
@@ -957,6 +963,18 @@ SolveResult AcModel::solve(int print_level, double tolerance) {
             resident_ipopt_->Options()->SetStringValue("mehrotra_algorithm", "no");
             resident_ipopt_->Options()->SetNumericValue("tol", tolerance);
             resident_ipopt_->Options()->SetIntegerValue("print_level", print_level);
+            if (acceptable_termination_) {
+                resident_ipopt_->Options()->SetNumericValue("acceptable_tol", 1e-3);
+                resident_ipopt_->Options()->SetIntegerValue("acceptable_iter", 3);
+                resident_ipopt_->Options()->SetNumericValue(
+                    "acceptable_constr_viol_tol", 5e-6);
+                resident_ipopt_->Options()->SetNumericValue(
+                    "acceptable_dual_inf_tol", 1e3);
+                resident_ipopt_->Options()->SetNumericValue(
+                    "acceptable_compl_inf_tol", 1e-3);
+                resident_ipopt_->Options()->SetNumericValue(
+                    "acceptable_obj_change_tol", 1e-7);
+            }
             const auto initialization = resident_ipopt_->Initialize();
             if (initialization != Ipopt::Solve_Succeeded) {
                 throw std::runtime_error("resident Ipopt initialization failed");
@@ -1001,6 +1019,7 @@ SolveResult AcModel::solve(int print_level, double tolerance) {
     result.wall_seconds = std::chrono::duration<double>(finish - start).count();
     result.iterations = iterations;
     result.resident_reoptimization = reoptimization;
+    result.acceptable_termination_enabled = acceptable_termination_;
     result.state = capture_state();
     return result;
 }

@@ -312,7 +312,13 @@ def main() -> int:
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
+    parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     args = parser.parse_args()
+
+    if args.ipopt_acceptable_termination and not args.resident_contingency_model:
+        parser.error(
+            "--ipopt-acceptable-termination requires --resident-contingency-model"
+        )
 
     for path in (args.case_json, args.case_dir, args.output_dir, args.executable):
         reject_onedrive(path)
@@ -365,6 +371,7 @@ def main() -> int:
         },
         "completed_contingency_count": 0,
         "resident_contingency_model": args.resident_contingency_model,
+        "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
     }
 
     def checkpoint() -> None:
@@ -480,6 +487,8 @@ def main() -> int:
         ]
         if args.resident_contingency_model:
             worker_arguments.append("resident")
+        if args.ipopt_acceptable_termination:
+            worker_arguments.append("acceptable")
         command = cpp_command(
             args.executable,
             args.distro,
@@ -580,6 +589,9 @@ def main() -> int:
                     "solver_iterations": result["solve"].get("iterations", -1),
                     "resident_reoptimization": result["solve"].get(
                         "resident_reoptimization", False
+                    ),
+                    "acceptable_termination_enabled": result["solve"].get(
+                        "acceptable_termination_enabled", False
                     ),
                     "model_preparation_wall_seconds": result.get(
                         "model_preparation_wall_seconds", 0.0
@@ -825,6 +837,19 @@ def main() -> int:
         "workers": worker_count,
         "requested_workers": args.workers,
         "resident_contingency_model": args.resident_contingency_model,
+        "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "ipopt_acceptable_options": (
+            {
+                "acceptable_tol": 1e-3,
+                "acceptable_iter": 3,
+                "acceptable_constr_viol_tol": 5e-6,
+                "acceptable_dual_inf_tol": 1e3,
+                "acceptable_compl_inf_tol": 1e-3,
+                "acceptable_obj_change_tol": 1e-7,
+            }
+            if args.ipopt_acceptable_termination
+            else None
+        ),
         "contingency_execution_mode": (
             "resident parametric model per isolated process worker with dynamic queue"
             if args.resident_contingency_model

@@ -422,7 +422,8 @@ bool solve_loaded_contingency(
     const std::string& label,
     const std::string& output_path,
     int print_level,
-    std::unique_ptr<gravityx::AcModel>* reusable_model = nullptr) {
+    std::unique_ptr<gravityx::AcModel>* reusable_model = nullptr,
+    bool acceptable_termination = false) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -446,7 +447,7 @@ bool solve_loaded_contingency(
         if (!*reusable_model) {
             *reusable_model = std::make_unique<gravityx::AcModel>(
                 data, gravityx::ModelMode::ContingencySoft,
-                base.commitment, context, true);
+                base.commitment, context, true, acceptable_termination);
             resident_model_created = true;
         } else {
             (*reusable_model)->set_contingency(context);
@@ -477,6 +478,7 @@ bool solve_loaded_contingency(
         {"source_index", match->source_index},
         {"component_position", match->component},
         {"resident_parametric_model", reusable_model != nullptr},
+        {"acceptable_termination_enabled", acceptable_termination},
         {"resident_model_created", resident_model_created},
         {"model_preparation_wall_seconds", preparation_seconds},
         {"solve", gravityx::solve_result_to_json(solve, true)},
@@ -551,7 +553,8 @@ int run_contingency_worker(
     const std::string& case_path,
     const std::string& base_result_path,
     int print_level,
-    bool reusable_model) {
+    bool reusable_model,
+    bool acceptable_termination) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     const auto data = gravityx::CaseData::load(case_path);
@@ -571,7 +574,8 @@ int run_contingency_worker(
         const auto output_path = task.at("output_path").get<std::string>();
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
-            reusable_model ? &resident_model : nullptr);
+            reusable_model ? &resident_model : nullptr,
+            acceptable_termination);
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
@@ -621,15 +625,29 @@ int main(int argc, char** argv) {
             const int print_level = argc == 6 ? std::stoi(argv[5]) : 0;
             return solve_contingency_batch(argv[2], argv[3], argv[4], print_level);
         }
-        if ((argc >= 4 && argc <= 6) &&
+        if ((argc >= 4 && argc <= 7) &&
             std::string(argv[1]) == "contingency-worker") {
             const int print_level = argc >= 5 ? std::stoi(argv[4]) : 0;
-            const bool reusable_model = argc == 6 && std::string(argv[5]) == "resident";
-            if (argc == 6 && !reusable_model) {
-                throw std::runtime_error("unknown contingency-worker mode");
+            bool reusable_model = false;
+            bool acceptable_termination = false;
+            for (int i = 5; i < argc; ++i) {
+                const std::string option = argv[i];
+                if (option == "resident") {
+                    reusable_model = true;
+                } else if (option == "acceptable") {
+                    acceptable_termination = true;
+                } else {
+                    throw std::runtime_error(
+                        "unknown contingency-worker option: " + option);
+                }
+            }
+            if (acceptable_termination && !reusable_model) {
+                throw std::runtime_error(
+                    "acceptable contingency termination requires resident mode");
             }
             return run_contingency_worker(
-                argv[2], argv[3], print_level, reusable_model);
+                argv[2], argv[3], print_level, reusable_model,
+                acceptable_termination);
         }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"
@@ -642,7 +660,7 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"
-                  << "  gravityx_go2 contingency-worker CASE.json BASE.json [print-level] [resident]\n";
+                  << "  gravityx_go2 contingency-worker CASE.json BASE.json [print-level] [resident] [acceptable]\n";
         return 2;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

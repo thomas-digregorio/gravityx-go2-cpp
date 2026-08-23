@@ -15,6 +15,7 @@ from run_experiment import (  # noqa: E402
     CompetitionTimeout,
     code2_time_limit,
     effective_process_timeout,
+    longest_first_contingencies,
     write_json,
     write_solution,
 )
@@ -95,6 +96,40 @@ class SolutionWriterTests(unittest.TestCase):
 
 
 class CompetitionTimingTests(unittest.TestCase):
+    def test_longest_first_schedule_uses_base_apparent_power(self):
+        case = {
+            "gen": {
+                "1": {"index": 1},
+                "2": {"index": 2},
+            },
+            "branch": {
+                "1": {"index": 1},
+                "2": {"index": 2},
+            },
+        }
+        state = {
+            "pg": [0.3, 0.8],
+            "qg": [0.4, 0.6],
+            "pf": [0.0, 0.6],
+            "qf": [0.2, 0.8],
+            "pt": [0.1, -0.5],
+            "qt": [0.0, -0.5],
+        }
+        records = [
+            {"label": "G_LOW", "type": "gen", "idx": 1},
+            {"label": "B_HIGH", "type": "branch", "idx": 2},
+            {"label": "G_HIGH", "type": "gen", "idx": 2},
+        ]
+        scheduled = longest_first_contingencies(case, state, records)
+        self.assertEqual(
+            [item["label"] for item in scheduled],
+            ["B_HIGH", "G_HIGH", "G_LOW"],
+        )
+        self.assertEqual([item["schedule_rank"] for item in scheduled], [1, 2, 3])
+        self.assertAlmostEqual(
+            scheduled[0]["schedule_score_base_apparent_power"], 1.0
+        )
+
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)
         self.assertEqual(code2_time_limit(0, 2.0), 0.0)

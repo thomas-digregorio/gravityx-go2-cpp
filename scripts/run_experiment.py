@@ -13,6 +13,7 @@ import concurrent.futures
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -283,6 +284,54 @@ def contingency_records(case: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(records, key=lambda item: item["label"])
 
 
+def longest_first_contingencies(
+    case: dict[str, Any],
+    base_state: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    generators = ordered(case, "gen")
+    branches = ordered(case, "branch")
+    generator_position = {
+        int(item["index"]): position for position, item in enumerate(generators)
+    }
+    branch_position = {
+        int(item["index"]): position for position, item in enumerate(branches)
+    }
+    scheduled: list[dict[str, Any]] = []
+    for source in records:
+        item = dict(source)
+        component = int(item["idx"])
+        if item["type"] == "gen":
+            position = generator_position[component]
+            score = math.hypot(
+                float(base_state["pg"][position]),
+                float(base_state["qg"][position]),
+            )
+        else:
+            position = branch_position[component]
+            score = max(
+                math.hypot(
+                    float(base_state["pf"][position]),
+                    float(base_state["qf"][position]),
+                ),
+                math.hypot(
+                    float(base_state["pt"][position]),
+                    float(base_state["qt"][position]),
+                ),
+            )
+        item["schedule_score_base_apparent_power"] = score
+        scheduled.append(item)
+    scheduled.sort(
+        key=lambda item: (
+            -float(item["schedule_score_base_apparent_power"]),
+            str(item["label"]),
+        )
+    )
+    for rank, item in enumerate(scheduled, start=1):
+        item["schedule_rank"] = rank
+    return scheduled
+
+
 def git_revision() -> str | None:
     completed = subprocess.run(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"],
@@ -313,6 +362,7 @@ def main() -> int:
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
+    parser.add_argument("--longest-first-schedule", action="store_true")
     args = parser.parse_args()
 
     if args.ipopt_acceptable_termination and not args.resident_contingency_model:
@@ -372,6 +422,7 @@ def main() -> int:
         "completed_contingency_count": 0,
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "longest_first_schedule": args.longest_first_schedule,
     }
 
     def checkpoint() -> None:
@@ -444,11 +495,28 @@ def main() -> int:
     commitment = [int(value) for value in base["commitment"]]
     base_state = base["selected_state"]
     write_solution(args.output_dir / "solution_BASECASE.txt", case, base_state, commitment)
+    if args.longest_first_schedule:
+        contingencies = longest_first_contingencies(case, base_state, contingencies)
+        schedule_mode = "descending base apparent power, deterministic label tie-break"
+    else:
+        contingencies = [dict(item) for item in contingencies]
+        for rank, item in enumerate(contingencies, start=1):
+            item["schedule_rank"] = rank
+        schedule_mode = "deterministic label order"
     run_status.update(
         {
             "stage": "code2",
             "base_success": True,
             "base_algorithm_wall_seconds": base["wall_seconds"],
+            "contingency_schedule_mode": schedule_mode,
+            "contingency_schedule": [
+                {
+                    "label": item["label"],
+                    "rank": item["schedule_rank"],
+                    "score": item.get("schedule_score_base_apparent_power"),
+                }
+                for item in contingencies
+            ],
         }
     )
     checkpoint()
@@ -581,6 +649,10 @@ def main() -> int:
                     "label": label,
                     "type": item["type"],
                     "source_index": int(item["idx"]),
+                    "schedule_rank": int(item["schedule_rank"]),
+                    "schedule_score_base_apparent_power": item.get(
+                        "schedule_score_base_apparent_power"
+                    ),
                     "worker_id": worker_id,
                     "solver_wall_seconds": result["solve"]["wall_seconds"],
                     "objective": result["solve"]["objective"],
@@ -850,6 +922,9 @@ def main() -> int:
             if args.ipopt_acceptable_termination
             else None
         ),
+        "longest_first_schedule": args.longest_first_schedule,
+        "contingency_schedule_mode": run_status["contingency_schedule_mode"],
+        "contingency_schedule": run_status["contingency_schedule"],
         "contingency_execution_mode": (
             "resident parametric model per isolated process worker with dynamic queue"
             if args.resident_contingency_model

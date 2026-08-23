@@ -113,6 +113,56 @@ int run_component_tests() {
         throw std::runtime_error(
             "component test failed: nonfinite candidate was accepted");
     }
+
+    gravityx::CaseData seed_case;
+    seed_case.buses.resize(2);
+    seed_case.buses[0].generators = {0};
+    seed_case.buses[0].branches_from = {0};
+    seed_case.buses[1].loads = {0};
+    seed_case.buses[1].branches_to = {0};
+    seed_case.generators.resize(1);
+    seed_case.generators[0].bus = 0;
+    seed_case.loads.resize(1);
+    seed_case.loads[0].bus = 1;
+    seed_case.loads[0].pd_nominal = 0.39;
+    seed_case.loads[0].qd_nominal = 0.095;
+    seed_case.branches.resize(1);
+    seed_case.branches[0].from = 0;
+    seed_case.branches[0].to = 1;
+
+    gravityx::AcState balanced;
+    balanced.vm = {1.0, 1.0};
+    balanced.pg = {0.4};
+    balanced.qg = {0.1};
+    balanced.demand_factor = {1.0};
+    balanced.pf = {0.4};
+    balanced.qf = {0.1};
+    balanced.pt = {-0.39};
+    balanced.qt = {-0.095};
+    const auto balanced_seed = gravityx::nodal_balance_slack_seed(
+        seed_case, balanced, 0.5, 0.0);
+    require_near(balanced_seed.active[0], 0.0, 1e-12, "balanced active seed at from bus");
+    require_near(balanced_seed.reactive[1], 0.0, 1e-12, "balanced reactive seed at to bus");
+
+    auto branch_outage = balanced;
+    branch_outage.pf[0] = 0.0;
+    branch_outage.qf[0] = 0.0;
+    branch_outage.pt[0] = 0.0;
+    branch_outage.qt[0] = 0.0;
+    const auto outage_seed = gravityx::nodal_balance_slack_seed(
+        seed_case, branch_outage, 0.5, 0.0);
+    require_near(outage_seed.active[0], 0.4, 1e-12, "branch-outage active seed at from bus");
+    require_near(outage_seed.active[1], 0.39, 1e-12, "branch-outage active seed at to bus");
+    require_near(outage_seed.reactive[0], 0.1, 1e-12, "branch-outage reactive seed at from bus");
+    require_near(outage_seed.reactive[1], 0.095, 1e-12, "branch-outage reactive seed at to bus");
+
+    auto generator_outage = balanced;
+    generator_outage.pg[0] = 0.0;
+    generator_outage.qg[0] = 0.0;
+    const auto generator_seed = gravityx::nodal_balance_slack_seed(
+        seed_case, generator_outage, 0.5, 0.0);
+    require_near(generator_seed.active[0], 0.4, 1e-12, "generator-outage active seed");
+    require_near(generator_seed.reactive[0], 0.1, 1e-12, "generator-outage reactive seed");
     std::cout << "component tests passed\n";
     return 0;
 }

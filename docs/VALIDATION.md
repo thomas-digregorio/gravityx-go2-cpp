@@ -64,6 +64,14 @@ worker assignment is recorded.  Workers run concurrently and are limited to
 one BLAS thread each to avoid oversubscription.  No contingency solution or
 optimizer state is reused by a different contingency.
 
+Each corrective model starts from the verified base state with the outaged
+component removed.  Its active- and reactive-balance slack variables are
+initialized from the independently recomputed nodal mismatch of that adjusted
+state, with a small interior margin and the unchanged source-model slack bound.
+This initialization changes neither the corrective equations nor their
+penalties; it avoids asking Ipopt to rediscover the outage-created imbalance
+from an all-zero slack start.
+
 For Final-event Division 1 experiments, the runner enforces the historical
 timing stages separately: Code1 has a 300-second wall limit and Code2 receives
 two seconds per source contingency.  A failed or timed-out run leaves a

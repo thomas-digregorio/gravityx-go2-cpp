@@ -50,6 +50,17 @@ struct ContingencyContext {
     AcState base_state;
 };
 
+struct BalanceSlackSeed {
+    std::vector<double> active;
+    std::vector<double> reactive;
+};
+
+BalanceSlackSeed nodal_balance_slack_seed(
+    const CaseData& data,
+    const AcState& state,
+    double upper_bound = 0.5,
+    double interior_margin = 1e-6);
+
 class AcModel {
 public:
     AcModel(

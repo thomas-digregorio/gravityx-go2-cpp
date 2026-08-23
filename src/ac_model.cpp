@@ -18,6 +18,7 @@ using gravity::param;
 using gravity::var;
 
 constexpr double kBoundInfinity = 1e19;
+constexpr double kBalanceSlackUpper = 0.5;
 
 void add_eq(Model& model, const std::string& name, func_ expression) {
     Constraint constraint(name);
@@ -136,6 +137,62 @@ std::vector<double> lambda_weights(const std::vector<PwlPoint>& points, double v
 
 }  // namespace
 
+BalanceSlackSeed nodal_balance_slack_seed(
+    const CaseData& data,
+    const AcState& state,
+    double upper_bound,
+    double interior_margin) {
+    const std::size_t nb = data.buses.size();
+    const std::size_t ng = data.generators.size();
+    const std::size_t nd = data.loads.size();
+    const std::size_t nl = data.branches.size();
+    if (state.vm.size() != nb || state.pg.size() != ng || state.qg.size() != ng ||
+        state.demand_factor.size() != nd || state.pf.size() != nl ||
+        state.qf.size() != nl || state.pt.size() != nl || state.qt.size() != nl) {
+        throw std::runtime_error("cannot seed nodal slacks from a dimensionally invalid state");
+    }
+    if (!std::isfinite(upper_bound) || upper_bound < 0.0 ||
+        !std::isfinite(interior_margin) || interior_margin < 0.0) {
+        throw std::runtime_error("invalid nodal-slack seed bounds");
+    }
+
+    BalanceSlackSeed seed;
+    seed.active.resize(nb);
+    seed.reactive.resize(nb);
+    for (std::size_t i = 0; i < nb; ++i) {
+        const auto& bus = data.buses[i];
+        double p = 0.0;
+        double q = 0.0;
+        for (int branch : bus.branches_from) {
+            p += state.pf.at(branch);
+            q += state.qf.at(branch);
+        }
+        for (int branch : bus.branches_to) {
+            p += state.pt.at(branch);
+            q += state.qt.at(branch);
+        }
+        for (int generator : bus.generators) {
+            p -= state.pg.at(generator);
+            q -= state.qg.at(generator);
+        }
+        for (int load : bus.loads) {
+            p += data.loads.at(load).pd_nominal * state.demand_factor.at(load);
+            q += data.loads.at(load).qd_nominal * state.demand_factor.at(load);
+        }
+        for (int shunt : bus.shunts) {
+            const double vm2 = state.vm[i] * state.vm[i];
+            p += data.shunts.at(shunt).gs * vm2;
+            q -= data.shunts.at(shunt).bs * vm2;
+        }
+        if (!std::isfinite(p) || !std::isfinite(q)) {
+            throw std::runtime_error("cannot seed nodal slacks from a nonfinite state");
+        }
+        seed.active[i] = std::min(upper_bound, std::abs(p) + interior_margin);
+        seed.reactive[i] = std::min(upper_bound, std::abs(q) + interior_margin);
+    }
+    return seed;
+}
+
 AcModel::AcModel(
     const CaseData& data,
     ModelMode mode,
@@ -164,7 +221,9 @@ AcModel::AcModel(
         const auto& state = contingency_->base_state;
         if (state.vm.size() != data_.buses.size() || state.va.size() != data_.buses.size() ||
             state.pg.size() != data_.generators.size() || state.qg.size() != data_.generators.size() ||
-            state.demand_factor.size() != data_.loads.size()) {
+            state.demand_factor.size() != data_.loads.size() ||
+            state.pf.size() != data_.branches.size() || state.qf.size() != data_.branches.size() ||
+            state.pt.size() != data_.branches.size() || state.qt.size() != data_.branches.size()) {
             throw std::runtime_error("contingency base state dimensions are invalid");
         }
     }
@@ -274,8 +333,12 @@ void AcModel::build_variables() {
     sm_slack_ = add_bounded_variable(model_, "sm_slack", slack_lower, slack_upper);
 
     if (mode_ != ModelMode::UnitCommitmentRelaxation) {
-        p_delta_ = add_bounded_variable(model_, "p_delta", std::vector<double>(nb, 0.0), std::vector<double>(nb, 0.5));
-        q_delta_ = add_bounded_variable(model_, "q_delta", std::vector<double>(nb, 0.0), std::vector<double>(nb, 0.5));
+        p_delta_ = add_bounded_variable(
+            model_, "p_delta", std::vector<double>(nb, 0.0),
+            std::vector<double>(nb, kBalanceSlackUpper));
+        q_delta_ = add_bounded_variable(
+            model_, "q_delta", std::vector<double>(nb, 0.0),
+            std::vector<double>(nb, kBalanceSlackUpper));
     } else {
         std::vector<double> z_lower(ng, 0.0), z_upper(ng, 1.0);
         for (std::size_t i = 0; i < ng; ++i) {
@@ -520,6 +583,11 @@ void AcModel::build_constraints_and_objective() {
 }
 
 void AcModel::initialize_source_point() {
+    std::optional<AcState> contingency_start;
+    if (mode_ == ModelMode::ContingencySoft) {
+        contingency_start = contingency_->base_state;
+    }
+
     for (std::size_t i = 0; i < data_.buses.size(); ++i) {
         const double vm = mode_ == ModelMode::ContingencySoft
             ? contingency_->base_state.vm[i]
@@ -527,8 +595,13 @@ void AcModel::initialize_source_point() {
         const double va = mode_ == ModelMode::ContingencySoft
             ? contingency_->base_state.va[i]
             : data_.buses[i].va_start;
-        vm_->initialize(i, clamp_to(vm, data_.buses[i].vmin, data_.buses[i].vmax));
+        const double bounded_vm = clamp_to(vm, data_.buses[i].vmin, data_.buses[i].vmax);
+        vm_->initialize(i, bounded_vm);
         va_->initialize(i, va);
+        if (contingency_start) {
+            contingency_start->vm[i] = bounded_vm;
+            contingency_start->va[i] = va;
+        }
     }
 
     for (std::size_t i = 0; i < data_.generators.size(); ++i) {
@@ -570,6 +643,10 @@ void AcModel::initialize_source_point() {
         }
         pg_->initialize(i, pg);
         qg_->initialize(i, qg);
+        if (contingency_start) {
+            contingency_start->pg[i] = pg;
+            contingency_start->qg[i] = qg;
+        }
 
         if (gen_lambda_offset_[i] >= 0) {
             const auto weights = lambda_weights(gen_points_[i], pg);
@@ -600,6 +677,9 @@ void AcModel::initialize_source_point() {
             z = clamp_to(z, lower, upper);
         }
         demand_->initialize(i, z);
+        if (contingency_start) {
+            contingency_start->demand_factor[i] = z;
+        }
         const auto weights = lambda_weights(load_points_[i], data_.loads[i].pd_nominal * z);
         for (int j = 0; j < static_cast<int>(weights.size()); ++j) {
             load_lambda_->initialize(load_lambda_offset_[i] + j, weights[j]);
@@ -608,15 +688,38 @@ void AcModel::initialize_source_point() {
 
     for (std::size_t i = 0; i < data_.branches.size(); ++i) {
         const bool outaged = contingency_ && contingency_->outaged_branch == static_cast<int>(i);
-        pf_->initialize(i, mode_ == ModelMode::ContingencySoft && !outaged ? contingency_->base_state.pf[i] : 0.0);
-        qf_->initialize(i, mode_ == ModelMode::ContingencySoft && !outaged ? contingency_->base_state.qf[i] : 0.0);
-        pt_->initialize(i, mode_ == ModelMode::ContingencySoft && !outaged ? contingency_->base_state.pt[i] : 0.0);
-        qt_->initialize(i, mode_ == ModelMode::ContingencySoft && !outaged ? contingency_->base_state.qt[i] : 0.0);
+        const double pf = mode_ == ModelMode::ContingencySoft && !outaged
+            ? contingency_->base_state.pf[i] : 0.0;
+        const double qf = mode_ == ModelMode::ContingencySoft && !outaged
+            ? contingency_->base_state.qf[i] : 0.0;
+        const double pt = mode_ == ModelMode::ContingencySoft && !outaged
+            ? contingency_->base_state.pt[i] : 0.0;
+        const double qt = mode_ == ModelMode::ContingencySoft && !outaged
+            ? contingency_->base_state.qt[i] : 0.0;
+        pf_->initialize(i, pf);
+        qf_->initialize(i, qf);
+        pt_->initialize(i, pt);
+        qt_->initialize(i, qt);
         sm_slack_->initialize(i, 0.0);
+        if (contingency_start) {
+            contingency_start->pf[i] = pf;
+            contingency_start->qf[i] = qf;
+            contingency_start->pt[i] = pt;
+            contingency_start->qt[i] = qt;
+        }
     }
     if (mode_ != ModelMode::UnitCommitmentRelaxation) {
-        p_delta_->initialize_all(0.0);
-        q_delta_->initialize_all(0.0);
+        if (contingency_start) {
+            const auto seed = nodal_balance_slack_seed(
+                data_, *contingency_start, kBalanceSlackUpper);
+            for (std::size_t i = 0; i < data_.buses.size(); ++i) {
+                p_delta_->initialize(i, seed.active[i]);
+                q_delta_->initialize(i, seed.reactive[i]);
+            }
+        } else {
+            p_delta_->initialize_all(0.0);
+            q_delta_->initialize_all(0.0);
+        }
     }
 }
 

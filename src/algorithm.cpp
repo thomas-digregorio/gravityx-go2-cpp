@@ -16,8 +16,8 @@ bool solver_succeeded(int status) {
 }
 
 bool state_is_acceptable(const SolveResult& result, const ValidationReport& validation, double tolerance) {
-    return solver_succeeded(result.status) && std::isfinite(result.objective) &&
-        validation.max_residual <= tolerance;
+    return solver_succeeded(result.status) &&
+        validated_candidate_is_feasible(result, validation, tolerance);
 }
 
 int rounded_status(double value, int prior, double threshold) {
@@ -28,6 +28,15 @@ int rounded_status(double value, int prior, double threshold) {
 }
 
 }  // namespace
+
+bool validated_candidate_is_feasible(
+    const SolveResult& result,
+    const ValidationReport& validation,
+    double tolerance) {
+    return tolerance >= 0.0 && std::isfinite(result.objective) &&
+        std::isfinite(validation.max_residual) &&
+        validation.max_residual <= tolerance;
+}
 
 nlohmann::json IbrRound::to_json() const {
     return {

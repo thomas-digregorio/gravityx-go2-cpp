@@ -32,6 +32,7 @@ DEFAULT_EVALUATOR = Path(
     r"C:\Users\thoma\Documents\goc2-dc-scopf-cpu\vendor\C2DataUtilities\data_utilities\evaluation.py"
 )
 WSL_LIBRARY_PATH = "/home/thomasdigregorio/.local/share/gravityx-go2-cpp/env/lib"
+FINALIZATION_RESERVE_SECONDS = 1.0
 
 
 class CompetitionTimeout(RuntimeError):
@@ -282,6 +283,8 @@ def main() -> int:
     parser.add_argument("--contingency-timeout", type=float, default=300.0)
     parser.add_argument("--code1-time-limit", type=float, default=300.0)
     parser.add_argument("--code2-seconds-per-contingency", type=float, default=2.0)
+    parser.add_argument("--total-time-limit", type=float, default=300.0)
+    parser.add_argument("--evaluation-reserve", type=float, default=7.0)
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--skip-evaluation", action="store_true")
@@ -293,17 +296,27 @@ def main() -> int:
         raise ValueError("workers must be positive")
     if args.code1_time_limit <= 0:
         raise ValueError("Code1 time limit must be positive")
+    if args.total_time_limit <= 0:
+        raise ValueError("end-to-end time limit must be positive")
+    if args.evaluation_reserve <= 0:
+        raise ValueError("evaluation reserve must be positive")
+    if args.evaluation_reserve + FINALIZATION_RESERVE_SECONDS >= args.total_time_limit:
+        raise ValueError("evaluation and finalization reserves exhaust the end-to-end limit")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError(f"cold-run output directory is not empty: {args.output_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
+    wall_start = time.perf_counter()
+    total_deadline = wall_start + args.total_time_limit
+    work_deadline = total_deadline - args.evaluation_reserve
+    evaluation_deadline = total_deadline - FINALIZATION_RESERVE_SECONDS
 
     case = read_json(args.case_json)
     contingencies = contingency_records(case)
     code2_limit = code2_time_limit(
         len(contingencies), args.code2_seconds_per_contingency
     )
-    started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
-    wall_start = time.perf_counter()
     internal = args.output_dir / "internal"
     base_json = internal / "base.json"
     records: list[dict[str, Any]] = []
@@ -320,6 +333,12 @@ def main() -> int:
             "contingency_count": len(contingencies),
             "timing_semantics": "Code1 and Code2 are separate wall-clock stages",
         },
+        "end_to_end_timing": {
+            "time_limit_seconds": args.total_time_limit,
+            "evaluation_reserve_seconds": args.evaluation_reserve,
+            "finalization_reserve_seconds": FINALIZATION_RESERVE_SECONDS,
+            "measurement_boundary": "normalized-case loading through official evaluation and result serialization",
+        },
         "completed_contingency_count": 0,
     }
 
@@ -330,12 +349,20 @@ def main() -> int:
 
     base_start = time.perf_counter()
     try:
+        base_deadline = min(
+            base_start + args.code1_time_limit,
+            work_deadline,
+        )
+        base_timeout = effective_process_timeout(
+            min(args.base_timeout, args.code1_time_limit),
+            base_deadline,
+        )
         base_process = run_cpp(
             args.executable,
             args.distro,
             ["run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"],
             internal / "base.console.log",
-            min(args.base_timeout, args.code1_time_limit),
+            base_timeout,
         )
     except Exception as error:
         run_status.update(
@@ -343,6 +370,7 @@ def main() -> int:
                 "stage": "code1",
                 "base_process_wall_seconds": time.perf_counter() - base_start,
                 "code1_within_limit": False,
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
                 "error": str(error),
                 "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "total_wall_seconds": time.perf_counter() - wall_start,
@@ -360,7 +388,7 @@ def main() -> int:
     )
     if base_process.returncode != 0:
         run_status["error"] = (
-            "Code1 reached its competition deadline"
+            "Code1 reached its competition or end-to-end work deadline"
             if getattr(base_process, "timed_out", False)
             else "cold C++ base/IBR solve failed"
         )
@@ -370,6 +398,10 @@ def main() -> int:
         raise RuntimeError(f"{run_status['error']}; see internal/base.console.log")
     if base_wall > args.code1_time_limit:
         run_status["error"] = "Code1 completed after its competition deadline"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    if time.perf_counter() > work_deadline:
+        run_status["error"] = "Code1 exhausted the time reserved for Code2 and evaluation"
         checkpoint()
         raise CompetitionTimeout(run_status["error"])
     base = read_json(base_json)
@@ -390,7 +422,13 @@ def main() -> int:
     checkpoint()
 
     contingency_start = time.perf_counter()
-    contingency_deadline = contingency_start + code2_limit
+    code2_deadline = contingency_start + code2_limit
+    contingency_deadline = min(code2_deadline, work_deadline)
+    contingency_deadline_name = (
+        "end-to-end work deadline"
+        if work_deadline <= code2_deadline
+        else "Code2 competition deadline"
+    )
     abort_contingencies = threading.Event()
 
     def solve_one(item: dict[str, Any]) -> dict[str, Any]:
@@ -420,7 +458,7 @@ def main() -> int:
         if process.returncode != 0:
             if getattr(process, "timed_out", False):
                 raise CompetitionTimeout(
-                    f"contingency {label} reached the Code2 competition deadline"
+                    f"contingency {label} reached the {contingency_deadline_name}"
                 )
             raise RuntimeError(f"contingency {label} failed; see {log_path}")
         result = read_json(result_path)
@@ -435,7 +473,7 @@ def main() -> int:
         )
         if time.perf_counter() > contingency_deadline:
             raise CompetitionTimeout(
-                f"contingency {label} finished after the Code2 competition deadline"
+                f"contingency {label} finished after the {contingency_deadline_name}"
             )
         return {
             "label": label,
@@ -445,6 +483,11 @@ def main() -> int:
             "solver_wall_seconds": result["solve"]["wall_seconds"],
             "objective": result["solve"]["objective"],
             "max_residual": result["validation"]["max_residual"],
+            "solver_status": result["solve"]["status"],
+            "solver_status_success": result.get("solver_status_success", False),
+            "accepted_feasible_nonconverged": result.get(
+                "accepted_feasible_nonconverged", False
+            ),
         }
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
@@ -467,6 +510,7 @@ def main() -> int:
             {
                 "stage": "code2",
                 "code2_within_limit": contingency_wall <= code2_limit,
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
                 "contingency_parallel_wall_seconds": contingency_wall,
                 "error": str(error),
                 "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -489,6 +533,10 @@ def main() -> int:
         run_status["error"] = "Code2 completed after its competition deadline"
         checkpoint()
         raise CompetitionTimeout(run_status["error"])
+    if time.perf_counter() > work_deadline:
+        run_status["error"] = "Code2 exhausted the time reserved for official evaluation"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
     checkpoint()
 
     evaluation_wall = 0.0
@@ -497,13 +545,43 @@ def main() -> int:
         for path in (args.python, args.evaluator):
             reject_onedrive(path)
         evaluation_start = time.perf_counter()
-        completed = subprocess.run(
-            [str(args.python), str(args.evaluator), "1", str(args.case_dir), str(args.output_dir)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        evaluator_timeout = effective_process_timeout(
+            args.total_time_limit,
+            evaluation_deadline,
         )
+        try:
+            completed = subprocess.run(
+                [
+                    str(args.python),
+                    str(args.evaluator),
+                    "1",
+                    str(args.case_dir),
+                    str(args.output_dir),
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=evaluator_timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            output = error.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode(errors="replace")
+            (internal / "evaluation.console.log").write_text(
+                output + "\nEND_TO_END_TIMEOUT\n", encoding="utf-8"
+            )
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": "official evaluator reached the end-to-end deadline",
+                    "end_to_end_within_limit": False,
+                    "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
+            raise CompetitionTimeout(run_status["error"]) from error
         evaluation_wall = time.perf_counter() - evaluation_start
         (internal / "evaluation.console.log").write_text(completed.stdout, encoding="utf-8")
         if completed.returncode != 0:
@@ -511,6 +589,7 @@ def main() -> int:
                 {
                     "stage": "evaluation",
                     "error": "official evaluator failed",
+                    "end_to_end_within_limit": time.perf_counter() <= total_deadline,
                     "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
                     "total_wall_seconds": time.perf_counter() - wall_start,
                 }
@@ -532,6 +611,7 @@ def main() -> int:
                 {
                     "stage": "evaluation",
                     "error": "official evaluator did not certify every case feasible",
+                    "end_to_end_within_limit": time.perf_counter() <= total_deadline,
                     "official_infeasibility": evaluation_summary.get("infeas"),
                     "official_infeasible_cases": infeasible_cases,
                     "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -540,6 +620,19 @@ def main() -> int:
             )
             checkpoint()
             raise RuntimeError(run_status["error"])
+
+    if time.perf_counter() > evaluation_deadline:
+        run_status.update(
+            {
+                "stage": "evaluation",
+                "error": "official evaluation left insufficient time for result serialization",
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
 
     total_wall = time.perf_counter() - wall_start
     max_residual = max((item["max_residual"] for item in records), default=0.0)
@@ -562,6 +655,10 @@ def main() -> int:
             "code1_within_limit": True,
             "code2_within_limit": True,
         },
+        "end_to_end_timing": {
+            **run_status["end_to_end_timing"],
+            "within_limit": True,
+        },
         "base_process_wall_seconds": base_wall,
         "base_algorithm_wall_seconds": base["wall_seconds"],
         "contingency_parallel_wall_seconds": contingency_wall,
@@ -569,6 +666,9 @@ def main() -> int:
         "evaluation_wall_seconds": evaluation_wall,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),
+        "accepted_feasible_nonconverged_count": sum(
+            bool(item["accepted_feasible_nonconverged"]) for item in records
+        ),
         "max_independent_contingency_residual": max_residual,
         "base": base,
         "contingencies": records,
@@ -584,14 +684,50 @@ def main() -> int:
             "official_objective": evaluation_summary.get("obj") if evaluation_summary else None,
             "official_infeasibility": evaluation_summary.get("infeas") if evaluation_summary else None,
             "completed_contingency_count": len(records),
+            "accepted_feasible_nonconverged_count": summary[
+                "accepted_feasible_nonconverged_count"
+            ],
+            "end_to_end_within_limit": True,
         }
     )
     checkpoint()
+    finalized_total = time.perf_counter() - wall_start
+    if finalized_total > args.total_time_limit:
+        run_status.update(
+            {
+                "success": False,
+                "stage": "finalization",
+                "error": "result serialization exceeded the end-to-end deadline",
+                "end_to_end_within_limit": False,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": finalized_total,
+            }
+        )
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    summary["total_wall_seconds"] = finalized_total
+    run_status["total_wall_seconds"] = finalized_total
+    write_json(args.output_dir / "run_summary.json", summary)
+    checkpoint()
+    reported_total = time.perf_counter() - wall_start
+    if reported_total > args.total_time_limit:
+        run_status.update(
+            {
+                "success": False,
+                "stage": "finalization",
+                "error": "final timing records exceeded the end-to-end deadline",
+                "end_to_end_within_limit": False,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": reported_total,
+            }
+        )
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
     print(
         json.dumps(
             {
                 "output_dir": str(args.output_dir),
-                "total_wall_seconds": total_wall,
+                "total_wall_seconds": reported_total,
                 "base_wall_seconds": base_wall,
                 "contingency_wall_seconds": contingency_wall,
                 "objective": evaluation_summary.get("obj") if evaluation_summary else None,

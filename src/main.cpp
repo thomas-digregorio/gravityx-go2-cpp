@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -87,6 +88,30 @@ int run_component_tests() {
     if (restored.vm != source.vm || restored.va != source.va || restored.pg != source.pg ||
         restored.commitment != source.commitment || restored.gen_lambda != source.gen_lambda) {
         throw std::runtime_error("component test failed: AC state JSON round trip");
+    }
+
+    gravityx::SolveResult nonconverged_feasible;
+    nonconverged_feasible.status = -2;
+    nonconverged_feasible.objective = 42.0;
+    gravityx::ValidationReport feasible_validation;
+    feasible_validation.max_residual = 1e-8;
+    if (!gravityx::validated_candidate_is_feasible(
+            nonconverged_feasible, feasible_validation, 1e-5)) {
+        throw std::runtime_error(
+            "component test failed: validated nonconverged candidate was rejected");
+    }
+    feasible_validation.max_residual = 1e-4;
+    if (gravityx::validated_candidate_is_feasible(
+            nonconverged_feasible, feasible_validation, 1e-5)) {
+        throw std::runtime_error(
+            "component test failed: invalid nonconverged candidate was accepted");
+    }
+    feasible_validation.max_residual = 1e-8;
+    nonconverged_feasible.objective = std::numeric_limits<double>::quiet_NaN();
+    if (gravityx::validated_candidate_is_feasible(
+            nonconverged_feasible, feasible_validation, 1e-5)) {
+        throw std::runtime_error(
+            "component test failed: nonfinite candidate was accepted");
     }
     std::cout << "component tests passed\n";
     return 0;
@@ -170,6 +195,18 @@ int run_parallel_circuit_regression() {
     if ((solve.status != 0 && solve.status != 1) || !std::isfinite(solve.objective) ||
         validation.max_residual > 1e-5) {
         throw std::runtime_error("parallel-circuit symbolic-DAG regression failed");
+    }
+    auto nonfinite_state = solve.state;
+    nonfinite_state.vm[0] = std::numeric_limits<double>::quiet_NaN();
+    bool nonfinite_rejected = false;
+    try {
+        static_cast<void>(gravityx::validate_state(
+            data, gravityx::ModelMode::BaseSoft, nonfinite_state, {1}));
+    } catch (const std::runtime_error&) {
+        nonfinite_rejected = true;
+    }
+    if (!nonfinite_rejected) {
+        throw std::runtime_error("nonfinite-state validation regression failed");
     }
     std::cout << "parallel-circuit regression passed with max residual "
               << validation.max_residual << '\n';
@@ -349,10 +386,14 @@ int solve_contingency(
     const auto validation = gravityx::validate_state(
         data, gravityx::ModelMode::ContingencySoft,
         solve.state, fixed_status, context);
-    const bool success = (solve.status == 0 || solve.status == 1) &&
-        std::isfinite(solve.objective) && validation.max_residual <= 1e-5;
+    const bool solver_status_success = solve.status == 0 || solve.status == 1;
+    const bool success = gravityx::validated_candidate_is_feasible(
+        solve, validation, 1e-5);
+    const bool accepted_feasible_nonconverged = success && !solver_status_success;
     const nlohmann::json output = {
         {"success", success},
+        {"solver_status_success", solver_status_success},
+        {"accepted_feasible_nonconverged", accepted_feasible_nonconverged},
         {"label", match->label},
         {"type", match->type == gravityx::ContingencyType::Generator ? "gen" : "branch"},
         {"source_index", match->source_index},
@@ -364,6 +405,8 @@ int solve_contingency(
     std::cout << nlohmann::json({
         {"output", output_path},
         {"success", success},
+        {"solver_status_success", solver_status_success},
+        {"accepted_feasible_nonconverged", accepted_feasible_nonconverged},
         {"label", match->label},
         {"status", solve.status},
         {"objective", solve.objective},

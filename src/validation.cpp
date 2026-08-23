@@ -51,6 +51,36 @@ double bound_violation(double value, double lower, double upper) {
     return std::max(positive_part(lower - value), positive_part(value - upper));
 }
 
+void require_finite_vector(const std::vector<double>& values, const std::string& name) {
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (!std::isfinite(values[i])) {
+            throw std::runtime_error(
+                "state contains nonfinite " + name + " value at position " +
+                std::to_string(i));
+        }
+    }
+}
+
+void require_finite_state(const AcState& state, const std::string& prefix) {
+    require_finite_vector(state.vm, prefix + "vm");
+    require_finite_vector(state.va, prefix + "va");
+    require_finite_vector(state.pg, prefix + "pg");
+    require_finite_vector(state.qg, prefix + "qg");
+    require_finite_vector(state.demand_factor, prefix + "demand_factor");
+    require_finite_vector(state.pf, prefix + "pf");
+    require_finite_vector(state.qf, prefix + "qf");
+    require_finite_vector(state.pt, prefix + "pt");
+    require_finite_vector(state.qt, prefix + "qt");
+    require_finite_vector(state.sm_slack, prefix + "sm_slack");
+    require_finite_vector(state.p_delta, prefix + "p_delta");
+    require_finite_vector(state.q_delta, prefix + "q_delta");
+    require_finite_vector(state.commitment, prefix + "commitment");
+    require_finite_vector(state.startup, prefix + "startup");
+    require_finite_vector(state.shutdown, prefix + "shutdown");
+    require_finite_vector(state.gen_lambda, prefix + "gen_lambda");
+    require_finite_vector(state.load_lambda, prefix + "load_lambda");
+}
+
 }  // namespace
 
 nlohmann::json ValidationReport::to_json() const {
@@ -103,6 +133,10 @@ ValidationReport validate_state(
             base.pt.size() != nl || base.qt.size() != nl) {
             throw std::runtime_error("contingency base state dimensions do not match case dimensions");
         }
+    }
+    require_finite_state(state, "candidate.");
+    if (contingency) {
+        require_finite_state(contingency->base_state, "base.");
     }
 
     std::vector<int> fixed_status = fixed_status_argument;

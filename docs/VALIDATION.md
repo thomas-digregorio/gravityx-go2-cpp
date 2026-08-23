@@ -12,8 +12,13 @@ The C++ checker recomputes, without consulting Gravity's expression graph:
 - applicable angle limits and soft thermal/current limits; and
 - the exact generator or branch removed in each contingency.
 
-An optimization result is accepted only when the Gravity/Ipopt status is
-successful and the independent maximum residual is no greater than `1e-5`.
+Base and commitment-rounding results require a successful Gravity/Ipopt status
+and an independent maximum residual no greater than `1e-5`.  A corrective
+contingency point with a finite objective is retained whenever the independent
+checker verifies the same `1e-5` residual limit, even if Ipopt terminates after
+finding that feasible point without reporting convergence.  The raw Ipopt
+status and this acceptance path are recorded, and the official evaluator must
+still certify every submitted case.
 
 The component suite also solves a two-bus AC case with two electrically
 identical parallel circuits.  This guards the branch-specific symbolic tags
@@ -59,4 +64,7 @@ For Final-event Division 1 experiments, the runner enforces the historical
 timing stages separately: Code1 has a 300-second wall limit and Code2 receives
 two seconds per source contingency.  A failed or timed-out run leaves a
 machine-readable `run_status.json`; a run is successful only after the official
-evaluator confirms every submitted case is feasible.
+evaluator confirms every submitted case is feasible.  The five-scenario
+reproduction additionally enforces a stricter 300-second end-to-end limit from
+normalized-case loading through official evaluation and result serialization,
+with seven seconds reserved for evaluation and one second for finalization.

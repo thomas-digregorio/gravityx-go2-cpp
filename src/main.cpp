@@ -92,6 +92,90 @@ int run_component_tests() {
     return 0;
 }
 
+int run_parallel_circuit_regression() {
+    gravityx::CaseData data;
+    data.name = "parallel-circuit-regression";
+    data.base_mva = 100.0;
+    data.delta = 1.0;
+    data.delta_r = 1.0;
+    data.delta_ctg = 1.0;
+    data.delta_r_ctg = 1.0;
+    data.sm_vio_limit = 0.2;
+    data.sm_cost_approx = 1e5;
+    data.p_delta_cost_approx = 1e5;
+    data.q_delta_cost_approx = 1e5;
+    data.buses = {
+        {"1", 1, 1, 3, 0.9, 1.1, 1.0, 0.0},
+        {"2", 2, 2, 1, 0.9, 1.1, 1.0, -0.05},
+    };
+    gravityx::Generator generator;
+    generator.source_key = "1";
+    generator.index = 1;
+    generator.bus = 0;
+    generator.status_prev = 1;
+    generator.suqual = 1;
+    generator.sdqual = 1;
+    generator.pg_start = 0.5;
+    generator.pg_prev = 0.5;
+    generator.pmin = 0.0;
+    generator.pmax = 2.0;
+    generator.qmin = -2.0;
+    generator.qmax = 2.0;
+    generator.prumax = generator.prdmax = 2.0;
+    generator.prumaxctg = generator.prdmaxctg = 2.0;
+    generator.ncost = 2;
+    generator.cost = {0.0, 0.0, 2.0, 20.0};
+    data.generators.push_back(generator);
+
+    gravityx::Load load;
+    load.source_key = "1";
+    load.index = 1;
+    load.bus = 1;
+    load.pd_nominal = load.pd_prev = 0.5;
+    load.qd_nominal = load.qd_prev = 0.1;
+    load.pd_min = 0.0;
+    load.pd_max = 1.0;
+    load.tmin = load.tmax = load.z_start = 1.0;
+    load.prumax = load.prdmax = 1.0;
+    load.prumaxctg = load.prdmaxctg = 1.0;
+    load.ncost = 2;
+    load.cost = {0.0, 0.0, 1.0, 1000.0};
+    data.loads.push_back(load);
+
+    gravityx::Branch branch;
+    branch.from = 0;
+    branch.to = 1;
+    branch.r = 0.01;
+    branch.x = 0.1;
+    branch.tap = 1.0;
+    branch.angmin = -1.0;
+    branch.angmax = 1.0;
+    branch.rate_a = 2.0;
+    branch.source_key = "1";
+    branch.index = 1;
+    data.branches.push_back(branch);
+    branch.source_key = "2";
+    branch.index = 2;
+    data.branches.push_back(branch);
+
+    data.buses[0].generators = {0};
+    data.buses[1].loads = {0};
+    data.buses[0].branches_from = {0, 1};
+    data.buses[1].branches_to = {0, 1};
+
+    gravityx::AcModel model(data, gravityx::ModelMode::BaseSoft, {1});
+    const auto solve = model.solve(0, 1e-7);
+    const auto validation = gravityx::validate_state(
+        data, gravityx::ModelMode::BaseSoft, solve.state, {1});
+    if ((solve.status != 0 && solve.status != 1) || !std::isfinite(solve.objective) ||
+        validation.max_residual > 1e-5) {
+        throw std::runtime_error("parallel-circuit symbolic-DAG regression failed");
+    }
+    std::cout << "parallel-circuit regression passed with max residual "
+              << validation.max_residual << '\n';
+    return 0;
+}
+
 nlohmann::json state_summary(const gravityx::SolveResult& result) {
     const auto& state = result.state;
     nlohmann::json summary = {
@@ -299,6 +383,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "component-tests") {
             return run_component_tests();
         }
+        if (argc == 2 && std::string(argv[1]) == "parallel-circuit-test") {
+            return run_parallel_circuit_regression();
+        }
         if (argc == 3 && std::string(argv[1]) == "inspect") {
             return run_inspect(argv[2]);
         }
@@ -322,6 +409,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"
                   << "  gravityx_go2 component-tests\n"
+                  << "  gravityx_go2 parallel-circuit-test\n"
                   << "  gravityx_go2 inspect CASE.json\n"
                   << "  gravityx_go2 solve-base CASE.json [print-level]\n"
                   << "  gravityx_go2 solve-relax CASE.json [print-level]\n"

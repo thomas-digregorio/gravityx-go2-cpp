@@ -440,31 +440,54 @@ void AcModel::build_constraints_and_objective() {
         const int f = branch.from;
         const int t = branch.to;
 
-        const auto cross_cos_ft = (*vm_)(f) * (*vm_)(t) * gravity::cos((*va_)(f) - (*va_)(t));
-        const auto cross_sin_ft = (*vm_)(f) * (*vm_)(t) * gravity::sin((*va_)(f) - (*va_)(t));
+        // This pinned Gravity revision keys nonlinear DAG nodes by their
+        // rendered expression.  Parallel circuits can therefore collide when
+        // they contain symbolically identical voltage terms, leaving one
+        // derivative node unevaluated.  Unit-valued, branch/equation-specific
+        // parameters keep the symbolic nodes distinct without changing the
+        // mathematical model.
+        param<double> pf_tag("branch_pf_tag_" + std::to_string(i));
+        param<double> qf_tag("branch_qf_tag_" + std::to_string(i));
+        param<double> pt_tag("branch_pt_tag_" + std::to_string(i));
+        param<double> qt_tag("branch_qt_tag_" + std::to_string(i));
+        param<double> thermal_f_tag("branch_thermal_f_tag_" + std::to_string(i));
+        param<double> thermal_t_tag("branch_thermal_t_tag_" + std::to_string(i));
+        pf_tag = 1.0;
+        qf_tag = 1.0;
+        pt_tag = 1.0;
+        qt_tag = 1.0;
+        thermal_f_tag = 1.0;
+        thermal_t_tag = 1.0;
+
         const double from_g_self = branch.transformer ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
         const double from_b_self = branch.transformer ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
 
-        func_ p_from = (*pf_)(i) + (-from_g_self) * gravity::power((*vm_)(f), 2);
-        p_from += (-((-g * tr + b * ti) / tm2)) * cross_cos_ft;
-        p_from += (-((-b * tr - g * ti) / tm2)) * cross_sin_ft;
+        func_ p_from = (*pf_)(i) + (-from_g_self) * pf_tag * gravity::power((*vm_)(f), 2);
+        p_from += (-((-g * tr + b * ti) / tm2)) * pf_tag * (*vm_)(f) * (*vm_)(t)
+            * gravity::cos((*va_)(f) - (*va_)(t));
+        p_from += (-((-b * tr - g * ti) / tm2)) * pf_tag * (*vm_)(f) * (*vm_)(t)
+            * gravity::sin((*va_)(f) - (*va_)(t));
         add_eq(model_, "ohms_pf_" + std::to_string(i), p_from);
 
-        func_ q_from = (*qf_)(i) + from_b_self * gravity::power((*vm_)(f), 2);
-        q_from += ((-b * tr - g * ti) / tm2) * cross_cos_ft;
-        q_from += (-((-g * tr + b * ti) / tm2)) * cross_sin_ft;
+        func_ q_from = (*qf_)(i) + from_b_self * qf_tag * gravity::power((*vm_)(f), 2);
+        q_from += ((-b * tr - g * ti) / tm2) * qf_tag * (*vm_)(f) * (*vm_)(t)
+            * gravity::cos((*va_)(f) - (*va_)(t));
+        q_from += (-((-g * tr + b * ti) / tm2)) * qf_tag * (*vm_)(f) * (*vm_)(t)
+            * gravity::sin((*va_)(f) - (*va_)(t));
         add_eq(model_, "ohms_qf_" + std::to_string(i), q_from);
 
-        const auto cross_cos_tf = (*vm_)(t) * (*vm_)(f) * gravity::cos((*va_)(t) - (*va_)(f));
-        const auto cross_sin_tf = (*vm_)(t) * (*vm_)(f) * gravity::sin((*va_)(t) - (*va_)(f));
-        func_ p_to = (*pt_)(i) + (-(g + branch.g_to)) * gravity::power((*vm_)(t), 2);
-        p_to += (-((-g * tr - b * ti) / tm2)) * cross_cos_tf;
-        p_to += (-((-b * tr + g * ti) / tm2)) * cross_sin_tf;
+        func_ p_to = (*pt_)(i) + (-(g + branch.g_to)) * pt_tag * gravity::power((*vm_)(t), 2);
+        p_to += (-((-g * tr - b * ti) / tm2)) * pt_tag * (*vm_)(t) * (*vm_)(f)
+            * gravity::cos((*va_)(t) - (*va_)(f));
+        p_to += (-((-b * tr + g * ti) / tm2)) * pt_tag * (*vm_)(t) * (*vm_)(f)
+            * gravity::sin((*va_)(t) - (*va_)(f));
         add_eq(model_, "ohms_pt_" + std::to_string(i), p_to);
 
-        func_ q_to = (*qt_)(i) + (b + branch.b_to) * gravity::power((*vm_)(t), 2);
-        q_to += ((-b * tr + g * ti) / tm2) * cross_cos_tf;
-        q_to += (-((-g * tr - b * ti) / tm2)) * cross_sin_tf;
+        func_ q_to = (*qt_)(i) + (b + branch.b_to) * qt_tag * gravity::power((*vm_)(t), 2);
+        q_to += ((-b * tr + g * ti) / tm2) * qt_tag * (*vm_)(t) * (*vm_)(f)
+            * gravity::cos((*va_)(t) - (*va_)(f));
+        q_to += (-((-g * tr - b * ti) / tm2)) * qt_tag * (*vm_)(t) * (*vm_)(f)
+            * gravity::sin((*va_)(t) - (*va_)(f));
         add_eq(model_, "ohms_qt_" + std::to_string(i), q_to);
 
         const double start_delta = mode_ == ModelMode::ContingencySoft
@@ -478,11 +501,15 @@ void AcModel::build_constraints_and_objective() {
         func_ thermal_from = gravity::power((*pf_)(i), 2) + gravity::power((*qf_)(i), 2);
         func_ thermal_to = gravity::power((*pt_)(i), 2) + gravity::power((*qt_)(i), 2);
         if (branch.transformer) {
-            thermal_from += (-branch.rate_a * branch.rate_a) * gravity::power(1.0 + (*sm_slack_)(i), 2);
-            thermal_to += (-branch.rate_a * branch.rate_a) * gravity::power(1.0 + (*sm_slack_)(i), 2);
+            thermal_from += (-branch.rate_a * branch.rate_a) * thermal_f_tag
+                * gravity::power(1.0 + (*sm_slack_)(i), 2);
+            thermal_to += (-branch.rate_a * branch.rate_a) * thermal_t_tag
+                * gravity::power(1.0 + (*sm_slack_)(i), 2);
         } else {
-            thermal_from += (-branch.rate_a * branch.rate_a) * gravity::power((*vm_)(f) + (*sm_slack_)(i), 2);
-            thermal_to += (-branch.rate_a * branch.rate_a) * gravity::power((*vm_)(t) + (*sm_slack_)(i), 2);
+            thermal_from += (-branch.rate_a * branch.rate_a) * thermal_f_tag
+                * gravity::power((*vm_)(f) + (*sm_slack_)(i), 2);
+            thermal_to += (-branch.rate_a * branch.rate_a) * thermal_t_tag
+                * gravity::power((*vm_)(t) + (*sm_slack_)(i), 2);
         }
         add_le(model_, "thermal_from_" + std::to_string(i), thermal_from);
         add_le(model_, "thermal_to_" + std::to_string(i), thermal_to);

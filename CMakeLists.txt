@@ -50,6 +50,7 @@ enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME gravity_smoke COMMAND gravityx_go2 smoke)
 add_test(NAME gravity_component_tests COMMAND gravityx_go2 component-tests)
+add_test(NAME gravity_parallel_circuit_regression COMMAND gravityx_go2 parallel-circuit-test)
 add_test(
     NAME solution_writer_tests
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_solution_writer.py"

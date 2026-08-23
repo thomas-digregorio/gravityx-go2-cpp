@@ -15,6 +15,12 @@ The C++ checker recomputes, without consulting Gravity's expression graph:
 An optimization result is accepted only when the Gravity/Ipopt status is
 successful and the independent maximum residual is no greater than `1e-5`.
 
+The component suite also solves a two-bus AC case with two electrically
+identical parallel circuits.  This guards the branch-specific symbolic tags
+needed by the pinned Gravity revision to prevent collisions between otherwise
+identical nonlinear DAG nodes.  Every tag is a fixed parameter with value one,
+so it changes symbolic identity but not the equation value or derivative.
+
 ## Tiny semantic oracle
 
 The official `PowerModelsSecurityConstrained.jl` formulation was used only as

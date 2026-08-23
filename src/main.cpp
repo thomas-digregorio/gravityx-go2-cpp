@@ -469,6 +469,39 @@ int solve_contingency_batch(
     return 0;
 }
 
+int run_contingency_worker(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    int print_level) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto base = load_base_point(base_result_path);
+    std::cout << "GRAVITYX_WORKER_READY" << std::endl;
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const auto task = nlohmann::json::parse(line);
+        if (task.value("stop", false)) {
+            return 0;
+        }
+        const auto label = task.at("label").get<std::string>();
+        const auto output_path = task.at("output_path").get<std::string>();
+        const bool success = solve_loaded_contingency(
+            data, base, label, output_path, print_level);
+        std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
+            {"label", label},
+            {"success", success},
+        }).dump() << std::endl;
+        if (!success) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -507,6 +540,11 @@ int main(int argc, char** argv) {
             const int print_level = argc == 6 ? std::stoi(argv[5]) : 0;
             return solve_contingency_batch(argv[2], argv[3], argv[4], print_level);
         }
+        if ((argc == 4 || argc == 5) &&
+            std::string(argv[1]) == "contingency-worker") {
+            const int print_level = argc == 5 ? std::stoi(argv[4]) : 0;
+            return run_contingency_worker(argv[2], argv[3], print_level);
+        }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"
                   << "  gravityx_go2 component-tests\n"
@@ -517,7 +555,8 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 run-ibr CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
-                  << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n";
+                  << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"
+                  << "  gravityx_go2 contingency-worker CASE.json BASE.json [print-level]\n";
         return 2;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

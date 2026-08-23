@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import subprocess
 import sys
@@ -199,18 +200,16 @@ def safe_label(label: str) -> str:
     return value
 
 
-def run_cpp(
+def cpp_command(
     executable: Path,
     distro: str,
     arguments: list[str],
-    log_path: Path,
     timeout: float,
-) -> subprocess.CompletedProcess[str]:
+) -> list[str]:
     if timeout <= 0:
         raise ValueError("C++ subprocess timeout must be positive")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     inner_timeout = max(timeout, 0.001)
-    command = [
+    return [
         "wsl",
         "-d",
         distro,
@@ -226,6 +225,20 @@ def run_cpp(
         to_wsl(executable),
         *arguments,
     ]
+
+
+def run_cpp(
+    executable: Path,
+    distro: str,
+    arguments: list[str],
+    log_path: Path,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0:
+        raise ValueError("C++ subprocess timeout must be positive")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    inner_timeout = max(timeout, 0.001)
+    command = cpp_command(executable, distro, arguments, inner_timeout)
     started = time.perf_counter()
     try:
         completed = subprocess.run(
@@ -431,80 +444,116 @@ def main() -> int:
     )
     abort_contingencies = threading.Event()
     worker_count = min(args.workers, len(contingencies))
-    batches: list[list[dict[str, Any]]] = [[] for _ in range(worker_count)]
-    for position, item in enumerate(contingencies):
-        batches[position % worker_count].append(item)
+    if worker_count < 1:
+        raise ValueError("at least one contingency is required")
+    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    for item in contingencies:
+        task_queue.put(item)
+    progress_lock = threading.Lock()
     worker_records: list[dict[str, Any]] = []
 
-    def solve_batch(
-        worker_id: int,
-        batch: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+    def solve_worker(worker_id: int) -> dict[str, Any]:
         if abort_contingencies.is_set():
             raise CompetitionTimeout("Code2 was cancelled after another worker failed")
-        manifest_path = internal / "worker_manifests" / f"worker_{worker_id:03d}.json"
         log_path = internal / "worker_logs" / f"worker_{worker_id:03d}.log"
-        tasks: list[dict[str, str]] = []
-        for item in batch:
-            label = str(item["label"])
-            result_path = internal / "contingencies" / f"{safe_label(label)}.json"
-            tasks.append(
-                {
-                    "label": label,
-                    "output_path": to_wsl(result_path),
-                }
-            )
-        write_json(
-            manifest_path,
-            {
-                "worker_id": worker_id,
-                "tasks": tasks,
-            },
-        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         task_timeout = effective_process_timeout(
             args.contingency_timeout, contingency_deadline
         )
-        process = run_cpp(
+        command = cpp_command(
             args.executable,
             args.distro,
             [
-                "solve-contingency-batch",
+                "contingency-worker",
                 to_wsl(args.case_json),
                 to_wsl(base_json),
-                to_wsl(manifest_path),
                 "0",
             ],
-            log_path,
             task_timeout,
         )
-        if process.returncode != 0:
-            if getattr(process, "timed_out", False):
-                raise CompetitionTimeout(
-                    f"contingency worker {worker_id} reached the {contingency_deadline_name}"
+        started = time.perf_counter()
+        output_lines: list[str] = []
+        assigned_labels: list[str] = []
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+
+        def read_until(prefix: str) -> str:
+            assert process.stdout is not None
+            while True:
+                line = process.stdout.readline()
+                if line == "":
+                    return_code = process.wait()
+                    if return_code == 124:
+                        raise CompetitionTimeout(
+                            f"contingency worker {worker_id} reached the "
+                            f"{contingency_deadline_name}"
+                        )
+                    raise RuntimeError(
+                        f"contingency worker {worker_id} exited with status "
+                        f"{return_code}; see {log_path}"
+                    )
+                output_lines.append(line)
+                stripped = line.rstrip("\r\n")
+                if stripped.startswith(prefix):
+                    return stripped[len(prefix):].strip()
+
+        try:
+            read_until("GRAVITYX_WORKER_READY")
+            while not abort_contingencies.is_set():
+                try:
+                    item = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                label = str(item["label"])
+                assigned_labels.append(label)
+                result_path = internal / "contingencies" / f"{safe_label(label)}.json"
+                assert process.stdin is not None
+                process.stdin.write(
+                    json.dumps(
+                        {
+                            "label": label,
+                            "output_path": to_wsl(result_path),
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
                 )
-            raise RuntimeError(f"contingency worker {worker_id} failed; see {log_path}")
-        if time.perf_counter() > contingency_deadline:
-            raise CompetitionTimeout(
-                f"contingency worker {worker_id} finished after the {contingency_deadline_name}"
-            )
-        batch_records: list[dict[str, Any]] = []
-        for item in batch:
-            label = str(item["label"])
-            result_path = internal / "contingencies" / f"{safe_label(label)}.json"
-            result = read_json(result_path)
-            if not result.get("success", False):
-                raise RuntimeError(
-                    f"contingency {label} did not pass independent validation"
+                process.stdin.flush()
+                acknowledgement = json.loads(
+                    read_until("GRAVITYX_TASK_RESULT ")
                 )
-            write_solution(
-                args.output_dir / f"solution_{label}.txt",
-                case,
-                result["solve"]["state"],
-                commitment,
-                item,
-            )
-            batch_records.append(
-                {
+                if acknowledgement.get("label") != label:
+                    raise RuntimeError(
+                        f"contingency worker {worker_id} acknowledged the wrong task"
+                    )
+                if not acknowledgement.get("success", False):
+                    raise RuntimeError(
+                        f"contingency {label} failed in worker {worker_id}; see {log_path}"
+                    )
+                if time.perf_counter() > contingency_deadline:
+                    raise CompetitionTimeout(
+                        f"contingency {label} finished after the "
+                        f"{contingency_deadline_name}"
+                    )
+                result = read_json(result_path)
+                if not result.get("success", False):
+                    raise RuntimeError(
+                        f"contingency {label} did not pass independent validation"
+                    )
+                write_solution(
+                    args.output_dir / f"solution_{label}.txt",
+                    case,
+                    result["solve"]["state"],
+                    commitment,
+                    item,
+                )
+                record = {
                     "label": label,
                     "type": item["type"],
                     "source_index": int(item["idx"]),
@@ -520,20 +569,67 @@ def main() -> int:
                         "accepted_feasible_nonconverged", False
                     ),
                 }
-            )
-        return {
-            "worker_id": worker_id,
-            "task_count": len(batch),
-            "process_wall_seconds": process.wall_seconds,  # type: ignore[attr-defined]
-            "records": batch_records,
-        }
+                task_queue.task_done()
+                with progress_lock:
+                    records.append(record)
+                    run_status["completed_contingency_count"] = len(records)
+                    run_status["last_completed_contingency"] = label
+                    checkpoint()
+                    print(
+                        f"completed {len(records)}/{len(contingencies)}: "
+                        f"{label} on worker {worker_id}",
+                        flush=True,
+                    )
+            if process.poll() is None:
+                assert process.stdin is not None
+                process.stdin.write('{"stop":true}\n')
+                process.stdin.flush()
+                process.stdin.close()
+                assert process.stdout is not None
+                output_lines.extend(process.stdout.readlines())
+            return_code = process.wait(timeout=10.0)
+            if return_code != 0:
+                if return_code == 124:
+                    raise CompetitionTimeout(
+                        f"contingency worker {worker_id} reached the "
+                        f"{contingency_deadline_name}"
+                    )
+                raise RuntimeError(
+                    f"contingency worker {worker_id} exited with status "
+                    f"{return_code}; see {log_path}"
+                )
+            return {
+                "worker_id": worker_id,
+                "task_count": len(assigned_labels),
+                "process_wall_seconds": time.perf_counter() - started,
+                "labels": assigned_labels,
+            }
+        except Exception:
+            abort_contingencies.set()
+            raise
+        finally:
+            if process.poll() is None:
+                try:
+                    assert process.stdin is not None
+                    process.stdin.write('{"stop":true}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                    process.wait(timeout=2.0)
+                except Exception:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            log_path.write_text("".join(output_lines), encoding="utf-8")
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
     futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
     try:
         futures = {
-            pool.submit(solve_batch, worker_id, batch): worker_id
-            for worker_id, batch in enumerate(batches)
+            pool.submit(solve_worker, worker_id): worker_id
+            for worker_id in range(worker_count)
         }
         for future in concurrent.futures.as_completed(futures):
             worker = future.result()
@@ -542,18 +638,13 @@ def main() -> int:
                     "worker_id": worker["worker_id"],
                     "task_count": worker["task_count"],
                     "process_wall_seconds": worker["process_wall_seconds"],
+                    "labels": worker["labels"],
                 }
             )
-            records.extend(worker["records"])
-            run_status["completed_contingency_count"] = len(records)
-            run_status["completed_worker_count"] = len(worker_records)
-            run_status["last_completed_worker"] = worker["worker_id"]
-            checkpoint()
-            print(
-                f"completed {len(records)}/{len(contingencies)}: "
-                f"worker {worker['worker_id']} ({worker['task_count']} contingencies)",
-                flush=True,
-            )
+            with progress_lock:
+                run_status["completed_worker_count"] = len(worker_records)
+                run_status["last_completed_worker"] = worker["worker_id"]
+                checkpoint()
     except Exception as error:
         abort_contingencies.set()
         for future in futures:
@@ -575,6 +666,11 @@ def main() -> int:
         raise
     else:
         pool.shutdown(wait=True)
+    if len(records) != len(contingencies):
+        raise RuntimeError(
+            f"dynamic contingency queue completed {len(records)} of "
+            f"{len(contingencies)} tasks"
+        )
     records.sort(key=lambda item: item["label"])
     worker_records.sort(key=lambda item: item["worker_id"])
     contingency_wall = time.perf_counter() - contingency_start
@@ -706,7 +802,7 @@ def main() -> int:
         },
         "workers": worker_count,
         "requested_workers": args.workers,
-        "contingency_execution_mode": "persistent isolated process batches",
+        "contingency_execution_mode": "persistent isolated process workers with dynamic queue",
         "competition_timing": {
             **run_status["competition_timing"],
             "code1_within_limit": True,

@@ -55,13 +55,14 @@ GravityX implementation.
 ## Cold-run discipline
 
 `scripts/run_experiment.py` refuses a nonempty output directory.  The base
-solve starts a new process.  Corrective contingencies are assigned
-deterministically, round-robin, to isolated persistent worker processes; each
-worker loads the immutable case and selected base state once, then constructs
-and solves a fresh Gravity/Ipopt model for each assigned contingency.  Workers
-run concurrently and are limited to one BLAS thread each to avoid
-oversubscription.  No contingency solution or optimizer state is reused by a
-different contingency.
+solve starts a new process.  Corrective contingencies enter a canonical-label
+queue consumed by isolated persistent worker processes; each worker loads the
+immutable case and selected base state once, then constructs and solves a fresh
+Gravity/Ipopt model before requesting its next contingency.  This dynamic queue
+prevents long contingencies from accumulating on one static worker.  The actual
+worker assignment is recorded.  Workers run concurrently and are limited to
+one BLAS thread each to avoid oversubscription.  No contingency solution or
+optimizer state is reused by a different contingency.
 
 For Final-event Division 1 experiments, the runner enforces the historical
 timing stages separately: Code1 has a 300-second wall limit and Code2 receives

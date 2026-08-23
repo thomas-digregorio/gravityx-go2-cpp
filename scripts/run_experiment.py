@@ -90,11 +90,21 @@ def read_json(path: Path) -> Any:
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     with temporary.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, indent=2, sort_keys=True)
         stream.write("\n")
-    temporary.replace(path)
+    delays = (0.01, 0.02, 0.04, 0.08, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10)
+    for attempt, delay in enumerate(delays):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == len(delays) - 1:
+                raise
+            time.sleep(delay)
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:

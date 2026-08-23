@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import json
 import tempfile
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -13,6 +15,7 @@ from run_experiment import (  # noqa: E402
     CompetitionTimeout,
     code2_time_limit,
     effective_process_timeout,
+    write_json,
     write_solution,
 )
 
@@ -103,6 +106,25 @@ class CompetitionTimingTests(unittest.TestCase):
     def test_expired_stage_is_rejected_before_launch(self):
         with self.assertRaises(CompetitionTimeout):
             effective_process_timeout(5.0, 100.0, now=100.0)
+
+    def test_json_checkpoint_retries_transient_windows_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "status.json"
+            original_replace = Path.replace
+            attempts = 0
+
+            def flaky_replace(source, target):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("simulated transient reader lock")
+                return original_replace(source, target)
+
+            with mock.patch.object(Path, "replace", flaky_replace):
+                write_json(destination, {"success": True})
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(json.loads(destination.read_text()), {"success": True})
 
 
 if __name__ == "__main__":

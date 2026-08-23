@@ -72,6 +72,8 @@ nlohmann::json solve_result_to_json(const SolveResult& result, bool include_stat
         {"status", result.status},
         {"objective", result.objective},
         {"wall_seconds", result.wall_seconds},
+        {"iterations", result.iterations},
+        {"resident_reoptimization", result.resident_reoptimization},
     };
     if (include_state) {
         value["state"] = ac_state_to_json(result.state);

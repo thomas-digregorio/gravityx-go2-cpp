@@ -1,10 +1,13 @@
 #include "gravityx/ac_model.hpp"
 
+#include <IpSolveStatistics.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 namespace gravityx {
@@ -19,6 +22,64 @@ using gravity::var;
 
 constexpr double kBoundInfinity = 1e19;
 constexpr double kBalanceSlackUpper = 0.5;
+
+void reset_gravity_function_tree(
+    gravity::func_* function,
+    std::unordered_set<const gravity::func_*>& visited);
+
+void reset_gravity_constant_tree(
+    gravity::constant_* value,
+    std::unordered_set<const gravity::func_*>& visited) {
+    if (!value) {
+        return;
+    }
+    if (value->get_type() == gravity::func_c) {
+        reset_gravity_function_tree(
+            static_cast<gravity::func_*>(value), visited);
+    } else if (value->get_type() == gravity::uexp_c) {
+        const auto* expression = static_cast<gravity::uexpr*>(value);
+        reset_gravity_function_tree(expression->_son.get(), visited);
+    } else if (value->get_type() == gravity::bexp_c) {
+        const auto* expression = static_cast<gravity::bexpr*>(value);
+        reset_gravity_function_tree(expression->_lson.get(), visited);
+        reset_gravity_function_tree(expression->_rson.get(), visited);
+    }
+}
+
+void reset_gravity_function_tree(
+    gravity::func_* function,
+    std::unordered_set<const gravity::func_*>& visited) {
+    if (!function || !visited.insert(function).second) {
+        return;
+    }
+    function->_evaluated = false;
+    reset_gravity_constant_tree(function->get_cst(), visited);
+    for (auto& item : function->get_lterms()) {
+        reset_gravity_constant_tree(item.second._coef, visited);
+    }
+    for (auto& item : function->get_qterms()) {
+        reset_gravity_constant_tree(item.second._coef, visited);
+    }
+    for (auto& item : function->get_pterms()) {
+        reset_gravity_constant_tree(item.second._coef, visited);
+    }
+    if (const auto expression = function->get_expr()) {
+        reset_gravity_constant_tree(expression.get(), visited);
+    }
+    if (const auto derivatives = function->get_dfdx()) {
+        for (auto& item : *derivatives) {
+            reset_gravity_function_tree(item.second.get(), visited);
+        }
+    }
+}
+
+void reset_gravity_model_parameter_caches(gravity::Model& model) {
+    std::unordered_set<const gravity::func_*> visited;
+    reset_gravity_function_tree(&model._obj, visited);
+    for (auto& item : model._cons) {
+        reset_gravity_function_tree(item.second.get(), visited);
+    }
+}
 
 void add_eq(Model& model, const std::string& name, func_ expression) {
     Constraint constraint(name);
@@ -197,11 +258,13 @@ AcModel::AcModel(
     const CaseData& data,
     ModelMode mode,
     std::vector<int> fixed_status,
-    std::optional<ContingencyContext> contingency)
+    std::optional<ContingencyContext> contingency,
+    bool reusable_contingencies)
     : data_(data),
       mode_(mode),
       fixed_status_(std::move(fixed_status)),
       contingency_(std::move(contingency)),
+      reusable_contingencies_(reusable_contingencies),
       model_(mode == ModelMode::BaseSoft ? "GO2 AC OPF soft" :
              mode == ModelMode::UnitCommitmentRelaxation ? "GO2 AC UC relaxation" :
              "GO2 corrective AC OPF soft") {
@@ -217,6 +280,9 @@ AcModel::AcModel(
     if ((mode_ == ModelMode::ContingencySoft) != contingency_.has_value()) {
         throw std::runtime_error("contingency mode and context must be supplied together");
     }
+    if (reusable_contingencies_ && mode_ != ModelMode::ContingencySoft) {
+        throw std::runtime_error("only a contingency model can be reusable");
+    }
     if (contingency_) {
         const auto& state = contingency_->base_state;
         if (state.vm.size() != data_.buses.size() || state.va.size() != data_.buses.size() ||
@@ -227,9 +293,63 @@ AcModel::AcModel(
             throw std::runtime_error("contingency base state dimensions are invalid");
         }
     }
+    if (reusable_contingencies_) {
+        build_availability_parameters();
+    }
     build_variables();
     build_constraints_and_objective();
     initialize_source_point();
+}
+
+void AcModel::build_availability_parameters() {
+    generator_available_ = std::make_unique<param<double>>("generator_available");
+    branch_available_ = std::make_unique<param<double>>("branch_available");
+    for (std::size_t i = 0; i < data_.generators.size(); ++i) {
+        generator_available_->set_val(i, 1.0);
+    }
+    for (std::size_t i = 0; i < data_.branches.size(); ++i) {
+        branch_available_->set_val(i, 1.0);
+    }
+
+    // Keep both parameters symbolically variable over [0, 1].  Gravity uses
+    // the recorded range when simplifying expression nodes during model
+    // construction, and set_val intentionally does not shrink that range.
+    if (!data_.generators.empty()) {
+        generator_available_->set_val(0, 0.0);
+        generator_available_->set_val(0, 1.0);
+    }
+    if (!data_.branches.empty()) {
+        branch_available_->set_val(0, 0.0);
+        branch_available_->set_val(0, 1.0);
+    }
+    update_availability_parameters(*contingency_);
+}
+
+void AcModel::update_availability_parameters(const ContingencyContext& contingency) {
+    const bool generator_outage = contingency.outaged_generator >= 0;
+    const bool branch_outage = contingency.outaged_branch >= 0;
+    if (generator_outage == branch_outage) {
+        throw std::runtime_error("a reusable contingency must outage exactly one component");
+    }
+    if (generator_outage &&
+        contingency.outaged_generator >= static_cast<int>(data_.generators.size())) {
+        throw std::runtime_error("reusable generator outage index is invalid");
+    }
+    if (branch_outage &&
+        contingency.outaged_branch >= static_cast<int>(data_.branches.size())) {
+        throw std::runtime_error("reusable branch outage index is invalid");
+    }
+    for (std::size_t i = 0; i < data_.generators.size(); ++i) {
+        generator_available_->set_val(i, 1.0);
+    }
+    for (std::size_t i = 0; i < data_.branches.size(); ++i) {
+        branch_available_->set_val(i, 1.0);
+    }
+    if (generator_outage) {
+        generator_available_->set_val(contingency.outaged_generator, 0.0);
+    } else {
+        branch_available_->set_val(contingency.outaged_branch, 0.0);
+    }
 }
 
 void AcModel::build_variables() {
@@ -252,14 +372,17 @@ void AcModel::build_variables() {
     int gen_lambda_count = 0;
     for (std::size_t i = 0; i < ng; ++i) {
         const auto& gen = data_.generators[i];
-        const bool outaged = contingency_ && contingency_->outaged_generator == static_cast<int>(i);
+        const bool outaged = !reusable_contingencies_ && contingency_ &&
+            contingency_->outaged_generator == static_cast<int>(i);
         const bool active = !outaged &&
             (mode_ == ModelMode::UnitCommitmentRelaxation || fixed_status_[i] == 1);
+        std::pair<double, double> active_pg_bounds{0.0, 0.0};
         if (mode_ == ModelMode::UnitCommitmentRelaxation) {
             pg_lower[i] = std::min(0.0, gen.pmin);
             pg_upper[i] = std::max(0.0, gen.pmax);
             qg_lower[i] = std::min(0.0, gen.qmin);
             qg_upper[i] = std::max(0.0, gen.qmax);
+            active_pg_bounds = {pg_lower[i], pg_upper[i]};
         } else if (active) {
             const auto bounds = mode_ == ModelMode::ContingencySoft
                 ? std::pair<double, double>{
@@ -269,16 +392,25 @@ void AcModel::build_variables() {
             if (bounds.first > bounds.second + 1e-12) {
                 throw std::runtime_error("empty generator ramp interval in " + gen.source_key);
             }
-            pg_lower[i] = bounds.first;
-            pg_upper[i] = bounds.second;
-            qg_lower[i] = gen.qmin;
-            qg_upper[i] = gen.qmax;
+            active_pg_bounds = bounds;
+            if (reusable_contingencies_) {
+                pg_lower[i] = std::min(0.0, bounds.first);
+                pg_upper[i] = std::max(0.0, bounds.second);
+                qg_lower[i] = std::min(0.0, gen.qmin);
+                qg_upper[i] = std::max(0.0, gen.qmax);
+            } else {
+                pg_lower[i] = bounds.first;
+                pg_upper[i] = bounds.second;
+                qg_lower[i] = gen.qmin;
+                qg_upper[i] = gen.qmax;
+            }
         } else {
             pg_lower[i] = pg_upper[i] = 0.0;
             qg_lower[i] = qg_upper[i] = 0.0;
         }
         if (active) {
-            gen_points_[i] = active_pwl_points(gen.cost, gen.ncost, pg_lower[i], pg_upper[i]);
+            gen_points_[i] = active_pwl_points(
+                gen.cost, gen.ncost, active_pg_bounds.first, active_pg_bounds.second);
             gen_lambda_offset_[i] = gen_lambda_count;
             gen_lambda_count += static_cast<int>(gen_points_[i].size());
         }
@@ -319,7 +451,8 @@ void AcModel::build_variables() {
 
     std::vector<double> flow_lower(nl), flow_upper(nl), slack_lower(nl, 0.0), slack_upper(nl, data_.sm_vio_limit);
     for (std::size_t i = 0; i < nl; ++i) {
-        const bool outaged = contingency_ && contingency_->outaged_branch == static_cast<int>(i);
+        const bool outaged = !reusable_contingencies_ && contingency_ &&
+            contingency_->outaged_branch == static_cast<int>(i);
         flow_lower[i] = outaged ? 0.0 : -data_.branches[i].rate_a;
         flow_upper[i] = outaged ? 0.0 : data_.branches[i].rate_a;
         if (outaged) {
@@ -382,7 +515,12 @@ void AcModel::build_constraints_and_objective() {
             power_expression += gen_points_[i][j].mw * (*gen_lambda_)(offset + j);
             objective -= interval_delta * gen_points_[i][j].cost * (*gen_lambda_)(offset + j);
         }
-        add_eq(model_, "gen_lambda_sum_" + std::to_string(i), sum_lambda - 1.0);
+        if (reusable_contingencies_) {
+            add_eq(model_, "gen_lambda_sum_" + std::to_string(i),
+                   sum_lambda - (*generator_available_)(i));
+        } else {
+            add_eq(model_, "gen_lambda_sum_" + std::to_string(i), sum_lambda - 1.0);
+        }
         add_eq(model_, "gen_pwl_power_" + std::to_string(i), power_expression - (*pg_)(i));
     }
 
@@ -430,9 +568,29 @@ void AcModel::build_constraints_and_objective() {
         }
     } else {
         for (std::size_t i = 0; i < data_.generators.size(); ++i) {
-            const bool outaged = contingency_ && contingency_->outaged_generator == static_cast<int>(i);
-            if (!outaged && fixed_status_[i] == 1) {
-                objective -= interval_delta * data_.generators[i].oncost;
+            const auto& gen = data_.generators[i];
+            const bool outaged = contingency_ &&
+                contingency_->outaged_generator == static_cast<int>(i);
+            if (reusable_contingencies_ && fixed_status_[i] == 1) {
+                const double pg_lower = std::max(
+                    gen.pmin,
+                    contingency_->base_state.pg[i] -
+                        data_.delta_r_ctg * gen.prdmaxctg);
+                const double pg_upper = std::min(
+                    gen.pmax,
+                    contingency_->base_state.pg[i] +
+                        data_.delta_r_ctg * gen.prumaxctg);
+                add_le(model_, "resident_gen_pmax_" + std::to_string(i),
+                       (*pg_)(i) - pg_upper * (*generator_available_)(i));
+                add_ge(model_, "resident_gen_pmin_" + std::to_string(i),
+                       (*pg_)(i) - pg_lower * (*generator_available_)(i));
+                add_le(model_, "resident_gen_qmax_" + std::to_string(i),
+                       (*qg_)(i) - gen.qmax * (*generator_available_)(i));
+                add_ge(model_, "resident_gen_qmin_" + std::to_string(i),
+                       (*qg_)(i) - gen.qmin * (*generator_available_)(i));
+                objective -= interval_delta * gen.oncost * (*generator_available_)(i);
+            } else if (!outaged && fixed_status_[i] == 1) {
+                objective -= interval_delta * gen.oncost;
             }
         }
     }
@@ -486,7 +644,8 @@ void AcModel::build_constraints_and_objective() {
     }
 
     for (std::size_t i = 0; i < data_.branches.size(); ++i) {
-        if (contingency_ && contingency_->outaged_branch == static_cast<int>(i)) {
+        if (!reusable_contingencies_ && contingency_ &&
+            contingency_->outaged_branch == static_cast<int>(i)) {
             continue;
         }
         const auto& branch = data_.branches[i];
@@ -521,35 +680,55 @@ void AcModel::build_constraints_and_objective() {
         qt_tag = 1.0;
         thermal_f_tag = 1.0;
         thermal_t_tag = 1.0;
+        const auto electrical_availability = [&]() {
+            if (reusable_contingencies_) {
+                return (*branch_available_)(i);
+            }
+            param<double> unit("branch_available_unit_" + std::to_string(i));
+            unit = 1.0;
+            return unit;
+        }();
 
         const double from_g_self = branch.transformer ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
         const double from_b_self = branch.transformer ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
 
-        func_ p_from = (*pf_)(i) + (-from_g_self) * pf_tag * gravity::power((*vm_)(f), 2);
-        p_from += (-((-g * tr + b * ti) / tm2)) * pf_tag * (*vm_)(f) * (*vm_)(t)
+        func_ p_from = (*pf_)(i) + (-from_g_self) * pf_tag * electrical_availability
+            * gravity::power((*vm_)(f), 2);
+        p_from += (-((-g * tr + b * ti) / tm2)) * pf_tag * electrical_availability
+            * (*vm_)(f) * (*vm_)(t)
             * gravity::cos((*va_)(f) - (*va_)(t));
-        p_from += (-((-b * tr - g * ti) / tm2)) * pf_tag * (*vm_)(f) * (*vm_)(t)
+        p_from += (-((-b * tr - g * ti) / tm2)) * pf_tag * electrical_availability
+            * (*vm_)(f) * (*vm_)(t)
             * gravity::sin((*va_)(f) - (*va_)(t));
         add_eq(model_, "ohms_pf_" + std::to_string(i), p_from);
 
-        func_ q_from = (*qf_)(i) + from_b_self * qf_tag * gravity::power((*vm_)(f), 2);
-        q_from += ((-b * tr - g * ti) / tm2) * qf_tag * (*vm_)(f) * (*vm_)(t)
+        func_ q_from = (*qf_)(i) + from_b_self * qf_tag * electrical_availability
+            * gravity::power((*vm_)(f), 2);
+        q_from += ((-b * tr - g * ti) / tm2) * qf_tag * electrical_availability
+            * (*vm_)(f) * (*vm_)(t)
             * gravity::cos((*va_)(f) - (*va_)(t));
-        q_from += (-((-g * tr + b * ti) / tm2)) * qf_tag * (*vm_)(f) * (*vm_)(t)
+        q_from += (-((-g * tr + b * ti) / tm2)) * qf_tag * electrical_availability
+            * (*vm_)(f) * (*vm_)(t)
             * gravity::sin((*va_)(f) - (*va_)(t));
         add_eq(model_, "ohms_qf_" + std::to_string(i), q_from);
 
-        func_ p_to = (*pt_)(i) + (-(g + branch.g_to)) * pt_tag * gravity::power((*vm_)(t), 2);
-        p_to += (-((-g * tr - b * ti) / tm2)) * pt_tag * (*vm_)(t) * (*vm_)(f)
+        func_ p_to = (*pt_)(i) + (-(g + branch.g_to)) * pt_tag * electrical_availability
+            * gravity::power((*vm_)(t), 2);
+        p_to += (-((-g * tr - b * ti) / tm2)) * pt_tag * electrical_availability
+            * (*vm_)(t) * (*vm_)(f)
             * gravity::cos((*va_)(t) - (*va_)(f));
-        p_to += (-((-b * tr + g * ti) / tm2)) * pt_tag * (*vm_)(t) * (*vm_)(f)
+        p_to += (-((-b * tr + g * ti) / tm2)) * pt_tag * electrical_availability
+            * (*vm_)(t) * (*vm_)(f)
             * gravity::sin((*va_)(t) - (*va_)(f));
         add_eq(model_, "ohms_pt_" + std::to_string(i), p_to);
 
-        func_ q_to = (*qt_)(i) + (b + branch.b_to) * qt_tag * gravity::power((*vm_)(t), 2);
-        q_to += ((-b * tr + g * ti) / tm2) * qt_tag * (*vm_)(t) * (*vm_)(f)
+        func_ q_to = (*qt_)(i) + (b + branch.b_to) * qt_tag * electrical_availability
+            * gravity::power((*vm_)(t), 2);
+        q_to += ((-b * tr + g * ti) / tm2) * qt_tag * electrical_availability
+            * (*vm_)(t) * (*vm_)(f)
             * gravity::cos((*va_)(t) - (*va_)(f));
-        q_to += (-((-g * tr - b * ti) / tm2)) * qt_tag * (*vm_)(t) * (*vm_)(f)
+        q_to += (-((-g * tr - b * ti) / tm2)) * qt_tag * electrical_availability
+            * (*vm_)(t) * (*vm_)(f)
             * gravity::sin((*va_)(t) - (*va_)(f));
         add_eq(model_, "ohms_qt_" + std::to_string(i), q_to);
 
@@ -557,8 +736,20 @@ void AcModel::build_constraints_and_objective() {
             ? contingency_->base_state.va[f] - contingency_->base_state.va[t]
             : data_.buses[f].va_start - data_.buses[t].va_start;
         if (start_delta >= branch.angmin && start_delta <= branch.angmax) {
-            add_le(model_, "angle_upper_" + std::to_string(i), (*va_)(f) - (*va_)(t) - branch.angmax);
-            add_ge(model_, "angle_lower_" + std::to_string(i), (*va_)(f) - (*va_)(t) - branch.angmin);
+            if (reusable_contingencies_) {
+                const auto available = (*branch_available_)(i);
+                add_le(model_, "angle_upper_" + std::to_string(i),
+                       available * ((*va_)(f) - (*va_)(t) - branch.angmax)
+                           - (1.0 - available));
+                add_ge(model_, "angle_lower_" + std::to_string(i),
+                       available * ((*va_)(f) - (*va_)(t) - branch.angmin)
+                           + (1.0 - available));
+            } else {
+                add_le(model_, "angle_upper_" + std::to_string(i),
+                       (*va_)(f) - (*va_)(t) - branch.angmax);
+                add_ge(model_, "angle_lower_" + std::to_string(i),
+                       (*va_)(f) - (*va_)(t) - branch.angmin);
+            }
         }
 
         func_ thermal_from = gravity::power((*pf_)(i), 2) + gravity::power((*qf_)(i), 2);
@@ -576,6 +767,10 @@ void AcModel::build_constraints_and_objective() {
         }
         add_le(model_, "thermal_from_" + std::to_string(i), thermal_from);
         add_le(model_, "thermal_to_" + std::to_string(i), thermal_to);
+        if (reusable_contingencies_) {
+            add_le(model_, "resident_sm_upper_" + std::to_string(i),
+                   (*sm_slack_)(i) - data_.sm_vio_limit * (*branch_available_)(i));
+        }
         objective -= interval_delta * data_.sm_cost_approx * (*sm_slack_)(i);
     }
 
@@ -649,9 +844,17 @@ void AcModel::initialize_source_point() {
         }
 
         if (gen_lambda_offset_[i] >= 0) {
-            const auto weights = lambda_weights(gen_points_[i], pg);
-            for (int j = 0; j < static_cast<int>(weights.size()); ++j) {
-                gen_lambda_->initialize(gen_lambda_offset_[i] + j, weights[j]);
+            const bool outaged = mode_ == ModelMode::ContingencySoft &&
+                contingency_->outaged_generator == static_cast<int>(i);
+            if (reusable_contingencies_ && outaged) {
+                for (int j = 0; j < static_cast<int>(gen_points_[i].size()); ++j) {
+                    gen_lambda_->initialize(gen_lambda_offset_[i] + j, 0.0);
+                }
+            } else {
+                const auto weights = lambda_weights(gen_points_[i], pg);
+                for (int j = 0; j < static_cast<int>(weights.size()); ++j) {
+                    gen_lambda_->initialize(gen_lambda_offset_[i] + j, weights[j]);
+                }
             }
         }
     }
@@ -723,16 +926,81 @@ void AcModel::initialize_source_point() {
     }
 }
 
+void AcModel::set_contingency(const ContingencyContext& contingency) {
+    if (!reusable_contingencies_) {
+        throw std::runtime_error("cannot update a non-reusable contingency model");
+    }
+    const auto& state = contingency.base_state;
+    if (state.vm.size() != data_.buses.size() || state.va.size() != data_.buses.size() ||
+        state.pg.size() != data_.generators.size() || state.qg.size() != data_.generators.size() ||
+        state.demand_factor.size() != data_.loads.size() ||
+        state.pf.size() != data_.branches.size() || state.qf.size() != data_.branches.size() ||
+        state.pt.size() != data_.branches.size() || state.qt.size() != data_.branches.size()) {
+        throw std::runtime_error("updated contingency base state dimensions are invalid");
+    }
+    update_availability_parameters(contingency);
+    contingency_ = contingency;
+    initialize_source_point();
+}
+
 SolveResult AcModel::solve(int print_level, double tolerance) {
     const auto start = std::chrono::steady_clock::now();
-    gravity::solver nlp(model_, gravity::ipopt);
-    const int status = nlp.run(print_level, false, tolerance, "mumps", "no");
+    int status = -1;
+    int iterations = -1;
+    const bool reoptimization = reusable_contingencies_ && resident_ipopt_solved_;
+    if (reusable_contingencies_) {
+        if (Ipopt::IsNull(resident_ipopt_)) {
+            resident_ipopt_ = IpoptApplicationFactory();
+            resident_ipopt_->RethrowNonIpoptException(true);
+            resident_ipopt_->Options()->SetStringValue("linear_solver", "mumps");
+            resident_ipopt_->Options()->SetStringValue("print_timing_statistics", "yes");
+            resident_ipopt_->Options()->SetStringValue("mehrotra_algorithm", "no");
+            resident_ipopt_->Options()->SetNumericValue("tol", tolerance);
+            resident_ipopt_->Options()->SetIntegerValue("print_level", print_level);
+            const auto initialization = resident_ipopt_->Initialize();
+            if (initialization != Ipopt::Solve_Succeeded) {
+                throw std::runtime_error("resident Ipopt initialization failed");
+            }
+            resident_program_ = new IpoptProgram(&model_);
+        } else {
+            resident_ipopt_->Options()->SetNumericValue("tol", tolerance);
+            resident_ipopt_->Options()->SetIntegerValue("print_level", print_level);
+            resident_ipopt_->Options()->SetNumericValue("mu_init", 0.5);
+            resident_ipopt_->Options()->SetStringValue("warm_start_init_point", "yes");
+            resident_ipopt_->Options()->SetStringValue("warm_start_same_structure", "no");
+        }
+
+        // Gravity stores maximization objectives with their natural sign and
+        // Ipopt minimizes.  Its stock solver negates before every call, while
+        // IpoptProgram::finalize_solution restores the natural sign.
+        if (model_._objt == gravity::maximize) {
+            model_._obj *= -1.0;
+        }
+        reset_gravity_model_parameter_caches(model_);
+        resident_program_->update_model();
+        // Re-enter OptimizeTNLP so Ipopt re-reads all parameter-dependent
+        // constraint values. ReOptimizeTNLP's same-structure path retained
+        // stale values with this pinned Gravity/Ipopt stack.
+        const auto application_status =
+            resident_ipopt_->OptimizeTNLP(resident_program_);
+        status = static_cast<int>(application_status);
+        resident_ipopt_solved_ = true;
+        const auto statistics = resident_ipopt_->Statistics();
+        if (Ipopt::IsValid(statistics)) {
+            iterations = statistics->IterationCount();
+        }
+    } else {
+        gravity::solver nlp(model_, gravity::ipopt);
+        status = nlp.run(print_level, false, tolerance, "mumps", "no");
+    }
     const auto finish = std::chrono::steady_clock::now();
 
     SolveResult result;
     result.status = status;
     result.objective = model_._obj_val;
     result.wall_seconds = std::chrono::duration<double>(finish - start).count();
+    result.iterations = iterations;
+    result.resident_reoptimization = reoptimization;
     result.state = capture_state();
     return result;
 }
@@ -765,7 +1033,27 @@ AcState AcModel::capture_state() const {
     state.commitment = capture(commitment_, data_.generators.size());
     state.startup = capture(startup_, data_.generators.size());
     state.shutdown = capture(shutdown_, data_.generators.size());
-    state.gen_lambda = capture(gen_lambda_, gen_lambda_->get_nb_instances());
+    const auto resident_gen_lambda = capture(gen_lambda_, gen_lambda_->get_nb_instances());
+    if (reusable_contingencies_ && contingency_->outaged_generator >= 0) {
+        // The independent checker and serialized result use the canonical
+        // per-contingency state layout: an outaged generator has no PWL
+        // lambda block.  The resident model retains that zeroed block only
+        // internally so its Jacobian/Hessian structure stays unchanged.
+        const int outage = contingency_->outaged_generator;
+        state.gen_lambda.reserve(
+            resident_gen_lambda.size() - gen_points_[outage].size());
+        for (std::size_t i = 0; i < data_.generators.size(); ++i) {
+            if (gen_lambda_offset_[i] < 0 || static_cast<int>(i) == outage) {
+                continue;
+            }
+            for (int j = 0; j < static_cast<int>(gen_points_[i].size()); ++j) {
+                state.gen_lambda.push_back(
+                    resident_gen_lambda[gen_lambda_offset_[i] + j]);
+            }
+        }
+    } else {
+        state.gen_lambda = resident_gen_lambda;
+    }
     state.load_lambda = capture(load_lambda_, load_lambda_->get_nb_instances());
     return state;
 }

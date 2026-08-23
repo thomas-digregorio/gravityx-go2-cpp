@@ -35,6 +35,7 @@ add_executable(gravityx_go2
     src/state_io.cpp
 )
 target_include_directories(gravityx_go2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_definitions(gravityx_go2 PRIVATE USE_IPOPT)
 target_link_libraries(gravityx_go2 PRIVATE
     gravity_pinned
     "${IPOPT_ROOT}/lib/libipopt.so"

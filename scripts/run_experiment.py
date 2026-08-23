@@ -311,6 +311,7 @@ def main() -> int:
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--skip-evaluation", action="store_true")
+    parser.add_argument("--resident-contingency-model", action="store_true")
     args = parser.parse_args()
 
     for path in (args.case_json, args.case_dir, args.output_dir, args.executable):
@@ -363,6 +364,7 @@ def main() -> int:
             "measurement_boundary": "normalized-case loading through official evaluation and result serialization",
         },
         "completed_contingency_count": 0,
+        "resident_contingency_model": args.resident_contingency_model,
     }
 
     def checkpoint() -> None:
@@ -470,15 +472,18 @@ def main() -> int:
         task_timeout = effective_process_timeout(
             args.contingency_timeout, contingency_deadline
         )
+        worker_arguments = [
+            "contingency-worker",
+            to_wsl(args.case_json),
+            to_wsl(base_json),
+            "0",
+        ]
+        if args.resident_contingency_model:
+            worker_arguments.append("resident")
         command = cpp_command(
             args.executable,
             args.distro,
-            [
-                "contingency-worker",
-                to_wsl(args.case_json),
-                to_wsl(base_json),
-                "0",
-            ],
+            worker_arguments,
             task_timeout,
         )
         started = time.perf_counter()
@@ -572,6 +577,13 @@ def main() -> int:
                     "objective": result["solve"]["objective"],
                     "max_residual": result["validation"]["max_residual"],
                     "solver_status": result["solve"]["status"],
+                    "solver_iterations": result["solve"].get("iterations", -1),
+                    "resident_reoptimization": result["solve"].get(
+                        "resident_reoptimization", False
+                    ),
+                    "model_preparation_wall_seconds": result.get(
+                        "model_preparation_wall_seconds", 0.0
+                    ),
                     "solver_status_success": result.get(
                         "solver_status_success", False
                     ),
@@ -812,7 +824,12 @@ def main() -> int:
         },
         "workers": worker_count,
         "requested_workers": args.workers,
-        "contingency_execution_mode": "persistent isolated process workers with dynamic queue",
+        "resident_contingency_model": args.resident_contingency_model,
+        "contingency_execution_mode": (
+            "resident parametric model per isolated process worker with dynamic queue"
+            if args.resident_contingency_model
+            else "fresh model per task in persistent isolated process workers with dynamic queue"
+        ),
         "competition_timing": {
             **run_status["competition_timing"],
             "code1_within_limit": True,
@@ -829,6 +846,12 @@ def main() -> int:
             item["process_wall_seconds"] for item in worker_records
         ),
         "contingency_solver_seconds_sum": sum(item["solver_wall_seconds"] for item in records),
+        "contingency_model_preparation_seconds_sum": sum(
+            item["model_preparation_wall_seconds"] for item in records
+        ),
+        "contingency_ipopt_iterations_sum": sum(
+            max(0, int(item["solver_iterations"])) for item in records
+        ),
         "evaluation_wall_seconds": evaluation_wall,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),

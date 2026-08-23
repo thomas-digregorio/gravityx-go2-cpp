@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -420,7 +421,8 @@ bool solve_loaded_contingency(
     const BasePoint& base,
     const std::string& label,
     const std::string& output_path,
-    int print_level) {
+    int print_level,
+    std::unique_ptr<gravityx::AcModel>* reusable_model = nullptr) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -436,9 +438,29 @@ bool solve_loaded_contingency(
         context.outaged_branch = match->component;
     }
 
-    gravityx::AcModel model(
-        data, gravityx::ModelMode::ContingencySoft, base.commitment, context);
-    const auto solve = model.solve(print_level, 1e-6);
+    const auto preparation_start = std::chrono::steady_clock::now();
+    std::unique_ptr<gravityx::AcModel> fresh_model;
+    gravityx::AcModel* model = nullptr;
+    bool resident_model_created = false;
+    if (reusable_model) {
+        if (!*reusable_model) {
+            *reusable_model = std::make_unique<gravityx::AcModel>(
+                data, gravityx::ModelMode::ContingencySoft,
+                base.commitment, context, true);
+            resident_model_created = true;
+        } else {
+            (*reusable_model)->set_contingency(context);
+        }
+        model = reusable_model->get();
+    } else {
+        fresh_model = std::make_unique<gravityx::AcModel>(
+            data, gravityx::ModelMode::ContingencySoft, base.commitment, context);
+        model = fresh_model.get();
+    }
+    const auto preparation_finish = std::chrono::steady_clock::now();
+    const double preparation_seconds = std::chrono::duration<double>(
+        preparation_finish - preparation_start).count();
+    const auto solve = model->solve(print_level, 1e-6);
     const auto validation = gravityx::validate_state(
         data, gravityx::ModelMode::ContingencySoft,
         solve.state, base.commitment, context);
@@ -454,6 +476,9 @@ bool solve_loaded_contingency(
         {"type", match->type == gravityx::ContingencyType::Generator ? "gen" : "branch"},
         {"source_index", match->source_index},
         {"component_position", match->component},
+        {"resident_parametric_model", reusable_model != nullptr},
+        {"resident_model_created", resident_model_created},
+        {"model_preparation_wall_seconds", preparation_seconds},
         {"solve", gravityx::solve_result_to_json(solve, true)},
         {"validation", validation.to_json()},
     };
@@ -467,6 +492,9 @@ bool solve_loaded_contingency(
         {"status", solve.status},
         {"objective", solve.objective},
         {"wall_seconds", solve.wall_seconds},
+        {"iterations", solve.iterations},
+        {"resident_reoptimization", solve.resident_reoptimization},
+        {"model_preparation_wall_seconds", preparation_seconds},
         {"max_residual", validation.max_residual},
     }).dump(2) << '\n';
     return success;
@@ -522,11 +550,13 @@ int solve_contingency_batch(
 int run_contingency_worker(
     const std::string& case_path,
     const std::string& base_result_path,
-    int print_level) {
+    int print_level,
+    bool reusable_model) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     const auto data = gravityx::CaseData::load(case_path);
     const auto base = load_base_point(base_result_path);
+    std::unique_ptr<gravityx::AcModel> resident_model;
     std::cout << "GRAVITYX_WORKER_READY" << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -540,7 +570,8 @@ int run_contingency_worker(
         const auto label = task.at("label").get<std::string>();
         const auto output_path = task.at("output_path").get<std::string>();
         const bool success = solve_loaded_contingency(
-            data, base, label, output_path, print_level);
+            data, base, label, output_path, print_level,
+            reusable_model ? &resident_model : nullptr);
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
@@ -590,10 +621,15 @@ int main(int argc, char** argv) {
             const int print_level = argc == 6 ? std::stoi(argv[5]) : 0;
             return solve_contingency_batch(argv[2], argv[3], argv[4], print_level);
         }
-        if ((argc == 4 || argc == 5) &&
+        if ((argc >= 4 && argc <= 6) &&
             std::string(argv[1]) == "contingency-worker") {
-            const int print_level = argc == 5 ? std::stoi(argv[4]) : 0;
-            return run_contingency_worker(argv[2], argv[3], print_level);
+            const int print_level = argc >= 5 ? std::stoi(argv[4]) : 0;
+            const bool reusable_model = argc == 6 && std::string(argv[5]) == "resident";
+            if (argc == 6 && !reusable_model) {
+                throw std::runtime_error("unknown contingency-worker mode");
+            }
+            return run_contingency_worker(
+                argv[2], argv[3], print_level, reusable_model);
         }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"
@@ -606,7 +642,7 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"
-                  << "  gravityx_go2 contingency-worker CASE.json BASE.json [print-level]\n";
+                  << "  gravityx_go2 contingency-worker CASE.json BASE.json [print-level] [resident]\n";
         return 2;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

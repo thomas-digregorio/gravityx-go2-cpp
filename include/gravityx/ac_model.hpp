@@ -41,6 +41,8 @@ struct SolveResult {
     int status{};
     double objective{};
     double wall_seconds{};
+    int iterations{-1};
+    bool resident_reoptimization{};
     AcState state;
 };
 
@@ -67,19 +69,29 @@ public:
         const CaseData& data,
         ModelMode mode,
         std::vector<int> fixed_status = {},
-        std::optional<ContingencyContext> contingency = std::nullopt);
+        std::optional<ContingencyContext> contingency = std::nullopt,
+        bool reusable_contingencies = false);
 
     SolveResult solve(int print_level = 0, double tolerance = 1e-6);
     void initialize_from(const AcState& state);
+    void set_contingency(const ContingencyContext& contingency);
     void set_commitment_bound(int generator, int status);
     void set_commitment_start(int generator, double value);
+    bool reusable_contingencies() const { return reusable_contingencies_; }
 
 private:
     const CaseData& data_;
     ModelMode mode_;
     std::vector<int> fixed_status_;
     std::optional<ContingencyContext> contingency_;
+    bool reusable_contingencies_{};
     gravity::Model model_;
+
+    std::unique_ptr<gravity::param<double>> generator_available_;
+    std::unique_ptr<gravity::param<double>> branch_available_;
+    Ipopt::SmartPtr<Ipopt::IpoptApplication> resident_ipopt_;
+    Ipopt::SmartPtr<IpoptProgram> resident_program_;
+    bool resident_ipopt_solved_{};
 
     std::unique_ptr<gravity::var<double>> vm_;
     std::unique_ptr<gravity::var<double>> va_;
@@ -104,6 +116,8 @@ private:
     std::vector<int> gen_lambda_offset_;
     std::vector<int> load_lambda_offset_;
 
+    void build_availability_parameters();
+    void update_availability_parameters(const ContingencyContext& contingency);
     void build_variables();
     void build_constraints_and_objective();
     void initialize_source_point();

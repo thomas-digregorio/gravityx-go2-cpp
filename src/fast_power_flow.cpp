@@ -2,6 +2,7 @@
 #include <Eigen/SparseLU>
 
 #include "gravityx/fast_power_flow.hpp"
+#include "gravityx/state_io.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -748,6 +749,21 @@ nlohmann::json FastPowerFlowResult::to_json() const {
     return {
         {"converged", converged},
         {"feasible", feasible},
+        {"direct_candidate_attempted", direct_candidate_attempted},
+        {"direct_candidate_selected", direct_candidate_selected},
+        {"direct_candidate_validation", direct_candidate_validation.to_json()},
+        {"newton_candidate_selected", newton_candidate_selected},
+        {"newton_candidate_validation", newton_candidate_validation.to_json()},
+        {"active_only_newton_attempted", active_only_newton_attempted},
+        {"active_only_newton_selected", active_only_newton_selected},
+        {"active_only_newton_converged", active_only_newton_converged},
+        {"active_only_newton_iterations", active_only_newton_iterations},
+        {"active_only_newton_validation", active_only_newton_validation.to_json()},
+        {"reactive_only_newton_attempted", reactive_only_newton_attempted},
+        {"reactive_only_newton_selected", reactive_only_newton_selected},
+        {"reactive_only_newton_converged", reactive_only_newton_converged},
+        {"reactive_only_newton_iterations", reactive_only_newton_iterations},
+        {"reactive_only_newton_validation", reactive_only_newton_validation.to_json()},
         {"distributed_balance_polish_attempted", distributed_balance_polish_attempted},
         {"distributed_balance_polish_selected", distributed_balance_polish_selected},
         {"distributed_balance_polish_iterations", distributed_balance_polish_iterations},
@@ -755,12 +771,311 @@ nlohmann::json FastPowerFlowResult::to_json() const {
         {"distributed_balance_polish_failure_reason", distributed_balance_polish_failure_reason},
         {"distributed_balance_polish_validation", distributed_balance_polish_validation.to_json()},
         {"newton_iterations", newton_iterations},
+        {"initial_newton_residual", initial_newton_residual},
         {"active_redispatch_passes", active_redispatch_passes},
         {"reactive_limit_passes", reactive_limit_passes},
         {"wall_seconds", wall_seconds},
         {"failure_reason", failure_reason},
         {"validation", validation.to_json()},
     };
+}
+
+nlohmann::json ValidatedSourceBaseResult::to_json() const {
+    return {
+        {"feasible", feasible},
+        {"wall_seconds", wall_seconds},
+        {"solve", solve_result_to_json(solve, true)},
+        {"validation", validation.to_json()},
+    };
+}
+
+double rebuild_base_state_derived_fields(
+    const CaseData& data,
+    const std::vector<int>& commitment,
+    AcState& state,
+    double balance_slack_upper) {
+    if (commitment.size() != data.generators.size() ||
+        state.vm.size() != data.buses.size() ||
+        state.va.size() != data.buses.size() ||
+        state.pg.size() != data.generators.size() ||
+        state.qg.size() != data.generators.size() ||
+        state.demand_factor.size() != data.loads.size()) {
+        throw std::runtime_error(
+            "cannot rebuild a dimensionally invalid base state");
+    }
+    if (!std::isfinite(balance_slack_upper) ||
+        balance_slack_upper < 0.0 || balance_slack_upper > 0.5) {
+        throw std::runtime_error("invalid base-state balance slack upper bound");
+    }
+
+    double objective = 0.0;
+    state.gen_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data.generators.size()); ++i) {
+        const auto& gen = data.generators[i];
+        if (commitment[i] != 0 && commitment[i] != 1) {
+            throw std::runtime_error("base-state commitment is not binary");
+        }
+        if (commitment[i] == 0) {
+            continue;
+        }
+        const double previous = gen.status_prev == 0 ? gen.pmin : gen.pg_prev;
+        const double lower = std::max(
+            gen.pmin, previous - data.delta_r * gen.prdmax);
+        const double upper = std::min(
+            gen.pmax, previous + data.delta_r * gen.prumax);
+        const auto points = active_pwl_points(gen.cost, gen.ncost, lower, upper);
+        const auto weights = interpolation_weights(points, state.pg[i]);
+        state.gen_lambda.insert(
+            state.gen_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective -= data.delta * points[j].cost * weights[j];
+        }
+        objective -= data.delta * gen.oncost;
+    }
+
+    state.load_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data.loads.size()); ++i) {
+        const auto& load = data.loads[i];
+        const auto points = active_pwl_points(
+            load.cost, load.ncost, load.pd_min, load.pd_max);
+        const auto weights = interpolation_weights(
+            points, load.pd_nominal * state.demand_factor[i]);
+        state.load_lambda.insert(
+            state.load_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective += data.delta * points[j].cost * weights[j];
+        }
+    }
+
+    compute_branch_flows(data, -1, state);
+    const auto balance = nodal_balance_slack_seed(
+        data, state, balance_slack_upper, 1e-7);
+    state.p_delta = balance.active;
+    state.q_delta = balance.reactive;
+    for (double value : state.sm_slack) {
+        objective -= data.delta * data.sm_cost_approx * value;
+    }
+    for (double value : state.p_delta) {
+        objective -= data.delta * data.p_delta_cost_approx * value;
+    }
+    for (double value : state.q_delta) {
+        objective -= data.delta * data.q_delta_cost_approx * value;
+    }
+    return objective;
+}
+
+double rebuild_contingency_state_derived_fields(
+    const CaseData& data,
+    const AcState& base_state,
+    const std::vector<int>& commitment,
+    const Contingency& contingency,
+    AcState& state,
+    double balance_slack_upper) {
+    if (commitment.size() != data.generators.size() ||
+        base_state.pg.size() != data.generators.size() ||
+        base_state.demand_factor.size() != data.loads.size() ||
+        state.vm.size() != data.buses.size() ||
+        state.va.size() != data.buses.size() ||
+        state.pg.size() != data.generators.size() ||
+        state.qg.size() != data.generators.size() ||
+        state.demand_factor.size() != data.loads.size()) {
+        throw std::runtime_error(
+            "cannot rebuild a dimensionally invalid contingency state");
+    }
+    if (!std::isfinite(balance_slack_upper) ||
+        balance_slack_upper < 0.0 || balance_slack_upper > 0.5) {
+        throw std::runtime_error(
+            "invalid contingency-state balance slack upper bound");
+    }
+    const int outaged_generator =
+        contingency.type == ContingencyType::Generator
+        ? contingency.component : -1;
+    const int outaged_branch =
+        contingency.type == ContingencyType::Branch
+        ? contingency.component : -1;
+
+    double objective = 0.0;
+    state.gen_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data.generators.size()); ++i) {
+        const auto& gen = data.generators[i];
+        const bool active = commitment[i] == 1 && i != outaged_generator;
+        if (!active) {
+            state.pg[i] = 0.0;
+            state.qg[i] = 0.0;
+            continue;
+        }
+        const double lower = std::max(
+            gen.pmin,
+            base_state.pg[i] - data.delta_r_ctg * gen.prdmaxctg);
+        const double upper = std::min(
+            gen.pmax,
+            base_state.pg[i] + data.delta_r_ctg * gen.prumaxctg);
+        const auto points = active_pwl_points(gen.cost, gen.ncost, lower, upper);
+        const auto weights = interpolation_weights(points, state.pg[i]);
+        state.gen_lambda.insert(
+            state.gen_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective -= data.delta_ctg * points[j].cost * weights[j];
+        }
+        objective -= data.delta_ctg * gen.oncost;
+    }
+
+    state.load_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data.loads.size()); ++i) {
+        const auto& load = data.loads[i];
+        const auto points = active_pwl_points(
+            load.cost, load.ncost, load.pd_min, load.pd_max);
+        const auto weights = interpolation_weights(
+            points, load.pd_nominal * state.demand_factor[i]);
+        state.load_lambda.insert(
+            state.load_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective += data.delta_ctg * points[j].cost * weights[j];
+        }
+    }
+
+    compute_branch_flows(data, outaged_branch, state);
+    const auto balance = nodal_balance_slack_seed(
+        data, state, balance_slack_upper, 1e-7);
+    state.p_delta = balance.active;
+    state.q_delta = balance.reactive;
+    for (double value : state.sm_slack) {
+        objective -= data.delta_ctg * data.sm_cost_approx * value;
+    }
+    for (double value : state.p_delta) {
+        objective -= data.delta_ctg * data.p_delta_cost_approx * value;
+    }
+    for (double value : state.q_delta) {
+        objective -= data.delta_ctg * data.q_delta_cost_approx * value;
+    }
+    return objective;
+}
+
+ValidatedSourceBaseResult build_validated_source_base(
+    const CaseData& data,
+    std::vector<int> commitment,
+    double validation_tolerance) {
+    const auto wall_start = std::chrono::steady_clock::now();
+    if (commitment.size() != data.generators.size()) {
+        throw std::runtime_error("validated source base commitment has wrong length");
+    }
+    if (!std::isfinite(validation_tolerance) || validation_tolerance < 0.0) {
+        throw std::runtime_error("invalid source-base validation tolerance");
+    }
+
+    AcState state;
+    state.vm.resize(data.buses.size());
+    state.va.resize(data.buses.size());
+    for (int i = 0; i < static_cast<int>(data.buses.size()); ++i) {
+        state.vm[i] = std::clamp(
+            data.buses[i].vm_start, data.buses[i].vmin, data.buses[i].vmax);
+        state.va[i] = data.buses[i].va_start;
+    }
+    for (const auto& component : connected_components(data, -1)) {
+        int reference = -1;
+        for (int bus : component) {
+            if (data.buses[bus].type == 3) {
+                reference = bus;
+                break;
+            }
+        }
+        if (reference >= 0) {
+            const double offset = state.va[reference];
+            for (int bus : component) {
+                state.va[bus] -= offset;
+            }
+        }
+    }
+
+    state.pg.assign(data.generators.size(), 0.0);
+    state.qg.assign(data.generators.size(), 0.0);
+    double objective = 0.0;
+    for (int i = 0; i < static_cast<int>(data.generators.size()); ++i) {
+        const auto& gen = data.generators[i];
+        if (commitment[i] != 0 && commitment[i] != 1) {
+            throw std::runtime_error("source-base commitment is not binary");
+        }
+        if (commitment[i] == 0) {
+            continue;
+        }
+        const double previous = gen.status_prev == 0 ? gen.pmin : gen.pg_prev;
+        const double lower = std::max(
+            gen.pmin, previous - data.delta_r * gen.prdmax);
+        const double upper = std::min(
+            gen.pmax, previous + data.delta_r * gen.prumax);
+        if (lower > upper + 1e-12) {
+            throw std::runtime_error(
+                "empty source-base generator interval: " + gen.source_key);
+        }
+        state.pg[i] = std::clamp(gen.pg_start, lower, upper);
+        state.qg[i] = std::clamp(gen.qg_start, gen.qmin, gen.qmax);
+        const auto points = active_pwl_points(gen.cost, gen.ncost, lower, upper);
+        const auto weights = interpolation_weights(points, state.pg[i]);
+        state.gen_lambda.insert(
+            state.gen_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective -= data.delta * points[j].cost * weights[j];
+        }
+        objective -= data.delta * gen.oncost;
+    }
+
+    state.demand_factor.resize(data.loads.size());
+    for (int i = 0; i < static_cast<int>(data.loads.size()); ++i) {
+        const auto& load = data.loads[i];
+        double lower = load.tmin;
+        double upper = load.tmax;
+        if (std::abs(load.pd_nominal) > 1e-12) {
+            lower = std::max(
+                lower,
+                (load.pd_prev - load.prdmax * data.delta_r) / load.pd_nominal);
+            upper = std::min(
+                upper,
+                (load.pd_prev + load.prumax * data.delta_r) / load.pd_nominal);
+        }
+        if (lower > upper + 1e-12) {
+            throw std::runtime_error(
+                "empty source-base load interval: " + load.source_key);
+        }
+        state.demand_factor[i] = std::clamp(load.z_start, lower, upper);
+        const auto points = active_pwl_points(
+            load.cost, load.ncost, load.pd_min, load.pd_max);
+        const auto weights = interpolation_weights(
+            points, load.pd_nominal * state.demand_factor[i]);
+        state.load_lambda.insert(
+            state.load_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective += data.delta * points[j].cost * weights[j];
+        }
+    }
+
+    compute_branch_flows(data, -1, state);
+    const auto balance = nodal_balance_slack_seed(data, state, 0.5);
+    state.p_delta = balance.active;
+    state.q_delta = balance.reactive;
+    for (double value : state.sm_slack) {
+        objective -= data.delta * data.sm_cost_approx * value;
+    }
+    for (double value : state.p_delta) {
+        objective -= data.delta * data.p_delta_cost_approx * value;
+    }
+    for (double value : state.q_delta) {
+        objective -= data.delta * data.q_delta_cost_approx * value;
+    }
+
+    ValidatedSourceBaseResult output;
+    output.solve.objective = objective;
+    output.solve.iterations = 0;
+    output.solve.state = std::move(state);
+    output.validation = validate_state(
+        data, ModelMode::BaseSoft, output.solve.state, commitment);
+    output.feasible = std::isfinite(objective) &&
+        std::isfinite(output.validation.max_residual) &&
+        output.validation.max_residual <= validation_tolerance;
+    output.solve.status = output.feasible ? 0 : 2;
+    output.wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    output.solve.wall_seconds = output.wall_seconds;
+    return output;
 }
 
 FastContingencyPowerFlow::FastContingencyPowerFlow(
@@ -783,14 +1098,26 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
 
 FastPowerFlowResult FastContingencyPowerFlow::solve(
     const Contingency& contingency) const {
+    return solve_impl(&contingency);
+}
+
+FastPowerFlowResult FastContingencyPowerFlow::solve_base() const {
+    return solve_impl(nullptr);
+}
+
+FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
+    const Contingency* contingency) const {
     const auto wall_start = std::chrono::steady_clock::now();
     FastPowerFlowResult output;
     const int nb = static_cast<int>(data_.buses.size());
     const int ng = static_cast<int>(data_.generators.size());
-    const int outaged_generator = contingency.type == ContingencyType::Generator
-        ? contingency.component : -1;
-    const int outaged_branch = contingency.type == ContingencyType::Branch
-        ? contingency.component : -1;
+    const bool base_mode = contingency == nullptr;
+    const int outaged_generator = !base_mode &&
+        contingency->type == ContingencyType::Generator
+        ? contingency->component : -1;
+    const int outaged_branch = !base_mode &&
+        contingency->type == ContingencyType::Branch
+        ? contingency->component : -1;
 
     std::vector<bool> active(ng, false);
     std::vector<double> p_lower(ng, 0.0), p_upper(ng, 0.0);
@@ -802,10 +1129,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
             continue;
         }
         const auto& gen = data_.generators[i];
-        p_lower[i] = std::max(
-            gen.pmin, base_state_.pg[i] - data_.delta_r_ctg * gen.prdmaxctg);
-        p_upper[i] = std::min(
-            gen.pmax, base_state_.pg[i] + data_.delta_r_ctg * gen.prumaxctg);
+        if (base_mode) {
+            const double previous = gen.status_prev == 0 ? gen.pmin : gen.pg_prev;
+            p_lower[i] = std::max(
+                gen.pmin, previous - data_.delta_r * gen.prdmax);
+            p_upper[i] = std::min(
+                gen.pmax, previous + data_.delta_r * gen.prumax);
+        } else {
+            p_lower[i] = std::max(
+                gen.pmin,
+                base_state_.pg[i] - data_.delta_r_ctg * gen.prdmaxctg);
+            p_upper[i] = std::min(
+                gen.pmax,
+                base_state_.pg[i] + data_.delta_r_ctg * gen.prumaxctg);
+        }
         q_lower[i] = gen.qmin;
         q_upper[i] = gen.qmax;
         if (p_lower[i] > p_upper[i] + 1e-12 || q_lower[i] > q_upper[i] + 1e-12) {
@@ -816,6 +1153,61 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
         }
         pg[i] = std::clamp(base_state_.pg[i], p_lower[i], p_upper[i]);
         qg[i] = std::clamp(base_state_.qg[i], q_lower[i], q_upper[i]);
+    }
+
+    std::optional<ContingencyContext> direct_context;
+    if (!base_mode) {
+        direct_context = ContingencyContext{};
+        direct_context->base_state = base_state_;
+        direct_context->outaged_generator = outaged_generator;
+        direct_context->outaged_branch = outaged_branch;
+    }
+    AcState direct_state = base_state_;
+    direct_state.pg = pg;
+    direct_state.qg = qg;
+    compute_branch_flows(data_, outaged_branch, direct_state);
+    const auto direct_balance = nodal_balance_slack_seed(
+        data_, direct_state, 0.5, 1e-7);
+    direct_state.p_delta = direct_balance.active;
+    direct_state.q_delta = direct_balance.reactive;
+    direct_state.gen_lambda.clear();
+    for (int i = 0; i < ng; ++i) {
+        if (!active[i]) {
+            continue;
+        }
+        const auto points = active_pwl_points(
+            data_.generators[i].cost, data_.generators[i].ncost,
+            p_lower[i], p_upper[i]);
+        append_weights(direct_state.gen_lambda, points, direct_state.pg[i]);
+    }
+    direct_state.load_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data_.loads.size()); ++i) {
+        const auto& load = data_.loads[i];
+        const auto points = active_pwl_points(
+            load.cost, load.ncost, load.pd_min, load.pd_max);
+        append_weights(
+            direct_state.load_lambda, points,
+            load.pd_nominal * direct_state.demand_factor[i]);
+    }
+    output.direct_candidate_attempted = true;
+    output.direct_candidate_validation = validate_state(
+        data_,
+        base_mode ? ModelMode::BaseSoft : ModelMode::ContingencySoft,
+        direct_state, commitment_, direct_context);
+    if (output.direct_candidate_validation.max_residual <=
+        options_.validation_tolerance) {
+        output.converged = true;
+        output.feasible = true;
+        output.direct_candidate_selected = true;
+        output.solve.status = 0;
+        output.solve.objective = 0.0;
+        output.solve.iterations = 0;
+        output.solve.state = std::move(direct_state);
+        output.validation = output.direct_candidate_validation;
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        output.solve.wall_seconds = output.wall_seconds;
+        return output;
     }
 
     const auto components = connected_components(data_, outaged_branch);
@@ -898,9 +1290,324 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
         load_q[load.bus] += load.qd_nominal * base_state_.demand_factor[i];
     }
     std::vector<double> fixed_q_bus(nb, 0.0);
+    std::vector<double> active_slack_target(nb, 0.0);
+    std::vector<double> reactive_slack_target(nb, 0.0);
+    if (!base_mode) {
+        for (int bus = 0; bus < nb; ++bus) {
+            double p_balance = 0.0;
+            double q_balance = 0.0;
+            for (int branch : data_.buses[bus].branches_from) {
+                p_balance += direct_state.pf[branch];
+                q_balance += direct_state.qf[branch];
+            }
+            for (int branch : data_.buses[bus].branches_to) {
+                p_balance += direct_state.pt[branch];
+                q_balance += direct_state.qt[branch];
+            }
+            for (int gen : data_.buses[bus].generators) {
+                p_balance -= direct_state.pg[gen];
+                q_balance -= direct_state.qg[gen];
+            }
+            for (int load : data_.buses[bus].loads) {
+                p_balance += data_.loads[load].pd_nominal
+                    * direct_state.demand_factor[load];
+                q_balance += data_.loads[load].qd_nominal
+                    * direct_state.demand_factor[load];
+            }
+            for (int shunt : data_.buses[bus].shunts) {
+                const double vm2 = direct_state.vm[bus] * direct_state.vm[bus];
+                p_balance += data_.shunts[shunt].gs * vm2;
+                q_balance -= data_.shunts[shunt].bs * vm2;
+            }
+            // The GO2 corrective model permits bounded nodal imbalance.  Use
+            // the post-outage direct candidate's signed balance, clipped to an
+            // interior feasible target, so Newton corrects only the amount
+            // beyond the allowed band.  Solving every bus to zero needlessly
+            // displaced a valid soft-balance operating point and diverged.
+            active_slack_target[bus] = std::clamp(p_balance, -0.49, 0.49);
+            reactive_slack_target[bus] = std::clamp(q_balance, -0.49, 0.49);
+        }
+    }
     for (int bus = 0; bus < nb; ++bus) {
         for (int gen : active_at_bus[bus]) {
             fixed_q_bus[bus] += qg[gen];
+        }
+    }
+
+    const auto evaluate_newton_candidate = [&](bool clamp_voltage) {
+        AcState candidate = base_state_;
+        candidate.vm = vm;
+        candidate.va = va;
+        candidate.pg = pg;
+        candidate.qg = qg;
+        if (clamp_voltage) {
+            for (int bus = 0; bus < nb; ++bus) {
+                candidate.vm[bus] = std::clamp(
+                    candidate.vm[bus],
+                    data_.buses[bus].vmin, data_.buses[bus].vmax);
+            }
+        }
+        compute_branch_flows(data_, outaged_branch, candidate);
+        for (int bus = 0; bus < nb; ++bus) {
+            if (active_at_bus[bus].empty()) {
+                continue;
+            }
+            double p_balance = 0.0;
+            double q_balance = 0.0;
+            for (int branch : data_.buses[bus].branches_from) {
+                p_balance += candidate.pf[branch];
+                q_balance += candidate.qf[branch];
+            }
+            for (int branch : data_.buses[bus].branches_to) {
+                p_balance += candidate.pt[branch];
+                q_balance += candidate.qt[branch];
+            }
+            double current_pg = 0.0;
+            double current_qg = 0.0;
+            for (int gen : data_.buses[bus].generators) {
+                p_balance -= candidate.pg[gen];
+                q_balance -= candidate.qg[gen];
+            }
+            for (int gen : active_at_bus[bus]) {
+                current_pg += candidate.pg[gen];
+                current_qg += candidate.qg[gen];
+            }
+            for (int load : data_.buses[bus].loads) {
+                p_balance += data_.loads[load].pd_nominal
+                    * candidate.demand_factor[load];
+                q_balance += data_.loads[load].qd_nominal
+                    * candidate.demand_factor[load];
+            }
+            for (int shunt : data_.buses[bus].shunts) {
+                const double vm2 = candidate.vm[bus] * candidate.vm[bus];
+                p_balance += data_.shunts[shunt].gs * vm2;
+                q_balance -= data_.shunts[shunt].bs * vm2;
+            }
+            const double p_target = std::clamp(p_balance, -0.49, 0.49);
+            const double q_target = std::clamp(q_balance, -0.49, 0.49);
+            auto proposed_pg = candidate.pg;
+            if (allocate_total(
+                    active_at_bus[bus], p_lower, p_upper,
+                    base_state_.pg,
+                    current_pg + p_balance - p_target,
+                    proposed_pg)) {
+                candidate.pg = std::move(proposed_pg);
+            }
+            auto proposed_qg = candidate.qg;
+            if (allocate_total(
+                    active_at_bus[bus], q_lower, q_upper,
+                    base_state_.qg,
+                    current_qg + q_balance - q_target,
+                    proposed_qg)) {
+                candidate.qg = std::move(proposed_qg);
+            }
+        }
+        const auto balance = nodal_balance_slack_seed(
+            data_, candidate, 0.5, 1e-7);
+        candidate.p_delta = balance.active;
+        candidate.q_delta = balance.reactive;
+        candidate.gen_lambda.clear();
+        for (int i = 0; i < ng; ++i) {
+            if (!active[i]) {
+                continue;
+            }
+            const auto points = active_pwl_points(
+                data_.generators[i].cost, data_.generators[i].ncost,
+                p_lower[i], p_upper[i]);
+            append_weights(candidate.gen_lambda, points, candidate.pg[i]);
+        }
+        candidate.load_lambda.clear();
+        for (int i = 0; i < static_cast<int>(data_.loads.size()); ++i) {
+            const auto& load = data_.loads[i];
+            const auto points = active_pwl_points(
+                load.cost, load.ncost, load.pd_min, load.pd_max);
+            append_weights(
+                candidate.load_lambda, points,
+                load.pd_nominal * candidate.demand_factor[i]);
+        }
+        auto validation = validate_state(
+            data_,
+            base_mode ? ModelMode::BaseSoft : ModelMode::ContingencySoft,
+            candidate, commitment_, direct_context);
+        return std::pair<AcState, ValidationReport>{
+            std::move(candidate), std::move(validation)};
+    };
+
+    if (!base_mode) {
+        const auto initial_vm = vm;
+        const auto initial_va = va;
+        std::vector<bool> active_only_pq(nb, false);
+        std::vector<double> active_only_p_spec(nb, 0.0);
+        std::vector<double> unused_q_spec(nb, 0.0);
+        for (int bus = 0; bus < nb; ++bus) {
+            active_only_p_spec[bus] =
+                -load_p[bus] + active_slack_target[bus];
+            for (int gen : active_at_bus[bus]) {
+                active_only_p_spec[bus] += pg[gen];
+            }
+        }
+        output.active_only_newton_attempted = true;
+        const auto active_only = run_newton(
+            data_, ybus, slack, active_only_pq,
+            active_only_p_spec, unused_q_spec,
+            options_.max_newton_iterations, options_.newton_tolerance,
+            vm, va);
+        output.active_only_newton_converged = active_only.converged;
+        output.active_only_newton_iterations = active_only.iterations;
+        output.newton_iterations += active_only.iterations;
+        auto [active_only_state, active_only_validation] =
+            evaluate_newton_candidate(false);
+        output.active_only_newton_validation = active_only_validation;
+        if (active_only_validation.max_residual <=
+            options_.validation_tolerance) {
+            output.converged = active_only.converged;
+            output.feasible = true;
+            output.active_only_newton_selected = true;
+            output.solve.status = active_only.converged ? 0 : 1;
+            output.solve.objective = 0.0;
+            output.solve.iterations = output.newton_iterations;
+            output.solve.state = std::move(active_only_state);
+            output.validation = active_only_validation;
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            output.solve.wall_seconds = output.wall_seconds;
+            return output;
+        }
+        if (active_only_validation.max_residual <
+            output.direct_candidate_validation.max_residual) {
+            vm = active_only_state.vm;
+            va = active_only_state.va;
+            pg = active_only_state.pg;
+            qg = active_only_state.qg;
+            std::fill(fixed_q_bus.begin(), fixed_q_bus.end(), 0.0);
+            for (int bus = 0; bus < nb; ++bus) {
+                for (int gen : active_at_bus[bus]) {
+                    fixed_q_bus[bus] += qg[gen];
+                }
+            }
+        } else {
+            vm = initial_vm;
+            va = initial_va;
+        }
+
+        const auto reactive_initial_vm = vm;
+        const auto reactive_initial_va = va;
+        std::vector<double> current_p_network;
+        std::vector<double> current_q_network;
+        network_injections(
+            ybus, vm, va, current_p_network, current_q_network);
+        std::vector<double> unused_p_spec(nb, 0.0);
+        std::vector<double> reactive_q_spec(nb, 0.0);
+        for (int bus = 0; bus < nb; ++bus) {
+            double generated_q = 0.0;
+            for (int gen : active_at_bus[bus]) {
+                generated_q += qg[gen];
+            }
+            const double q_balance = current_q_network[bus]
+                - generated_q + load_q[bus];
+            const double q_target = std::clamp(q_balance, -0.49, 0.49);
+            reactive_q_spec[bus] = generated_q - load_q[bus] + q_target;
+        }
+        std::vector<bool> fixed_angle(nb, true);
+        output.reactive_only_newton_attempted = true;
+        const auto reactive_only = run_newton(
+            data_, ybus, fixed_angle, pq,
+            unused_p_spec, reactive_q_spec,
+            options_.max_newton_iterations, options_.newton_tolerance,
+            vm, va);
+        output.reactive_only_newton_converged = reactive_only.converged;
+        output.reactive_only_newton_iterations = reactive_only.iterations;
+        output.newton_iterations += reactive_only.iterations;
+        auto [reactive_state, reactive_validation] =
+            evaluate_newton_candidate(false);
+        if (reactive_validation.worst_category == "variable_bound") {
+            auto [clamped_state, clamped_validation] =
+                evaluate_newton_candidate(true);
+            if (clamped_validation.max_residual <
+                reactive_validation.max_residual) {
+                reactive_state = std::move(clamped_state);
+                reactive_validation = clamped_validation;
+            }
+        }
+        for (int scaling_pass = 0;
+             scaling_pass < 6 &&
+             reactive_validation.max_residual > options_.validation_tolerance &&
+             (reactive_validation.worst_category == "variable_bound" ||
+              reactive_validation.worst_category == "flow_limit");
+             ++scaling_pass) {
+            double maximum_component_ratio = 1.0;
+            for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
+                if (i == outaged_branch || data_.branches[i].rate_a <= 1e-12) {
+                    continue;
+                }
+                maximum_component_ratio = std::max(
+                    maximum_component_ratio,
+                    std::max({std::abs(reactive_state.pf[i]),
+                              std::abs(reactive_state.qf[i]),
+                              std::abs(reactive_state.pt[i]),
+                              std::abs(reactive_state.qt[i])})
+                        / data_.branches[i].rate_a);
+            }
+            if (maximum_component_ratio <= 1.0 + 1e-12) {
+                break;
+            }
+            const double scale = std::min(
+                0.9995, 0.9999 / std::sqrt(maximum_component_ratio));
+            vm = reactive_state.vm;
+            va = reactive_state.va;
+            pg = reactive_state.pg;
+            qg = reactive_state.qg;
+            bool changed = false;
+            for (int bus = 0; bus < nb; ++bus) {
+                const double reduced = std::max(
+                    data_.buses[bus].vmin, vm[bus] * scale);
+                changed = changed || reduced < vm[bus] - 1e-12;
+                vm[bus] = reduced;
+            }
+            if (!changed) {
+                break;
+            }
+            auto [scaled_state, scaled_validation] =
+                evaluate_newton_candidate(false);
+            if (scaled_validation.max_residual + 1e-12 <
+                reactive_validation.max_residual) {
+                reactive_state = std::move(scaled_state);
+                reactive_validation = scaled_validation;
+            } else {
+                break;
+            }
+        }
+        output.reactive_only_newton_validation = reactive_validation;
+        if (reactive_validation.max_residual <=
+            options_.validation_tolerance) {
+            output.converged = reactive_only.converged;
+            output.feasible = true;
+            output.reactive_only_newton_selected = true;
+            output.solve.status = reactive_only.converged ? 0 : 1;
+            output.solve.objective = 0.0;
+            output.solve.iterations = output.newton_iterations;
+            output.solve.state = std::move(reactive_state);
+            output.validation = reactive_validation;
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            output.solve.wall_seconds = output.wall_seconds;
+            return output;
+        }
+        if (reactive_validation.max_residual <
+            output.active_only_newton_validation.max_residual) {
+            vm = reactive_state.vm;
+            va = reactive_state.va;
+            pg = reactive_state.pg;
+            qg = reactive_state.qg;
+            std::fill(fixed_q_bus.begin(), fixed_q_bus.end(), 0.0);
+            for (int bus = 0; bus < nb; ++bus) {
+                for (int gen : active_at_bus[bus]) {
+                    fixed_q_bus[bus] += qg[gen];
+                }
+            }
+        } else {
+            vm = reactive_initial_vm;
+            va = reactive_initial_va;
         }
     }
 
@@ -916,17 +1623,65 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
             output.reactive_limit_passes = std::max(output.reactive_limit_passes, q_pass);
             std::vector<double> p_spec(nb, 0.0), q_spec(nb, 0.0);
             for (int bus = 0; bus < nb; ++bus) {
-                p_spec[bus] = -load_p[bus];
-                q_spec[bus] = fixed_q_bus[bus] - load_q[bus];
+                p_spec[bus] = -load_p[bus] + active_slack_target[bus];
+                q_spec[bus] = fixed_q_bus[bus] - load_q[bus]
+                    + reactive_slack_target[bus];
                 for (int gen : active_at_bus[bus]) {
                     p_spec[bus] += pg[gen];
                 }
+            }
+            if (active_pass == 0 && q_pass == 0) {
+                std::vector<double> initial_p;
+                std::vector<double> initial_q;
+                network_injections(ybus, vm, va, initial_p, initial_q);
+                std::vector<int> angle_index(nb, -1);
+                std::vector<int> voltage_index(nb, -1);
+                int angle_count = 0;
+                int voltage_count = 0;
+                for (int bus = 0; bus < nb; ++bus) {
+                    if (!slack[bus]) {
+                        angle_index[bus] = angle_count++;
+                    }
+                    if (pq[bus]) {
+                        voltage_index[bus] = voltage_count++;
+                    }
+                }
+                output.initial_newton_residual = mismatch_norm(
+                    p_spec, q_spec, initial_p, initial_q,
+                    angle_index, voltage_index);
             }
             const NewtonResult newton = run_newton(
                 data_, ybus, slack, pq, p_spec, q_spec,
                 options_.max_newton_iterations, options_.newton_tolerance,
                 vm, va);
             output.newton_iterations += newton.iterations;
+            auto [newton_state, newton_validation] =
+                evaluate_newton_candidate(false);
+            if (newton_validation.worst_category == "variable_bound") {
+                auto [clamped_state, clamped_validation] =
+                    evaluate_newton_candidate(true);
+                if (clamped_validation.max_residual <
+                    newton_validation.max_residual) {
+                    newton_state = std::move(clamped_state);
+                    newton_validation = clamped_validation;
+                }
+            }
+            output.newton_candidate_validation = newton_validation;
+            if (newton_validation.max_residual <=
+                options_.validation_tolerance) {
+                output.converged = newton.converged;
+                output.feasible = true;
+                output.newton_candidate_selected = true;
+                output.solve.status = newton.converged ? 0 : 1;
+                output.solve.objective = 0.0;
+                output.solve.iterations = output.newton_iterations;
+                output.solve.state = std::move(newton_state);
+                output.validation = newton_validation;
+                output.wall_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall_start).count();
+                output.solve.wall_seconds = output.wall_seconds;
+                return output;
+            }
             if (!newton.converged) {
                 output.failure_reason = newton.failure_reason;
                 approximate_candidate = true;
@@ -941,8 +1696,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
                 const double projected = std::clamp(
                     vm[bus], data_.buses[bus].vmin, data_.buses[bus].vmax);
                 if (std::abs(projected - vm[bus]) > 1e-9) {
+                    const double target = vm[bus] < data_.buses[bus].vmin
+                        ? 0.49 : -0.49;
                     vm[bus] = projected;
-                    pq[bus] = false;
+                    if (std::abs(reactive_slack_target[bus] - target) > 1e-12) {
+                        // Base and corrective models both permit a bounded
+                        // local reactive-balance slack.  Keep this bus in the
+                        // Newton Q equations and solve to an interior 0.49-p.u.
+                        // target before treating its voltage as fixed.  This
+                        // avoids concentrating an arbitrary Q mismatch at a
+                        // projected voltage-bound bus.
+                        reactive_slack_target[bus] = target;
+                    } else {
+                        pq[bus] = false;
+                    }
                     projected_voltage = true;
                 }
             }
@@ -962,7 +1729,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
                     lower += q_lower[gen];
                     upper += q_upper[gen];
                 }
-                const double required = q_network[bus] + load_q[bus];
+                const double required = q_network[bus] + load_q[bus]
+                    - reactive_slack_target[bus];
                 if (required < lower - 1e-7 || required > upper + 1e-7) {
                     fixed_q_bus[bus] = std::clamp(required, lower, upper);
                     pq[bus] = true;
@@ -993,7 +1761,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
                     break;
                 }
             }
-            const double required_slack = p_network[slack_bus] + load_p[slack_bus];
+            const double required_slack = p_network[slack_bus]
+                + load_p[slack_bus] - active_slack_target[slack_bus];
             double slack_lower = 0.0;
             double slack_upper = 0.0;
             for (int gen : active_at_bus[slack_bus]) {
@@ -1050,10 +1819,13 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
                 required_p += pg[gen];
             }
             if (slack[bus]) {
-                required_p = p_network[bus] + load_p[bus];
+                required_p = p_network[bus] + load_p[bus]
+                    - active_slack_target[bus];
             }
             const double required_q = pq[bus]
-                ? fixed_q_bus[bus] : q_network[bus] + load_q[bus];
+                ? fixed_q_bus[bus]
+                : q_network[bus] + load_q[bus]
+                    - reactive_slack_target[bus];
             auto proposed_pg = pg;
             auto proposed_qg = qg;
             if (!allocate_total(
@@ -1135,15 +1907,21 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
     std::vector<double> load_reactive_preferred(nd, 0.0);
     for (int i = 0; i < nd; ++i) {
         const auto& load = data_.loads[i];
-        const double previous = load.pd_nominal * base_state_.demand_factor[i];
+        const double previous = base_mode
+            ? load.pd_prev
+            : load.pd_nominal * base_state_.demand_factor[i];
         const double factor_lower = std::abs(load.pd_nominal) <= 1e-12
             ? load.tmin
             : std::max(load.tmin,
-                (previous - load.prdmaxctg * data_.delta_r_ctg) / load.pd_nominal);
+                (previous - (base_mode ? load.prdmax * data_.delta_r
+                                       : load.prdmaxctg * data_.delta_r_ctg))
+                    / load.pd_nominal);
         const double factor_upper = std::abs(load.pd_nominal) <= 1e-12
             ? load.tmax
             : std::min(load.tmax,
-                (previous + load.prumaxctg * data_.delta_r_ctg) / load.pd_nominal);
+                (previous + (base_mode ? load.prumax * data_.delta_r
+                                       : load.prumaxctg * data_.delta_r_ctg))
+                    / load.pd_nominal);
         load_power_lower[i] = std::min(
             load.pd_nominal * factor_lower, load.pd_nominal * factor_upper);
         load_power_upper[i] = std::max(
@@ -1335,18 +2113,25 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
 
     refresh_network_fields();
 
-    ContingencyContext context;
-    context.base_state = base_state_;
-    context.outaged_generator = outaged_generator;
-    context.outaged_branch = outaged_branch;
+    std::optional<ContingencyContext> context;
+    if (!base_mode) {
+        context = ContingencyContext{};
+        context->base_state = base_state_;
+        context->outaged_generator = outaged_generator;
+        context->outaged_branch = outaged_branch;
+    }
+    const auto validate_candidate = [&](const AcState& candidate) {
+        return validate_state(
+            data_,
+            base_mode ? ModelMode::BaseSoft : ModelMode::ContingencySoft,
+            candidate, commitment_, context);
+    };
     output.solve.status = 0;
     output.solve.objective = 0.0;
     output.solve.iterations = output.newton_iterations;
     output.solve.state = std::move(state);
     output.converged = !approximate_candidate;
-    output.validation = validate_state(
-        data_, ModelMode::ContingencySoft,
-        output.solve.state, commitment_, context);
+    output.validation = validate_candidate(output.solve.state);
     for (int scaling_pass = 0;
          scaling_pass < 6 && output.validation.max_residual > options_.validation_tolerance;
          ++scaling_pass) {
@@ -1381,9 +2166,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
         state = output.solve.state;
         refresh_network_fields();
         output.solve.state = state;
-        output.validation = validate_state(
-            data_, ModelMode::ContingencySoft,
-            output.solve.state, commitment_, context);
+        output.validation = validate_candidate(output.solve.state);
     }
 
     // Voltage projection used to clear branch-component bounds can disturb
@@ -1549,9 +2332,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
                 }
             }
             refresh_network_fields();
-            const ValidationReport polished_validation = validate_state(
-                data_, ModelMode::ContingencySoft,
-                state, commitment_, context);
+            const ValidationReport polished_validation =
+                validate_candidate(state);
             output.distributed_balance_polish_validation = polished_validation;
             if (polished_validation.max_residual + 1e-12 <
                 best_validation.max_residual) {
@@ -1634,9 +2416,13 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
     }
     output.feasible = output.validation.max_residual <= options_.validation_tolerance;
     if (!output.feasible) {
-        output.failure_reason = "independent validation failed: "
+        const std::string validation_failure =
+            "independent validation failed: "
             + output.validation.worst_category + " at "
             + output.validation.worst_identity;
+        output.failure_reason = output.failure_reason.empty()
+            ? validation_failure
+            : output.failure_reason + "; " + validation_failure;
     } else if (approximate_candidate) {
         output.failure_reason.clear();
     }

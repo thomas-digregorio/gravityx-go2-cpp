@@ -350,6 +350,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--executable", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--fast-workers", type=int, default=8)
     parser.add_argument("--distro", default="Ubuntu-24.04")
     parser.add_argument("--base-timeout", type=float, default=900.0)
     parser.add_argument("--contingency-timeout", type=float, default=300.0)
@@ -364,6 +365,10 @@ def main() -> int:
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
+    parser.add_argument("--validated-source-base", action="store_true")
+    parser.add_argument("--two-stage-contingency-screen", action="store_true")
+    parser.add_argument("--linearized-contingency-fallback", action="store_true")
+    parser.add_argument("--linearized-contingency-only", action="store_true")
     parser.add_argument("--longest-first-schedule", action="store_true")
     args = parser.parse_args()
 
@@ -371,11 +376,23 @@ def main() -> int:
         parser.error(
             "--ipopt-acceptable-termination requires --resident-contingency-model"
         )
+    if args.two_stage_contingency_screen and not args.fast_power_flow_screen:
+        parser.error(
+            "--two-stage-contingency-screen requires --fast-power-flow-screen"
+        )
+    if (args.linearized_contingency_only and
+            not args.linearized_contingency_fallback):
+        parser.error(
+            "--linearized-contingency-only requires "
+            "--linearized-contingency-fallback"
+        )
 
     for path in (args.case_json, args.case_dir, args.output_dir, args.executable):
         reject_onedrive(path)
     if args.workers < 1:
         raise ValueError("workers must be positive")
+    if args.fast_workers < 1:
+        raise ValueError("fast workers must be positive")
     if args.code1_time_limit <= 0:
         raise ValueError("Code1 time limit must be positive")
     if args.total_time_limit <= 0:
@@ -426,6 +443,10 @@ def main() -> int:
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "source_status_base": args.source_status_base,
+        "validated_source_base": args.validated_source_base,
+        "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "linearized_contingency_fallback": args.linearized_contingency_fallback,
+        "linearized_contingency_only": args.linearized_contingency_only,
         "longest_first_schedule": args.longest_first_schedule,
     }
 
@@ -444,11 +465,19 @@ def main() -> int:
             min(args.base_timeout, args.code1_time_limit),
             base_deadline,
         )
-        base_arguments = [
-            "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
-        ]
-        if args.source_status_base:
-            base_arguments.append("source-only")
+        if args.validated_source_base:
+            base_arguments = [
+                "validated-source-base-json",
+                to_wsl(args.case_json),
+                to_wsl(base_json),
+                "fast-only",
+            ]
+        else:
+            base_arguments = [
+                "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
+            ]
+            if args.source_status_base:
+                base_arguments.append("source-only")
         base_process = run_cpp(
             args.executable,
             args.distro,
@@ -539,14 +568,278 @@ def main() -> int:
         else "Code2 competition deadline"
     )
     abort_contingencies = threading.Event()
-    worker_count = min(args.workers, len(contingencies))
-    if worker_count < 1:
-        raise ValueError("at least one contingency is required")
-    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-    for item in contingencies:
-        task_queue.put(item)
     progress_lock = threading.Lock()
     worker_records: list[dict[str, Any]] = []
+    screen_records: list[dict[str, Any]] = []
+    fast_worker_count = 0
+    fast_screen_wall = 0.0
+
+    def contingency_record(
+        item: dict[str, Any],
+        result: dict[str, Any],
+        worker_id: int,
+        execution_phase: str,
+    ) -> dict[str, Any]:
+        return {
+            "label": str(item["label"]),
+            "type": item["type"],
+            "source_index": int(item["idx"]),
+            "schedule_rank": int(item["schedule_rank"]),
+            "schedule_score_base_apparent_power": item.get(
+                "schedule_score_base_apparent_power"
+            ),
+            "worker_id": worker_id,
+            "execution_phase": execution_phase,
+            "solver_wall_seconds": result["solve"]["wall_seconds"],
+            "objective": result["solve"]["objective"],
+            "max_residual": result["validation"]["max_residual"],
+            "solver_status": result["solve"]["status"],
+            "solver_iterations": result["solve"].get("iterations", -1),
+            "resident_reoptimization": result["solve"].get(
+                "resident_reoptimization", False
+            ),
+            "acceptable_termination_enabled": result["solve"].get(
+                "acceptable_termination_enabled", False
+            ),
+            "model_preparation_wall_seconds": result.get(
+                "model_preparation_wall_seconds", 0.0
+            ),
+            "solver_status_success": result.get("solver_status_success", False),
+            "accepted_feasible_nonconverged": result.get(
+                "accepted_feasible_nonconverged", False
+            ),
+            "solution_method": result.get("solution_method", "ipopt_corrective"),
+            "fast_power_flow_screen": result.get(
+                "fast_power_flow_screen", False
+            ),
+            "fast_screen": result.get("fast_screen"),
+        }
+
+    def save_secure_result(
+        item: dict[str, Any],
+        result: dict[str, Any],
+        worker_id: int,
+        execution_phase: str,
+    ) -> None:
+        label = str(item["label"])
+        write_solution(
+            args.output_dir / f"solution_{label}.txt",
+            case,
+            result["solve"]["state"],
+            commitment,
+            item,
+        )
+        record = contingency_record(item, result, worker_id, execution_phase)
+        with progress_lock:
+            records.append(record)
+            run_status["completed_contingency_count"] = len(records)
+            run_status["last_completed_contingency"] = label
+            checkpoint()
+            print(
+                f"completed {len(records)}/{len(contingencies)}: "
+                f"{label} on {execution_phase} worker {worker_id}",
+                flush=True,
+            )
+
+    exact_contingencies = list(contingencies)
+    if args.two_stage_contingency_screen:
+        fast_screen_start = time.perf_counter()
+        screen_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        for item in contingencies:
+            screen_queue.put(item)
+        fallback_items: list[dict[str, Any]] = []
+        fast_worker_count = min(args.fast_workers, len(contingencies))
+
+        def screen_worker(worker_id: int) -> dict[str, Any]:
+            log_path = (
+                internal / "fast_screen_worker_logs" / f"worker_{worker_id:03d}.log"
+            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            task_timeout = effective_process_timeout(
+                args.contingency_timeout, contingency_deadline
+            )
+            command = cpp_command(
+                args.executable,
+                args.distro,
+                [
+                    "contingency-worker",
+                    to_wsl(args.case_json),
+                    to_wsl(base_json),
+                    "0",
+                    "fast-pf",
+                    "fast-only",
+                ],
+                task_timeout,
+            )
+            started = time.perf_counter()
+            output_lines: list[str] = []
+            assigned_labels: list[str] = []
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+
+            def read_until(prefix: str) -> str:
+                assert process.stdout is not None
+                while True:
+                    line = process.stdout.readline()
+                    if line == "":
+                        return_code = process.wait()
+                        if return_code == 124:
+                            raise CompetitionTimeout(
+                                f"fast-screen worker {worker_id} reached the "
+                                f"{contingency_deadline_name}"
+                            )
+                        raise RuntimeError(
+                            f"fast-screen worker {worker_id} exited with status "
+                            f"{return_code}; see {log_path}"
+                        )
+                    output_lines.append(line)
+                    stripped = line.rstrip("\r\n")
+                    if stripped.startswith(prefix):
+                        return stripped[len(prefix):].strip()
+
+            try:
+                read_until("GRAVITYX_WORKER_READY")
+                while not abort_contingencies.is_set():
+                    try:
+                        item = screen_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    label = str(item["label"])
+                    assigned_labels.append(label)
+                    result_path = (
+                        internal / "contingencies" / f"{safe_label(label)}.json"
+                    )
+                    assert process.stdin is not None
+                    process.stdin.write(
+                        json.dumps(
+                            {
+                                "label": label,
+                                "output_path": to_wsl(result_path),
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                    process.stdin.flush()
+                    acknowledgement = json.loads(
+                        read_until("GRAVITYX_TASK_RESULT ")
+                    )
+                    if acknowledgement.get("label") != label or not acknowledgement.get(
+                        "success", False
+                    ):
+                        raise RuntimeError(
+                            f"fast screen {label} failed to execute on worker "
+                            f"{worker_id}; see {log_path}"
+                        )
+                    if time.perf_counter() > contingency_deadline:
+                        raise CompetitionTimeout(
+                            f"fast screen {label} finished after the "
+                            f"{contingency_deadline_name}"
+                        )
+                    result = read_json(result_path)
+                    if result.get("success", False):
+                        save_secure_result(item, result, worker_id, "fast_screen")
+                    elif result.get("screen_completed", False):
+                        with progress_lock:
+                            fallback_items.append(item)
+                    else:
+                        raise RuntimeError(
+                            f"fast screen {label} returned an incomplete result"
+                        )
+                    with progress_lock:
+                        screen_records.append(
+                            {
+                                "label": label,
+                                "worker_id": worker_id,
+                                "feasible": bool(result.get("success", False)),
+                                "wall_seconds": result["solve"]["wall_seconds"],
+                                "max_residual": result["validation"]["max_residual"],
+                                "failure_reason": (
+                                    result.get("fast_screen") or {}
+                                ).get("failure_reason", ""),
+                            }
+                        )
+                        run_status["screened_contingency_count"] = len(screen_records)
+                        run_status["fast_screen_fallback_count"] = len(fallback_items)
+                        checkpoint()
+                    screen_queue.task_done()
+                if process.poll() is None:
+                    assert process.stdin is not None
+                    process.stdin.write('{"stop":true}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                    assert process.stdout is not None
+                    output_lines.extend(process.stdout.readlines())
+                return_code = process.wait(timeout=10.0)
+                if return_code != 0:
+                    raise RuntimeError(
+                        f"fast-screen worker {worker_id} exited with status "
+                        f"{return_code}; see {log_path}"
+                    )
+                return {
+                    "phase": "fast_screen",
+                    "worker_id": worker_id,
+                    "task_count": len(assigned_labels),
+                    "process_wall_seconds": time.perf_counter() - started,
+                    "labels": assigned_labels,
+                }
+            except Exception:
+                abort_contingencies.set()
+                raise
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                log_path.write_text("".join(output_lines), encoding="utf-8")
+
+        fast_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=fast_worker_count
+        )
+        fast_futures: dict[
+            concurrent.futures.Future[dict[str, Any]], int
+        ] = {}
+        try:
+            fast_futures = {
+                fast_pool.submit(screen_worker, worker_id): worker_id
+                for worker_id in range(fast_worker_count)
+            }
+            for future in concurrent.futures.as_completed(fast_futures):
+                worker_records.append(future.result())
+        except Exception:
+            abort_contingencies.set()
+            for future in fast_futures:
+                future.cancel()
+            fast_pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            fast_pool.shutdown(wait=True)
+        fast_screen_wall = time.perf_counter() - fast_screen_start
+        if len(screen_records) != len(contingencies):
+            raise RuntimeError(
+                f"fast-screen queue completed {len(screen_records)} of "
+                f"{len(contingencies)} tasks"
+            )
+        exact_contingencies = sorted(
+            fallback_items, key=lambda item: int(item["schedule_rank"])
+        )
+        run_status["fast_screen_feasible_count"] = len(records)
+        run_status["fast_screen_fallback_count"] = len(exact_contingencies)
+        checkpoint()
+
+    worker_count = min(args.workers, len(exact_contingencies))
+    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    for item in exact_contingencies:
+        task_queue.put(item)
 
     def solve_worker(worker_id: int) -> dict[str, Any]:
         if abort_contingencies.is_set():
@@ -566,8 +859,12 @@ def main() -> int:
             worker_arguments.append("resident")
         if args.ipopt_acceptable_termination:
             worker_arguments.append("acceptable")
-        if args.fast_power_flow_screen:
+        if args.fast_power_flow_screen and not args.two_stage_contingency_screen:
             worker_arguments.append("fast-pf")
+        if args.linearized_contingency_fallback:
+            worker_arguments.append("linearized")
+        if args.linearized_contingency_only:
+            worker_arguments.append("linearized-only")
         command = cpp_command(
             args.executable,
             args.distro,
@@ -649,59 +946,19 @@ def main() -> int:
                     raise RuntimeError(
                         f"contingency {label} did not pass independent validation"
                     )
-                write_solution(
-                    args.output_dir / f"solution_{label}.txt",
-                    case,
-                    result["solve"]["state"],
-                    commitment,
-                    item,
-                )
-                record = {
-                    "label": label,
-                    "type": item["type"],
-                    "source_index": int(item["idx"]),
-                    "schedule_rank": int(item["schedule_rank"]),
-                    "schedule_score_base_apparent_power": item.get(
-                        "schedule_score_base_apparent_power"
-                    ),
-                    "worker_id": worker_id,
-                    "solver_wall_seconds": result["solve"]["wall_seconds"],
-                    "objective": result["solve"]["objective"],
-                    "max_residual": result["validation"]["max_residual"],
-                    "solver_status": result["solve"]["status"],
-                    "solver_iterations": result["solve"].get("iterations", -1),
-                    "resident_reoptimization": result["solve"].get(
-                        "resident_reoptimization", False
-                    ),
-                    "acceptable_termination_enabled": result["solve"].get(
-                        "acceptable_termination_enabled", False
-                    ),
-                    "model_preparation_wall_seconds": result.get(
-                        "model_preparation_wall_seconds", 0.0
-                    ),
-                    "solver_status_success": result.get(
-                        "solver_status_success", False
-                    ),
-                    "accepted_feasible_nonconverged": result.get(
-                        "accepted_feasible_nonconverged", False
-                    ),
-                    "solution_method": result.get("solution_method", "ipopt_corrective"),
-                    "fast_power_flow_screen": result.get(
-                        "fast_power_flow_screen", False
-                    ),
-                    "fast_screen": result.get("fast_screen"),
-                }
                 task_queue.task_done()
-                with progress_lock:
-                    records.append(record)
-                    run_status["completed_contingency_count"] = len(records)
-                    run_status["last_completed_contingency"] = label
-                    checkpoint()
-                    print(
-                        f"completed {len(records)}/{len(contingencies)}: "
-                        f"{label} on worker {worker_id}",
-                        flush=True,
+                save_secure_result(
+                    item,
+                    result,
+                    worker_id,
+                    (
+                        "linearized_fallback"
+                        if args.linearized_contingency_fallback
+                        else "exact_fallback"
                     )
+                    if args.two_stage_contingency_screen
+                    else "combined_screen_and_fallback",
+                )
             if process.poll() is None:
                 assert process.stdin is not None
                 process.stdin.write('{"stop":true}\n')
@@ -721,6 +978,11 @@ def main() -> int:
                     f"{return_code}; see {log_path}"
                 )
             return {
+                "phase": (
+                    "linearized_fallback"
+                    if args.linearized_contingency_fallback
+                    else "exact_fallback"
+                ),
                 "worker_id": worker_id,
                 "task_count": len(assigned_labels),
                 "process_wall_seconds": time.perf_counter() - started,
@@ -746,7 +1008,7 @@ def main() -> int:
                         process.wait()
             log_path.write_text("".join(output_lines), encoding="utf-8")
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, worker_count))
     futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
     try:
         futures = {
@@ -757,6 +1019,7 @@ def main() -> int:
             worker = future.result()
             worker_records.append(
                 {
+                    "phase": worker.get("phase", "exact_fallback"),
                     "worker_id": worker["worker_id"],
                     "task_count": worker["task_count"],
                     "process_wall_seconds": worker["process_wall_seconds"],
@@ -911,9 +1174,14 @@ def main() -> int:
     max_residual = max((item["max_residual"] for item in records), default=0.0)
     summary = {
         "method": (
+            "C++ source commitment with HiGHS sequential-linearized AC base, "
+            "parallel sparse-Newton screening, and isolated resident Ipopt fallback"
+            if args.validated_source_base and args.two_stage_contingency_screen
+            else (
             "Gravity C++ source-status AC base plus validated sparse-Newton contingency screen"
             if args.source_status_base and args.fast_power_flow_screen
             else "Gravity C++ continuous AC-UC relaxation plus deterministic iterative batch rounding"
+            )
         ),
         "exact_unpublished_gravityx_binary": False,
         "framework_faithful": True,
@@ -928,10 +1196,16 @@ def main() -> int:
         },
         "workers": worker_count,
         "requested_workers": args.workers,
+        "fast_workers": fast_worker_count,
+        "requested_fast_workers": args.fast_workers,
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "source_status_base": args.source_status_base,
+        "validated_source_base": args.validated_source_base,
+        "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "linearized_contingency_fallback": args.linearized_contingency_fallback,
+        "linearized_contingency_only": args.linearized_contingency_only,
         "ipopt_acceptable_options": (
             {
                 "acceptable_tol": 1e-3,
@@ -948,12 +1222,22 @@ def main() -> int:
         "contingency_schedule_mode": run_status["contingency_schedule_mode"],
         "contingency_schedule": run_status["contingency_schedule"],
         "contingency_execution_mode": (
+            (
+                "parallel fast-only sparse-Newton screen followed by "
+                "HiGHS sequential-linearized contingency fallback queue"
+                if args.linearized_contingency_fallback
+                else "parallel fast-only sparse-Newton screen followed by "
+                     "resident Ipopt fallback queue"
+            )
+            if args.two_stage_contingency_screen
+            else (
             "validated sparse-Newton screen with resident Ipopt fallback per isolated worker"
             if args.fast_power_flow_screen and args.resident_contingency_model
             else (
                 "resident parametric model per isolated process worker with dynamic queue"
                 if args.resident_contingency_model
                 else "fresh model per task in persistent isolated process workers with dynamic queue"
+            )
             )
         ),
         "competition_timing": {
@@ -968,6 +1252,7 @@ def main() -> int:
         "base_process_wall_seconds": base_wall,
         "base_algorithm_wall_seconds": base["wall_seconds"],
         "contingency_parallel_wall_seconds": contingency_wall,
+        "fast_screen_parallel_wall_seconds": fast_screen_wall,
         "contingency_worker_process_seconds_sum": sum(
             item["process_wall_seconds"] for item in worker_records
         ),
@@ -985,14 +1270,32 @@ def main() -> int:
             bool(item["accepted_feasible_nonconverged"]) for item in records
         ),
         "fast_power_flow_accepted_count": sum(
-            item["solution_method"] == "fast_newton_power_flow" for item in records
+            item["solution_method"] in {
+                "fast_newton_power_flow",
+                "direct_base_state_outage_candidate",
+            }
+            for item in records
+        ),
+        "direct_outage_candidate_accepted_count": sum(
+            item["solution_method"] == "direct_base_state_outage_candidate"
+            for item in records
         ),
         "ipopt_fallback_count": sum(
             item["solution_method"] == "ipopt_corrective_fallback" for item in records
         ),
+        "linearized_contingency_accepted_count": sum(
+            item["solution_method"] == "highs_sequential_linearized_contingency"
+            for item in records
+        ),
+        "fast_screen_fallback_count": sum(
+            not bool(item["feasible"]) for item in screen_records
+        ),
         "max_independent_contingency_residual": max_residual,
         "base": base,
         "contingency_workers": worker_records,
+        "fast_screen_records": sorted(
+            screen_records, key=lambda item: item["label"]
+        ),
         "contingencies": records,
         "official_evaluation": evaluation_summary,
     }

@@ -20,6 +20,8 @@ endif()
 
 find_package(nlohmann_json CONFIG REQUIRED HINTS "${IPOPT_ROOT}")
 find_package(Eigen3 CONFIG REQUIRED HINTS "${IPOPT_ROOT}")
+find_path(HIGHS_INCLUDE_DIR highs/Highs.h HINTS "${IPOPT_ROOT}/include" REQUIRED)
+find_library(HIGHS_LIBRARY highs HINTS "${IPOPT_ROOT}/lib" REQUIRED)
 
 add_library(gravity_pinned STATIC IMPORTED GLOBAL)
 set_target_properties(gravity_pinned PROPERTIES
@@ -33,16 +35,22 @@ add_executable(gravityx_go2
     src/ac_model.cpp
     src/algorithm.cpp
     src/fast_power_flow.cpp
+    src/linearized_ac_seed.cpp
     src/validation.cpp
     src/state_io.cpp
 )
-target_include_directories(gravityx_go2 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(gravityx_go2 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${HIGHS_INCLUDE_DIR}"
+    "${HIGHS_INCLUDE_DIR}/highs"
+)
 target_compile_definitions(gravityx_go2 PRIVATE USE_IPOPT)
 target_link_libraries(gravityx_go2 PRIVATE
     gravity_pinned
     "${IPOPT_ROOT}/lib/libipopt.so"
     Eigen3::Eigen
     nlohmann_json::nlohmann_json
+    "${HIGHS_LIBRARY}"
     m
     pthread
 )

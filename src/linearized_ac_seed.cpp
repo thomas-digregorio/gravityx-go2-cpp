@@ -501,10 +501,11 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
 
     Highs highs;
     highs.setOptionValue("output_flag", false);
+    highs.setOptionValue("threads", 1);
     highs.setOptionValue("presolve", "on");
     highs.setOptionValue("solver", "ipm");
     highs.setOptionValue("run_crossover", "off");
-    highs.setOptionValue("time_limit", 10.0);
+    highs.setOptionValue("time_limit", 30.0);
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
     highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     if (highs.addVars(column_count, lower.data(), upper.data()) != HighsStatus::kOk ||

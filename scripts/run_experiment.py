@@ -67,9 +67,15 @@ def streamed_queue_get(
     screening_finished: threading.Event,
     abort: threading.Event,
     poll_seconds: float = 0.1,
+    preferred_queue: queue.Queue[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Wait for streamed fallback work until screening is complete or aborted."""
     while not abort.is_set():
+        if preferred_queue is not None:
+            try:
+                return preferred_queue.get_nowait()
+            except queue.Empty:
+                pass
         try:
             return task_queue.get(timeout=poll_seconds)
         except queue.Empty:
@@ -348,6 +354,86 @@ def longest_first_contingencies(
     return scheduled
 
 
+def load_fallback_schedule_profile(
+    path: Path,
+    case_sha256: str,
+    contingency_labels: set[str],
+    worker_count: int,
+) -> tuple[dict[str, dict[str, float | int]], dict[str, Any]]:
+    reject_onedrive(path)
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("fallback schedule profile must use schema_version 1")
+    if raw.get("case_sha256") != case_sha256:
+        raise ValueError("fallback schedule profile case hash does not match")
+    if int(raw.get("worker_count", -1)) != worker_count:
+        raise ValueError("fallback schedule profile worker count does not match")
+    assignments = raw.get("assignments")
+    if not isinstance(assignments, list) or not assignments:
+        raise ValueError("fallback schedule profile assignments must be nonempty")
+
+    by_label: dict[str, dict[str, float | int]] = {}
+    predicted_loads = [0.0] * worker_count
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise ValueError("fallback schedule assignment must be an object")
+        label = str(assignment.get("label", ""))
+        worker = int(assignment.get("worker", -1))
+        predicted = float(assignment.get("predicted_wall_seconds", math.nan))
+        if label not in contingency_labels:
+            raise ValueError(f"unknown profiled contingency label: {label}")
+        if label in by_label:
+            raise ValueError(f"duplicate profiled contingency label: {label}")
+        if worker < 0 or worker >= worker_count:
+            raise ValueError(f"invalid profiled worker for {label}: {worker}")
+        if not math.isfinite(predicted) or predicted <= 0.0:
+            raise ValueError(f"invalid predicted wall time for {label}: {predicted}")
+        by_label[label] = {
+            "worker": worker,
+            "predicted_wall_seconds": predicted,
+        }
+        predicted_loads[worker] += predicted
+
+    metadata = {
+        "path": str(path.resolve()),
+        "sha256": sha256(path),
+        "schema_version": 1,
+        "worker_count": worker_count,
+        "assignment_count": len(by_label),
+        "predicted_worker_load_seconds": predicted_loads,
+        "uses_prior_solution_state": False,
+    }
+    return by_label, metadata
+
+
+def apply_fallback_schedule_profile(
+    contingencies: list[dict[str, Any]],
+    profile: dict[str, dict[str, float | int]],
+) -> list[dict[str, Any]]:
+    scheduled = [dict(item) for item in contingencies]
+    prior_rank = {
+        str(item["label"]): int(item.get("schedule_rank", position + 1))
+        for position, item in enumerate(scheduled)
+    }
+    scheduled.sort(
+        key=lambda item: (
+            0 if str(item["label"]) in profile else 1,
+            -float(profile[str(item["label"])]["predicted_wall_seconds"])
+            if str(item["label"]) in profile else prior_rank[str(item["label"])],
+            str(item["label"]),
+        )
+    )
+    for rank, item in enumerate(scheduled, start=1):
+        item["schedule_rank"] = rank
+        assignment = profile.get(str(item["label"]))
+        if assignment is not None:
+            item["profiled_fallback_worker"] = int(assignment["worker"])
+            item["profiled_fallback_wall_seconds"] = float(
+                assignment["predicted_wall_seconds"]
+            )
+    return scheduled
+
+
 def git_revision() -> str | None:
     completed = subprocess.run(
         ["git", "-C", str(REPO), "rev-parse", "HEAD"],
@@ -386,6 +472,7 @@ def main() -> int:
     parser.add_argument("--linearized-contingency-fallback", action="store_true")
     parser.add_argument("--linearized-contingency-only", action="store_true")
     parser.add_argument("--longest-first-schedule", action="store_true")
+    parser.add_argument("--fallback-schedule-profile", type=Path)
     args = parser.parse_args()
 
     if args.ipopt_acceptable_termination and not args.resident_contingency_model:
@@ -402,9 +489,17 @@ def main() -> int:
             "--linearized-contingency-only requires "
             "--linearized-contingency-fallback"
         )
+    if (args.fallback_schedule_profile is not None and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--fallback-schedule-profile requires "
+            "--two-stage-contingency-screen"
+        )
 
     for path in (args.case_json, args.case_dir, args.output_dir, args.executable):
         reject_onedrive(path)
+    if args.fallback_schedule_profile is not None:
+        reject_onedrive(args.fallback_schedule_profile)
     if args.workers < 1:
         raise ValueError("workers must be positive")
     if args.fast_workers < 1:
@@ -429,6 +524,18 @@ def main() -> int:
 
     case = read_json(args.case_json)
     contingencies = contingency_records(case)
+    case_json_sha256 = sha256(args.case_json)
+    fallback_schedule: dict[str, dict[str, float | int]] = {}
+    fallback_schedule_metadata: dict[str, Any] | None = None
+    if args.fallback_schedule_profile is not None:
+        fallback_schedule, fallback_schedule_metadata = (
+            load_fallback_schedule_profile(
+                args.fallback_schedule_profile,
+                case_json_sha256,
+                {str(item["label"]) for item in contingencies},
+                min(args.workers, len(contingencies)),
+            )
+        )
     code2_limit = code2_time_limit(
         len(contingencies), args.code2_seconds_per_contingency
     )
@@ -465,6 +572,7 @@ def main() -> int:
         "linearized_contingency_fallback": args.linearized_contingency_fallback,
         "linearized_contingency_only": args.linearized_contingency_only,
         "longest_first_schedule": args.longest_first_schedule,
+        "fallback_schedule_profile": fallback_schedule_metadata,
     }
 
     def checkpoint() -> None:
@@ -558,6 +666,14 @@ def main() -> int:
         for rank, item in enumerate(contingencies, start=1):
             item["schedule_rank"] = rank
         schedule_mode = "deterministic label order"
+    if fallback_schedule:
+        contingencies = apply_fallback_schedule_profile(
+            contingencies, fallback_schedule
+        )
+        schedule_mode = (
+            "profiled fallback wall time and worker assignment, then "
+            + schedule_mode
+        )
     run_status.update(
         {
             "stage": "code2",
@@ -569,6 +685,12 @@ def main() -> int:
                     "label": item["label"],
                     "rank": item["schedule_rank"],
                     "score": item.get("schedule_score_base_apparent_power"),
+                    "profiled_fallback_worker": item.get(
+                        "profiled_fallback_worker"
+                    ),
+                    "profiled_fallback_wall_seconds": item.get(
+                        "profiled_fallback_wall_seconds"
+                    ),
                 }
                 for item in contingencies
             ],
@@ -606,6 +728,10 @@ def main() -> int:
                 "schedule_score_base_apparent_power"
             ),
             "worker_id": worker_id,
+            "profiled_fallback_worker": item.get("profiled_fallback_worker"),
+            "profiled_fallback_wall_seconds": item.get(
+                "profiled_fallback_wall_seconds"
+            ),
             "execution_phase": execution_phase,
             "solver_wall_seconds": result["solve"]["wall_seconds"],
             "objective": result["solve"]["objective"],
@@ -660,6 +786,10 @@ def main() -> int:
 
     exact_contingencies = list(contingencies)
     task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    worker_count = min(args.workers, len(contingencies))
+    profiled_task_queues: list[queue.Queue[dict[str, Any]]] = [
+        queue.Queue() for _ in range(worker_count)
+    ]
     screening_finished = threading.Event()
     fast_pool: concurrent.futures.ThreadPoolExecutor | None = None
     fast_futures: dict[
@@ -771,7 +901,13 @@ def main() -> int:
                     elif result.get("screen_completed", False):
                         with progress_lock:
                             fallback_items.append(item)
-                            task_queue.put(item)
+                            assignment = fallback_schedule.get(label)
+                            if assignment is None:
+                                task_queue.put(item)
+                            else:
+                                profiled_task_queues[
+                                    int(assignment["worker"])
+                                ].put(item)
                     else:
                         raise RuntimeError(
                             f"fast screen {label} returned an incomplete result"
@@ -838,11 +974,8 @@ def main() -> int:
             task_queue.put(item)
         screening_finished.set()
 
-    worker_count = min(
-        args.workers,
-        len(contingencies) if args.two_stage_contingency_screen
-        else len(exact_contingencies),
-    )
+    if not args.two_stage_contingency_screen:
+        worker_count = min(args.workers, len(exact_contingencies))
 
     def solve_worker(worker_id: int) -> dict[str, Any]:
         if abort_contingencies.is_set():
@@ -914,7 +1047,13 @@ def main() -> int:
             read_until("GRAVITYX_WORKER_READY")
             while not abort_contingencies.is_set():
                 item = streamed_queue_get(
-                    task_queue, screening_finished, abort_contingencies
+                    task_queue,
+                    screening_finished,
+                    abort_contingencies,
+                    preferred_queue=(
+                        profiled_task_queues[worker_id]
+                        if fallback_schedule else None
+                    ),
                 )
                 if item is None:
                     break
@@ -954,7 +1093,6 @@ def main() -> int:
                     raise RuntimeError(
                         f"contingency {label} did not pass independent validation"
                     )
-                task_queue.task_done()
                 save_secure_result(
                     item,
                     result,

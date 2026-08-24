@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "case_sha256": "6ead1a631345205dfdc7d38a262ab41c0de639cbf466cb7fb8f7ba3fafefaef0",
+  "worker_count": 8,
+  "purpose": "Scheduling-only profile derived from prior cold-run wall times; contains no primal, dual, commitment, or network state.",
+  "assignments": [
+    {"label": "CTG_000323", "worker": 0, "predicted_wall_seconds": 52.59},
+    {"label": "CTG_000008", "worker": 0, "predicted_wall_seconds": 30.63},
+    {"label": "CTG_000018", "worker": 0, "predicted_wall_seconds": 29.96},
+    {"label": "CTG_000119", "worker": 0, "predicted_wall_seconds": 27.49},
+    {"label": "CTG_000003", "worker": 0, "predicted_wall_seconds": 27.08},
+
+    {"label": "CTG_000339", "worker": 1, "predicted_wall_seconds": 86.72},
+    {"label": "CTG_000365", "worker": 1, "predicted_wall_seconds": 47.73},
+    {"label": "CTG_000025", "worker": 1, "predicted_wall_seconds": 31.97},
+
+    {"label": "CTG_000452", "worker": 2, "predicted_wall_seconds": 63.00},
+    {"label": "CTG_000035", "worker": 2, "predicted_wall_seconds": 52.63},
+    {"label": "CTG_000033", "worker": 2, "predicted_wall_seconds": 26.85},
+    {"label": "CTG_000449", "worker": 2, "predicted_wall_seconds": 26.38},
+
+    {"label": "CTG_000461", "worker": 3, "predicted_wall_seconds": 67.89},
+    {"label": "CTG_000468", "worker": 3, "predicted_wall_seconds": 63.86},
+    {"label": "CTG_000331", "worker": 3, "predicted_wall_seconds": 34.97},
+
+    {"label": "CTG_000361", "worker": 4, "predicted_wall_seconds": 53.96},
+    {"label": "CTG_000360", "worker": 4, "predicted_wall_seconds": 32.81},
+    {"label": "CTG_000019", "worker": 4, "predicted_wall_seconds": 28.79},
+    {"label": "CTG_000389", "worker": 4, "predicted_wall_seconds": 27.40},
+    {"label": "CTG_000481", "worker": 4, "predicted_wall_seconds": 25.89},
+
+    {"label": "CTG_000017", "worker": 5, "predicted_wall_seconds": 61.17},
+    {"label": "CTG_000495", "worker": 5, "predicted_wall_seconds": 37.98},
+    {"label": "CTG_000321", "worker": 5, "predicted_wall_seconds": 35.57},
+    {"label": "CTG_000486", "worker": 5, "predicted_wall_seconds": 32.29},
+
+    {"label": "CTG_000034", "worker": 6, "predicted_wall_seconds": 43.41},
+    {"label": "CTG_000482", "worker": 6, "predicted_wall_seconds": 33.85},
+    {"label": "CTG_000009", "worker": 6, "predicted_wall_seconds": 32.32},
+    {"label": "CTG_000036", "worker": 6, "predicted_wall_seconds": 32.03},
+    {"label": "CTG_000451", "worker": 6, "predicted_wall_seconds": 27.01},
+
+    {"label": "CTG_000023", "worker": 7, "predicted_wall_seconds": 32.09},
+    {"label": "CTG_000367", "worker": 7, "predicted_wall_seconds": 31.29},
+    {"label": "CTG_000024", "worker": 7, "predicted_wall_seconds": 29.77},
+    {"label": "CTG_000390", "worker": 7, "predicted_wall_seconds": 28.47},
+    {"label": "CTG_000000", "worker": 7, "predicted_wall_seconds": 27.52},
+    {"label": "CTG_000317", "worker": 7, "predicted_wall_seconds": 19.32}
+  ]
+}

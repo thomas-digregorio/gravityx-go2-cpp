@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from run_experiment import (  # noqa: E402
     CompetitionTimeout,
+    apply_fallback_schedule_profile,
     code2_time_limit,
     effective_process_timeout,
     longest_first_contingencies,
@@ -100,6 +101,21 @@ class SolutionWriterTests(unittest.TestCase):
 
 
 class CompetitionTimingTests(unittest.TestCase):
+    def test_profiled_schedule_prioritizes_measured_fallbacks(self):
+        contingencies = [
+            {"label": "A", "schedule_rank": 1},
+            {"label": "B", "schedule_rank": 2},
+            {"label": "C", "schedule_rank": 3},
+        ]
+        profile = {
+            "B": {"worker": 1, "predicted_wall_seconds": 2.0},
+            "C": {"worker": 0, "predicted_wall_seconds": 5.0},
+        }
+        scheduled = apply_fallback_schedule_profile(contingencies, profile)
+        self.assertEqual([item["label"] for item in scheduled], ["C", "B", "A"])
+        self.assertEqual([item["schedule_rank"] for item in scheduled], [1, 2, 3])
+        self.assertEqual(scheduled[0]["profiled_fallback_worker"], 0)
+
     def test_streamed_fallback_waits_for_screening_and_then_drains(self):
         tasks = queue.Queue()
         screening_finished = threading.Event()
@@ -126,6 +142,21 @@ class CompetitionTimingTests(unittest.TestCase):
             streamed_queue_get(
                 tasks, screening_finished, abort, poll_seconds=0.005
             )
+        )
+
+        preferred = queue.Queue()
+        preferred.put({"label": "PROFILED"})
+        shared = queue.Queue()
+        shared.put({"label": "SHARED"})
+        self.assertEqual(
+            streamed_queue_get(
+                shared,
+                screening_finished,
+                abort,
+                poll_seconds=0.005,
+                preferred_queue=preferred,
+            )["label"],
+            "PROFILED",
         )
 
     def test_longest_first_schedule_uses_base_apparent_power(self):

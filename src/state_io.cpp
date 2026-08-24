@@ -42,6 +42,16 @@ nlohmann::json ac_state_to_json(const AcState& state) {
     };
 }
 
+nlohmann::json ac_submission_state_to_json(const AcState& state) {
+    return {
+        {"vm", state.vm},
+        {"va", state.va},
+        {"pg", state.pg},
+        {"qg", state.qg},
+        {"demand_factor", state.demand_factor},
+    };
+}
+
 AcState ac_state_from_json(const nlohmann::json& value) {
     if (!value.is_object()) {
         throw std::runtime_error("AC state must be a JSON object");
@@ -79,6 +89,12 @@ nlohmann::json solve_result_to_json(const SolveResult& result, bool include_stat
     if (include_state) {
         value["state"] = ac_state_to_json(result.state);
     }
+    return value;
+}
+
+nlohmann::json solve_result_to_submission_json(const SolveResult& result) {
+    auto value = solve_result_to_json(result, false);
+    value["state"] = ac_submission_state_to_json(result.state);
     return value;
 }
 

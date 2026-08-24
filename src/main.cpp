@@ -92,6 +92,18 @@ int run_component_tests() {
         restored.commitment != source.commitment || restored.gen_lambda != source.gen_lambda) {
         throw std::runtime_error("component test failed: AC state JSON round trip");
     }
+    source.qg = {0.1};
+    source.demand_factor = {0.95};
+    source.pf = {0.4};
+    const auto submission_state = gravityx::ac_submission_state_to_json(source);
+    if (submission_state.size() != 5 || !submission_state.contains("vm") ||
+        !submission_state.contains("va") || !submission_state.contains("pg") ||
+        !submission_state.contains("qg") ||
+        !submission_state.contains("demand_factor") ||
+        submission_state.contains("pf") || submission_state.contains("gen_lambda")) {
+        throw std::runtime_error(
+            "component test failed: compact submission state schema");
+    }
 
     gravityx::SolveResult nonconverged_feasible;
     nonconverged_feasible.status = -2;
@@ -843,7 +855,7 @@ bool solve_loaded_contingency(
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
                 {"model_preparation_wall_seconds", 0.0},
-                {"solve", gravityx::solve_result_to_json(fast_result->solve, true)},
+                {"solve", gravityx::solve_result_to_submission_json(fast_result->solve)},
                 {"validation", fast_result->validation.to_json()},
             };
             write_json_file(output_path, output);
@@ -882,7 +894,7 @@ bool solve_loaded_contingency(
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
                 {"model_preparation_wall_seconds", 0.0},
-                {"solve", gravityx::solve_result_to_json(fast_result->solve, true)},
+                {"solve", gravityx::solve_result_to_json(fast_result->solve, false)},
                 {"validation", fast_result->validation.to_json()},
             };
             write_json_file(output_path, output);
@@ -1002,7 +1014,7 @@ bool solve_loaded_contingency(
                     {"acceptable_termination_enabled", false},
                     {"resident_model_created", false},
                     {"model_preparation_wall_seconds", 0.0},
-                    {"solve", gravityx::solve_result_to_json(solve, true)},
+                    {"solve", gravityx::solve_result_to_submission_json(solve)},
                     {"validation", validation.to_json()},
                 };
                 write_json_file(output_path, output);
@@ -1079,7 +1091,7 @@ bool solve_loaded_contingency(
                     {"acceptable_termination_enabled", false},
                     {"resident_model_created", false},
                     {"model_preparation_wall_seconds", 0.0},
-                    {"solve", gravityx::solve_result_to_json(solve, true)},
+                    {"solve", gravityx::solve_result_to_submission_json(solve)},
                     {"validation", nonlinear_validation.to_json()},
                 };
                 write_json_file(output_path, output);
@@ -1188,7 +1200,7 @@ bool solve_loaded_contingency(
         {"acceptable_termination_enabled", acceptable_termination},
         {"resident_model_created", resident_model_created},
         {"model_preparation_wall_seconds", preparation_seconds},
-        {"solve", gravityx::solve_result_to_json(solve, true)},
+        {"solve", gravityx::solve_result_to_submission_json(solve)},
         {"validation", validation.to_json()},
     };
     write_json_file(output_path, output);

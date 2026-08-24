@@ -198,8 +198,9 @@ class CompetitionTimingTests(unittest.TestCase):
             )
         )
 
-        preferred = queue.Queue()
-        preferred.put({"label": "PROFILED"})
+        profiled = queue.PriorityQueue()
+        profiled.put((-2.0, 2, "SHORT", {"label": "SHORT"}))
+        profiled.put((-5.0, 1, "LONG", {"label": "LONG"}))
         shared = queue.Queue()
         shared.put({"label": "SHARED"})
         self.assertEqual(
@@ -208,26 +209,29 @@ class CompetitionTimingTests(unittest.TestCase):
                 screening_finished,
                 abort,
                 poll_seconds=0.005,
-                preferred_queue=preferred,
+                profiled_queue=profiled,
             )["label"],
-            "PROFILED",
+            "LONG",
         )
-
-        preferred = queue.Queue()
-        stealable = queue.Queue()
-        stealable.put({"label": "STOLEN"})
-        shared = queue.Queue()
-        shared.put({"label": "SHARED"})
         self.assertEqual(
             streamed_queue_get(
                 shared,
                 screening_finished,
                 abort,
                 poll_seconds=0.005,
-                preferred_queue=preferred,
-                steal_queues=[preferred, stealable],
+                profiled_queue=profiled,
             )["label"],
-            "STOLEN",
+            "SHORT",
+        )
+        self.assertEqual(
+            streamed_queue_get(
+                shared,
+                screening_finished,
+                abort,
+                poll_seconds=0.005,
+                profiled_queue=profiled,
+            )["label"],
+            "SHARED",
         )
 
     def test_longest_first_schedule_uses_base_apparent_power(self):

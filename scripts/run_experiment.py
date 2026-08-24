@@ -69,30 +69,22 @@ def streamed_queue_get(
     screening_finished: threading.Event,
     abort: threading.Event,
     poll_seconds: float = 0.1,
-    preferred_queue: queue.Queue[dict[str, Any]] | None = None,
-    steal_queues: list[queue.Queue[dict[str, Any]]] | None = None,
+    profiled_queue: queue.PriorityQueue[
+        tuple[float, int, str, dict[str, Any]]
+    ] | None = None,
 ) -> dict[str, Any] | None:
     """Wait for streamed fallback work until screening is complete or aborted.
 
-    Profiled worker assignments are soft affinities. A worker checks its own
-    queue first, then steals already-ready work from other profiled queues
-    before waiting on the shared queue. This prevents inaccurate wall-time
-    profiles from stranding corrective solves behind an idle worker.
+    Measured fallback durations define one global longest-first priority queue.
+    Any available worker can claim its next item, so neither stale worker
+    affinity nor fast-screen completion order can strand a long corrective LP.
     """
     while not abort.is_set():
-        if preferred_queue is not None:
+        if profiled_queue is not None:
             try:
-                return preferred_queue.get_nowait()
+                return profiled_queue.get_nowait()[3]
             except queue.Empty:
                 pass
-        if steal_queues is not None:
-            for candidate_queue in steal_queues:
-                if candidate_queue is preferred_queue:
-                    continue
-                try:
-                    return candidate_queue.get_nowait()
-                except queue.Empty:
-                    pass
         try:
             return task_queue.get(timeout=poll_seconds)
         except queue.Empty:
@@ -547,7 +539,8 @@ def load_fallback_schedule_profile(
         "worker_count": worker_count,
         "assignment_count": len(by_label),
         "predicted_worker_load_seconds": predicted_loads,
-        "worker_assignments_are_soft_affinities": True,
+        "worker_assignments_used_for_dispatch": False,
+        "dispatch_priority": "descending predicted wall seconds",
         "uses_prior_solution_state": False,
     }
     return by_label, metadata
@@ -600,6 +593,7 @@ def main() -> int:
     parser.add_argument("--executable", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--fast-workers", type=int, default=8)
+    parser.add_argument("--post-screen-workers", type=int)
     parser.add_argument("--distro", default="Ubuntu-24.04")
     parser.add_argument("--base-timeout", type=float, default=900.0)
     parser.add_argument("--contingency-timeout", type=float, default=300.0)
@@ -658,6 +652,16 @@ def main() -> int:
         raise ValueError("workers must be positive")
     if args.fast_workers < 1:
         raise ValueError("fast workers must be positive")
+    if args.post_screen_workers is None:
+        args.post_screen_workers = args.workers
+    if args.post_screen_workers < args.workers:
+        parser.error("--post-screen-workers cannot be less than --workers")
+    if (args.post_screen_workers > args.workers and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--post-screen-workers expansion requires "
+            "--two-stage-contingency-screen"
+        )
     if args.evaluation_processes < 1:
         raise ValueError("evaluation processes must be positive")
     if args.evaluation_processes > 1 and args.mpiexec is None:
@@ -729,12 +733,14 @@ def main() -> int:
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "initial_corrective_worker_count": args.workers,
+        "post_screen_corrective_worker_count": args.post_screen_workers,
         "streaming_fallback_overlap": False,
         "linearized_contingency_fallback": args.linearized_contingency_fallback,
         "linearized_contingency_only": args.linearized_contingency_only,
         "longest_first_schedule": args.longest_first_schedule,
         "fallback_schedule_profile": fallback_schedule_metadata,
-        "profiled_fallback_work_stealing": bool(fallback_schedule),
+        "profiled_fallback_global_priority": bool(fallback_schedule),
         "evaluation_processes": args.evaluation_processes,
     }
 
@@ -836,8 +842,7 @@ def main() -> int:
             contingencies, fallback_schedule
         )
         schedule_mode = (
-            "profiled fallback wall time and soft worker affinity with "
-            "idle-worker stealing, then "
+            "global descending profiled fallback wall time, then "
             + schedule_mode
         )
     run_status.update(
@@ -960,9 +965,12 @@ def main() -> int:
     exact_contingencies = list(contingencies)
     task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
     worker_count = min(args.workers, len(contingencies))
-    profiled_task_queues: list[queue.Queue[dict[str, Any]]] = [
-        queue.Queue() for _ in range(worker_count)
-    ]
+    post_screen_worker_count = min(
+        args.post_screen_workers, len(contingencies)
+    )
+    profiled_task_queue: queue.PriorityQueue[
+        tuple[float, int, str, dict[str, Any]]
+    ] = queue.PriorityQueue()
     screening_finished = threading.Event()
     fast_pool: concurrent.futures.ThreadPoolExecutor | None = None
     fast_futures: dict[
@@ -1078,9 +1086,16 @@ def main() -> int:
                             if assignment is None:
                                 task_queue.put(item)
                             else:
-                                profiled_task_queues[
-                                    int(assignment["worker"])
-                                ].put(item)
+                                profiled_task_queue.put(
+                                    (
+                                        -float(
+                                            assignment["predicted_wall_seconds"]
+                                        ),
+                                        int(item["schedule_rank"]),
+                                        label,
+                                        item,
+                                    )
+                                )
                     else:
                         raise RuntimeError(
                             f"fast screen {label} returned an incomplete result"
@@ -1224,14 +1239,8 @@ def main() -> int:
                     task_queue,
                     screening_finished,
                     abort_contingencies,
-                    preferred_queue=(
-                        profiled_task_queues[worker_id]
-                        if fallback_schedule else None
-                    ),
-                    steal_queues=(
-                        profiled_task_queues[worker_id + 1 :]
-                        + profiled_task_queues[:worker_id]
-                        if fallback_schedule else None
+                    profiled_queue=(
+                        profiled_task_queue if fallback_schedule else None
                     ),
                 )
                 if item is None:
@@ -1350,7 +1359,9 @@ def main() -> int:
                         process.wait()
             log_path.write_text("".join(output_lines), encoding="utf-8")
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, worker_count))
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, post_screen_worker_count)
+    )
     futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
     try:
         futures = {
@@ -1377,6 +1388,18 @@ def main() -> int:
             )
             run_status["fast_screen_fallback_count"] = len(exact_contingencies)
             run_status["streaming_fallback_overlap"] = True
+            if post_screen_worker_count > worker_count:
+                for worker_id in range(worker_count, post_screen_worker_count):
+                    future = pool.submit(solve_worker, worker_id)
+                    futures[future] = worker_id
+                print(
+                    "expanded corrective worker pool after screening: "
+                    f"{worker_count} -> {post_screen_worker_count}",
+                    flush=True,
+                )
+            run_status["active_post_screen_corrective_worker_count"] = (
+                post_screen_worker_count
+            )
             checkpoint()
             screening_finished.set()
         for future in concurrent.futures.as_completed(futures):

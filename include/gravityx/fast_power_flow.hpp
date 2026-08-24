@@ -11,6 +11,7 @@
 namespace gravityx {
 
 struct FastPowerFlowOptions {
+    bool distributed_balance_polish{true};
     int max_newton_iterations{50};
     int max_active_redispatch_passes{20};
     int max_reactive_limit_passes{8};
@@ -21,6 +22,12 @@ struct FastPowerFlowOptions {
 struct FastPowerFlowResult {
     bool converged{};
     bool feasible{};
+    bool distributed_balance_polish_attempted{};
+    bool distributed_balance_polish_selected{};
+    int distributed_balance_polish_iterations{};
+    int distributed_balance_voltage_projections{};
+    std::string distributed_balance_polish_failure_reason;
+    ValidationReport distributed_balance_polish_validation;
     int newton_iterations{};
     int active_redispatch_passes{};
     int reactive_limit_passes{};

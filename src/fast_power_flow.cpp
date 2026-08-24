@@ -295,6 +295,258 @@ NewtonResult run_newton(
     return {false, max_iterations, "Newton failed"};
 }
 
+NewtonResult run_distributed_active_newton(
+    const CaseData& data,
+    const YRows& ybus,
+    const std::vector<bool>& slack,
+    const std::vector<bool>& pq,
+    const std::vector<int>& component_of,
+    const std::vector<double>& active_slack_weights,
+    const std::vector<double>& p_spec,
+    const std::vector<double>& q_spec,
+    int max_iterations,
+    double tolerance,
+    std::vector<double>& vm,
+    std::vector<double>& va) {
+    const int nb = static_cast<int>(data.buses.size());
+    if (component_of.size() != static_cast<std::size_t>(nb) ||
+        active_slack_weights.size() != static_cast<std::size_t>(nb)) {
+        return {false, 0, "distributed-slack dimensions are inconsistent"};
+    }
+
+    int component_count = 0;
+    for (int component : component_of) {
+        component_count = std::max(component_count, component + 1);
+    }
+    if (component_count <= 0) {
+        return {false, 0, "distributed-slack component set is empty"};
+    }
+
+    std::vector<int> angle_index(nb, -1);
+    std::vector<int> voltage_index(nb, -1);
+    int angle_count = 0;
+    int voltage_count = 0;
+    for (int i = 0; i < nb; ++i) {
+        if (!slack[i]) {
+            angle_index[i] = angle_count++;
+        }
+        if (pq[i]) {
+            voltage_index[i] = voltage_count++;
+        }
+    }
+    const int voltage_offset = angle_count;
+    const int delta_offset = angle_count + voltage_count;
+    const int dimension = delta_offset + component_count;
+    if (dimension != nb + voltage_count) {
+        return {false, 0, "distributed-slack Newton system is not square"};
+    }
+
+    std::vector<double> distributed_delta(component_count, 0.0);
+    std::vector<double> distributed_weight_sum(component_count, 0.0);
+    std::vector<double> p;
+    std::vector<double> q;
+    network_injections(ybus, vm, va, p, q);
+    for (int i = 0; i < nb; ++i) {
+        distributed_delta[component_of[i]] += p[i] - p_spec[i];
+        distributed_weight_sum[component_of[i]] += active_slack_weights[i];
+    }
+    for (int c = 0; c < component_count; ++c) {
+        if (std::abs(distributed_weight_sum[c]) <= 1e-12) {
+            return {false, 0,
+                "distributed-slack weights have zero component sum"};
+        }
+        distributed_delta[c] /= distributed_weight_sum[c];
+    }
+    const auto residual_norm = [&]() {
+        double result = 0.0;
+        for (int i = 0; i < nb; ++i) {
+            const double distributed_target = p_spec[i]
+                + active_slack_weights[i] * distributed_delta[component_of[i]];
+            result = std::max(result, std::abs(distributed_target - p[i]));
+            if (voltage_index[i] >= 0) {
+                result = std::max(result, std::abs(q_spec[i] - q[i]));
+            }
+        }
+        return result;
+    };
+
+    for (int iteration = 0; iteration <= max_iterations; ++iteration) {
+        network_injections(ybus, vm, va, p, q);
+        const double norm = residual_norm();
+        if (norm <= tolerance) {
+            return {true, iteration, {}};
+        }
+        if (iteration == max_iterations) {
+            return {false, iteration,
+                "distributed-slack Newton iteration limit; residual="
+                    + std::to_string(norm)};
+        }
+
+        Eigen::VectorXd mismatch(dimension);
+        mismatch.setZero();
+        for (int i = 0; i < nb; ++i) {
+            mismatch[i] = p_spec[i]
+                + active_slack_weights[i] * distributed_delta[component_of[i]]
+                - p[i];
+            if (voltage_index[i] >= 0) {
+                mismatch[nb + voltage_index[i]] = q_spec[i] - q[i];
+            }
+        }
+
+        std::vector<Triplet> entries;
+        entries.reserve(static_cast<std::size_t>(dimension) * 8);
+        for (int i = 0; i < nb; ++i) {
+            const double vi = vm[i];
+            if (vi <= 1e-8) {
+                return {false, iteration, "nonpositive voltage magnitude"};
+            }
+            const auto diagonal = ybus[i].find(i);
+            const double gii = diagonal == ybus[i].end()
+                ? 0.0 : diagonal->second.real();
+            const double bii = diagonal == ybus[i].end()
+                ? 0.0 : diagonal->second.imag();
+
+            const int p_row = i;
+            if (angle_index[i] >= 0) {
+                entries.emplace_back(
+                    p_row, angle_index[i], -q[i] - bii * vi * vi);
+            }
+            if (voltage_index[i] >= 0) {
+                entries.emplace_back(
+                    p_row, voltage_offset + voltage_index[i],
+                    p[i] / vi + gii * vi);
+            }
+            if (std::abs(active_slack_weights[i]) > 0.0) {
+                entries.emplace_back(
+                    p_row, delta_offset + component_of[i],
+                    -active_slack_weights[i]);
+            }
+            for (const auto& [j, admittance] : ybus[i]) {
+                if (j == i) {
+                    continue;
+                }
+                const double delta = va[i] - va[j];
+                const double gij = admittance.real();
+                const double bij = admittance.imag();
+                if (angle_index[j] >= 0) {
+                    entries.emplace_back(
+                        p_row, angle_index[j],
+                        vi * vm[j]
+                            * (gij * std::sin(delta) - bij * std::cos(delta)));
+                }
+                if (voltage_index[j] >= 0) {
+                    entries.emplace_back(
+                        p_row, voltage_offset + voltage_index[j],
+                        vi * (gij * std::cos(delta) + bij * std::sin(delta)));
+                }
+            }
+
+            if (voltage_index[i] < 0) {
+                continue;
+            }
+            const int q_row = nb + voltage_index[i];
+            if (angle_index[i] >= 0) {
+                entries.emplace_back(
+                    q_row, angle_index[i], p[i] - gii * vi * vi);
+            }
+            entries.emplace_back(
+                q_row, voltage_offset + voltage_index[i],
+                q[i] / vi - bii * vi);
+            for (const auto& [j, admittance] : ybus[i]) {
+                if (j == i) {
+                    continue;
+                }
+                const double delta = va[i] - va[j];
+                const double gij = admittance.real();
+                const double bij = admittance.imag();
+                if (angle_index[j] >= 0) {
+                    entries.emplace_back(
+                        q_row, angle_index[j],
+                        -vi * vm[j]
+                            * (gij * std::cos(delta) + bij * std::sin(delta)));
+                }
+                if (voltage_index[j] >= 0) {
+                    entries.emplace_back(
+                        q_row, voltage_offset + voltage_index[j],
+                        vi * (gij * std::sin(delta) - bij * std::cos(delta)));
+                }
+            }
+        }
+
+        SparseMatrix jacobian(dimension, dimension);
+        jacobian.setFromTriplets(entries.begin(), entries.end());
+        Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
+        factorization.analyzePattern(jacobian);
+        factorization.factorize(jacobian);
+        if (factorization.info() != Eigen::Success) {
+            return {false, iteration,
+                "distributed-slack Jacobian factorization failed"};
+        }
+        const Eigen::VectorXd step = factorization.solve(mismatch);
+        if (factorization.info() != Eigen::Success || !step.allFinite()) {
+            return {false, iteration, "distributed-slack Newton solve failed"};
+        }
+
+        double scale = 1.0;
+        double max_angle_step = 0.0;
+        double max_voltage_step = 0.0;
+        for (int i = 0; i < nb; ++i) {
+            if (angle_index[i] >= 0) {
+                max_angle_step = std::max(
+                    max_angle_step, std::abs(step[angle_index[i]]));
+            }
+            if (voltage_index[i] >= 0) {
+                max_voltage_step = std::max(
+                    max_voltage_step,
+                    std::abs(step[voltage_offset + voltage_index[i]]));
+            }
+        }
+        if (max_angle_step > 0.5) {
+            scale = std::min(scale, 0.5 / max_angle_step);
+        }
+        if (max_voltage_step > 0.1) {
+            scale = std::min(scale, 0.1 / max_voltage_step);
+        }
+        scale = std::clamp(scale, 1e-4, 1.0);
+
+        const auto prior_vm = vm;
+        const auto prior_va = va;
+        const auto prior_delta = distributed_delta;
+        const double prior_norm = norm;
+        bool accepted = false;
+        for (int line_search = 0; line_search < 12; ++line_search) {
+            vm = prior_vm;
+            va = prior_va;
+            distributed_delta = prior_delta;
+            for (int i = 0; i < nb; ++i) {
+                if (angle_index[i] >= 0) {
+                    va[i] += scale * step[angle_index[i]];
+                }
+                if (voltage_index[i] >= 0) {
+                    vm[i] += scale * step[voltage_offset + voltage_index[i]];
+                }
+            }
+            for (int c = 0; c < component_count; ++c) {
+                distributed_delta[c] += scale * step[delta_offset + c];
+            }
+            network_injections(ybus, vm, va, p, q);
+            const double trial_norm = residual_norm();
+            if (std::isfinite(trial_norm) && trial_norm < prior_norm) {
+                accepted = true;
+                break;
+            }
+            scale *= 0.5;
+        }
+        if (!accepted) {
+            vm = prior_vm;
+            va = prior_va;
+            return {false, iteration,
+                "distributed-slack Newton line search stagnated"};
+        }
+    }
+    return {false, max_iterations, "distributed-slack Newton failed"};
+}
+
 bool allocate_total(
     const std::vector<int>& indices,
     const std::vector<double>& lower,
@@ -496,6 +748,12 @@ nlohmann::json FastPowerFlowResult::to_json() const {
     return {
         {"converged", converged},
         {"feasible", feasible},
+        {"distributed_balance_polish_attempted", distributed_balance_polish_attempted},
+        {"distributed_balance_polish_selected", distributed_balance_polish_selected},
+        {"distributed_balance_polish_iterations", distributed_balance_polish_iterations},
+        {"distributed_balance_voltage_projections", distributed_balance_voltage_projections},
+        {"distributed_balance_polish_failure_reason", distributed_balance_polish_failure_reason},
+        {"distributed_balance_polish_validation", distributed_balance_polish_validation.to_json()},
         {"newton_iterations", newton_iterations},
         {"active_redispatch_passes", active_redispatch_passes},
         {"reactive_limit_passes", reactive_limit_passes},
@@ -1126,6 +1384,253 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
         output.validation = validate_state(
             data_, ModelMode::ContingencySoft,
             output.solve.state, commitment_, context);
+    }
+
+    // Voltage projection used to clear branch-component bounds can disturb
+    // nodal balance.  A conventional single-slack power flow concentrates the
+    // resulting active mismatch at one reference bus and can exceed the
+    // model's per-bus soft-imbalance bound.  Re-solve the AC equations with a
+    // distributed active slack across buses in each connected component. The
+    // corrective model explicitly permits up to 0.5 p.u. of active imbalance
+    // at each bus. Select bounded imbalance targets near the current state and
+    // solve one scalar correction per component so nonlinear losses remain
+    // consistent, rather than forcing the entire loss mismatch onto one bus.
+    // The original state remains the incumbent and every candidate must
+    // improve independent validation.
+    if (options_.distributed_balance_polish &&
+        output.validation.max_residual > options_.validation_tolerance &&
+        output.validation.worst_category == "active_balance") {
+        output.distributed_balance_polish_attempted = true;
+        const AcState original_state = output.solve.state;
+        const ValidationReport original_validation = output.validation;
+        AcState best_state = original_state;
+        ValidationReport best_validation = original_validation;
+
+        std::vector<bool> polish_pq = pq;
+
+        state = original_state;
+        for (int repair_pass = 0; repair_pass < 8; ++repair_pass) {
+            std::vector<double> p_spec(nb, 0.0);
+            std::vector<double> q_spec(nb, 0.0);
+            for (int bus = 0; bus < nb; ++bus) {
+                for (int gen : data_.buses[bus].generators) {
+                    p_spec[bus] += state.pg[gen];
+                    q_spec[bus] += state.qg[gen];
+                }
+                for (int load : data_.buses[bus].loads) {
+                    p_spec[bus] -= data_.loads[load].pd_nominal
+                        * state.demand_factor[load];
+                    q_spec[bus] -= data_.loads[load].qd_nominal
+                        * state.demand_factor[load];
+                }
+            }
+            std::vector<double> p_network;
+            std::vector<double> q_network;
+            network_injections(
+                ybus, state.vm, state.va, p_network, q_network);
+            std::vector<double> active_slack_weights(nb, 0.0);
+            bool weights_valid = true;
+            for (const auto& component : components) {
+                std::vector<int> participant_buses = component;
+                double total_balance = 0.0;
+                for (int bus : component) {
+                    total_balance += p_network[bus] - p_spec[bus];
+                }
+                if (participant_buses.empty()) {
+                    weights_valid = false;
+                    break;
+                }
+                if (std::abs(total_balance) <= 1e-10) {
+                    const double weight = 1.0 / participant_buses.size();
+                    for (int bus : participant_buses) {
+                        active_slack_weights[bus] = weight;
+                    }
+                } else {
+                    std::vector<double> target_lower(nb, 0.0);
+                    std::vector<double> target_upper(nb, 0.0);
+                    std::vector<double> target_preferred(nb, 0.0);
+                    std::vector<double> target_values(nb, 0.0);
+                    for (int bus : participant_buses) {
+                        target_lower[bus] = -0.49;
+                        target_upper[bus] = 0.49;
+                        target_preferred[bus] = std::clamp(
+                            p_network[bus] - p_spec[bus], -0.49, 0.49);
+                    }
+                    if (!allocate_total(
+                            participant_buses,
+                            target_lower, target_upper, target_preferred,
+                            total_balance, target_values)) {
+                        weights_valid = false;
+                        break;
+                    }
+                    for (int bus : participant_buses) {
+                        active_slack_weights[bus] = target_values[bus];
+                    }
+                }
+            }
+            if (!weights_valid) {
+                output.distributed_balance_polish_failure_reason =
+                    "cannot allocate bounded distributed active slack";
+                break;
+            }
+            const NewtonResult polish = run_distributed_active_newton(
+                data_, ybus, slack, polish_pq, component_of,
+                active_slack_weights, p_spec, q_spec,
+                options_.max_newton_iterations, options_.newton_tolerance,
+                state.vm, state.va);
+            output.distributed_balance_polish_iterations += polish.iterations;
+            if (!polish.converged) {
+                output.distributed_balance_polish_failure_reason =
+                    polish.failure_reason;
+                break;
+            }
+
+            bool projected_voltage = false;
+            for (int bus = 0; bus < nb; ++bus) {
+                if (!polish_pq[bus]) {
+                    continue;
+                }
+                const double projected = std::clamp(
+                    state.vm[bus],
+                    data_.buses[bus].vmin, data_.buses[bus].vmax);
+                if (std::abs(projected - state.vm[bus]) > 1e-9) {
+                    state.vm[bus] = projected;
+                    polish_pq[bus] = false;
+                    projected_voltage = true;
+                    ++output.distributed_balance_voltage_projections;
+                }
+            }
+            if (projected_voltage) {
+                continue;
+            }
+
+            bool dispatch_valid = true;
+            network_injections(ybus, state.vm, state.va, p_network, q_network);
+            for (int bus = 0; bus < nb; ++bus) {
+                if (active_at_bus[bus].empty() || polish_pq[bus]) {
+                    continue;
+                }
+                const double required_q = q_network[bus] + load_q[bus];
+                double lower = 0.0;
+                double upper = 0.0;
+                for (int gen : active_at_bus[bus]) {
+                    lower += q_lower[gen];
+                    upper += q_upper[gen];
+                }
+                auto proposed = state.qg;
+                if (!allocate_total(
+                        active_at_bus[bus], q_lower, q_upper,
+                        state.qg, std::clamp(required_q, lower, upper),
+                        proposed)) {
+                    dispatch_valid = false;
+                    break;
+                }
+                state.qg = std::move(proposed);
+            }
+            if (!dispatch_valid) {
+                output.distributed_balance_polish_failure_reason =
+                    "distributed reactive dispatch exceeds generator bounds";
+                break;
+            }
+
+            for (const auto& component : components) {
+                int angle_reference = -1;
+                for (int bus : component) {
+                    if (data_.buses[bus].type == 3) {
+                        angle_reference = bus;
+                        break;
+                    }
+                }
+                if (angle_reference >= 0) {
+                    const double offset = state.va[angle_reference];
+                    for (int bus : component) {
+                        state.va[bus] -= offset;
+                    }
+                }
+            }
+            refresh_network_fields();
+            const ValidationReport polished_validation = validate_state(
+                data_, ModelMode::ContingencySoft,
+                state, commitment_, context);
+            output.distributed_balance_polish_validation = polished_validation;
+            if (polished_validation.max_residual + 1e-12 <
+                best_validation.max_residual) {
+                best_state = state;
+                best_validation = polished_validation;
+            }
+            if (polished_validation.max_residual <=
+                options_.validation_tolerance) {
+                break;
+            }
+            if (polished_validation.worst_category == "reactive_balance") {
+                network_injections(
+                    ybus, state.vm, state.va, p_network, q_network);
+                bool released_reactive_bus = false;
+                for (int bus = 0; bus < nb; ++bus) {
+                    if (active_at_bus[bus].empty() || polish_pq[bus]) {
+                        continue;
+                    }
+                    double generated_q = 0.0;
+                    for (int gen : active_at_bus[bus]) {
+                        generated_q += state.qg[gen];
+                    }
+                    const double q_balance =
+                        q_network[bus] + load_q[bus] - generated_q;
+                    if (std::abs(q_balance) <= 0.45) {
+                        continue;
+                    }
+                    const auto& source_bus = data_.buses[bus];
+                    if (state.vm[bus] <= source_bus.vmin + 1e-7 ||
+                        state.vm[bus] >= source_bus.vmax - 1e-7) {
+                        continue;
+                    }
+                    polish_pq[bus] = true;
+                    released_reactive_bus = true;
+                }
+                if (released_reactive_bus) {
+                    continue;
+                }
+                break;
+            }
+            if (polished_validation.worst_category != "variable_bound" &&
+                polished_validation.worst_category != "flow_limit") {
+                break;
+            }
+
+            double maximum_component_ratio = 1.0;
+            for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
+                if (i == outaged_branch || data_.branches[i].rate_a <= 1e-12) {
+                    continue;
+                }
+                maximum_component_ratio = std::max(maximum_component_ratio,
+                    std::max({std::abs(state.pf[i]), std::abs(state.qf[i]),
+                              std::abs(state.pt[i]), std::abs(state.qt[i])})
+                        / data_.branches[i].rate_a);
+            }
+            const double scale = std::min(
+                0.9995, 0.9999 / std::sqrt(maximum_component_ratio));
+            bool changed = false;
+            for (int bus = 0; bus < nb; ++bus) {
+                const double reduced = std::max(
+                    data_.buses[bus].vmin, state.vm[bus] * scale);
+                changed = changed || reduced < state.vm[bus] - 1e-12;
+                state.vm[bus] = reduced;
+            }
+            if (!changed) {
+                break;
+            }
+            refresh_network_fields();
+        }
+
+        output.newton_iterations += output.distributed_balance_polish_iterations;
+        if (best_validation.max_residual + 1e-12 <
+            original_validation.max_residual) {
+            output.solve.state = std::move(best_state);
+            output.validation = best_validation;
+            output.distributed_balance_polish_selected = true;
+        } else {
+            state = original_state;
+        }
     }
     output.feasible = output.validation.max_residual <= options_.validation_tolerance;
     if (!output.feasible) {

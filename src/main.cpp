@@ -656,6 +656,17 @@ int run_validated_source_base_json(
                     success = true;
                     break;
                 }
+                // On the 8k-bus cases this continuation is only a way to find
+                // a useful center for the linearized feasibility LP.  Once a
+                // sub-0.1 p.u. candidate exists, the lower-load points were
+                // measured to move away from feasibility while consuming most
+                // of twenty seconds.  The candidate is not accepted here: it
+                // still goes through the linearized solve, sparse Newton, and
+                // the unchanged independent validator below.
+                if (data.buses.size() >= 8000 &&
+                    selected_validation.max_residual <= 0.1) {
+                    break;
+                }
             }
         }
         base_method = "validated_sparse_newton_source_point_repair";
@@ -707,9 +718,37 @@ int run_validated_source_base_json(
             }
             gravityx::FastContingencyPowerFlow nonlinear_repair(
                 data, linear_state, commitment);
-            const auto nonlinear = nonlinear_repair.solve_base();
+            auto nonlinear = nonlinear_repair.solve_base();
             wall_seconds += nonlinear.wall_seconds;
             round_json["nonlinear_repair"] = nonlinear.to_json();
+            nlohmann::json nonlinear_restarts = nlohmann::json::array();
+            // A failed Newton pass can leave a much better voltage/dispatch
+            // center than the LP candidate that started it.  Restarting from
+            // that center costs about a second at 8k buses and can avoid a
+            // second 45-second LP.  Keep at most two strictly improving
+            // restarts; none is accepted without the same full validator.
+            for (int restart = 1;
+                 data.buses.size() >= 8000 && restart <= 2 &&
+                 !nonlinear.feasible &&
+                 nonlinear.validation.max_residual <= 0.25;
+                 ++restart) {
+                gravityx::FastContingencyPowerFlow restart_repair(
+                    data, nonlinear.solve.state, commitment);
+                const auto restarted = restart_repair.solve_base();
+                wall_seconds += restarted.wall_seconds;
+                auto restart_json = restarted.to_json();
+                restart_json["restart"] = restart;
+                nonlinear_restarts.push_back(std::move(restart_json));
+                if (restarted.feasible ||
+                    restarted.validation.max_residual + 1e-12 <
+                        nonlinear.validation.max_residual) {
+                    nonlinear = restarted;
+                } else {
+                    break;
+                }
+            }
+            round_json["nonlinear_restarts"] =
+                std::move(nonlinear_restarts);
             linearized_repair_json.push_back(std::move(round_json));
             if (nonlinear.validation.max_residual <
                 selected_validation.max_residual) {

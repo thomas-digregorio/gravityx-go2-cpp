@@ -15,6 +15,7 @@ struct LinearizedAcSeedResult {
     bool success{};
     double wall_seconds{};
     bool projected_balance_slack{};
+    double time_limit_seconds{};
     int model_status{};
     int iterations{};
     double objective{};
@@ -31,6 +32,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     double balance_slack_limit = 0.49,
     const std::optional<ContingencyContext>& contingency = std::nullopt,
     bool project_balance_slack = false,
-    bool request_lightweight_large_seed = false);
+    bool request_lightweight_large_seed = false,
+    double time_limit_seconds = 60.0);
 
 }  // namespace gravityx

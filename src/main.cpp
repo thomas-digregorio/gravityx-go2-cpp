@@ -268,6 +268,14 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "linearized AC seed regression failed: " + linear_seed.status);
     }
+    const auto extended_linear_seed = gravityx::solve_linearized_ac_seed(
+        data, source_base.solve.state, {1}, 0.49, std::nullopt, false, false,
+        90.0);
+    if (!extended_linear_seed.success ||
+        std::abs(extended_linear_seed.time_limit_seconds - 90.0) > 1e-12) {
+        throw std::runtime_error(
+            "extended linearized AC time-limit regression failed");
+    }
     const auto lightweight_seed = gravityx::solve_linearized_ac_seed(
         data, source_base.solve.state, {1}, 0.49, std::nullopt, false, true);
     if (!lightweight_seed.success) {
@@ -1006,8 +1014,16 @@ bool solve_loaded_contingency(
                  linear.status == "Unknown")) {
                 attempt["projected_balance_retry_scheduled"] = true;
                 linearized_attempts.push_back(std::move(attempt));
+                // Under eight-way contention the large projected-balance IPM
+                // can be only a few iterations short at the historical
+                // 60-second cutoff.  Let that same Phase-I formulation finish
+                // instead of discarding it and rebuilding two costlier
+                // reference retries.  The runner's per-worker and global
+                // deadlines remain the hard outer bounds.
+                constexpr double kLargeProjectedBalanceTimeLimitSeconds = 90.0;
                 linear = gravityx::solve_linearized_ac_seed(
-                    data, reference, base.commitment, 0.49, context, true);
+                    data, reference, base.commitment, 0.49, context, true,
+                    false, kLargeProjectedBalanceTimeLimitSeconds);
                 linearized_wall_seconds += linear.wall_seconds;
                 linearized_iterations += std::max(0, linear.iterations);
                 attempt = linear.to_json(false);

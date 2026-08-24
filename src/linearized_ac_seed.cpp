@@ -173,6 +173,7 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"success", success},
         {"wall_seconds", wall_seconds},
         {"projected_balance_slack", projected_balance_slack},
+        {"time_limit_seconds", time_limit_seconds},
         {"model_status", model_status},
         {"status", status},
         {"iterations", iterations},
@@ -191,7 +192,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     double balance_slack_limit,
     const std::optional<ContingencyContext>& contingency,
     bool project_balance_slack,
-    bool request_lightweight_large_seed) {
+    bool request_lightweight_large_seed,
+    double time_limit_seconds) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -207,6 +209,9 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     }
     if (!(balance_slack_limit > 0.0 && balance_slack_limit < 0.5)) {
         throw std::runtime_error("linearized AC balance slack must be in (0, 0.5)");
+    }
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error("linearized AC time limit must be positive");
     }
     if (contingency) {
         const auto& base = contingency->base_state;
@@ -600,7 +605,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         : "ipm";
     highs.setOptionValue("solver", solver);
     highs.setOptionValue("run_crossover", "off");
-    highs.setOptionValue("time_limit", 60.0);
+    highs.setOptionValue("time_limit", time_limit_seconds);
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
     highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     if (highs.addVars(column_count, lower.data(), upper.data()) != HighsStatus::kOk ||
@@ -619,6 +624,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
 
     LinearizedAcSeedResult output;
     output.projected_balance_slack = projected_balance_slack;
+    output.time_limit_seconds = time_limit_seconds;
     output.model_status = static_cast<int>(model_status);
     output.status = highs.modelStatusToString(model_status);
     output.iterations = static_cast<int>(

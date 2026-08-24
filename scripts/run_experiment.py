@@ -756,6 +756,9 @@ def main() -> int:
                 "fast_power_flow_screen", False
             ),
             "fast_screen": result.get("fast_screen"),
+            "precomputed_fast_screen_reference": result.get(
+                "precomputed_fast_screen_reference", False
+            ),
         }
 
     def save_secure_result(
@@ -1060,13 +1063,16 @@ def main() -> int:
                 label = str(item["label"])
                 assigned_labels.append(label)
                 result_path = internal / "contingencies" / f"{safe_label(label)}.json"
+                task = {
+                    "label": label,
+                    "output_path": to_wsl(result_path),
+                }
+                if args.two_stage_contingency_screen:
+                    task["fast_screen_path"] = to_wsl(result_path)
                 assert process.stdin is not None
                 process.stdin.write(
                     json.dumps(
-                        {
-                            "label": label,
-                            "output_path": to_wsl(result_path),
-                        },
+                        task,
                         separators=(",", ":"),
                     )
                     + "\n"
@@ -1078,6 +1084,13 @@ def main() -> int:
                 if acknowledgement.get("label") != label:
                     raise RuntimeError(
                         f"contingency worker {worker_id} acknowledged the wrong task"
+                    )
+                if (args.two_stage_contingency_screen and
+                        not acknowledgement.get(
+                            "precomputed_fast_screen_reference", False)):
+                    raise RuntimeError(
+                        f"contingency worker {worker_id} did not accept the "
+                        f"precomputed fast-screen reference for {label}"
                     )
                 if not acknowledgement.get("success", False):
                     raise RuntimeError(

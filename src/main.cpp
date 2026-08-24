@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -816,7 +817,8 @@ bool solve_loaded_contingency(
     gravityx::FastContingencyPowerFlow* fast_power_flow = nullptr,
     bool fast_only = false,
     bool linearized_fallback = false,
-    bool linearized_only = false) {
+    bool linearized_only = false,
+    const gravityx::AcState* precomputed_fast_state = nullptr) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -833,7 +835,12 @@ bool solve_loaded_contingency(
     }
 
     std::optional<gravityx::FastPowerFlowResult> fast_result;
-    if (fast_power_flow) {
+    const bool reused_fast_screen_reference = precomputed_fast_state != nullptr;
+    if (precomputed_fast_state) {
+        fast_result.emplace();
+        fast_result->solve.state = *precomputed_fast_state;
+        fast_result->failure_reason = "precomputed_fast_screen_reference";
+    } else if (fast_power_flow) {
         fast_result = fast_power_flow->solve(*match);
         if (fast_result->feasible) {
             const std::string solution_method =
@@ -894,7 +901,7 @@ bool solve_loaded_contingency(
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
                 {"model_preparation_wall_seconds", 0.0},
-                {"solve", gravityx::solve_result_to_json(fast_result->solve, false)},
+                {"solve", gravityx::solve_result_to_submission_json(fast_result->solve)},
                 {"validation", fast_result->validation.to_json()},
             };
             write_json_file(output_path, output);
@@ -912,6 +919,10 @@ bool solve_loaded_contingency(
         auto best_validation = gravityx::validate_state(
             data, gravityx::ModelMode::ContingencySoft,
             best_state, base.commitment, context);
+        if (reused_fast_screen_reference) {
+            fast_result->solve.objective = best_objective;
+            fast_result->validation = best_validation;
+        }
         auto reference = best_state;
         double linearized_wall_seconds = 0.0;
         int linearized_iterations = 0;
@@ -1007,6 +1018,7 @@ bool solve_loaded_contingency(
                     {"source_index", match->source_index},
                     {"component_position", match->component},
                     {"solution_method", "highs_sequential_linearized_contingency"},
+                    {"precomputed_fast_screen_reference", reused_fast_screen_reference},
                     {"fast_power_flow_screen", fast_power_flow != nullptr},
                     {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
                     {"linearized_attempts", linearized_attempts},
@@ -1084,6 +1096,7 @@ bool solve_loaded_contingency(
                     {"source_index", match->source_index},
                     {"component_position", match->component},
                     {"solution_method", "highs_linearized_contingency_plus_fast_newton"},
+                    {"precomputed_fast_screen_reference", reused_fast_screen_reference},
                     {"fast_power_flow_screen", fast_power_flow != nullptr},
                     {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
                     {"linearized_attempts", linearized_attempts},
@@ -1135,6 +1148,7 @@ bool solve_loaded_contingency(
                 {"source_index", match->source_index},
                 {"component_position", match->component},
                 {"solution_method", "highs_sequential_linearized_contingency_failed"},
+                {"precomputed_fast_screen_reference", reused_fast_screen_reference},
                 {"linearized_status", last_status},
                 {"fast_power_flow_screen", fast_power_flow != nullptr},
                 {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
@@ -1193,6 +1207,7 @@ bool solve_loaded_contingency(
         {"source_index", match->source_index},
         {"component_position", match->component},
         {"solution_method", "ipopt_corrective_fallback"},
+        {"precomputed_fast_screen_reference", reused_fast_screen_reference},
         {"fast_power_flow_screen", fast_power_flow != nullptr},
         {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
         {"linearized_attempts", linearized_attempts},
@@ -1351,14 +1366,33 @@ int run_contingency_worker(
         }
         const auto label = task.at("label").get<std::string>();
         const auto output_path = task.at("output_path").get<std::string>();
+        std::optional<gravityx::AcState> precomputed_fast_state;
+        if (task.contains("fast_screen_path")) {
+            const auto fast_screen_path =
+                task.at("fast_screen_path").get<std::string>();
+            const auto fast_screen_json = read_json_file(fast_screen_path);
+            if (fast_screen_json.value("label", std::string()) != label ||
+                !fast_screen_json.value("screen_completed", false) ||
+                !fast_screen_json.value("requires_exact_fallback", false) ||
+                !fast_screen_json.contains("solve") ||
+                !fast_screen_json.at("solve").contains("state")) {
+                throw std::runtime_error(
+                    "invalid precomputed fast-screen result for " + label);
+            }
+            precomputed_fast_state = gravityx::ac_state_from_json(
+                fast_screen_json.at("solve").at("state"));
+        }
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
             reusable_model ? &resident_model : nullptr,
             acceptable_termination, fast_power_flow.get(), fast_only,
-            linearized_fallback, linearized_only);
+            linearized_fallback, linearized_only,
+            precomputed_fast_state ? &*precomputed_fast_state : nullptr);
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
+            {"precomputed_fast_screen_reference",
+             precomputed_fast_state.has_value()},
         }).dump() << std::endl;
         if (!success) {
             return 1;

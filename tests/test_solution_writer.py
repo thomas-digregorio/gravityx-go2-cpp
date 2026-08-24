@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
+import concurrent.futures
 import json
+import queue
 import tempfile
 from pathlib import Path
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -16,6 +19,7 @@ from run_experiment import (  # noqa: E402
     code2_time_limit,
     effective_process_timeout,
     longest_first_contingencies,
+    streamed_queue_get,
     write_json,
     write_solution,
 )
@@ -96,6 +100,34 @@ class SolutionWriterTests(unittest.TestCase):
 
 
 class CompetitionTimingTests(unittest.TestCase):
+    def test_streamed_fallback_waits_for_screening_and_then_drains(self):
+        tasks = queue.Queue()
+        screening_finished = threading.Event()
+        abort = threading.Event()
+        waiter_started = threading.Event()
+
+        def wait_for_task():
+            waiter_started.set()
+            return streamed_queue_get(
+                tasks, screening_finished, abort, poll_seconds=0.005
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(wait_for_task)
+            self.assertTrue(waiter_started.wait(timeout=1.0))
+            with self.assertRaises(concurrent.futures.TimeoutError):
+                future.result(timeout=0.02)
+            expected = {"label": "CTG_TEST"}
+            tasks.put(expected)
+            self.assertEqual(future.result(timeout=1.0), expected)
+
+        screening_finished.set()
+        self.assertIsNone(
+            streamed_queue_get(
+                tasks, screening_finished, abort, poll_seconds=0.005
+            )
+        )
+
     def test_longest_first_schedule_uses_base_apparent_power(self):
         case = {
             "gen": {

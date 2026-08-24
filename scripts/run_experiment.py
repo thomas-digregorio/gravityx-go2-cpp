@@ -62,6 +62,22 @@ def effective_process_timeout(
     return min(per_process_timeout, remaining)
 
 
+def streamed_queue_get(
+    task_queue: queue.Queue[dict[str, Any]],
+    screening_finished: threading.Event,
+    abort: threading.Event,
+    poll_seconds: float = 0.1,
+) -> dict[str, Any] | None:
+    """Wait for streamed fallback work until screening is complete or aborted."""
+    while not abort.is_set():
+        try:
+            return task_queue.get(timeout=poll_seconds)
+        except queue.Empty:
+            if screening_finished.is_set():
+                return None
+    return None
+
+
 def reject_onedrive(path: Path) -> None:
     if "onedrive" in str(path.resolve()).lower():
         raise ValueError(f"refusing OneDrive path: {path}")
@@ -445,6 +461,7 @@ def main() -> int:
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "streaming_fallback_overlap": False,
         "linearized_contingency_fallback": args.linearized_contingency_fallback,
         "linearized_contingency_only": args.linearized_contingency_only,
         "longest_first_schedule": args.longest_first_schedule,
@@ -642,6 +659,12 @@ def main() -> int:
             )
 
     exact_contingencies = list(contingencies)
+    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    screening_finished = threading.Event()
+    fast_pool: concurrent.futures.ThreadPoolExecutor | None = None
+    fast_futures: dict[
+        concurrent.futures.Future[dict[str, Any]], int
+    ] = {}
     if args.two_stage_contingency_screen:
         fast_screen_start = time.perf_counter()
         screen_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -748,6 +771,7 @@ def main() -> int:
                     elif result.get("screen_completed", False):
                         with progress_lock:
                             fallback_items.append(item)
+                            task_queue.put(item)
                     else:
                         raise RuntimeError(
                             f"fast screen {label} returned an incomplete result"
@@ -805,41 +829,20 @@ def main() -> int:
         fast_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=fast_worker_count
         )
-        fast_futures: dict[
-            concurrent.futures.Future[dict[str, Any]], int
-        ] = {}
-        try:
-            fast_futures = {
-                fast_pool.submit(screen_worker, worker_id): worker_id
-                for worker_id in range(fast_worker_count)
-            }
-            for future in concurrent.futures.as_completed(fast_futures):
-                worker_records.append(future.result())
-        except Exception:
-            abort_contingencies.set()
-            for future in fast_futures:
-                future.cancel()
-            fast_pool.shutdown(wait=True, cancel_futures=True)
-            raise
-        else:
-            fast_pool.shutdown(wait=True)
-        fast_screen_wall = time.perf_counter() - fast_screen_start
-        if len(screen_records) != len(contingencies):
-            raise RuntimeError(
-                f"fast-screen queue completed {len(screen_records)} of "
-                f"{len(contingencies)} tasks"
-            )
-        exact_contingencies = sorted(
-            fallback_items, key=lambda item: int(item["schedule_rank"])
-        )
-        run_status["fast_screen_feasible_count"] = len(records)
-        run_status["fast_screen_fallback_count"] = len(exact_contingencies)
-        checkpoint()
+        fast_futures = {
+            fast_pool.submit(screen_worker, worker_id): worker_id
+            for worker_id in range(fast_worker_count)
+        }
+    else:
+        for item in exact_contingencies:
+            task_queue.put(item)
+        screening_finished.set()
 
-    worker_count = min(args.workers, len(exact_contingencies))
-    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-    for item in exact_contingencies:
-        task_queue.put(item)
+    worker_count = min(
+        args.workers,
+        len(contingencies) if args.two_stage_contingency_screen
+        else len(exact_contingencies),
+    )
 
     def solve_worker(worker_id: int) -> dict[str, Any]:
         if abort_contingencies.is_set():
@@ -910,9 +913,10 @@ def main() -> int:
         try:
             read_until("GRAVITYX_WORKER_READY")
             while not abort_contingencies.is_set():
-                try:
-                    item = task_queue.get_nowait()
-                except queue.Empty:
+                item = streamed_queue_get(
+                    task_queue, screening_finished, abort_contingencies
+                )
+                if item is None:
                     break
                 label = str(item["label"])
                 assigned_labels.append(label)
@@ -1019,6 +1023,28 @@ def main() -> int:
             pool.submit(solve_worker, worker_id): worker_id
             for worker_id in range(worker_count)
         }
+        if args.two_stage_contingency_screen:
+            assert fast_pool is not None
+            for future in concurrent.futures.as_completed(fast_futures):
+                worker_records.append(future.result())
+            fast_pool.shutdown(wait=True)
+            fast_pool = None
+            fast_screen_wall = time.perf_counter() - fast_screen_start
+            if len(screen_records) != len(contingencies):
+                raise RuntimeError(
+                    f"fast-screen queue completed {len(screen_records)} of "
+                    f"{len(contingencies)} tasks"
+                )
+            exact_contingencies = sorted(
+                fallback_items, key=lambda item: int(item["schedule_rank"])
+            )
+            run_status["fast_screen_feasible_count"] = sum(
+                bool(item["feasible"]) for item in screen_records
+            )
+            run_status["fast_screen_fallback_count"] = len(exact_contingencies)
+            run_status["streaming_fallback_overlap"] = True
+            checkpoint()
+            screening_finished.set()
         for future in concurrent.futures.as_completed(futures):
             worker = future.result()
             worker_records.append(
@@ -1036,8 +1062,13 @@ def main() -> int:
                 checkpoint()
     except Exception as error:
         abort_contingencies.set()
+        screening_finished.set()
+        for future in fast_futures:
+            future.cancel()
         for future in futures:
             future.cancel()
+        if fast_pool is not None:
+            fast_pool.shutdown(wait=True, cancel_futures=True)
         pool.shutdown(wait=True, cancel_futures=True)
         contingency_wall = time.perf_counter() - contingency_start
         run_status.update(

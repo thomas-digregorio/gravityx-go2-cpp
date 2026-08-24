@@ -905,6 +905,7 @@ bool solve_loaded_contingency(
         int linearized_iterations = 0;
         std::string last_status = "not_run";
         int last_model_status = -1;
+        std::string reference_source = fast_result ? "fast_screen" : "base";
         constexpr int kMaximumLinearizedRounds = 3;
         for (int round = 1; round <= kMaximumLinearizedRounds; ++round) {
             auto linear = gravityx::solve_linearized_ac_seed(
@@ -913,8 +914,10 @@ bool solve_loaded_contingency(
             linearized_iterations += std::max(0, linear.iterations);
             auto attempt = linear.to_json(false);
             attempt["round"] = round;
-            if (!linear.success && round == 1 && data.buses.size() >= 8000 &&
-                linear.status == "Infeasible") {
+            attempt["reference_source"] = reference_source;
+            if (!linear.success && data.buses.size() >= 8000 &&
+                (linear.status == "Infeasible" ||
+                 linear.status == "Unknown")) {
                 attempt["projected_balance_retry_scheduled"] = true;
                 linearized_attempts.push_back(std::move(attempt));
                 linear = gravityx::solve_linearized_ac_seed(
@@ -924,10 +927,18 @@ bool solve_loaded_contingency(
                 attempt = linear.to_json(false);
                 attempt["round"] = round;
                 attempt["projected_balance_retry"] = true;
+                attempt["reference_source"] = reference_source;
             }
             last_status = linear.status;
             last_model_status = linear.model_status;
             if (!linear.success) {
+                if (fast_result && reference_source != "base") {
+                    attempt["base_reference_retry_scheduled"] = true;
+                    linearized_attempts.push_back(std::move(attempt));
+                    reference = base.state;
+                    reference_source = "base";
+                    continue;
+                }
                 attempt["validation"] = nullptr;
                 linearized_attempts.push_back(std::move(attempt));
                 break;
@@ -1089,8 +1100,10 @@ bool solve_loaded_contingency(
             if (!nonlinear_candidate.vm.empty() &&
                 nonlinear_validation.max_residual < validation.max_residual) {
                 reference = std::move(nonlinear_candidate);
+                reference_source = "iterated_nonlinear_repair";
             } else {
                 reference = std::move(candidate);
+                reference_source = "iterated_linear_seed";
             }
         }
         linearized_seed = best_state;

@@ -100,6 +100,8 @@ struct Branch {
     double angmin{};
     double angmax{};
     double rate_a{};
+    double rate_b{};
+    double rate_c{};
 };
 
 enum class ContingencyType {

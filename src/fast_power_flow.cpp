@@ -644,6 +644,7 @@ void append_weights(
 void compute_branch_flows(
     const CaseData& data,
     int outaged_branch,
+    bool contingency_mode,
     AcState& state) {
     const int nl = static_cast<int>(data.branches.size());
     state.pf.assign(nl, 0.0);
@@ -692,13 +693,14 @@ void compute_branch_flows(
 
         const double from_magnitude = std::hypot(state.pf[i], state.qf[i]);
         const double to_magnitude = std::hypot(state.pt[i], state.qt[i]);
-        if (branch.rate_a > 1e-12) {
+        const double rating = contingency_mode ? branch.rate_c : branch.rate_a;
+        if (rating > 1e-12) {
             const double from_required = branch.transformer
-                ? from_magnitude / branch.rate_a - 1.0
-                : from_magnitude / branch.rate_a - state.vm[f];
+                ? from_magnitude / rating - 1.0
+                : from_magnitude / rating - state.vm[f];
             const double to_required = branch.transformer
-                ? to_magnitude / branch.rate_a - 1.0
-                : to_magnitude / branch.rate_a - state.vm[t];
+                ? to_magnitude / rating - 1.0
+                : to_magnitude / rating - state.vm[t];
             state.sm_slack[i] = std::max({0.0, from_required, to_required});
         }
     }
@@ -847,7 +849,7 @@ double rebuild_base_state_derived_fields(
         }
     }
 
-    compute_branch_flows(data, -1, state);
+    compute_branch_flows(data, -1, false, state);
     const auto balance = nodal_balance_slack_seed(
         data, state, balance_slack_upper, 1e-7);
     state.p_delta = balance.active;
@@ -934,7 +936,7 @@ double rebuild_contingency_state_derived_fields(
         }
     }
 
-    compute_branch_flows(data, outaged_branch, state);
+    compute_branch_flows(data, outaged_branch, true, state);
     const auto balance = nodal_balance_slack_seed(
         data, state, balance_slack_upper, 1e-7);
     state.p_delta = balance.active;
@@ -1048,7 +1050,7 @@ ValidatedSourceBaseResult build_validated_source_base(
         }
     }
 
-    compute_branch_flows(data, -1, state);
+    compute_branch_flows(data, -1, false, state);
     const auto balance = nodal_balance_slack_seed(data, state, 0.5);
     state.p_delta = balance.active;
     state.q_delta = balance.reactive;
@@ -1101,23 +1103,47 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
     return solve_impl(&contingency);
 }
 
+FastPowerFlowResult FastContingencyPowerFlow::solve(
+    const Contingency& contingency,
+    const AcState& initial_state) const {
+    return solve_impl(&contingency, &initial_state);
+}
+
 FastPowerFlowResult FastContingencyPowerFlow::solve_base() const {
     return solve_impl(nullptr);
 }
 
 FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
-    const Contingency* contingency) const {
+    const Contingency* contingency,
+    const AcState* supplied_initial_state) const {
     const auto wall_start = std::chrono::steady_clock::now();
     FastPowerFlowResult output;
     const int nb = static_cast<int>(data_.buses.size());
     const int ng = static_cast<int>(data_.generators.size());
     const bool base_mode = contingency == nullptr;
+    const auto branch_rating = [&](int index) {
+        return base_mode
+            ? data_.branches[index].rate_a
+            : data_.branches[index].rate_c;
+    };
     const int outaged_generator = !base_mode &&
         contingency->type == ContingencyType::Generator
         ? contingency->component : -1;
     const int outaged_branch = !base_mode &&
         contingency->type == ContingencyType::Branch
         ? contingency->component : -1;
+    const AcState& initial_state = supplied_initial_state
+        ? *supplied_initial_state : base_state_;
+    if (initial_state.vm.size() != data_.buses.size() ||
+        initial_state.va.size() != data_.buses.size() ||
+        initial_state.pg.size() != data_.generators.size() ||
+        initial_state.qg.size() != data_.generators.size() ||
+        initial_state.demand_factor.size() != data_.loads.size()) {
+        output.failure_reason = "fast power flow initial state has wrong dimensions";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
 
     std::vector<bool> active(ng, false);
     std::vector<double> p_lower(ng, 0.0), p_upper(ng, 0.0);
@@ -1151,8 +1177,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 std::chrono::steady_clock::now() - wall_start).count();
             return output;
         }
-        pg[i] = std::clamp(base_state_.pg[i], p_lower[i], p_upper[i]);
-        qg[i] = std::clamp(base_state_.qg[i], q_lower[i], q_upper[i]);
+        pg[i] = std::clamp(initial_state.pg[i], p_lower[i], p_upper[i]);
+        qg[i] = std::clamp(initial_state.qg[i], q_lower[i], q_upper[i]);
     }
 
     std::optional<ContingencyContext> direct_context;
@@ -1162,10 +1188,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         direct_context->outaged_generator = outaged_generator;
         direct_context->outaged_branch = outaged_branch;
     }
-    AcState direct_state = base_state_;
+    AcState direct_state = initial_state;
     direct_state.pg = pg;
     direct_state.qg = qg;
-    compute_branch_flows(data_, outaged_branch, direct_state);
+    compute_branch_flows(data_, outaged_branch, !base_mode, direct_state);
     const auto direct_balance = nodal_balance_slack_seed(
         data_, direct_state, 0.5, 1e-7);
     direct_state.p_delta = direct_balance.active;
@@ -1256,7 +1282,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         for (int bus : component) {
             for (int gen : data_.buses[bus].generators) {
                 if (commitment_[gen] == 1) {
-                    target += base_state_.pg[gen];
+                    target += initial_state.pg[gen];
                 }
                 if (active[gen]) {
                     participants.push_back(gen);
@@ -1269,13 +1295,13 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             target = std::clamp(target, lower, upper);
             allocate_total(
                 participants, p_lower, p_upper,
-                base_state_.pg, target, pg);
+                initial_state.pg, target, pg);
         }
     }
 
     const YRows ybus = build_ybus(data_, outaged_branch);
-    std::vector<double> vm = base_state_.vm;
-    std::vector<double> va = base_state_.va;
+    std::vector<double> vm = initial_state.vm;
+    std::vector<double> va = initial_state.va;
     for (int i = 0; i < nb; ++i) {
         vm[i] = std::clamp(vm[i], data_.buses[i].vmin, data_.buses[i].vmax);
         if (data_.buses[i].type == 3) {
@@ -1286,8 +1312,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     std::vector<double> load_p(nb, 0.0), load_q(nb, 0.0);
     for (int i = 0; i < static_cast<int>(data_.loads.size()); ++i) {
         const auto& load = data_.loads[i];
-        load_p[load.bus] += load.pd_nominal * base_state_.demand_factor[i];
-        load_q[load.bus] += load.qd_nominal * base_state_.demand_factor[i];
+        load_p[load.bus] += load.pd_nominal * initial_state.demand_factor[i];
+        load_q[load.bus] += load.qd_nominal * initial_state.demand_factor[i];
     }
     std::vector<double> fixed_q_bus(nb, 0.0);
     std::vector<double> active_slack_target(nb, 0.0);
@@ -1335,7 +1361,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     }
 
     const auto evaluate_newton_candidate = [&](bool clamp_voltage) {
-        AcState candidate = base_state_;
+        AcState candidate = initial_state;
         candidate.vm = vm;
         candidate.va = va;
         candidate.pg = pg;
@@ -1347,7 +1373,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     data_.buses[bus].vmin, data_.buses[bus].vmax);
             }
         }
-        compute_branch_flows(data_, outaged_branch, candidate);
+        compute_branch_flows(data_, outaged_branch, !base_mode, candidate);
         for (int bus = 0; bus < nb; ++bus) {
             if (active_at_bus[bus].empty()) {
                 continue;
@@ -1388,7 +1414,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             auto proposed_pg = candidate.pg;
             if (allocate_total(
                     active_at_bus[bus], p_lower, p_upper,
-                    base_state_.pg,
+                    initial_state.pg,
                     current_pg + p_balance - p_target,
                     proposed_pg)) {
                 candidate.pg = std::move(proposed_pg);
@@ -1396,7 +1422,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             auto proposed_qg = candidate.qg;
             if (allocate_total(
                     active_at_bus[bus], q_lower, q_upper,
-                    base_state_.qg,
+                    initial_state.qg,
                     current_qg + q_balance - q_target,
                     proposed_qg)) {
                 candidate.qg = std::move(proposed_qg);
@@ -1537,7 +1563,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
              ++scaling_pass) {
             double maximum_component_ratio = 1.0;
             for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
-                if (i == outaged_branch || data_.branches[i].rate_a <= 1e-12) {
+                const double rating = branch_rating(i);
+                if (i == outaged_branch || rating <= 1e-12) {
                     continue;
                 }
                 maximum_component_ratio = std::max(
@@ -1546,7 +1573,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                               std::abs(reactive_state.qf[i]),
                               std::abs(reactive_state.pt[i]),
                               std::abs(reactive_state.qt[i])})
-                        / data_.branches[i].rate_a);
+                        / rating);
             }
             if (maximum_component_ratio <= 1.0 + 1e-12) {
                 break;
@@ -1830,10 +1857,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             auto proposed_qg = qg;
             if (!allocate_total(
                     active_at_bus[bus], p_lower, p_upper,
-                    base_state_.pg, required_p, proposed_pg) ||
+                    initial_state.pg, required_p, proposed_pg) ||
                 !allocate_total(
                     active_at_bus[bus], q_lower, q_upper,
-                    base_state_.qg, required_q, proposed_qg)) {
+                    initial_state.qg, required_q, proposed_qg)) {
                 approximate_candidate = true;
                 output.failure_reason = "generator allocation failed; validating bounded-residual candidate";
                 break;
@@ -1863,12 +1890,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             vm[bus], data_.buses[bus].vmin, data_.buses[bus].vmax);
     }
 
-    AcState state = base_state_;
+    AcState state = initial_state;
     state.vm = std::move(vm);
     state.va = std::move(va);
     state.pg = std::move(pg);
     state.qg = std::move(qg);
-    compute_branch_flows(data_, outaged_branch, state);
+    compute_branch_flows(data_, outaged_branch, !base_mode, state);
     state.p_delta.assign(nb, 0.0);
     state.q_delta.assign(nb, 0.0);
     for (int bus = 0; bus < nb; ++bus) {
@@ -1932,7 +1959,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         load_reactive_upper[i] = std::max(
             load.qd_nominal * factor_lower, load.qd_nominal * factor_upper);
         load_reactive_preferred[i] =
-            load.qd_nominal * base_state_.demand_factor[i];
+            load.qd_nominal * initial_state.demand_factor[i];
     }
 
     const auto refresh_pwl_weights = [&]() {
@@ -1958,7 +1985,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     };
 
     const auto refresh_network_fields = [&]() {
-        compute_branch_flows(data_, outaged_branch, state);
+        compute_branch_flows(data_, outaged_branch, !base_mode, state);
         const auto compute_balances = [&]() {
             std::pair<std::vector<double>, std::vector<double>> balances{
                 std::vector<double>(nb, 0.0), std::vector<double>(nb, 0.0)};
@@ -2006,7 +2033,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 auto proposed = state.qg;
                 if (allocate_total(
                         active_at_bus[bus], q_lower, q_upper,
-                        base_state_.qg, current + q_excess, proposed)) {
+                        initial_state.qg, current + q_excess, proposed)) {
                     state.qg = std::move(proposed);
                 }
             }
@@ -2062,7 +2089,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             auto proposed = state.pg;
             if (allocate_total(
                     active_at_bus[bus], p_lower, p_upper,
-                    base_state_.pg, current + p_excess, proposed)) {
+                    initial_state.pg, current + p_excess, proposed)) {
                 state.pg = std::move(proposed);
             }
         }
@@ -2141,7 +2168,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
         double maximum_component_ratio = 1.0;
         for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
-            if (i == outaged_branch || data_.branches[i].rate_a <= 1e-12) {
+            const double rating = branch_rating(i);
+            if (i == outaged_branch || rating <= 1e-12) {
                 continue;
             }
             maximum_component_ratio = std::max(maximum_component_ratio,
@@ -2149,7 +2177,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                           std::abs(output.solve.state.qf[i]),
                           std::abs(output.solve.state.pt[i]),
                           std::abs(output.solve.state.qt[i])})
-                    / data_.branches[i].rate_a);
+                    / rating);
         }
         const double scale = std::min(0.9995,
             0.9999 / std::sqrt(maximum_component_ratio));
@@ -2182,7 +2210,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     // improve independent validation.
     if (options_.distributed_balance_polish &&
         output.validation.max_residual > options_.validation_tolerance &&
-        output.validation.worst_category == "active_balance") {
+        (output.validation.worst_category == "active_balance" ||
+         output.validation.worst_category == "reactive_balance")) {
         output.distributed_balance_polish_attempted = true;
         const AcState original_state = output.solve.state;
         const ValidationReport original_validation = output.validation;
@@ -2381,13 +2410,14 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
 
             double maximum_component_ratio = 1.0;
             for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
-                if (i == outaged_branch || data_.branches[i].rate_a <= 1e-12) {
+                const double rating = branch_rating(i);
+                if (i == outaged_branch || rating <= 1e-12) {
                     continue;
                 }
                 maximum_component_ratio = std::max(maximum_component_ratio,
                     std::max({std::abs(state.pf[i]), std::abs(state.qf[i]),
                               std::abs(state.pt[i]), std::abs(state.qt[i])})
-                        / data_.branches[i].rate_a);
+                        / rating);
             }
             const double scale = std::min(
                 0.9995, 0.9999 / std::sqrt(maximum_component_ratio));

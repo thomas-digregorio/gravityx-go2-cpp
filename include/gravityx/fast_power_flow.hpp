@@ -93,6 +93,9 @@ public:
 
     FastPowerFlowResult solve_base() const;
     FastPowerFlowResult solve(const Contingency& contingency) const;
+    FastPowerFlowResult solve(
+        const Contingency& contingency,
+        const AcState& initial_state) const;
 
 private:
     const CaseData& data_;
@@ -100,7 +103,9 @@ private:
     std::vector<int> commitment_;
     FastPowerFlowOptions options_;
 
-    FastPowerFlowResult solve_impl(const Contingency* contingency) const;
+    FastPowerFlowResult solve_impl(
+        const Contingency* contingency,
+        const AcState* initial_state = nullptr) const;
 };
 
 }  // namespace gravityx

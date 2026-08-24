@@ -859,7 +859,11 @@ def main() -> int:
             worker_arguments.append("resident")
         if args.ipopt_acceptable_termination:
             worker_arguments.append("acceptable")
-        if args.fast_power_flow_screen and not args.two_stage_contingency_screen:
+        # Recompute the fast-screen candidate in second-stage workers as well.
+        # The linearized repair uses that candidate as its reference; dropping
+        # it between stages can make an otherwise tractable trust-region LP
+        # appear infeasible.
+        if args.fast_power_flow_screen:
             worker_arguments.append("fast-pf")
         if args.linearized_contingency_fallback:
             worker_arguments.append("linearized")
@@ -1284,7 +1288,10 @@ def main() -> int:
             item["solution_method"] == "ipopt_corrective_fallback" for item in records
         ),
         "linearized_contingency_accepted_count": sum(
-            item["solution_method"] == "highs_sequential_linearized_contingency"
+            item["solution_method"] in {
+                "highs_sequential_linearized_contingency",
+                "highs_linearized_contingency_plus_fast_newton",
+            }
             for item in records
         ),
         "fast_screen_fallback_count": sum(

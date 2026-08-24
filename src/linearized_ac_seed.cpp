@@ -8,6 +8,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -217,6 +218,17 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         ? contingency->outaged_generator : -1;
     const int outaged_branch = contingency
         ? contingency->outaged_branch : -1;
+    // At 8k-bus scale this LP is only a nonlinear-feasibility seed.  Including
+    // every linearized branch box and angle row more than doubles its size and
+    // dominated the five-minute contingency budget.  The returned candidate is
+    // never accepted on this reduced model: sparse Newton follows immediately,
+    // then the independent nonlinear validator checks every source branch flow
+    // and angle constraint.  Smaller cases retain the original full seed LP.
+    const char* full_seed_override = std::getenv("GRAVITYX_FULL_LINEAR_SEED");
+    const bool force_full_seed = full_seed_override != nullptr &&
+        std::string(full_seed_override) != "0";
+    const bool lightweight_large_contingency_seed =
+        contingency && nb >= 8000 && !force_full_seed;
 
     const int vm_offset = 0;
     const int va_offset = vm_offset + nb;
@@ -236,22 +248,42 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     std::vector<double> upper(column_count, kHighsInf);
     std::vector<double> cost(column_count, 0.0);
     for (int i = 0; i < nb; ++i) {
-        lower[vm_offset + i] = data.buses[i].vmin;
-        upper[vm_offset + i] = data.buses[i].vmax;
-        lower[va_offset + i] = -10.0;
-        upper[va_offset + i] = 10.0;
+        lower[vm_offset + i] = lightweight_large_contingency_seed
+            ? std::max(
+                data.buses[i].vmin,
+                reference.vm[i] - 0.05)
+            : data.buses[i].vmin;
+        upper[vm_offset + i] = lightweight_large_contingency_seed
+            ? std::min(
+                data.buses[i].vmax,
+                reference.vm[i] + 0.05)
+            : data.buses[i].vmax;
+        lower[va_offset + i] = lightweight_large_contingency_seed
+            ? std::max(
+                -10.0,
+                reference.va[i] - 0.15)
+            : -10.0;
+        upper[va_offset + i] = lightweight_large_contingency_seed
+            ? std::min(
+                10.0,
+                reference.va[i] + 0.15)
+            : 10.0;
         if (data.buses[i].type == 3) {
             lower[va_offset + i] = 0.0;
             upper[va_offset + i] = 0.0;
         }
-        upper[p_pos_offset + i] = balance_slack_limit;
-        upper[p_neg_offset + i] = balance_slack_limit;
-        upper[q_pos_offset + i] = balance_slack_limit;
-        upper[q_neg_offset + i] = balance_slack_limit;
-        cost[p_pos_offset + i] = 1e6;
-        cost[p_neg_offset + i] = 1e6;
-        cost[q_pos_offset + i] = 1e6;
-        cost[q_neg_offset + i] = 1e6;
+        const double seed_balance_slack =
+            lightweight_large_contingency_seed ? 0.0 : balance_slack_limit;
+        upper[p_pos_offset + i] = seed_balance_slack;
+        upper[p_neg_offset + i] = seed_balance_slack;
+        upper[q_pos_offset + i] = seed_balance_slack;
+        upper[q_neg_offset + i] = seed_balance_slack;
+        if (!lightweight_large_contingency_seed) {
+            cost[p_pos_offset + i] = 1e6;
+            cost[p_neg_offset + i] = 1e6;
+            cost[q_pos_offset + i] = 1e6;
+            cost[q_neg_offset + i] = 1e6;
+        }
     }
     for (int i = 0; i < ng; ++i) {
         const auto& gen = data.generators[i];
@@ -402,18 +434,46 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         rows.push_back(std::move(reactive));
     }
 
+    const auto affine_range = [&](const AffineFlow& flow, const Branch& branch) {
+        double minimum = flow.constant;
+        double maximum = flow.constant;
+        const std::array<std::pair<int, double>, 4> terms{{
+            {vm_offset + branch.from, flow.vm_from},
+            {vm_offset + branch.to, flow.vm_to},
+            {va_offset + branch.from, flow.va_from},
+            {va_offset + branch.to, flow.va_to},
+        }};
+        for (const auto& [column, coefficient] : terms) {
+            if (coefficient >= 0.0) {
+                minimum += coefficient * lower[column];
+                maximum += coefficient * upper[column];
+            } else {
+                minimum += coefficient * upper[column];
+                maximum += coefficient * lower[column];
+            }
+        }
+        return std::pair<double, double>{minimum, maximum};
+    };
+
     for (int i = 0; i < nl; ++i) {
         if (i == outaged_branch) {
             continue;
         }
         const auto& branch = data.branches[i];
+        const double rating = contingency ? branch.rate_c : branch.rate_a;
         const std::array<const AffineFlow*, 4> flows{
             &linearized[i].pf, &linearized[i].qf,
             &linearized[i].pt, &linearized[i].qt};
         for (const auto* flow : flows) {
+            if (lightweight_large_contingency_seed) {
+                const auto [minimum, maximum] = affine_range(*flow, branch);
+                if (minimum >= -rating && maximum <= rating) {
+                    continue;
+                }
+            }
             SparseRow row;
-            row.lower = -branch.rate_a - flow->constant;
-            row.upper = branch.rate_a - flow->constant;
+            row.lower = -rating - flow->constant;
+            row.upper = rating - flow->constant;
             append(row, vm_offset + branch.from, flow->vm_from);
             append(row, vm_offset + branch.to, flow->vm_to);
             append(row, va_offset + branch.from, flow->va_from);
@@ -426,7 +486,15 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
                 - contingency->base_state.va[branch.to]
             : data.buses[branch.from].va_start
                 - data.buses[branch.to].va_start;
-        if (source_delta >= branch.angmin && source_delta <= branch.angmax) {
+        const double angle_minimum =
+            lower[va_offset + branch.from] - upper[va_offset + branch.to];
+        const double angle_maximum =
+            upper[va_offset + branch.from] - lower[va_offset + branch.to];
+        const bool angle_row_is_redundant =
+            lightweight_large_contingency_seed &&
+            angle_minimum >= branch.angmin && angle_maximum <= branch.angmax;
+        if (source_delta >= branch.angmin && source_delta <= branch.angmax &&
+            !angle_row_is_redundant) {
             SparseRow angle;
             angle.lower = branch.angmin;
             angle.upper = branch.angmax;
@@ -500,12 +568,22 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     }
 
     Highs highs;
-    highs.setOptionValue("output_flag", false);
+    const char* highs_log = std::getenv("GRAVITYX_HIGHS_LOG");
+    highs.setOptionValue(
+        "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
     highs.setOptionValue("threads", 1);
     highs.setOptionValue("presolve", "on");
-    highs.setOptionValue("solver", "ipm");
+    // The 8k-bus trust-region seed has a much smaller, better-scaled presolved
+    // system than the original full contingency LP.  IPM solves this form in
+    // less than half the measured dual-simplex time and returns a candidate
+    // that the nonlinear correction can validate in one round.
+    const char* solver_override = std::getenv("GRAVITYX_LINEAR_SEED_SOLVER");
+    const std::string solver = solver_override != nullptr
+        ? std::string(solver_override)
+        : "ipm";
+    highs.setOptionValue("solver", solver);
     highs.setOptionValue("run_crossover", "off");
-    highs.setOptionValue("time_limit", 30.0);
+    highs.setOptionValue("time_limit", 60.0);
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
     highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     if (highs.addVars(column_count, lower.data(), upper.data()) != HighsStatus::kOk ||

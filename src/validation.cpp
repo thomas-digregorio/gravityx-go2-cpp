@@ -362,8 +362,10 @@ ValidationReport validate_state(
         const auto& branch = data.branches[i];
         const bool outaged = contingency &&
             contingency->outaged_branch == static_cast<int>(i);
-        const double flow_lower = outaged ? 0.0 : -branch.rate_a;
-        const double flow_upper = outaged ? 0.0 : branch.rate_a;
+        const double rating = mode == ModelMode::ContingencySoft
+            ? branch.rate_c : branch.rate_a;
+        const double flow_lower = outaged ? 0.0 : -rating;
+        const double flow_upper = outaged ? 0.0 : rating;
         for (const auto& item : std::vector<std::pair<std::string, double>>{
                  {"pf", state.pf[i]}, {"qf", state.qf[i]},
                  {"pt", state.pt[i]}, {"qt", state.qt[i]}}) {
@@ -421,11 +423,11 @@ ValidationReport validate_state(
         const double from_squared = state.pf[i] * state.pf[i] + state.qf[i] * state.qf[i];
         const double to_squared = state.pt[i] * state.pt[i] + state.qt[i] * state.qt[i];
         const double from_limit = branch.transformer
-            ? branch.rate_a * branch.rate_a * std::pow(1.0 + state.sm_slack[i], 2)
-            : branch.rate_a * branch.rate_a * std::pow(state.vm[f] + state.sm_slack[i], 2);
+            ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
+            : rating * rating * std::pow(state.vm[f] + state.sm_slack[i], 2);
         const double to_limit = branch.transformer
-            ? branch.rate_a * branch.rate_a * std::pow(1.0 + state.sm_slack[i], 2)
-            : branch.rate_a * branch.rate_a * std::pow(state.vm[t] + state.sm_slack[i], 2);
+            ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
+            : rating * rating * std::pow(state.vm[t] + state.sm_slack[i], 2);
         update_category(report.max_flow_limit_violation,
             std::max(positive_part(from_squared - from_limit), positive_part(to_squared - to_limit)),
             "flow_limit", "branch:" + branch.source_key);

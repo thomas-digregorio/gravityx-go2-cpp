@@ -229,6 +229,8 @@ int run_parallel_circuit_regression() {
     branch.angmin = -1.0;
     branch.angmax = 1.0;
     branch.rate_a = 2.0;
+    branch.rate_b = 2.0;
+    branch.rate_c = 2.0;
     branch.source_key = "1";
     branch.index = 1;
     data.branches.push_back(branch);
@@ -275,9 +277,32 @@ int run_parallel_circuit_regression() {
             "validated fast power-flow contingency regression failed: "
             + fast_result.failure_reason);
     }
+    auto contingency_rating_data = data;
+    contingency_rating_data.branches[1].rate_a = 0.1;
+    contingency_rating_data.branches[1].rate_c = 2.0;
+    if (std::hypot(fast_result.solve.state.pf[1],
+                   fast_result.solve.state.qf[1]) <= 0.1) {
+        throw std::runtime_error(
+            "contingency-rating regression fixture does not exceed RATE_A");
+    }
+    auto base_rating_state = fast_result.solve.state;
+    gravityx::rebuild_base_state_derived_fields(
+        contingency_rating_data, {1}, base_rating_state);
+    if (base_rating_state.sm_slack[1] <= 0.0) {
+        throw std::runtime_error(
+            "base-case RATE_A regression failed to create thermal slack");
+    }
     gravityx::ContingencyContext branch_context;
     branch_context.outaged_branch = branch_contingency.component;
     branch_context.base_state = solve.state;
+    const auto contingency_rating_validation = gravityx::validate_state(
+        contingency_rating_data, gravityx::ModelMode::ContingencySoft,
+        fast_result.solve.state, {1}, branch_context);
+    if (contingency_rating_validation.max_residual > 1e-5) {
+        throw std::runtime_error(
+            "contingency RATE_C regression failed with residual " +
+            std::to_string(contingency_rating_validation.max_residual));
+    }
     auto linear_reference = solve.state;
     gravityx::ValidationReport linear_validation;
     bool linear_contingency_feasible = false;
@@ -897,6 +922,25 @@ bool solve_loaded_contingency(
             }
 
             auto candidate = linear.state;
+            const auto maximum_step = [](const std::vector<double>& left,
+                                         const std::vector<double>& right) {
+                double maximum = 0.0;
+                const auto count = std::min(left.size(), right.size());
+                for (std::size_t i = 0; i < count; ++i) {
+                    maximum = std::max(maximum, std::abs(left[i] - right[i]));
+                }
+                return maximum;
+            };
+            attempt["maximum_voltage_magnitude_step"] =
+                maximum_step(candidate.vm, reference.vm);
+            attempt["maximum_voltage_angle_step"] =
+                maximum_step(candidate.va, reference.va);
+            attempt["maximum_active_generation_step"] =
+                maximum_step(candidate.pg, reference.pg);
+            attempt["maximum_reactive_generation_step"] =
+                maximum_step(candidate.qg, reference.qg);
+            attempt["maximum_demand_factor_step"] =
+                maximum_step(candidate.demand_factor, reference.demand_factor);
             const double objective =
                 gravityx::rebuild_contingency_state_derived_fields(
                     data, base.state, base.commitment, *match, candidate);
@@ -905,13 +949,14 @@ bool solve_loaded_contingency(
                 candidate, base.commitment, context);
             attempt["exact_objective"] = objective;
             attempt["validation"] = validation.to_json();
-            linearized_attempts.push_back(std::move(attempt));
             if (validation.max_residual < best_validation.max_residual) {
                 best_state = candidate;
                 best_objective = objective;
                 best_validation = validation;
             }
             if (validation.max_residual <= 1e-5) {
+                attempt["nonlinear_repair"] = nullptr;
+                linearized_attempts.push_back(std::move(attempt));
                 gravityx::SolveResult solve;
                 solve.status = 0;
                 solve.objective = objective;
@@ -952,7 +997,89 @@ bool solve_loaded_contingency(
                 }).dump(2) << '\n';
                 return true;
             }
-            reference = std::move(candidate);
+
+            std::optional<gravityx::FastPowerFlowResult> nonlinear;
+            if (fast_power_flow) {
+                nonlinear = fast_power_flow->solve(*match, candidate);
+            } else {
+                gravityx::FastContingencyPowerFlow nonlinear_solver(
+                    data, base.state, base.commitment);
+                nonlinear = nonlinear_solver.solve(*match, candidate);
+            }
+            linearized_wall_seconds += nonlinear->wall_seconds;
+            linearized_iterations += std::max(0, nonlinear->solve.iterations);
+            attempt["nonlinear_repair"] = nonlinear->to_json();
+
+            auto nonlinear_candidate = nonlinear->solve.state;
+            double nonlinear_objective = best_objective;
+            auto nonlinear_validation = nonlinear->validation;
+            if (!nonlinear_candidate.vm.empty()) {
+                nonlinear_objective =
+                    gravityx::rebuild_contingency_state_derived_fields(
+                        data, base.state, base.commitment, *match,
+                        nonlinear_candidate);
+                nonlinear_validation = gravityx::validate_state(
+                    data, gravityx::ModelMode::ContingencySoft,
+                    nonlinear_candidate, base.commitment, context);
+                attempt["nonlinear_exact_objective"] = nonlinear_objective;
+                attempt["nonlinear_validation"] =
+                    nonlinear_validation.to_json();
+                if (nonlinear_validation.max_residual <
+                    best_validation.max_residual) {
+                    best_state = nonlinear_candidate;
+                    best_objective = nonlinear_objective;
+                    best_validation = nonlinear_validation;
+                }
+            }
+            linearized_attempts.push_back(std::move(attempt));
+            if (!nonlinear_candidate.vm.empty() &&
+                nonlinear_validation.max_residual <= 1e-5) {
+                gravityx::SolveResult solve;
+                solve.status = 0;
+                solve.objective = nonlinear_objective;
+                solve.wall_seconds = linearized_wall_seconds;
+                solve.iterations = linearized_iterations;
+                solve.state = std::move(nonlinear_candidate);
+                const nlohmann::json output = {
+                    {"success", true},
+                    {"solver_status_success", true},
+                    {"accepted_feasible_nonconverged", false},
+                    {"label", match->label},
+                    {"type", match->type == gravityx::ContingencyType::Generator ? "gen" : "branch"},
+                    {"source_index", match->source_index},
+                    {"component_position", match->component},
+                    {"solution_method", "highs_linearized_contingency_plus_fast_newton"},
+                    {"fast_power_flow_screen", fast_power_flow != nullptr},
+                    {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
+                    {"linearized_attempts", linearized_attempts},
+                    {"resident_parametric_model", false},
+                    {"acceptable_termination_enabled", false},
+                    {"resident_model_created", false},
+                    {"model_preparation_wall_seconds", 0.0},
+                    {"solve", gravityx::solve_result_to_json(solve, true)},
+                    {"validation", nonlinear_validation.to_json()},
+                };
+                write_json_file(output_path, output);
+                std::cout << nlohmann::json({
+                    {"output", output_path},
+                    {"success", true},
+                    {"label", match->label},
+                    {"status", 0},
+                    {"objective", nonlinear_objective},
+                    {"wall_seconds", linearized_wall_seconds},
+                    {"iterations", linearized_iterations},
+                    {"linearized_rounds", round},
+                    {"max_residual", nonlinear_validation.max_residual},
+                    {"solution_method", "highs_linearized_contingency_plus_fast_newton"},
+                }).dump(2) << '\n';
+                return true;
+            }
+            if (!nonlinear_candidate.vm.empty() &&
+                nonlinear_validation.max_residual < validation.max_residual) {
+                reference = std::move(nonlinear_candidate);
+            } else {
+                reference = std::move(candidate);
+            }
         }
         linearized_seed = best_state;
         if (linearized_only) {

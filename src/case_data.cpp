@@ -164,6 +164,8 @@ CaseData CaseData::load(const std::string& path) {
         branch.angmin = item.at("angmin").get<double>();
         branch.angmax = item.at("angmax").get<double>();
         branch.rate_a = item.at("rate_a").get<double>();
+        branch.rate_b = item.value("rate_b", branch.rate_a);
+        branch.rate_c = item.value("rate_c", branch.rate_a);
         return branch;
     });
 

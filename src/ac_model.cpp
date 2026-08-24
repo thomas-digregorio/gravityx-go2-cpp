@@ -459,8 +459,10 @@ void AcModel::build_variables() {
     for (std::size_t i = 0; i < nl; ++i) {
         const bool outaged = !reusable_contingencies_ && contingency_ &&
             contingency_->outaged_branch == static_cast<int>(i);
-        flow_lower[i] = outaged ? 0.0 : -data_.branches[i].rate_a;
-        flow_upper[i] = outaged ? 0.0 : data_.branches[i].rate_a;
+        const double rating = mode_ == ModelMode::ContingencySoft
+            ? data_.branches[i].rate_c : data_.branches[i].rate_a;
+        flow_lower[i] = outaged ? 0.0 : -rating;
+        flow_upper[i] = outaged ? 0.0 : rating;
         if (outaged) {
             slack_upper[i] = 0.0;
         }
@@ -760,15 +762,17 @@ void AcModel::build_constraints_and_objective() {
 
         func_ thermal_from = gravity::power((*pf_)(i), 2) + gravity::power((*qf_)(i), 2);
         func_ thermal_to = gravity::power((*pt_)(i), 2) + gravity::power((*qt_)(i), 2);
+        const double rating = mode_ == ModelMode::ContingencySoft
+            ? branch.rate_c : branch.rate_a;
         if (branch.transformer) {
-            thermal_from += (-branch.rate_a * branch.rate_a) * thermal_f_tag
+            thermal_from += (-rating * rating) * thermal_f_tag
                 * gravity::power(1.0 + (*sm_slack_)(i), 2);
-            thermal_to += (-branch.rate_a * branch.rate_a) * thermal_t_tag
+            thermal_to += (-rating * rating) * thermal_t_tag
                 * gravity::power(1.0 + (*sm_slack_)(i), 2);
         } else {
-            thermal_from += (-branch.rate_a * branch.rate_a) * thermal_f_tag
+            thermal_from += (-rating * rating) * thermal_f_tag
                 * gravity::power((*vm_)(f) + (*sm_slack_)(i), 2);
-            thermal_to += (-branch.rate_a * branch.rate_a) * thermal_t_tag
+            thermal_to += (-rating * rating) * thermal_t_tag
                 * gravity::power((*vm_)(t) + (*sm_slack_)(i), 2);
         }
         add_le(model_, "thermal_from_" + std::to_string(i), thermal_from);

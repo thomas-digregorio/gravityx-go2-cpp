@@ -18,8 +18,7 @@ with every reproduction-specific choice recorded in the run manifest.
 
 - Initial reproduction target: GO Challenge 2 Final `C2FEN00617`, scenario
   `005`; validated scale suites now include the public Final 617-, 2,020-, and
-  4,200-bus scenario families; the 8,300-bus family is the current scale
-  target.
+  4,200-, and 8,300-bus scenario families.
 - Input normalization: the pinned official PowerModelsSecurityConstrained GO2
   parser exports a neutral JSON representation of RAW/JSON/CON data.
 - Optimization: Gravity C++ variables, objectives, and constraints; Ipopt with
@@ -39,6 +38,7 @@ The multi-scenario scale results are recorded in:
 - `docs/C2FEN00617_ABLATION_20260823.md`
 - `docs/C2FEN02020_FINAL_SCENARIOS_20260824.md`
 - `docs/C2FEN04200_FINAL_SCENARIOS_20260824.md`
+- `docs/C2FEN08300_FINAL_SCENARIOS_20260824.md`
 
 ## What is implemented
 

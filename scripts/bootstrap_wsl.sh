@@ -19,7 +19,7 @@ if [[ ! -x "${tool_root}/bin/micromamba" ]]; then
 fi
 if [[ ! -x "${env_root}/bin/cmake" ]]; then
   MAMBA_ROOT_PREFIX="${tool_root}/mamba-root" "${tool_root}/bin/micromamba" create -y \
-    -p "${env_root}" -c conda-forge cmake ninja ipopt pkg-config nlohmann_json
+    -p "${env_root}" -c conda-forge cmake ninja ipopt pkg-config nlohmann_json eigen
 fi
 if [[ ! -d "${gravity_root}/.git" ]]; then
   git clone https://github.com/coin-or/Gravity.git "${gravity_root}"

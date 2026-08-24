@@ -19,6 +19,7 @@ if(NOT EXISTS "${IPOPT_ROOT}/lib/libipopt.so")
 endif()
 
 find_package(nlohmann_json CONFIG REQUIRED HINTS "${IPOPT_ROOT}")
+find_package(Eigen3 CONFIG REQUIRED HINTS "${IPOPT_ROOT}")
 
 add_library(gravity_pinned STATIC IMPORTED GLOBAL)
 set_target_properties(gravity_pinned PROPERTIES
@@ -31,6 +32,7 @@ add_executable(gravityx_go2
     src/case_data.cpp
     src/ac_model.cpp
     src/algorithm.cpp
+    src/fast_power_flow.cpp
     src/validation.cpp
     src/state_io.cpp
 )
@@ -39,6 +41,7 @@ target_compile_definitions(gravityx_go2 PRIVATE USE_IPOPT)
 target_link_libraries(gravityx_go2 PRIVATE
     gravity_pinned
     "${IPOPT_ROOT}/lib/libipopt.so"
+    Eigen3::Eigen
     nlohmann_json::nlohmann_json
     m
     pthread

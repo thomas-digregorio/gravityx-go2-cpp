@@ -362,6 +362,8 @@ def main() -> int:
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
+    parser.add_argument("--fast-power-flow-screen", action="store_true")
+    parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--longest-first-schedule", action="store_true")
     args = parser.parse_args()
 
@@ -422,6 +424,8 @@ def main() -> int:
         "completed_contingency_count": 0,
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "fast_power_flow_screen": args.fast_power_flow_screen,
+        "source_status_base": args.source_status_base,
         "longest_first_schedule": args.longest_first_schedule,
     }
 
@@ -440,10 +444,15 @@ def main() -> int:
             min(args.base_timeout, args.code1_time_limit),
             base_deadline,
         )
+        base_arguments = [
+            "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
+        ]
+        if args.source_status_base:
+            base_arguments.append("source-only")
         base_process = run_cpp(
             args.executable,
             args.distro,
-            ["run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"],
+            base_arguments,
             internal / "base.console.log",
             base_timeout,
         )
@@ -557,6 +566,8 @@ def main() -> int:
             worker_arguments.append("resident")
         if args.ipopt_acceptable_termination:
             worker_arguments.append("acceptable")
+        if args.fast_power_flow_screen:
+            worker_arguments.append("fast-pf")
         command = cpp_command(
             args.executable,
             args.distro,
@@ -674,6 +685,11 @@ def main() -> int:
                     "accepted_feasible_nonconverged": result.get(
                         "accepted_feasible_nonconverged", False
                     ),
+                    "solution_method": result.get("solution_method", "ipopt_corrective"),
+                    "fast_power_flow_screen": result.get(
+                        "fast_power_flow_screen", False
+                    ),
+                    "fast_screen": result.get("fast_screen"),
                 }
                 task_queue.task_done()
                 with progress_lock:
@@ -894,7 +910,11 @@ def main() -> int:
     total_wall = time.perf_counter() - wall_start
     max_residual = max((item["max_residual"] for item in records), default=0.0)
     summary = {
-        "method": "Gravity C++ continuous AC-UC relaxation plus deterministic iterative batch rounding",
+        "method": (
+            "Gravity C++ source-status AC base plus validated sparse-Newton contingency screen"
+            if args.source_status_base and args.fast_power_flow_screen
+            else "Gravity C++ continuous AC-UC relaxation plus deterministic iterative batch rounding"
+        ),
         "exact_unpublished_gravityx_binary": False,
         "framework_faithful": True,
         "started_at_utc": started_utc,
@@ -910,6 +930,8 @@ def main() -> int:
         "requested_workers": args.workers,
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "fast_power_flow_screen": args.fast_power_flow_screen,
+        "source_status_base": args.source_status_base,
         "ipopt_acceptable_options": (
             {
                 "acceptable_tol": 1e-3,
@@ -926,9 +948,13 @@ def main() -> int:
         "contingency_schedule_mode": run_status["contingency_schedule_mode"],
         "contingency_schedule": run_status["contingency_schedule"],
         "contingency_execution_mode": (
-            "resident parametric model per isolated process worker with dynamic queue"
-            if args.resident_contingency_model
-            else "fresh model per task in persistent isolated process workers with dynamic queue"
+            "validated sparse-Newton screen with resident Ipopt fallback per isolated worker"
+            if args.fast_power_flow_screen and args.resident_contingency_model
+            else (
+                "resident parametric model per isolated process worker with dynamic queue"
+                if args.resident_contingency_model
+                else "fresh model per task in persistent isolated process workers with dynamic queue"
+            )
         ),
         "competition_timing": {
             **run_status["competition_timing"],
@@ -957,6 +983,12 @@ def main() -> int:
         "contingency_count": len(records),
         "accepted_feasible_nonconverged_count": sum(
             bool(item["accepted_feasible_nonconverged"]) for item in records
+        ),
+        "fast_power_flow_accepted_count": sum(
+            item["solution_method"] == "fast_newton_power_flow" for item in records
+        ),
+        "ipopt_fallback_count": sum(
+            item["solution_method"] == "ipopt_corrective_fallback" for item in records
         ),
         "max_independent_contingency_residual": max_residual,
         "base": base,

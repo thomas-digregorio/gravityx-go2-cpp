@@ -36,6 +36,7 @@ def run_trial(
     records: list[dict[str, Any]],
     workers: int,
     timeout_seconds: float,
+    fast_power_flow_screen: bool,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -52,17 +53,20 @@ def run_trial(
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             raise CompetitionTimeout("calibration deadline expired before worker launch")
+        worker_arguments = [
+            "contingency-worker",
+            to_wsl(case_json),
+            to_wsl(base_json),
+            "0",
+            "resident",
+            "acceptable",
+        ]
+        if fast_power_flow_screen:
+            worker_arguments.append("fast-pf")
         command = cpp_command(
             executable,
             distro,
-            [
-                "contingency-worker",
-                to_wsl(case_json),
-                to_wsl(base_json),
-                "0",
-                "resident",
-                "acceptable",
-            ],
+            worker_arguments,
             remaining,
         )
         output_lines: list[str] = []
@@ -134,6 +138,7 @@ def run_trial(
                             ],
                             "iterations": result["solve"].get("iterations", -1),
                             "max_residual": result["validation"]["max_residual"],
+                            "solution_method": result.get("solution_method"),
                         }
                     )
             if process.poll() is None:
@@ -217,6 +222,7 @@ def main() -> int:
     parser.add_argument("--task-count", type=int, default=32)
     parser.add_argument("--trial-timeout", type=float, default=180.0)
     parser.add_argument("--cooldown", type=float, default=30.0)
+    parser.add_argument("--fast-power-flow-screen", action="store_true")
     args = parser.parse_args()
 
     for path in (args.case_json, args.base_json, args.output_dir, args.executable):
@@ -258,6 +264,7 @@ def main() -> int:
             records,
             workers,
             args.trial_timeout,
+            args.fast_power_flow_screen,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

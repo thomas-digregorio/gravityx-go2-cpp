@@ -103,6 +103,15 @@ IbrResult run_iterative_batch_rounding(const CaseData& data, const IbrOptions& o
         return output;
     }
 
+    if (options.source_status_only) {
+        output.commitment = prior;
+        output.selected_state = output.base.state;
+        output.success = true;
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
     AcModel relaxation(data, ModelMode::UnitCommitmentRelaxation);
     relaxation.initialize_from(output.base.state);
     IbrRound initial;

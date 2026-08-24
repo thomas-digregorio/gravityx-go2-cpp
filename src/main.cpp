@@ -1,6 +1,7 @@
 #include "gravityx/ac_model.hpp"
 #include "gravityx/algorithm.hpp"
 #include "gravityx/case_data.hpp"
+#include "gravityx/fast_power_flow.hpp"
 #include "gravityx/state_io.hpp"
 #include "gravityx/validation.hpp"
 
@@ -247,6 +248,19 @@ int run_parallel_circuit_regression() {
         validation.max_residual > 1e-5) {
         throw std::runtime_error("parallel-circuit symbolic-DAG regression failed");
     }
+    gravityx::Contingency branch_contingency;
+    branch_contingency.label = "parallel-outage";
+    branch_contingency.type = gravityx::ContingencyType::Branch;
+    branch_contingency.source_index = 1;
+    branch_contingency.component = 0;
+    gravityx::FastContingencyPowerFlow fast_screen(
+        data, solve.state, {1});
+    const auto fast_result = fast_screen.solve(branch_contingency);
+    if (!fast_result.feasible || fast_result.validation.max_residual > 1e-5) {
+        throw std::runtime_error(
+            "validated fast power-flow contingency regression failed: "
+            + fast_result.failure_reason);
+    }
     auto nonfinite_state = solve.state;
     nonfinite_state.vm[0] = std::numeric_limits<double>::quiet_NaN();
     bool nonfinite_rejected = false;
@@ -378,12 +392,17 @@ int run_ibr(const std::string& path, int print_level) {
     return result.success ? 0 : 1;
 }
 
-int run_ibr_json(const std::string& path, const std::string& output_path, int print_level) {
+int run_ibr_json(
+    const std::string& path,
+    const std::string& output_path,
+    int print_level,
+    bool source_status_only = false) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto data = gravityx::CaseData::load(path);
     gravityx::IbrOptions options;
     options.print_level = print_level;
+    options.source_status_only = source_status_only;
     const auto result = gravityx::run_iterative_batch_rounding(data, options);
     const auto json = result.to_json(true);
     write_json_file(output_path, json);
@@ -423,7 +442,8 @@ bool solve_loaded_contingency(
     const std::string& output_path,
     int print_level,
     std::unique_ptr<gravityx::AcModel>* reusable_model = nullptr,
-    bool acceptable_termination = false) {
+    bool acceptable_termination = false,
+    gravityx::FastContingencyPowerFlow* fast_power_flow = nullptr) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -437,6 +457,48 @@ bool solve_loaded_contingency(
         context.outaged_generator = match->component;
     } else {
         context.outaged_branch = match->component;
+    }
+
+    std::optional<gravityx::FastPowerFlowResult> fast_result;
+    if (fast_power_flow) {
+        fast_result = fast_power_flow->solve(*match);
+        if (fast_result->feasible) {
+            const nlohmann::json output = {
+                {"success", true},
+                {"solver_status_success", true},
+                {"accepted_feasible_nonconverged", false},
+                {"label", match->label},
+                {"type", match->type == gravityx::ContingencyType::Generator ? "gen" : "branch"},
+                {"source_index", match->source_index},
+                {"component_position", match->component},
+                {"solution_method", "fast_newton_power_flow"},
+                {"fast_power_flow_screen", true},
+                {"fast_screen", fast_result->to_json()},
+                {"resident_parametric_model", false},
+                {"acceptable_termination_enabled", false},
+                {"resident_model_created", false},
+                {"model_preparation_wall_seconds", 0.0},
+                {"solve", gravityx::solve_result_to_json(fast_result->solve, true)},
+                {"validation", fast_result->validation.to_json()},
+            };
+            write_json_file(output_path, output);
+            std::cout << nlohmann::json({
+                {"output", output_path},
+                {"success", true},
+                {"solver_status_success", true},
+                {"accepted_feasible_nonconverged", false},
+                {"label", match->label},
+                {"status", 0},
+                {"objective", fast_result->solve.objective},
+                {"wall_seconds", fast_result->wall_seconds},
+                {"iterations", fast_result->newton_iterations},
+                {"resident_reoptimization", false},
+                {"model_preparation_wall_seconds", 0.0},
+                {"max_residual", fast_result->validation.max_residual},
+                {"solution_method", "fast_newton_power_flow"},
+            }).dump(2) << '\n';
+            return true;
+        }
     }
 
     const auto preparation_start = std::chrono::steady_clock::now();
@@ -477,6 +539,9 @@ bool solve_loaded_contingency(
         {"type", match->type == gravityx::ContingencyType::Generator ? "gen" : "branch"},
         {"source_index", match->source_index},
         {"component_position", match->component},
+        {"solution_method", "ipopt_corrective_fallback"},
+        {"fast_power_flow_screen", fast_power_flow != nullptr},
+        {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
         {"resident_parametric_model", reusable_model != nullptr},
         {"acceptable_termination_enabled", acceptable_termination},
         {"resident_model_created", resident_model_created},
@@ -514,6 +579,49 @@ int solve_contingency(
     const auto base = load_base_point(base_result_path);
     return solve_loaded_contingency(
         data, base, label, output_path, print_level) ? 0 : 1;
+}
+
+int screen_all_contingencies(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto base = load_base_point(base_result_path);
+    gravityx::FastContingencyPowerFlow screen(
+        data, base.state, base.commitment);
+    nlohmann::json records = nlohmann::json::array();
+    int feasible_count = 0;
+    const auto started = std::chrono::steady_clock::now();
+    for (const auto& contingency : data.contingencies) {
+        const auto result = screen.solve(contingency);
+        auto record = result.to_json();
+        record["label"] = contingency.label;
+        record["type"] = contingency.type == gravityx::ContingencyType::Generator
+            ? "gen" : "branch";
+        record["source_index"] = contingency.source_index;
+        records.push_back(std::move(record));
+        feasible_count += result.feasible ? 1 : 0;
+    }
+    const double wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    write_json_file(output_path, {
+        {"contingency_count", data.contingencies.size()},
+        {"feasible_count", feasible_count},
+        {"fallback_count", static_cast<int>(data.contingencies.size()) - feasible_count},
+        {"wall_seconds", wall_seconds},
+        {"records", records},
+    });
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"contingency_count", data.contingencies.size()},
+        {"feasible_count", feasible_count},
+        {"fallback_count", static_cast<int>(data.contingencies.size()) - feasible_count},
+        {"wall_seconds", wall_seconds},
+    }).dump(2) << '\n';
+    return 0;
 }
 
 int solve_contingency_batch(
@@ -554,12 +662,18 @@ int run_contingency_worker(
     const std::string& base_result_path,
     int print_level,
     bool reusable_model,
-    bool acceptable_termination) {
+    bool acceptable_termination,
+    bool fast_power_flow_screen) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     const auto data = gravityx::CaseData::load(case_path);
     const auto base = load_base_point(base_result_path);
     std::unique_ptr<gravityx::AcModel> resident_model;
+    std::unique_ptr<gravityx::FastContingencyPowerFlow> fast_power_flow;
+    if (fast_power_flow_screen) {
+        fast_power_flow = std::make_unique<gravityx::FastContingencyPowerFlow>(
+            data, base.state, base.commitment);
+    }
     std::cout << "GRAVITYX_WORKER_READY" << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -575,7 +689,7 @@ int run_contingency_worker(
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
             reusable_model ? &resident_model : nullptr,
-            acceptable_termination);
+            acceptable_termination, fast_power_flow.get());
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
@@ -612,30 +726,47 @@ int main(int argc, char** argv) {
             const int print_level = argc == 4 ? std::stoi(argv[3]) : 0;
             return run_ibr(argv[2], print_level);
         }
-        if ((argc == 4 || argc == 5) && std::string(argv[1]) == "run-ibr-json") {
+        if ((argc >= 4 && argc <= 6) && std::string(argv[1]) == "run-ibr-json") {
             const int print_level = argc == 5 ? std::stoi(argv[4]) : 0;
-            return run_ibr_json(argv[2], argv[3], print_level);
+            bool source_status_only = false;
+            for (int i = 4; i < argc; ++i) {
+                const std::string option = argv[i];
+                if (option == "source-only") {
+                    source_status_only = true;
+                } else if (i == 4) {
+                    continue;
+                } else {
+                    throw std::runtime_error("unknown run-ibr-json option: " + option);
+                }
+            }
+            return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
             return solve_contingency(argv[2], argv[3], argv[4], argv[5], print_level);
+        }
+        if (argc == 5 && std::string(argv[1]) == "screen-all-contingencies") {
+            return screen_all_contingencies(argv[2], argv[3], argv[4]);
         }
         if ((argc == 5 || argc == 6) &&
             std::string(argv[1]) == "solve-contingency-batch") {
             const int print_level = argc == 6 ? std::stoi(argv[5]) : 0;
             return solve_contingency_batch(argv[2], argv[3], argv[4], print_level);
         }
-        if ((argc >= 4 && argc <= 7) &&
+        if ((argc >= 4 && argc <= 8) &&
             std::string(argv[1]) == "contingency-worker") {
             const int print_level = argc >= 5 ? std::stoi(argv[4]) : 0;
             bool reusable_model = false;
             bool acceptable_termination = false;
+            bool fast_power_flow_screen = false;
             for (int i = 5; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "resident") {
                     reusable_model = true;
                 } else if (option == "acceptable") {
                     acceptable_termination = true;
+                } else if (option == "fast-pf") {
+                    fast_power_flow_screen = true;
                 } else {
                     throw std::runtime_error(
                         "unknown contingency-worker option: " + option);
@@ -647,7 +778,7 @@ int main(int argc, char** argv) {
             }
             return run_contingency_worker(
                 argv[2], argv[3], print_level, reusable_model,
-                acceptable_termination);
+                acceptable_termination, fast_power_flow_screen);
         }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"
@@ -659,6 +790,7 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 run-ibr CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
+                  << "  gravityx_go2 screen-all-contingencies CASE.json BASE.json OUTPUT.json\n"
                   << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"
                   << "  gravityx_go2 contingency-worker CASE.json BASE.json [print-level] [resident] [acceptable]\n";
         return 2;

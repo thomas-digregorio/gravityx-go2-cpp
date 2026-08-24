@@ -172,6 +172,7 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
     nlohmann::json value = {
         {"success", success},
         {"wall_seconds", wall_seconds},
+        {"projected_balance_slack", projected_balance_slack},
         {"model_status", model_status},
         {"status", status},
         {"iterations", iterations},
@@ -188,7 +189,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const AcState& reference,
     const std::vector<int>& commitment,
     double balance_slack_limit,
-    const std::optional<ContingencyContext>& contingency) {
+    const std::optional<ContingencyContext>& contingency,
+    bool project_balance_slack) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -229,6 +231,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         std::string(full_seed_override) != "0";
     const bool lightweight_large_contingency_seed =
         contingency && nb >= 8000 && !force_full_seed;
+    const bool projected_balance_slack =
+        lightweight_large_contingency_seed && project_balance_slack;
 
     const int vm_offset = 0;
     const int va_offset = vm_offset + nb;
@@ -272,12 +276,12 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             lower[va_offset + i] = 0.0;
             upper[va_offset + i] = 0.0;
         }
-        const double seed_balance_slack =
+        const double explicit_slack_upper =
             lightweight_large_contingency_seed ? 0.0 : balance_slack_limit;
-        upper[p_pos_offset + i] = seed_balance_slack;
-        upper[p_neg_offset + i] = seed_balance_slack;
-        upper[q_pos_offset + i] = seed_balance_slack;
-        upper[q_neg_offset + i] = seed_balance_slack;
+        upper[p_pos_offset + i] = explicit_slack_upper;
+        upper[p_neg_offset + i] = explicit_slack_upper;
+        upper[q_pos_offset + i] = explicit_slack_upper;
+        upper[q_neg_offset + i] = explicit_slack_upper;
         if (!lightweight_large_contingency_seed) {
             cost[p_pos_offset + i] = 1e6;
             cost[p_neg_offset + i] = 1e6;
@@ -422,12 +426,23 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         reactive_constant += bs * reference.vm[bus] * reference.vm[bus];
         append(active, vm_offset + bus, 2.0 * gs * reference.vm[bus]);
         append(reactive, vm_offset + bus, -2.0 * bs * reference.vm[bus]);
-        append(active, p_pos_offset + bus, -1.0);
-        append(active, p_neg_offset + bus, 1.0);
-        append(reactive, q_pos_offset + bus, -1.0);
-        append(reactive, q_neg_offset + bus, 1.0);
-        active.lower = active.upper = -active_constant;
-        reactive.lower = reactive.upper = -reactive_constant;
+        if (projected_balance_slack) {
+            // Project the two bounded positive/negative balance-slack columns
+            // onto the balance row.  This has the identical feasible set in
+            // the physical seed variables but removes four active columns per
+            // bus from the large contingency IPM system.
+            active.lower = -active_constant - balance_slack_limit;
+            active.upper = -active_constant + balance_slack_limit;
+            reactive.lower = -reactive_constant - balance_slack_limit;
+            reactive.upper = -reactive_constant + balance_slack_limit;
+        } else {
+            append(active, p_pos_offset + bus, -1.0);
+            append(active, p_neg_offset + bus, 1.0);
+            append(reactive, q_pos_offset + bus, -1.0);
+            append(reactive, q_neg_offset + bus, 1.0);
+            active.lower = active.upper = -active_constant;
+            reactive.lower = reactive.upper = -reactive_constant;
+        }
         normalize(active);
         normalize(reactive);
         rows.push_back(std::move(active));
@@ -601,6 +616,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const auto& info = highs.getInfo();
 
     LinearizedAcSeedResult output;
+    output.projected_balance_slack = projected_balance_slack;
     output.model_status = static_cast<int>(model_status);
     output.status = highs.modelStatusToString(model_status);
     output.iterations = static_cast<int>(

@@ -907,14 +907,26 @@ bool solve_loaded_contingency(
         int last_model_status = -1;
         constexpr int kMaximumLinearizedRounds = 3;
         for (int round = 1; round <= kMaximumLinearizedRounds; ++round) {
-            const auto linear = gravityx::solve_linearized_ac_seed(
+            auto linear = gravityx::solve_linearized_ac_seed(
                 data, reference, base.commitment, 0.49, context);
             linearized_wall_seconds += linear.wall_seconds;
             linearized_iterations += std::max(0, linear.iterations);
-            last_status = linear.status;
-            last_model_status = linear.model_status;
             auto attempt = linear.to_json(false);
             attempt["round"] = round;
+            if (!linear.success && round == 1 && data.buses.size() >= 8000 &&
+                linear.status == "Infeasible") {
+                attempt["projected_balance_retry_scheduled"] = true;
+                linearized_attempts.push_back(std::move(attempt));
+                linear = gravityx::solve_linearized_ac_seed(
+                    data, reference, base.commitment, 0.49, context, true);
+                linearized_wall_seconds += linear.wall_seconds;
+                linearized_iterations += std::max(0, linear.iterations);
+                attempt = linear.to_json(false);
+                attempt["round"] = round;
+                attempt["projected_balance_retry"] = true;
+            }
+            last_status = linear.status;
+            last_model_status = linear.model_status;
             if (!linear.success) {
                 attempt["validation"] = nullptr;
                 linearized_attempts.push_back(std::move(attempt));

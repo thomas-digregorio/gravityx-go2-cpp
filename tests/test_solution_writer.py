@@ -21,6 +21,7 @@ from run_experiment import (  # noqa: E402
     effective_process_timeout,
     longest_first_contingencies,
     streamed_queue_get,
+    validate_and_normalize_evaluation_details,
     write_json,
     write_solution,
 )
@@ -101,6 +102,59 @@ class SolutionWriterTests(unittest.TestCase):
 
 
 class CompetitionTimingTests(unittest.TestCase):
+    def test_parallel_evaluation_requires_and_normalizes_every_detail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            internal = output / "internal"
+            details = {
+                "BASECASE": {"obj": {"val": 10.0}, "infeas": {"val": False}},
+                "CTG_A": {"obj": {"val": 4.0}, "infeas": {"val": False}},
+                "CTG_B": {"obj": {"val": 8.0}, "infeas": {"val": False}},
+            }
+            for label, detail in details.items():
+                write_json(output / f"eval_detail_{label}.json", detail)
+            write_json(
+                output / "eval_summary.json",
+                {
+                    "num_ctg": 2,
+                    "obj": 16.0,
+                    "infeas": 0.0,
+                    "obj_cumulative": 99.0,
+                    "obj_all_cases": {"BASECASE": 8.0},
+                    "infeas_cumulative": 0.0,
+                    "infeas_all_cases": {"BASECASE": 0},
+                },
+            )
+            summary = json.loads((output / "eval_summary.json").read_text())
+            normalized, certificate = validate_and_normalize_evaluation_details(
+                output, internal, {"CTG_A", "CTG_B"}, summary, 3
+            )
+
+            self.assertEqual(normalized["obj_cumulative"], 16.0)
+            self.assertEqual(
+                normalized["obj_all_cases"],
+                {"BASECASE": 10.0, "CTG_A": 4.0, "CTG_B": 8.0},
+            )
+            self.assertEqual(len(normalized["infeas_all_cases"]), 3)
+            self.assertTrue(certificate["complete_label_set"])
+            self.assertTrue((internal / "eval_summary.vendor_mpi.json").exists())
+
+    def test_parallel_evaluation_rejects_missing_detail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            write_json(
+                output / "eval_detail_BASECASE.json",
+                {"obj": {"val": 10.0}, "infeas": {"val": False}},
+            )
+            with self.assertRaisesRegex(RuntimeError, "detail-set mismatch"):
+                validate_and_normalize_evaluation_details(
+                    output,
+                    output / "internal",
+                    {"CTG_A"},
+                    {"num_ctg": 1, "obj": 10.0, "infeas": 0.0},
+                    2,
+                )
+
     def test_profiled_schedule_prioritizes_measured_fallbacks(self):
         contingencies = [
             {"label": "A", "schedule_rank": 1},

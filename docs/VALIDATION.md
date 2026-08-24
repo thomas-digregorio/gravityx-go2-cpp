@@ -25,6 +25,10 @@ identical parallel circuits.  This guards the branch-specific symbolic tags
 needed by the pinned Gravity revision to prevent collisions between otherwise
 identical nonlinear DAG nodes.  Every tag is a fixed parameter with value one,
 so it changes symbolic identity but not the equation value or derivative.
+The same fixture exercises the large-case lightweight linearized seed and
+checks that its voltage and angle variables remain inside the requested trust
+region.  Rows are omitted only when their affine range over that box proves
+them redundant; nonlinear acceptance still uses the complete checker.
 
 ## Tiny semantic oracle
 
@@ -87,3 +91,14 @@ evaluator confirms every submitted case is feasible.  The five-scenario
 reproduction additionally enforces a stricter 300-second end-to-end limit from
 normalized-case loading through official evaluation and result serialization,
 with seven seconds reserved for evaluation and one second for finalization.
+
+For the 8,300-bus path, `--evaluation-processes` invokes the unchanged case
+evaluation through Microsoft MPI.  The vendor MPI implementation writes the
+correct per-case detail files and recomputes the top-level objective and
+infeasibility from them, but its serial-only `obj_cumulative`,
+`infeas_cumulative`, `obj_all_cases`, and `infeas_all_cases` accumulators are
+stale.  The runner therefore refuses pre-existing evaluator artifacts, requires
+exactly one detail for the base case and every source contingency, checks every
+detail's objective and infeasibility, verifies the aggregate arithmetic, archives the
+raw MPI summary, and reconstructs those bookkeeping fields.  A missing,
+extra, malformed, non-finite, or infeasible detail fails the run.

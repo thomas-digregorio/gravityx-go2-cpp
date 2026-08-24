@@ -190,7 +190,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const std::vector<int>& commitment,
     double balance_slack_limit,
     const std::optional<ContingencyContext>& contingency,
-    bool project_balance_slack) {
+    bool project_balance_slack,
+    bool request_lightweight_large_seed) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -229,10 +230,11 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const char* full_seed_override = std::getenv("GRAVITYX_FULL_LINEAR_SEED");
     const bool force_full_seed = full_seed_override != nullptr &&
         std::string(full_seed_override) != "0";
-    const bool lightweight_large_contingency_seed =
-        contingency && nb >= 8000 && !force_full_seed;
+    const bool lightweight_large_seed = !force_full_seed &&
+        ((contingency.has_value() && nb >= 8000) ||
+         request_lightweight_large_seed);
     const bool projected_balance_slack =
-        lightweight_large_contingency_seed && project_balance_slack;
+        lightweight_large_seed && project_balance_slack;
 
     const int vm_offset = 0;
     const int va_offset = vm_offset + nb;
@@ -252,22 +254,22 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     std::vector<double> upper(column_count, kHighsInf);
     std::vector<double> cost(column_count, 0.0);
     for (int i = 0; i < nb; ++i) {
-        lower[vm_offset + i] = lightweight_large_contingency_seed
+        lower[vm_offset + i] = lightweight_large_seed
             ? std::max(
                 data.buses[i].vmin,
                 reference.vm[i] - 0.05)
             : data.buses[i].vmin;
-        upper[vm_offset + i] = lightweight_large_contingency_seed
+        upper[vm_offset + i] = lightweight_large_seed
             ? std::min(
                 data.buses[i].vmax,
                 reference.vm[i] + 0.05)
             : data.buses[i].vmax;
-        lower[va_offset + i] = lightweight_large_contingency_seed
+        lower[va_offset + i] = lightweight_large_seed
             ? std::max(
                 -10.0,
                 reference.va[i] - 0.15)
             : -10.0;
-        upper[va_offset + i] = lightweight_large_contingency_seed
+        upper[va_offset + i] = lightweight_large_seed
             ? std::min(
                 10.0,
                 reference.va[i] + 0.15)
@@ -277,12 +279,12 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             upper[va_offset + i] = 0.0;
         }
         const double explicit_slack_upper =
-            lightweight_large_contingency_seed ? 0.0 : balance_slack_limit;
+            lightweight_large_seed ? 0.0 : balance_slack_limit;
         upper[p_pos_offset + i] = explicit_slack_upper;
         upper[p_neg_offset + i] = explicit_slack_upper;
         upper[q_pos_offset + i] = explicit_slack_upper;
         upper[q_neg_offset + i] = explicit_slack_upper;
-        if (!lightweight_large_contingency_seed) {
+        if (!lightweight_large_seed) {
             cost[p_pos_offset + i] = 1e6;
             cost[p_neg_offset + i] = 1e6;
             cost[q_pos_offset + i] = 1e6;
@@ -480,7 +482,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             &linearized[i].pf, &linearized[i].qf,
             &linearized[i].pt, &linearized[i].qt};
         for (const auto* flow : flows) {
-            if (lightweight_large_contingency_seed) {
+            if (lightweight_large_seed) {
                 const auto [minimum, maximum] = affine_range(*flow, branch);
                 if (minimum >= -rating && maximum <= rating) {
                     continue;
@@ -506,7 +508,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         const double angle_maximum =
             upper[va_offset + branch.from] - lower[va_offset + branch.to];
         const bool angle_row_is_redundant =
-            lightweight_large_contingency_seed &&
+            lightweight_large_seed &&
             angle_minimum >= branch.angmin && angle_maximum <= branch.angmax;
         if (source_delta >= branch.angmin && source_delta <= branch.angmax &&
             !angle_row_is_redundant) {

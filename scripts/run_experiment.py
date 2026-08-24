@@ -9,6 +9,7 @@ format, records provenance, and invokes the official evaluator.
 from __future__ import annotations
 
 import argparse
+import csv
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -128,6 +130,135 @@ def write_json(path: Path, value: Any) -> None:
             if attempt == len(delays) - 1:
                 raise
             time.sleep(delay)
+
+
+def validate_and_normalize_evaluation_details(
+    output_dir: Path,
+    internal_dir: Path,
+    expected_contingency_labels: set[str],
+    summary: dict[str, Any],
+    parallel_processes: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require exhaustive official details and repair stale MPI bookkeeping."""
+    expected_labels = {"BASECASE", *expected_contingency_labels}
+    detail_paths = {
+        path.stem.removeprefix("eval_detail_"): path
+        for path in output_dir.glob("eval_detail_*.json")
+    }
+    actual_labels = set(detail_paths)
+    missing = sorted(expected_labels - actual_labels)
+    extra = sorted(actual_labels - expected_labels)
+    if missing or extra:
+        raise RuntimeError(
+            "official evaluator detail-set mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    objectives: dict[str, float] = {}
+    infeasibilities: dict[str, bool] = {}
+    for label in sorted(expected_labels):
+        detail = read_json(detail_paths[label])
+        try:
+            objective = float(detail["obj"]["val"])
+            infeasible = bool(detail["infeas"]["val"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid official evaluator detail for {label}"
+            ) from error
+        if not math.isfinite(objective):
+            raise RuntimeError(
+                f"non-finite official objective for {label}: {objective}"
+            )
+        objectives[label] = objective
+        infeasibilities[label] = infeasible
+
+    contingency_count = len(expected_contingency_labels)
+    if int(summary.get("num_ctg", -1)) != contingency_count:
+        raise RuntimeError(
+            "official evaluator contingency count mismatch: "
+            f"summary={summary.get('num_ctg')}, expected={contingency_count}"
+        )
+    expected_objective = objectives["BASECASE"]
+    if contingency_count:
+        expected_objective += math.fsum(
+            objectives[label] for label in sorted(expected_contingency_labels)
+        ) / contingency_count
+    serial_cumulative_objective = objectives["BASECASE"]
+    for label in sorted(expected_contingency_labels):
+        serial_cumulative_objective += objectives[label] / contingency_count
+    reported_objective = float(summary.get("obj", math.nan))
+    if not math.isclose(
+        reported_objective,
+        expected_objective,
+        rel_tol=1e-12,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError(
+            "official evaluator objective disagrees with its detail files: "
+            f"summary={reported_objective}, details={expected_objective}"
+        )
+
+    infeasible_labels = sorted(
+        label for label, infeasible in infeasibilities.items() if infeasible
+    )
+    expected_infeasibility = float(len(infeasible_labels))
+    reported_infeasibility = float(summary.get("infeas", math.nan))
+    if reported_infeasibility != expected_infeasibility:
+        raise RuntimeError(
+            "official evaluator infeasibility disagrees with its detail files: "
+            f"summary={reported_infeasibility}, details={expected_infeasibility}"
+        )
+
+    normalized = dict(summary)
+    repaired_fields: list[str] = []
+    if parallel_processes > 1:
+        internal_dir.mkdir(parents=True, exist_ok=True)
+        write_json(internal_dir / "eval_summary.vendor_mpi.json", summary)
+        vendor_csv = output_dir / "eval_summary.csv"
+        if vendor_csv.exists():
+            shutil.copy2(vendor_csv, internal_dir / "eval_summary.vendor_mpi.csv")
+
+        normalized["obj_cumulative"] = serial_cumulative_objective
+        normalized["obj_all_cases"] = {
+            label: objectives[label] for label in sorted(expected_labels)
+        }
+        normalized["infeas_cumulative"] = expected_infeasibility
+        normalized["infeas_all_cases"] = {
+            label: infeasibilities[label] for label in sorted(expected_labels)
+        }
+        repaired_fields = [
+            "obj_cumulative",
+            "obj_all_cases",
+            "infeas_cumulative",
+            "infeas_all_cases",
+        ]
+        write_json(output_dir / "eval_summary.json", normalized)
+
+        if vendor_csv.exists():
+            with vendor_csv.open("r", encoding="utf-8", newline="") as stream:
+                rows = list(csv.reader(stream))
+            for row in rows:
+                if row and row[0] in repaired_fields:
+                    row[1:] = [str(normalized[row[0]])]
+            with vendor_csv.open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows(rows)
+
+    certificate = {
+        "schema_version": 1,
+        "parallel_processes": parallel_processes,
+        "expected_contingency_count": contingency_count,
+        "expected_detail_count": contingency_count + 1,
+        "observed_detail_count": len(detail_paths),
+        "complete_label_set": True,
+        "objective_from_details": expected_objective,
+        "serial_cumulative_objective_from_details": serial_cumulative_objective,
+        "reported_objective": reported_objective,
+        "infeasible_labels": infeasible_labels,
+        "reported_infeasibility": reported_infeasibility,
+        "repaired_vendor_mpi_bookkeeping_fields": repaired_fields,
+    }
+    write_json(internal_dir / "official_evaluation_certificate.json", certificate)
+    return normalized, certificate
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:
@@ -462,12 +593,15 @@ def main() -> int:
     parser.add_argument("--evaluation-reserve", type=float, default=7.0)
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
+    parser.add_argument("--evaluation-processes", type=int, default=1)
+    parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
+    parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
     parser.add_argument("--linearized-contingency-fallback", action="store_true")
     parser.add_argument("--linearized-contingency-only", action="store_true")
@@ -482,6 +616,10 @@ def main() -> int:
     if args.two_stage_contingency_screen and not args.fast_power_flow_screen:
         parser.error(
             "--two-stage-contingency-screen requires --fast-power-flow-screen"
+        )
+    if args.robust_contingency_base and not args.validated_source_base:
+        parser.error(
+            "--robust-contingency-base requires --validated-source-base"
         )
     if (args.linearized_contingency_only and
             not args.linearized_contingency_fallback):
@@ -504,6 +642,12 @@ def main() -> int:
         raise ValueError("workers must be positive")
     if args.fast_workers < 1:
         raise ValueError("fast workers must be positive")
+    if args.evaluation_processes < 1:
+        raise ValueError("evaluation processes must be positive")
+    if args.evaluation_processes > 1 and args.mpiexec is None:
+        parser.error("--evaluation-processes greater than one requires --mpiexec")
+    if args.mpiexec is not None:
+        reject_onedrive(args.mpiexec)
     if args.code1_time_limit <= 0:
         raise ValueError("Code1 time limit must be positive")
     if args.total_time_limit <= 0:
@@ -567,12 +711,14 @@ def main() -> int:
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
+        "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "streaming_fallback_overlap": False,
         "linearized_contingency_fallback": args.linearized_contingency_fallback,
         "linearized_contingency_only": args.linearized_contingency_only,
         "longest_first_schedule": args.longest_first_schedule,
         "fallback_schedule_profile": fallback_schedule_metadata,
+        "evaluation_processes": args.evaluation_processes,
     }
 
     def checkpoint() -> None:
@@ -597,6 +743,8 @@ def main() -> int:
                 to_wsl(base_json),
                 "fast-only",
             ]
+            if args.robust_contingency_base:
+                base_arguments.append("robust-contingency-seed")
         else:
             base_arguments = [
                 "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
@@ -1263,23 +1411,52 @@ def main() -> int:
 
     evaluation_wall = 0.0
     evaluation_summary: dict[str, Any] | None = None
+    evaluation_certificate: dict[str, Any] | None = None
     if not args.skip_evaluation:
         for path in (args.python, args.evaluator):
             reject_onedrive(path)
+        if args.mpiexec is not None:
+            reject_onedrive(args.mpiexec)
+        stale_evaluation_outputs = [
+            path
+            for pattern in (
+                "eval_detail_*.json",
+                "eval_summary.json",
+                "eval_summary.csv",
+                "eval_detail.json",
+                "eval_detail.csv",
+                "sol_change_*.csv",
+                "sol_change.csv",
+            )
+            for path in args.output_dir.glob(pattern)
+        ]
+        if stale_evaluation_outputs:
+            raise RuntimeError(
+                "refusing stale official-evaluation artifacts: "
+                + ", ".join(sorted(path.name for path in stale_evaluation_outputs))
+            )
         evaluation_start = time.perf_counter()
         evaluator_timeout = effective_process_timeout(
             args.total_time_limit,
             evaluation_deadline,
         )
+        evaluator_command = [
+            str(args.python),
+            str(args.evaluator),
+            "1",
+            str(args.case_dir),
+            str(args.output_dir),
+        ]
+        if args.evaluation_processes > 1:
+            evaluator_command = [
+                str(args.mpiexec),
+                "-np",
+                str(args.evaluation_processes),
+                *evaluator_command,
+            ]
         try:
             completed = subprocess.run(
-                [
-                    str(args.python),
-                    str(args.evaluator),
-                    "1",
-                    str(args.case_dir),
-                    str(args.output_dir),
-                ],
+                evaluator_command,
                 check=False,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -1319,6 +1496,32 @@ def main() -> int:
             checkpoint()
             raise RuntimeError("official evaluator failed; see internal/evaluation.console.log")
         evaluation_summary = read_json(args.output_dir / "eval_summary.json")
+        evaluation_summary, evaluation_certificate = (
+            validate_and_normalize_evaluation_details(
+                args.output_dir,
+                internal,
+                {str(item["label"]) for item in contingencies},
+                evaluation_summary,
+                args.evaluation_processes,
+            )
+        )
+        evaluation_certificate.update(
+            {
+                "evaluator_path": str(args.evaluator.resolve()),
+                "evaluator_sha256": sha256(args.evaluator),
+                "python_path": str(args.python.resolve()),
+                "mpiexec_path": (
+                    str(args.mpiexec.resolve()) if args.mpiexec is not None else None
+                ),
+                "mpiexec_sha256": (
+                    sha256(args.mpiexec) if args.mpiexec is not None else None
+                ),
+            }
+        )
+        write_json(
+            internal / "official_evaluation_certificate.json",
+            evaluation_certificate,
+        )
         infeasible_cases = [
             label
             for label, infeasible in evaluation_summary.get("infeas_all_cases", {}).items()
@@ -1389,6 +1592,7 @@ def main() -> int:
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
+        "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "linearized_contingency_fallback": args.linearized_contingency_fallback,
         "linearized_contingency_only": args.linearized_contingency_only,
@@ -1450,6 +1654,8 @@ def main() -> int:
             max(0, int(item["solver_iterations"])) for item in records
         ),
         "evaluation_wall_seconds": evaluation_wall,
+        "evaluation_processes": args.evaluation_processes,
+        "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),
         "accepted_feasible_nonconverged_count": sum(

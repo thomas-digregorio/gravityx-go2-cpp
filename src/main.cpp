@@ -268,6 +268,22 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "linearized AC seed regression failed: " + linear_seed.status);
     }
+    const auto lightweight_seed = gravityx::solve_linearized_ac_seed(
+        data, source_base.solve.state, {1}, 0.49, std::nullopt, false, true);
+    if (!lightweight_seed.success) {
+        throw std::runtime_error(
+            "lightweight linearized AC seed regression failed: " +
+            lightweight_seed.status);
+    }
+    for (int i = 0; i < static_cast<int>(data.buses.size()); ++i) {
+        if (std::abs(lightweight_seed.state.vm[i] - source_base.solve.state.vm[i]) >
+                0.05 + 1e-9 ||
+            std::abs(lightweight_seed.state.va[i] - source_base.solve.state.va[i]) >
+                0.15 + 1e-9) {
+            throw std::runtime_error(
+                "lightweight linearized AC seed left its trust region");
+        }
+    }
 
     gravityx::AcModel model(data, gravityx::ModelMode::BaseSoft, {1});
     const auto solve = model.solve(0, 1e-7);
@@ -501,7 +517,8 @@ int run_ibr_json(
 int run_validated_source_base_json(
     const std::string& path,
     const std::string& output_path,
-    bool allow_exact_fallback = true) {
+    bool allow_exact_fallback = true,
+    bool allow_large_base_newton_restart = true) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto data = gravityx::CaseData::load(path);
@@ -675,10 +692,16 @@ int run_validated_source_base_json(
         auto linear_reference = selected_solve.state;
         double linear_reference_residual = selected_validation.max_residual;
         for (int round = 1; round <= 4; ++round) {
+            const bool lightweight_large_base_seed =
+                data.buses.size() >= 8000 && round >= 2 &&
+                !allow_large_base_newton_restart;
             const auto linear = gravityx::solve_linearized_ac_seed(
-                data, linear_reference, commitment);
+                data, linear_reference, commitment, 0.49, std::nullopt,
+                false, lightweight_large_base_seed);
             auto round_json = linear.to_json(false);
             round_json["round"] = round;
+            round_json["lightweight_large_base_seed"] =
+                lightweight_large_base_seed;
             wall_seconds += linear.wall_seconds;
             if (!linear.success) {
                 round_json["nonlinear_repair"] = nullptr;
@@ -728,6 +751,7 @@ int run_validated_source_base_json(
             // second 45-second LP.  Keep at most two strictly improving
             // restarts; none is accepted without the same full validator.
             for (int restart = 1;
+                 allow_large_base_newton_restart &&
                  data.buses.size() >= 8000 && restart <= 2 &&
                  !nonlinear.feasible &&
                  nonlinear.validation.max_residual <= 0.25;
@@ -1480,12 +1504,24 @@ int main(int argc, char** argv) {
             }
             return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
-        if ((argc == 4 || argc == 5) &&
+        if ((argc >= 4 && argc <= 6) &&
             std::string(argv[1]) == "validated-source-base-json") {
-            const bool allow_exact_fallback = argc == 4 ||
-                std::string(argv[4]) != "fast-only";
+            bool allow_exact_fallback = true;
+            bool allow_large_base_newton_restart = true;
+            for (int i = 4; i < argc; ++i) {
+                const std::string option = argv[i];
+                if (option == "fast-only") {
+                    allow_exact_fallback = false;
+                } else if (option == "robust-contingency-seed") {
+                    allow_large_base_newton_restart = false;
+                } else {
+                    throw std::runtime_error(
+                        "unknown validated-source-base-json option: " + option);
+                }
+            }
             return run_validated_source_base_json(
-                argv[2], argv[3], allow_exact_fallback);
+                argv[2], argv[3], allow_exact_fallback,
+                allow_large_base_newton_restart);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
@@ -1546,7 +1582,7 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 solve-relax CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
-                  << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only]\n"
+                  << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only] [robust-contingency-seed]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 screen-all-contingencies CASE.json BASE.json OUTPUT.json\n"
                   << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"

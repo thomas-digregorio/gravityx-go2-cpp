@@ -1,4 +1,5 @@
 .deps/
+.eval-mpi-env/
 .build*/
 .data/
 .toolchain/

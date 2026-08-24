@@ -18,7 +18,8 @@ with every reproduction-specific choice recorded in the run manifest.
 
 - Initial reproduction target: GO Challenge 2 Final `C2FEN00617`, scenario
   `005`; validated scale suites now include the public Final 617-, 2,020-, and
-  4,200-bus scenario families.
+  4,200-bus scenario families; the 8,300-bus family is the current scale
+  target.
 - Input normalization: the pinned official PowerModelsSecurityConstrained GO2
   parser exports a neutral JSON representation of RAW/JSON/CON data.
 - Optimization: Gravity C++ variables, objectives, and constraints; Ipopt with
@@ -54,6 +55,11 @@ The multi-scenario scale results are recorded in:
   the selected base commitment fixed and source corrective ramp limits.
 - An independent C++ checker validates every physical result, after which the
   official GO Challenge 2 evaluator supplies the reported score.
+- The official evaluator can run through Microsoft MPI.  Because its MPI
+  branch leaves serial accumulator fields stale, the runner requires the exact
+  base-plus-contingency detail-label set, checks every per-case infeasibility,
+  recomputes the aggregate, archives the raw vendor summary, and normalizes
+  only those bookkeeping fields.
 
 Python is used only for process orchestration, official text-file generation,
 and evaluator invocation.  The Julia tool under `tools/` is a development-only

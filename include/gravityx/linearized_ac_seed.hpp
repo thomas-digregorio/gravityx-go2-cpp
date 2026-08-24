@@ -30,6 +30,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const std::vector<int>& commitment,
     double balance_slack_limit = 0.49,
     const std::optional<ContingencyContext>& contingency = std::nullopt,
-    bool project_balance_slack = false);
+    bool project_balance_slack = false,
+    bool request_lightweight_large_seed = false);
 
 }  // namespace gravityx

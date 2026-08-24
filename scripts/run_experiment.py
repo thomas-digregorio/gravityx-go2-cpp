@@ -70,14 +70,29 @@ def streamed_queue_get(
     abort: threading.Event,
     poll_seconds: float = 0.1,
     preferred_queue: queue.Queue[dict[str, Any]] | None = None,
+    steal_queues: list[queue.Queue[dict[str, Any]]] | None = None,
 ) -> dict[str, Any] | None:
-    """Wait for streamed fallback work until screening is complete or aborted."""
+    """Wait for streamed fallback work until screening is complete or aborted.
+
+    Profiled worker assignments are soft affinities. A worker checks its own
+    queue first, then steals already-ready work from other profiled queues
+    before waiting on the shared queue. This prevents inaccurate wall-time
+    profiles from stranding corrective solves behind an idle worker.
+    """
     while not abort.is_set():
         if preferred_queue is not None:
             try:
                 return preferred_queue.get_nowait()
             except queue.Empty:
                 pass
+        if steal_queues is not None:
+            for candidate_queue in steal_queues:
+                if candidate_queue is preferred_queue:
+                    continue
+                try:
+                    return candidate_queue.get_nowait()
+                except queue.Empty:
+                    pass
         try:
             return task_queue.get(timeout=poll_seconds)
         except queue.Empty:
@@ -532,6 +547,7 @@ def load_fallback_schedule_profile(
         "worker_count": worker_count,
         "assignment_count": len(by_label),
         "predicted_worker_load_seconds": predicted_loads,
+        "worker_assignments_are_soft_affinities": True,
         "uses_prior_solution_state": False,
     }
     return by_label, metadata
@@ -718,6 +734,7 @@ def main() -> int:
         "linearized_contingency_only": args.linearized_contingency_only,
         "longest_first_schedule": args.longest_first_schedule,
         "fallback_schedule_profile": fallback_schedule_metadata,
+        "profiled_fallback_work_stealing": bool(fallback_schedule),
         "evaluation_processes": args.evaluation_processes,
     }
 
@@ -819,7 +836,8 @@ def main() -> int:
             contingencies, fallback_schedule
         )
         schedule_mode = (
-            "profiled fallback wall time and worker assignment, then "
+            "profiled fallback wall time and soft worker affinity with "
+            "idle-worker stealing, then "
             + schedule_mode
         )
     run_status.update(
@@ -879,6 +897,10 @@ def main() -> int:
             "profiled_fallback_worker": item.get("profiled_fallback_worker"),
             "profiled_fallback_wall_seconds": item.get(
                 "profiled_fallback_wall_seconds"
+            ),
+            "profiled_fallback_stolen": (
+                item.get("profiled_fallback_worker") is not None
+                and int(item["profiled_fallback_worker"]) != worker_id
             ),
             "execution_phase": execution_phase,
             "solver_wall_seconds": result["solve"]["wall_seconds"],
@@ -1165,6 +1187,7 @@ def main() -> int:
         started = time.perf_counter()
         output_lines: list[str] = []
         assigned_labels: list[str] = []
+        stolen_labels: list[str] = []
         process = subprocess.Popen(
             command,
             text=True,
@@ -1205,11 +1228,22 @@ def main() -> int:
                         profiled_task_queues[worker_id]
                         if fallback_schedule else None
                     ),
+                    steal_queues=(
+                        profiled_task_queues[worker_id + 1 :]
+                        + profiled_task_queues[:worker_id]
+                        if fallback_schedule else None
+                    ),
                 )
                 if item is None:
                     break
                 label = str(item["label"])
                 assigned_labels.append(label)
+                profiled_worker = item.get("profiled_fallback_worker")
+                if (
+                    profiled_worker is not None
+                    and int(profiled_worker) != worker_id
+                ):
+                    stolen_labels.append(label)
                 result_path = internal / "contingencies" / f"{safe_label(label)}.json"
                 task = {
                     "label": label,
@@ -1294,6 +1328,7 @@ def main() -> int:
                 "task_count": len(assigned_labels),
                 "process_wall_seconds": time.perf_counter() - started,
                 "labels": assigned_labels,
+                "profiled_stolen_labels": stolen_labels,
             }
         except Exception:
             abort_contingencies.set()
@@ -1353,6 +1388,9 @@ def main() -> int:
                     "task_count": worker["task_count"],
                     "process_wall_seconds": worker["process_wall_seconds"],
                     "labels": worker["labels"],
+                    "profiled_stolen_labels": worker.get(
+                        "profiled_stolen_labels", []
+                    ),
                 }
             )
             with progress_lock:

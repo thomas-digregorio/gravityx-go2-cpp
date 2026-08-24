@@ -213,6 +213,23 @@ class CompetitionTimingTests(unittest.TestCase):
             "PROFILED",
         )
 
+        preferred = queue.Queue()
+        stealable = queue.Queue()
+        stealable.put({"label": "STOLEN"})
+        shared = queue.Queue()
+        shared.put({"label": "SHARED"})
+        self.assertEqual(
+            streamed_queue_get(
+                shared,
+                screening_finished,
+                abort,
+                poll_seconds=0.005,
+                preferred_queue=preferred,
+                steal_queues=[preferred, stealable],
+            )["label"],
+            "STOLEN",
+        )
+
     def test_longest_first_schedule_uses_base_apparent_power(self):
         case = {
             "gen": {

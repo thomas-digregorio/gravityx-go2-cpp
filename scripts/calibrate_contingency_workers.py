@@ -18,6 +18,7 @@ from run_experiment import (
     CompetitionTimeout,
     contingency_records,
     cpp_command,
+    fast_screen_affinity_groups,
     longest_first_contingencies,
     read_json,
     reject_onedrive,
@@ -37,11 +38,19 @@ def run_trial(
     workers: int,
     timeout_seconds: float,
     fast_power_flow_screen: bool,
+    fast_only: bool = False,
+    task_groups: list[list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
-    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-    for item in records:
-        task_queue.put(item)
+    task_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+    if task_groups is None:
+        task_groups = [[item] for item in records]
+    if [item["label"] for group in task_groups for item in group] != [
+        item["label"] for item in records
+    ]:
+        raise ValueError("task groups must contain every record exactly once in order")
+    for group in task_groups:
+        task_queue.put(group)
     abort = threading.Event()
     deadline = time.perf_counter() + timeout_seconds
     completed: list[dict[str, Any]] = []
@@ -63,6 +72,8 @@ def run_trial(
         ]
         if fast_power_flow_screen:
             worker_arguments.append("fast-pf")
+        if fast_only:
+            worker_arguments.append("fast-only")
         command = cpp_command(
             executable,
             distro,
@@ -103,44 +114,77 @@ def run_trial(
             read_until("GRAVITYX_WORKER_READY")
             while not abort.is_set():
                 try:
-                    item = task_queue.get_nowait()
+                    group = task_queue.get_nowait()
                 except queue.Empty:
                     break
-                label = str(item["label"])
-                labels.append(label)
-                result_path = output_dir / "results" / f"{safe_label(label)}.json"
-                assert process.stdin is not None
-                process.stdin.write(
-                    json.dumps(
-                        {"label": label, "output_path": to_wsl(result_path)},
-                        separators=(",", ":"),
+                for item in group:
+                    label = str(item["label"])
+                    labels.append(label)
+                    result_path = (
+                        output_dir / "results" / f"{safe_label(label)}.json"
                     )
-                    + "\n"
-                )
-                process.stdin.flush()
-                acknowledgement = json.loads(
-                    read_until("GRAVITYX_TASK_RESULT ")
-                )
-                if acknowledgement.get("label") != label:
-                    raise RuntimeError(f"worker {worker_id} acknowledged wrong task")
-                if not acknowledgement.get("success", False):
-                    raise RuntimeError(f"calibration contingency {label} failed")
-                result = read_json(result_path)
+                    assert process.stdin is not None
+                    process.stdin.write(
+                        json.dumps(
+                            {
+                                "label": label,
+                                "output_path": to_wsl(result_path),
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                    process.stdin.flush()
+                    acknowledgement = json.loads(
+                        read_until("GRAVITYX_TASK_RESULT ")
+                    )
+                    if acknowledgement.get("label") != label:
+                        raise RuntimeError(
+                            f"worker {worker_id} acknowledged wrong task"
+                        )
+                    if not acknowledgement.get("success", False):
+                        raise RuntimeError(
+                            f"calibration contingency {label} failed"
+                        )
+                    result = read_json(result_path)
+                    with completed_lock:
+                        completed.append(
+                            {
+                                "label": label,
+                                "worker_id": worker_id,
+                                "solver_wall_seconds": result["solve"][
+                                    "wall_seconds"
+                                ],
+                                "model_preparation_wall_seconds": result[
+                                    "model_preparation_wall_seconds"
+                                ],
+                                "iterations": result["solve"].get(
+                                    "iterations", -1
+                                ),
+                                "max_residual": result["validation"][
+                                    "max_residual"
+                                ],
+                                "solution_method": result.get(
+                                    "solution_method"
+                                ),
+                                "secure": bool(result.get("success", False)),
+                                "screen_completed": bool(
+                                    result.get("screen_completed", False)
+                                ),
+                                "requires_exact_fallback": bool(
+                                    result.get("requires_exact_fallback", False)
+                                ),
+                                "rolling_corrective_seed_label": result.get(
+                                    "rolling_corrective_seed_label"
+                                ),
+                                "corrective_seed_bank_size": int(
+                                    acknowledgement.get(
+                                        "corrective_seed_bank_size", 0
+                                    )
+                                ),
+                            }
+                        )
                 task_queue.task_done()
-                with completed_lock:
-                    completed.append(
-                        {
-                            "label": label,
-                            "worker_id": worker_id,
-                            "solver_wall_seconds": result["solve"]["wall_seconds"],
-                            "model_preparation_wall_seconds": result[
-                                "model_preparation_wall_seconds"
-                            ],
-                            "iterations": result["solve"].get("iterations", -1),
-                            "max_residual": result["validation"]["max_residual"],
-                            "solution_method": result.get("solution_method"),
-                        }
-                    )
             if process.poll() is None:
                 assert process.stdin is not None
                 process.stdin.write('{"stop":true}\n')
@@ -198,6 +242,14 @@ def run_trial(
         "max_residual": max(
             (item["max_residual"] for item in completed), default=None
         ),
+        "secure_count": sum(item["secure"] for item in completed),
+        "fallback_count": sum(
+            item["requires_exact_fallback"] for item in completed
+        ),
+        "rolling_seed_selected_count": sum(
+            item["rolling_corrective_seed_label"] is not None
+            for item in completed
+        ),
         "solver_seconds_sum": sum(
             item["solver_wall_seconds"] for item in completed
         ),
@@ -223,6 +275,9 @@ def main() -> int:
     parser.add_argument("--trial-timeout", type=float, default=180.0)
     parser.add_argument("--cooldown", type=float, default=30.0)
     parser.add_argument("--fast-power-flow-screen", action="store_true")
+    parser.add_argument("--fast-only", action="store_true")
+    parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
+    parser.add_argument("--selection-offset", type=int, default=0)
     args = parser.parse_args()
 
     for path in (args.case_json, args.base_json, args.output_dir, args.executable):
@@ -231,18 +286,38 @@ def main() -> int:
         raise ValueError(f"calibration output already exists: {args.output_dir}")
     if any(workers < 1 for workers in args.workers):
         raise ValueError("worker counts must be positive")
+    if args.fast_only and not args.fast_power_flow_screen:
+        parser.error("--fast-only requires --fast-power-flow-screen")
+    if args.fast_screen_affinity_schedule and not args.fast_only:
+        parser.error("--fast-screen-affinity-schedule requires --fast-only")
+    if args.selection_offset < 0:
+        parser.error("--selection-offset must be nonnegative")
 
     case = read_json(args.case_json)
     base = read_json(args.base_json)
-    records = longest_first_contingencies(
+    ordered_records = longest_first_contingencies(
         case,
         base["selected_state"],
         contingency_records(case),
-    )[: args.task_count]
+    )
+    records = ordered_records[
+        args.selection_offset : args.selection_offset + args.task_count
+    ]
+    if len(records) != args.task_count:
+        parser.error("selection offset and task count exceed contingency count")
+    task_groups: list[list[dict[str, Any]]] | None = None
+    if args.fast_screen_affinity_schedule:
+        task_groups = fast_screen_affinity_groups(
+            case, base["selected_state"], records
+        )
+        records = [item for group in task_groups for item in group]
     args.output_dir.mkdir(parents=True)
     summary: dict[str, Any] = {
         "purpose": "non-official fixed-subset resident-worker calibration",
         "task_count": len(records),
+        "selection_offset": args.selection_offset,
+        "fast_only": args.fast_only,
+        "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "schedule": [item["label"] for item in records],
         "trials": [],
     }
@@ -265,6 +340,8 @@ def main() -> int:
             workers,
             args.trial_timeout,
             args.fast_power_flow_screen,
+            args.fast_only,
+            task_groups,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

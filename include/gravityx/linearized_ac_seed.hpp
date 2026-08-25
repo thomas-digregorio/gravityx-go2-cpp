@@ -16,6 +16,7 @@ struct LinearizedAcSeedResult {
     double wall_seconds{};
     bool projected_balance_slack{};
     bool branch_security_rows_omitted{};
+    int branch_security_subset_count{};
     bool feasibility_only{};
     bool solution_value_valid{};
     bool info_valid{};
@@ -48,6 +49,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     bool request_lightweight_large_seed = false,
     double time_limit_seconds = 60.0,
     bool omit_branch_security_rows = false,
-    bool feasibility_only = false);
+    bool feasibility_only = false,
+    const std::vector<int>& branch_security_subset = {});
 
 }  // namespace gravityx

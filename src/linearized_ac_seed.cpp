@@ -175,6 +175,7 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"wall_seconds", wall_seconds},
         {"projected_balance_slack", projected_balance_slack},
         {"branch_security_rows_omitted", branch_security_rows_omitted},
+        {"branch_security_subset_count", branch_security_subset_count},
         {"feasibility_only", feasibility_only},
         {"solution_value_valid", solution_value_valid},
         {"info_valid", info_valid},
@@ -210,7 +211,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     bool request_lightweight_large_seed,
     double time_limit_seconds,
     bool omit_branch_security_rows,
-    bool feasibility_only) {
+    bool feasibility_only,
+    const std::vector<int>& branch_security_subset) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -233,6 +235,19 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     if (omit_branch_security_rows && !contingency) {
         throw std::runtime_error(
             "branch-security-row omission is only valid for contingency seeds");
+    }
+    std::vector<unsigned char> selected_branch_security(
+        static_cast<std::size_t>(nl), 0);
+    int branch_security_subset_count = 0;
+    for (const int branch : branch_security_subset) {
+        if (branch < 0 || branch >= nl) {
+            throw std::runtime_error(
+                "linearized AC branch-security subset index is out of range");
+        }
+        if (!selected_branch_security[static_cast<std::size_t>(branch)]) {
+            selected_branch_security[static_cast<std::size_t>(branch)] = 1;
+            ++branch_security_subset_count;
+        }
     }
     if (contingency) {
         const auto& base = contingency->base_state;
@@ -504,54 +519,56 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         return std::pair<double, double>{minimum, maximum};
     };
 
-    if (!omit_branch_security_rows) {
-        for (int i = 0; i < nl; ++i) {
-            if (i == outaged_branch) {
-                continue;
-            }
-            const auto& branch = data.branches[i];
-            const double rating = contingency ? branch.rate_c : branch.rate_a;
-            const std::array<const AffineFlow*, 4> flows{
-                &linearized[i].pf, &linearized[i].qf,
-                &linearized[i].pt, &linearized[i].qt};
-            for (const auto* flow : flows) {
-                if (lightweight_large_seed) {
-                    const auto [minimum, maximum] = affine_range(*flow, branch);
-                    if (minimum >= -rating && maximum <= rating) {
-                        continue;
-                    }
+    for (int i = 0; i < nl; ++i) {
+        if (omit_branch_security_rows &&
+            !selected_branch_security[static_cast<std::size_t>(i)]) {
+            continue;
+        }
+        if (i == outaged_branch) {
+            continue;
+        }
+        const auto& branch = data.branches[i];
+        const double rating = contingency ? branch.rate_c : branch.rate_a;
+        const std::array<const AffineFlow*, 4> flows{
+            &linearized[i].pf, &linearized[i].qf,
+            &linearized[i].pt, &linearized[i].qt};
+        for (const auto* flow : flows) {
+            if (lightweight_large_seed) {
+                const auto [minimum, maximum] = affine_range(*flow, branch);
+                if (minimum >= -rating && maximum <= rating) {
+                    continue;
                 }
-                SparseRow row;
-                row.lower = -rating - flow->constant;
-                row.upper = rating - flow->constant;
-                append(row, vm_offset + branch.from, flow->vm_from);
-                append(row, vm_offset + branch.to, flow->vm_to);
-                append(row, va_offset + branch.from, flow->va_from);
-                append(row, va_offset + branch.to, flow->va_to);
-                normalize(row);
-                rows.push_back(std::move(row));
             }
-            const double source_delta = contingency
-                ? contingency->base_state.va[branch.from]
-                    - contingency->base_state.va[branch.to]
-                : data.buses[branch.from].va_start
-                    - data.buses[branch.to].va_start;
-            const double angle_minimum =
-                lower[va_offset + branch.from] - upper[va_offset + branch.to];
-            const double angle_maximum =
-                upper[va_offset + branch.from] - lower[va_offset + branch.to];
-            const bool angle_row_is_redundant =
-                lightweight_large_seed &&
-                angle_minimum >= branch.angmin && angle_maximum <= branch.angmax;
-            if (source_delta >= branch.angmin && source_delta <= branch.angmax &&
-                !angle_row_is_redundant) {
-                SparseRow angle;
-                angle.lower = branch.angmin;
-                angle.upper = branch.angmax;
-                append(angle, va_offset + branch.from, 1.0);
-                append(angle, va_offset + branch.to, -1.0);
-                rows.push_back(std::move(angle));
-            }
+            SparseRow row;
+            row.lower = -rating - flow->constant;
+            row.upper = rating - flow->constant;
+            append(row, vm_offset + branch.from, flow->vm_from);
+            append(row, vm_offset + branch.to, flow->vm_to);
+            append(row, va_offset + branch.from, flow->va_from);
+            append(row, va_offset + branch.to, flow->va_to);
+            normalize(row);
+            rows.push_back(std::move(row));
+        }
+        const double source_delta = contingency
+            ? contingency->base_state.va[branch.from]
+                - contingency->base_state.va[branch.to]
+            : data.buses[branch.from].va_start
+                - data.buses[branch.to].va_start;
+        const double angle_minimum =
+            lower[va_offset + branch.from] - upper[va_offset + branch.to];
+        const double angle_maximum =
+            upper[va_offset + branch.from] - lower[va_offset + branch.to];
+        const bool angle_row_is_redundant =
+            lightweight_large_seed &&
+            angle_minimum >= branch.angmin && angle_maximum <= branch.angmax;
+        if (source_delta >= branch.angmin && source_delta <= branch.angmax &&
+            !angle_row_is_redundant) {
+            SparseRow angle;
+            angle.lower = branch.angmin;
+            angle.upper = branch.angmax;
+            append(angle, va_offset + branch.from, 1.0);
+            append(angle, va_offset + branch.to, -1.0);
+            rows.push_back(std::move(angle));
         }
     }
 
@@ -667,6 +684,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     LinearizedAcSeedResult output;
     output.projected_balance_slack = projected_balance_slack;
     output.branch_security_rows_omitted = omit_branch_security_rows;
+    output.branch_security_subset_count = branch_security_subset_count;
     output.feasibility_only = feasibility_only;
     output.time_limit_seconds = time_limit_seconds;
     output.ipm_optimality_tolerance = ipm_optimality_tolerance;

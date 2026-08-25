@@ -339,16 +339,24 @@ int run_parallel_circuit_regression() {
         gravityx::solve_linearized_ac_seed(
             data, solve.state, {1}, 0.49, branch_context,
             true, false, 60.0, true, true);
+    const auto subset_security_contingency_seed =
+        gravityx::solve_linearized_ac_seed(
+            data, solve.state, {1}, 0.49, branch_context,
+            true, false, 60.0, true, true, {1});
     if (!full_contingency_seed.success ||
         !balance_only_contingency_seed.success ||
+        !subset_security_contingency_seed.success ||
         !balance_only_contingency_seed.projected_balance_slack ||
         !balance_only_contingency_seed.branch_security_rows_omitted ||
         !balance_only_contingency_seed.feasibility_only ||
+        subset_security_contingency_seed.branch_security_subset_count != 1 ||
         std::abs(balance_only_contingency_seed.ipm_optimality_tolerance -
                  1e-4) > 1e-12 ||
         std::abs(full_contingency_seed.ipm_optimality_tolerance -
                  1e-8) > 1e-14 ||
         balance_only_contingency_seed.row_count >=
+            subset_security_contingency_seed.row_count ||
+        subset_security_contingency_seed.row_count >
             full_contingency_seed.row_count) {
         throw std::runtime_error(
             "balance-only contingency Phase-I regression failed");
@@ -1127,6 +1135,79 @@ bool solve_loaded_contingency(
                 }
             }
         }
+        std::vector<int> dynamic_security_branches;
+        std::vector<unsigned char> dynamic_security_selected(
+            data.branches.size(), 0);
+        const auto collect_violated_security_branches =
+            [&](const gravityx::AcState& state) {
+                nlohmann::json added = nlohmann::json::array();
+                if (state.pf.size() != data.branches.size() ||
+                    state.qf.size() != data.branches.size() ||
+                    state.pt.size() != data.branches.size() ||
+                    state.qt.size() != data.branches.size() ||
+                    state.sm_slack.size() != data.branches.size()) {
+                    return added;
+                }
+                constexpr double kSecurityCollectionTolerance = 1e-5;
+                for (std::size_t i = 0; i < data.branches.size(); ++i) {
+                    if (static_cast<int>(i) == context.outaged_branch) {
+                        continue;
+                    }
+                    const auto& branch = data.branches[i];
+                    const double rating = branch.rate_c;
+                    const double box_violation = std::max({
+                        std::abs(state.pf[i]) - rating,
+                        std::abs(state.qf[i]) - rating,
+                        std::abs(state.pt[i]) - rating,
+                        std::abs(state.qt[i]) - rating,
+                    });
+                    const double source_delta =
+                        base.state.va[branch.from] - base.state.va[branch.to];
+                    double angle_violation = 0.0;
+                    if (source_delta >= branch.angmin &&
+                        source_delta <= branch.angmax) {
+                        const double angle =
+                            state.va[branch.from] - state.va[branch.to];
+                        angle_violation = std::max(
+                            angle - branch.angmax,
+                            branch.angmin - angle);
+                    }
+                    const double slack = state.sm_slack[i];
+                    const double from_scale = branch.transformer
+                        ? 1.0 + slack : state.vm[branch.from] + slack;
+                    const double to_scale = branch.transformer
+                        ? 1.0 + slack : state.vm[branch.to] + slack;
+                    const double apparent_violation = std::max(
+                        state.pf[i] * state.pf[i] +
+                            state.qf[i] * state.qf[i] -
+                            rating * rating * from_scale * from_scale,
+                        state.pt[i] * state.pt[i] +
+                            state.qt[i] * state.qt[i] -
+                            rating * rating * to_scale * to_scale);
+                    if (std::max({box_violation, angle_violation,
+                                  apparent_violation}) <=
+                        kSecurityCollectionTolerance ||
+                        dynamic_security_selected[i]) {
+                        continue;
+                    }
+                    dynamic_security_selected[i] = 1;
+                    dynamic_security_branches.push_back(
+                        static_cast<int>(i));
+                    added.push_back({
+                        {"component_position", static_cast<int>(i)},
+                        {"source_key", branch.source_key},
+                        {"box_violation", std::max(0.0, box_violation)},
+                        {"angle_violation", std::max(0.0, angle_violation)},
+                        {"apparent_flow_violation",
+                         std::max(0.0, apparent_violation)},
+                    });
+                }
+                std::sort(dynamic_security_branches.begin(),
+                          dynamic_security_branches.end());
+                return added;
+            };
+        const auto initial_dynamic_security_branches =
+            collect_violated_security_branches(best_state);
         auto reference = best_state;
         double linearized_wall_seconds = 0.0;
         int linearized_iterations = 0;
@@ -1142,7 +1223,7 @@ bool solve_loaded_contingency(
             // acceptance relaxation: sparse nonlinear repair and the complete
             // validator still check every source branch rating and angle row.
             const bool balance_only_phase_one =
-                data.buses.size() >= 16000 && round == 1;
+                data.buses.size() >= 16000;
             // Keep a 0.25-p.u. interior margin below the source model's
             // 0.5-p.u. corrective balance limit.  The previous 0.49 target
             // left only 0.01 p.u. for AC linearization error; CTG_000005's
@@ -1154,7 +1235,7 @@ bool solve_loaded_contingency(
                 data, reference, base.commitment,
                 linearized_balance_slack, context,
                 balance_only_phase_one, false, 60.0, balance_only_phase_one,
-                balance_only_phase_one);
+                balance_only_phase_one, dynamic_security_branches);
             linearized_wall_seconds += linear.wall_seconds;
             linearized_iterations += std::max(0, linear.iterations);
             auto attempt = linear.to_json(false);
@@ -1163,6 +1244,10 @@ bool solve_loaded_contingency(
             attempt["balance_only_phase_one"] = balance_only_phase_one;
             attempt["linearized_balance_slack"] =
                 linearized_balance_slack;
+            attempt["initial_dynamic_security_branches"] =
+                initial_dynamic_security_branches;
+            attempt["active_dynamic_security_branch_positions"] =
+                dynamic_security_branches;
             if (!linear.success && data.buses.size() >= 8000 &&
                 (linear.status == "Infeasible" ||
                  linear.status == "Unknown")) {
@@ -1176,8 +1261,12 @@ bool solve_loaded_contingency(
                 // deadlines remain the hard outer bounds.
                 constexpr double kLargeProjectedBalanceTimeLimitSeconds = 90.0;
                 linear = gravityx::solve_linearized_ac_seed(
-                    data, reference, base.commitment, 0.49, context, true,
-                    false, kLargeProjectedBalanceTimeLimitSeconds);
+                    data, reference, base.commitment,
+                    balance_only_phase_one ? 0.25 : 0.49,
+                    context, true, false,
+                    kLargeProjectedBalanceTimeLimitSeconds,
+                    balance_only_phase_one, balance_only_phase_one,
+                    dynamic_security_branches);
                 linearized_wall_seconds += linear.wall_seconds;
                 linearized_iterations += std::max(0, linear.iterations);
                 attempt = linear.to_json(false);
@@ -1312,6 +1401,13 @@ bool solve_loaded_contingency(
                     best_state = nonlinear_candidate;
                     best_objective = nonlinear_objective;
                     best_validation = nonlinear_validation;
+                }
+                if (data.buses.size() >= 16000) {
+                    attempt["new_dynamic_security_branches"] =
+                        collect_violated_security_branches(
+                            nonlinear_candidate);
+                    attempt["active_dynamic_security_branch_positions_after_repair"] =
+                        dynamic_security_branches;
                 }
             }
             const char* linearized_log = std::getenv("GRAVITYX_HIGHS_LOG");

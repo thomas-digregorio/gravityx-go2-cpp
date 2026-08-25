@@ -170,7 +170,12 @@ def validate_and_normalize_evaluation_details(
     parallel_mode: str = "mpi",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Require exhaustive official details and repair stale MPI bookkeeping."""
-    if parallel_mode not in {"serial", "mpi", "serial_shards"}:
+    if parallel_mode not in {
+        "serial",
+        "mpi",
+        "serial_shards",
+        "streaming_serial_shards",
+    }:
         raise ValueError(f"invalid evaluation parallel mode: {parallel_mode}")
     expected_labels = {"BASECASE", *expected_contingency_labels}
     detail_paths = {
@@ -360,34 +365,44 @@ def link_or_copy(source: Path, destination: Path) -> str:
         return "copy"
 
 
-def run_serial_evaluation_shards(
-    python: Path,
-    evaluator: Path,
+def contiguous_shard_groups(
+    labels: list[str],
+    shard_count: int,
+) -> list[list[str]]:
+    """Partition an ordered schedule into balanced contiguous shards."""
+    if shard_count < 1:
+        raise ValueError("shard count must be positive")
+    if not labels:
+        raise ValueError("evaluation sharding requires contingencies")
+    active_shards = min(shard_count, len(labels))
+    minimum_size, remainder = divmod(len(labels), active_shards)
+    groups: list[list[str]] = []
+    offset = 0
+    for shard_index in range(active_shards):
+        size = minimum_size + (1 if shard_index < remainder else 0)
+        groups.append(labels[offset : offset + size])
+        offset += size
+    if offset != len(labels) or any(not group for group in groups):
+        raise RuntimeError("invalid contiguous evaluation shard partition")
+    return groups
+
+
+def prepare_serial_evaluation_shards(
     case_dir: Path,
     output_dir: Path,
     internal_dir: Path,
-    contingency_labels: set[str],
-    shard_count: int,
-    deadline: float,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run unchanged vendor evaluation in independent serial shards.
-
-    The vendor MPI dispatcher uses nonblocking object sends without retaining
-    their request buffers and can corrupt messages on large jobs.  Independent
-    serial processes avoid that transport layer while preserving the exact
-    vendor parser and per-case equations.  Every detail is required and merged
-    by label before the ordinary exhaustive certificate is applied.
-    """
-    labels = sorted(contingency_labels)
-    if shard_count < 2:
-        raise ValueError("serial evaluation sharding requires at least two shards")
-    if not labels:
-        raise ValueError("serial evaluation sharding requires contingencies")
-    active_shards = min(shard_count, len(labels))
-    groups = [labels[index::active_shards] for index in range(active_shards)]
-    shard_root = internal_dir / "serial_evaluation_shards"
+    groups: list[list[str]],
+    root_name: str,
+    materialize_all_solutions: bool,
+) -> list[dict[str, Any]]:
+    """Prepare immutable inputs for exact vendor-evaluator subprocesses."""
+    if not groups or any(not group for group in groups):
+        raise ValueError("serial evaluation groups must be nonempty")
+    shard_root = internal_dir / root_name
     if shard_root.exists():
-        raise RuntimeError(f"serial evaluation shard directory already exists: {shard_root}")
+        raise RuntimeError(
+            f"serial evaluation shard directory already exists: {shard_root}"
+        )
     shard_root.mkdir(parents=True)
 
     case_files = [case_dir / name for name in ("case.raw", "case.json")]
@@ -398,8 +413,16 @@ def run_serial_evaluation_shards(
     if not base_solution.is_file():
         raise RuntimeError("official evaluation base solution is missing")
 
+    seen_labels: set[str] = set()
     shard_records: list[dict[str, Any]] = []
     for shard_index, group in enumerate(groups):
+        duplicates = seen_labels.intersection(group)
+        if duplicates:
+            raise ValueError(
+                "duplicate labels across serial evaluation shards: "
+                + ", ".join(sorted(duplicates))
+            )
+        seen_labels.update(group)
         shard_dir = shard_root / f"shard_{shard_index:03d}"
         shard_case = shard_dir / "case"
         shard_solutions = shard_dir / "solutions"
@@ -416,88 +439,122 @@ def run_serial_evaluation_shards(
         input_materialization["solution_BASECASE.txt"] = link_or_copy(
             base_solution, shard_solutions / "solution_BASECASE.txt"
         )
-        for label in group:
-            solution = output_dir / f"solution_{label}.txt"
-            if not solution.is_file():
-                raise RuntimeError(
-                    f"official evaluation solution is missing: {solution}"
-                )
-            link_or_copy(solution, shard_solutions / solution.name)
+        if materialize_all_solutions:
+            for label in group:
+                solution = output_dir / f"solution_{label}.txt"
+                if not solution.is_file():
+                    raise RuntimeError(
+                        f"official evaluation solution is missing: {solution}"
+                    )
+                link_or_copy(solution, shard_solutions / solution.name)
         shard_records.append(
             {
                 "shard_index": shard_index,
-                "labels": group,
+                "labels": list(group),
                 "case_dir": shard_case,
                 "solution_dir": shard_solutions,
                 "console_log": shard_dir / "evaluation.console.log",
                 "input_materialization": input_materialization,
             }
         )
+    return shard_records
 
-    def evaluate_shard(record: dict[str, Any]) -> dict[str, Any]:
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0.0:
-            raise CompetitionTimeout(
-                "serial official-evaluation shard deadline has expired"
-            )
-        command = [
-            str(python),
-            str(evaluator),
-            "1",
-            str(record["case_dir"]),
-            str(record["solution_dir"]),
-        ]
-        started = time.perf_counter()
-        try:
-            with record["console_log"].open("w", encoding="utf-8") as log:
-                completed = subprocess.run(
-                    command,
-                    check=False,
-                    text=True,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    timeout=remaining,
-                )
-        except subprocess.TimeoutExpired as error:
-            raise CompetitionTimeout(
-                f"official evaluator shard {record['shard_index']} reached the deadline"
-            ) from error
-        wall_seconds = time.perf_counter() - started
-        if completed.returncode != 0:
-            raise RuntimeError(
-                "official evaluator shard failed: "
-                f"index={record['shard_index']}, returncode={completed.returncode}"
-            )
-        summary_path = record["solution_dir"] / "eval_summary.json"
-        if not summary_path.is_file():
-            raise RuntimeError(
-                f"official evaluator shard {record['shard_index']} wrote no summary"
-            )
-        summary = read_json(summary_path)
-        normalized, certificate = validate_and_normalize_evaluation_details(
-            record["solution_dir"],
-            record["solution_dir"] / "internal_validation",
-            set(record["labels"]),
-            summary,
-            1,
-            "serial",
+
+def finalize_serial_evaluation_shard(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one completed unchanged-vendor serial evaluation shard."""
+    summary_path = record["solution_dir"] / "eval_summary.json"
+    if not summary_path.is_file():
+        raise RuntimeError(
+            f"official evaluator shard {record['shard_index']} wrote no summary"
         )
-        return {
+    summary = read_json(summary_path)
+    normalized, certificate = validate_and_normalize_evaluation_details(
+        record["solution_dir"],
+        record["solution_dir"] / "internal_validation",
+        set(record["labels"]),
+        summary,
+        1,
+        "serial",
+    )
+    return {
+        **record,
+        "summary": normalized,
+        "certificate": certificate,
+    }
+
+
+def evaluate_serial_evaluation_shard(
+    python: Path,
+    evaluator: Path,
+    record: dict[str, Any],
+    deadline: float,
+) -> dict[str, Any]:
+    """Run and validate one exact vendor-evaluator shard."""
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0.0:
+        raise CompetitionTimeout(
+            "serial official-evaluation shard deadline has expired"
+        )
+    command = [
+        str(python),
+        str(evaluator),
+        "1",
+        str(record["case_dir"]),
+        str(record["solution_dir"]),
+    ]
+    started = time.perf_counter()
+    try:
+        with record["console_log"].open("w", encoding="utf-8") as log:
+            completed = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=remaining,
+            )
+    except subprocess.TimeoutExpired as error:
+        raise CompetitionTimeout(
+            f"official evaluator shard {record['shard_index']} reached the deadline"
+        ) from error
+    wall_seconds = time.perf_counter() - started
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "official evaluator shard failed: "
+            f"index={record['shard_index']}, returncode={completed.returncode}"
+        )
+    return finalize_serial_evaluation_shard(
+        {
             **record,
             "returncode": completed.returncode,
             "wall_seconds": wall_seconds,
-            "summary": normalized,
-            "certificate": certificate,
         }
+    )
 
-    completed_records: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=active_shards
-    ) as executor:
-        futures = [executor.submit(evaluate_shard, record) for record in shard_records]
-        for future in concurrent.futures.as_completed(futures):
-            completed_records.append(future.result())
+
+def merge_serial_evaluation_shards(
+    completed_records: list[dict[str, Any]],
+    output_dir: Path,
+    internal_dir: Path,
+    labels: list[str],
+    requested_shards: int,
+    mode: str,
+    metadata_name: str,
+    maximum_parallel_processes: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge an exhaustive set of independently validated vendor shards."""
+    if not completed_records:
+        raise RuntimeError("no official evaluation shards completed")
     completed_records.sort(key=lambda record: int(record["shard_index"]))
+    observed_labels = [
+        label for record in completed_records for label in record["labels"]
+    ]
+    if len(observed_labels) != len(set(observed_labels)):
+        raise RuntimeError("official evaluation shards contain duplicate labels")
+    if set(observed_labels) != set(labels):
+        raise RuntimeError("official evaluation shards do not cover the exact label set")
 
     base_detail_hash: str | None = None
     base_detail_source: Path | None = None
@@ -553,9 +610,10 @@ def run_serial_evaluation_shards(
     }
     write_json(output_dir / "eval_summary.json", summary)
     shard_metadata = {
-        "mode": "independent_serial_shards",
-        "requested_shards": shard_count,
-        "active_shards": active_shards,
+        "mode": mode,
+        "requested_shards": requested_shards,
+        "active_shards": len(completed_records),
+        "maximum_parallel_processes": maximum_parallel_processes,
         "base_detail_sha256": base_detail_hash,
         "shards": [
             {
@@ -573,9 +631,284 @@ def run_serial_evaluation_shards(
         ],
     }
     write_json(
-        internal_dir / "serial_evaluation_shards.json", shard_metadata
+        internal_dir / metadata_name, shard_metadata
     )
     return summary, shard_metadata
+
+
+def run_serial_evaluation_shards(
+    python: Path,
+    evaluator: Path,
+    case_dir: Path,
+    output_dir: Path,
+    internal_dir: Path,
+    contingency_labels: set[str],
+    shard_count: int,
+    deadline: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run unchanged vendor evaluation in independent serial shards.
+
+    The vendor MPI dispatcher uses nonblocking object sends without retaining
+    their request buffers and can corrupt messages on large jobs.  Independent
+    serial processes avoid that transport layer while preserving the exact
+    vendor parser and per-case equations.  Every detail is required and merged
+    by label before the ordinary exhaustive certificate is applied.
+    """
+    labels = sorted(contingency_labels)
+    if shard_count < 2:
+        raise ValueError("serial evaluation sharding requires at least two shards")
+    if not labels:
+        raise ValueError("serial evaluation sharding requires contingencies")
+    active_shards = min(shard_count, len(labels))
+    groups = [labels[index::active_shards] for index in range(active_shards)]
+    shard_records = prepare_serial_evaluation_shards(
+        case_dir,
+        output_dir,
+        internal_dir,
+        groups,
+        "serial_evaluation_shards",
+        True,
+    )
+    completed_records: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=active_shards
+    ) as executor:
+        futures = [
+            executor.submit(
+                evaluate_serial_evaluation_shard,
+                python,
+                evaluator,
+                record,
+                deadline,
+            )
+            for record in shard_records
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            completed_records.append(future.result())
+    return merge_serial_evaluation_shards(
+        completed_records,
+        output_dir,
+        internal_dir,
+        labels,
+        shard_count,
+        "independent_serial_shards",
+        "serial_evaluation_shards.json",
+        active_shards,
+    )
+
+
+class StreamingSerialEvaluation:
+    """Overlap exact unchanged-vendor shards with contingency generation."""
+
+    def __init__(
+        self,
+        python: Path,
+        evaluator: Path,
+        case_dir: Path,
+        output_dir: Path,
+        internal_dir: Path,
+        ordered_labels: list[str],
+        shard_count: int,
+        maximum_processes: int,
+        deadline: float,
+    ) -> None:
+        if maximum_processes < 1:
+            raise ValueError("streaming evaluation processes must be positive")
+        if len(ordered_labels) != len(set(ordered_labels)):
+            raise ValueError("streaming evaluation labels must be unique")
+        self.python = python
+        self.evaluator = evaluator
+        self.output_dir = output_dir
+        self.internal_dir = internal_dir
+        self.labels = list(ordered_labels)
+        self.requested_shards = shard_count
+        self.maximum_processes = maximum_processes
+        self.deadline = deadline
+        groups = contiguous_shard_groups(self.labels, shard_count)
+        self.records = prepare_serial_evaluation_shards(
+            case_dir,
+            output_dir,
+            internal_dir,
+            groups,
+            "streaming_serial_evaluation_shards",
+            False,
+        )
+        self.record_by_label: dict[str, dict[str, Any]] = {}
+        for record in self.records:
+            record["pending_labels"] = set(record["labels"])
+            for label in record["labels"]:
+                self.record_by_label[label] = record
+        self.completed_labels: set[str] = set()
+        self.ready_records: list[dict[str, Any]] = []
+        self.running_records: dict[int, dict[str, Any]] = {}
+        self.completed_records: list[dict[str, Any]] = []
+        self.lock = threading.RLock()
+        self.aborted = False
+        self.first_process_started: float | None = None
+        self.last_process_finished: float | None = None
+
+    def _abort_locked(self) -> None:
+        self.aborted = True
+        for record in list(self.running_records.values()):
+            process = record["process"]
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            log = record.get("log_handle")
+            if log is not None and not log.closed:
+                log.close()
+        self.running_records.clear()
+
+    def abort(self) -> None:
+        with self.lock:
+            self._abort_locked()
+
+    def _collect_finished_locked(self) -> None:
+        for shard_index, record in list(self.running_records.items()):
+            process = record["process"]
+            returncode = process.poll()
+            if returncode is None:
+                continue
+            log = record["log_handle"]
+            if not log.closed:
+                log.close()
+            record["returncode"] = returncode
+            record["wall_seconds"] = (
+                time.perf_counter() - float(record["process_started"])
+            )
+            del record["process"]
+            del record["log_handle"]
+            del record["process_started"]
+            del self.running_records[shard_index]
+            self.last_process_finished = time.perf_counter()
+            if returncode != 0:
+                self._abort_locked()
+                raise RuntimeError(
+                    "streaming official evaluator shard failed: "
+                    f"index={shard_index}, returncode={returncode}"
+                )
+            self.completed_records.append(record)
+
+    def _launch_ready_locked(self) -> None:
+        self._collect_finished_locked()
+        while (
+            self.ready_records
+            and len(self.running_records) < self.maximum_processes
+        ):
+            if time.perf_counter() >= self.deadline:
+                self._abort_locked()
+                raise CompetitionTimeout(
+                    "streaming official evaluation reached its deadline"
+                )
+            record = self.ready_records.pop(0)
+            command = [
+                str(self.python),
+                str(self.evaluator),
+                "1",
+                str(record["case_dir"]),
+                str(record["solution_dir"]),
+            ]
+            log = record["console_log"].open("w", encoding="utf-8")
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            started = time.perf_counter()
+            if self.first_process_started is None:
+                self.first_process_started = started
+            record["process"] = process
+            record["log_handle"] = log
+            record["process_started"] = started
+            self.running_records[int(record["shard_index"])] = record
+
+    def mark_completed(self, label: str) -> None:
+        if label not in self.record_by_label:
+            raise RuntimeError(f"unknown streaming evaluation label: {label}")
+        with self.lock:
+            if self.aborted:
+                raise CompetitionTimeout("streaming official evaluation was aborted")
+            if label in self.completed_labels:
+                raise RuntimeError(
+                    f"duplicate streaming evaluation completion: {label}"
+                )
+            source = self.output_dir / f"solution_{label}.txt"
+            if not source.is_file() or source.stat().st_size <= 0:
+                raise RuntimeError(
+                    "streaming official evaluation solution is incomplete: "
+                    f"{source}"
+                )
+            record = self.record_by_label[label]
+            destination = record["solution_dir"] / source.name
+            link_or_copy(source, destination)
+            self.completed_labels.add(label)
+            record["pending_labels"].remove(label)
+            if not record["pending_labels"]:
+                self.ready_records.append(record)
+            self._launch_ready_locked()
+
+    def finish(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        tail_started = time.perf_counter()
+        with self.lock:
+            completed_before_tail_wait = len(self.completed_records)
+            missing = set(self.labels) - self.completed_labels
+            if missing:
+                self._abort_locked()
+                raise RuntimeError(
+                    "streaming official evaluation is missing completed solutions: "
+                    + ", ".join(sorted(missing))
+                )
+        while True:
+            with self.lock:
+                if self.aborted:
+                    raise CompetitionTimeout(
+                        "streaming official evaluation was aborted"
+                    )
+                self._launch_ready_locked()
+                if len(self.completed_records) == len(self.records):
+                    break
+                if time.perf_counter() >= self.deadline:
+                    self._abort_locked()
+                    raise CompetitionTimeout(
+                        "streaming official evaluation reached its deadline"
+                    )
+            time.sleep(0.05)
+        finalized_records = [
+            finalize_serial_evaluation_shard(record)
+            for record in self.completed_records
+        ]
+        summary, metadata = merge_serial_evaluation_shards(
+            finalized_records,
+            self.output_dir,
+            self.internal_dir,
+            sorted(self.labels),
+            self.requested_shards,
+            "overlapped_serial_shards",
+            "streaming_serial_evaluation_shards.json",
+            self.maximum_processes,
+        )
+        now = time.perf_counter()
+        metadata.update(
+            {
+                "tail_wait_seconds": now - tail_started,
+                "overlap_span_seconds": (
+                    now - self.first_process_started
+                    if self.first_process_started is not None
+                    else 0.0
+                ),
+                "completed_before_tail_wait": completed_before_tail_wait,
+            }
+        )
+        write_json(
+            self.internal_dir / "streaming_serial_evaluation_shards.json",
+            metadata,
+        )
+        return summary, metadata
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:
@@ -1011,6 +1344,10 @@ def main() -> int:
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--evaluation-processes", type=int, default=1)
     parser.add_argument("--serial-evaluation-shards", type=int, default=1)
+    parser.add_argument(
+        "--streaming-serial-evaluation-shards", type=int, default=1
+    )
+    parser.add_argument("--streaming-evaluation-processes", type=int, default=2)
     parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
@@ -1105,10 +1442,25 @@ def main() -> int:
         raise ValueError("evaluation processes must be positive")
     if args.serial_evaluation_shards < 1:
         raise ValueError("serial evaluation shards must be positive")
+    if args.streaming_serial_evaluation_shards < 1:
+        raise ValueError("streaming serial evaluation shards must be positive")
+    if args.streaming_evaluation_processes < 1:
+        raise ValueError("streaming evaluation processes must be positive")
     if args.serial_evaluation_shards > 1 and args.evaluation_processes > 1:
         parser.error(
             "--serial-evaluation-shards cannot be combined with MPI evaluation"
         )
+    if args.streaming_serial_evaluation_shards > 1:
+        if args.serial_evaluation_shards > 1 or args.evaluation_processes > 1:
+            parser.error(
+                "--streaming-serial-evaluation-shards cannot be combined "
+                "with post-Code2 sharded or MPI evaluation"
+            )
+        if args.skip_evaluation:
+            parser.error(
+                "--streaming-serial-evaluation-shards cannot be combined "
+                "with --skip-evaluation"
+            )
     if args.evaluation_processes > 1 and args.mpiexec is None:
         parser.error("--evaluation-processes greater than one requires --mpiexec")
     if args.mpiexec is not None:
@@ -1194,6 +1546,12 @@ def main() -> int:
         "profiled_fallback_global_priority": bool(fallback_schedule),
         "evaluation_processes": args.evaluation_processes,
         "serial_evaluation_shards": args.serial_evaluation_shards,
+        "streaming_serial_evaluation_shards": (
+            args.streaming_serial_evaluation_shards
+        ),
+        "streaming_evaluation_processes": (
+            args.streaming_evaluation_processes
+        ),
     }
 
     def checkpoint() -> None:
@@ -1384,6 +1742,44 @@ def main() -> int:
     )
     checkpoint()
 
+    streaming_evaluation: StreamingSerialEvaluation | None = None
+    if args.streaming_serial_evaluation_shards > 1:
+        for path in (args.python, args.evaluator):
+            reject_onedrive(path)
+        stale_evaluation_outputs = [
+            path
+            for pattern in (
+                "eval_detail_*.json",
+                "eval_summary.json",
+                "eval_summary.csv",
+                "eval_detail.json",
+                "eval_detail.csv",
+                "sol_change_*.csv",
+                "sol_change.csv",
+            )
+            for path in args.output_dir.glob(pattern)
+        ]
+        if stale_evaluation_outputs:
+            raise RuntimeError(
+                "refusing stale official-evaluation artifacts: "
+                + ", ".join(
+                    sorted(path.name for path in stale_evaluation_outputs)
+                )
+            )
+        streaming_evaluation = StreamingSerialEvaluation(
+            args.python,
+            args.evaluator,
+            args.case_dir,
+            args.output_dir,
+            internal,
+            [str(item["label"]) for item in contingencies],
+            args.streaming_serial_evaluation_shards,
+            args.streaming_evaluation_processes,
+            evaluation_deadline,
+        )
+        run_status["streaming_evaluation_prepared"] = True
+        checkpoint()
+
     contingency_start = time.perf_counter()
     code2_deadline = contingency_start + code2_limit
     contingency_deadline = min(code2_deadline, work_deadline)
@@ -1498,6 +1894,8 @@ def main() -> int:
                 f"{label} on {execution_phase} worker {worker_id}",
                 flush=True,
             )
+        if streaming_evaluation is not None:
+            streaming_evaluation.mark_completed(label)
 
     exact_contingencies = list(contingencies)
     task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -2018,6 +2416,8 @@ def main() -> int:
     except Exception as error:
         abort_contingencies.set()
         screening_finished.set()
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
         for future in fast_futures:
             future.cancel()
         for future in futures:
@@ -2046,6 +2446,8 @@ def main() -> int:
     else:
         pool.shutdown(wait=True)
     if len(records) != len(contingencies):
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
         raise RuntimeError(
             f"dynamic contingency queue completed {len(records)} of "
             f"{len(contingencies)} tasks"
@@ -2060,16 +2462,21 @@ def main() -> int:
         }
     )
     if contingency_wall > code2_limit:
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
         run_status["error"] = "Code2 completed after its competition deadline"
         checkpoint()
         raise CompetitionTimeout(run_status["error"])
     if time.perf_counter() > work_deadline:
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
         run_status["error"] = "Code2 exhausted the time reserved for official evaluation"
         checkpoint()
         raise CompetitionTimeout(run_status["error"])
     checkpoint()
 
     evaluation_wall = 0.0
+    evaluation_tail_wall = 0.0
     evaluation_summary: dict[str, Any] | None = None
     evaluation_certificate: dict[str, Any] | None = None
     serial_evaluation_metadata: dict[str, Any] | None = None
@@ -2078,30 +2485,37 @@ def main() -> int:
             reject_onedrive(path)
         if args.mpiexec is not None:
             reject_onedrive(args.mpiexec)
-        stale_evaluation_outputs = [
-            path
-            for pattern in (
-                "eval_detail_*.json",
-                "eval_summary.json",
-                "eval_summary.csv",
-                "eval_detail.json",
-                "eval_detail.csv",
-                "sol_change_*.csv",
-                "sol_change.csv",
-            )
-            for path in args.output_dir.glob(pattern)
-        ]
-        if stale_evaluation_outputs:
-            raise RuntimeError(
-                "refusing stale official-evaluation artifacts: "
-                + ", ".join(sorted(path.name for path in stale_evaluation_outputs))
-            )
+        if streaming_evaluation is None:
+            stale_evaluation_outputs = [
+                path
+                for pattern in (
+                    "eval_detail_*.json",
+                    "eval_summary.json",
+                    "eval_summary.csv",
+                    "eval_detail.json",
+                    "eval_detail.csv",
+                    "sol_change_*.csv",
+                    "sol_change.csv",
+                )
+                for path in args.output_dir.glob(pattern)
+            ]
+            if stale_evaluation_outputs:
+                raise RuntimeError(
+                    "refusing stale official-evaluation artifacts: "
+                    + ", ".join(
+                        sorted(path.name for path in stale_evaluation_outputs)
+                    )
+                )
         evaluation_start = time.perf_counter()
         expected_evaluation_labels = {
             str(item["label"]) for item in contingencies
         }
         try:
-            if args.serial_evaluation_shards > 1:
+            if streaming_evaluation is not None:
+                evaluation_summary, serial_evaluation_metadata = (
+                    streaming_evaluation.finish()
+                )
+            elif args.serial_evaluation_shards > 1:
                 evaluation_summary, serial_evaluation_metadata = (
                     run_serial_evaluation_shards(
                         args.python,
@@ -2170,17 +2584,49 @@ def main() -> int:
             )
             checkpoint()
             raise CompetitionTimeout(run_status["error"]) from error
-        evaluation_wall = time.perf_counter() - evaluation_start
+        except Exception as error:
+            if streaming_evaluation is not None:
+                streaming_evaluation.abort()
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": str(error),
+                    "end_to_end_within_limit": (
+                        time.perf_counter() <= total_deadline
+                    ),
+                    "finished_at_utc": dt.datetime.now(
+                        dt.timezone.utc
+                    ).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
+            raise
+        evaluation_tail_wall = time.perf_counter() - evaluation_start
+        evaluation_wall = (
+            float(serial_evaluation_metadata["overlap_span_seconds"])
+            if streaming_evaluation is not None
+            and serial_evaluation_metadata is not None
+            else evaluation_tail_wall
+        )
         assert evaluation_summary is not None
         evaluation_mode = (
-            "serial_shards"
-            if args.serial_evaluation_shards > 1
-            else ("mpi" if args.evaluation_processes > 1 else "serial")
+            "streaming_serial_shards"
+            if streaming_evaluation is not None
+            else (
+                "serial_shards"
+                if args.serial_evaluation_shards > 1
+                else ("mpi" if args.evaluation_processes > 1 else "serial")
+            )
         )
         certificate_parallel_processes = (
-            min(args.serial_evaluation_shards, len(contingencies))
-            if args.serial_evaluation_shards > 1
-            else args.evaluation_processes
+            args.streaming_evaluation_processes
+            if streaming_evaluation is not None
+            else (
+                min(args.serial_evaluation_shards, len(contingencies))
+                if args.serial_evaluation_shards > 1
+                else args.evaluation_processes
+            )
         )
         evaluation_summary, evaluation_certificate = (
             validate_and_normalize_evaluation_details(
@@ -2204,6 +2650,7 @@ def main() -> int:
                     sha256(args.mpiexec) if args.mpiexec is not None else None
                 ),
                 "serial_evaluation_shards": serial_evaluation_metadata,
+                "streaming_evaluation": streaming_evaluation is not None,
             }
         )
         write_json(
@@ -2346,8 +2793,15 @@ def main() -> int:
             max(0, int(item["solver_iterations"])) for item in records
         ),
         "evaluation_wall_seconds": evaluation_wall,
+        "evaluation_tail_wall_seconds": evaluation_tail_wall,
         "evaluation_processes": args.evaluation_processes,
         "serial_evaluation_shards": args.serial_evaluation_shards,
+        "streaming_serial_evaluation_shards": (
+            args.streaming_serial_evaluation_shards
+        ),
+        "streaming_evaluation_processes": (
+            args.streaming_evaluation_processes
+        ),
         "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),

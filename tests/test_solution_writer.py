@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 import sys
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -16,9 +17,11 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from run_experiment import (  # noqa: E402
     CompetitionTimeout,
+    StreamingSerialEvaluation,
     apply_fallback_schedule_profile,
     code2_completed_within_limit,
     code2_time_limit,
+    contiguous_shard_groups,
     effective_process_timeout,
     fast_screen_affinity_groups,
     longest_first_contingencies,
@@ -397,6 +400,98 @@ class CompetitionTimingTests(unittest.TestCase):
             easy_first_groups[0][0]["fast_screen_affinity_score"],
             easy_first_groups[-1][0]["fast_screen_affinity_score"],
         )
+
+    def test_contiguous_evaluation_shards_preserve_schedule(self):
+        labels = [f"CTG_{index}" for index in range(7)]
+        groups = contiguous_shard_groups(labels, 3)
+        self.assertEqual([len(group) for group in groups], [3, 2, 2])
+        self.assertEqual([label for group in groups for label in group], labels)
+
+    def test_streaming_evaluation_runs_ready_shards_and_merges_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "case"
+            output_dir = root / "output"
+            internal_dir = output_dir / "internal"
+            case_dir.mkdir()
+            output_dir.mkdir()
+            (case_dir / "case.raw").write_text("raw\n", encoding="utf-8")
+            (case_dir / "case.json").write_text("{}\n", encoding="utf-8")
+            labels = ["CTG_A", "CTG_B", "CTG_C", "CTG_D"]
+            (case_dir / "case.con").write_text(
+                "".join(
+                    f"CONTINGENCY {label}\nEND\n" for label in labels
+                )
+                + "END\n",
+                encoding="utf-8",
+            )
+            (output_dir / "solution_BASECASE.txt").write_text(
+                "base\n", encoding="utf-8"
+            )
+            evaluator = root / "fake_evaluator.py"
+            evaluator.write_text(
+                """
+import json
+from pathlib import Path
+import sys
+
+case_dir = Path(sys.argv[2])
+solution_dir = Path(sys.argv[3])
+labels = []
+for line in (case_dir / "case.con").read_text(encoding="utf-8").splitlines():
+    if line.startswith("CONTINGENCY "):
+        labels.append(line.split()[1])
+
+details = {"BASECASE": {"obj": {"val": 10.0}, "infeas": {"val": False}}}
+for index, label in enumerate(labels, start=1):
+    details[label] = {"obj": {"val": float(index)}, "infeas": {"val": False}}
+for label, detail in details.items():
+    (solution_dir / f"eval_detail_{label}.json").write_text(
+        json.dumps(detail), encoding="utf-8"
+    )
+objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(labels)
+(solution_dir / "eval_summary.json").write_text(
+    json.dumps({
+        "solutions_exist": True,
+        "num_ctg": len(labels),
+        "obj": objective,
+        "infeas": 0.0,
+    }),
+    encoding="utf-8",
+)
+""".lstrip(),
+                encoding="utf-8",
+            )
+            manager = StreamingSerialEvaluation(
+                Path(sys.executable),
+                evaluator,
+                case_dir,
+                output_dir,
+                internal_dir,
+                labels,
+                2,
+                1,
+                time.perf_counter() + 30.0,
+            )
+            for label in labels:
+                (output_dir / f"solution_{label}.txt").write_text(
+                    f"{label}\n", encoding="utf-8"
+                )
+                manager.mark_completed(label)
+            summary, metadata = manager.finish()
+
+            self.assertEqual(summary["num_ctg"], 4)
+            self.assertEqual(summary["infeas"], 0.0)
+            self.assertEqual(metadata["mode"], "overlapped_serial_shards")
+            self.assertEqual(metadata["active_shards"], 2)
+            self.assertEqual(metadata["maximum_parallel_processes"], 1)
+            self.assertEqual(
+                {
+                    path.stem.removeprefix("eval_detail_")
+                    for path in output_dir.glob("eval_detail_*.json")
+                },
+                {"BASECASE", *labels},
+            )
 
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)

@@ -3544,6 +3544,34 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             "active_angle";
                         return true;
                     };
+                    const auto try_reactive_band =
+                        [&](double damping,
+                            bool require_continuation_decrease) {
+                        auto trial = correction_reference;
+                        if (!cache.apply_reactive_band_correction(
+                                data_, q_balance_by_bus,
+                                trial.vm, damping)) {
+                            return false;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (require_continuation_decrease &&
+                            trial_validation.max_residual >
+                                0.999 *
+                                    predictor_validation.max_residual) {
+                            return false;
+                        }
+                        if (trial_validation.max_residual + 1e-10 >=
+                            selected_validation.max_residual) {
+                            return false;
+                        }
+                        selected_correction = std::move(trial);
+                        selected_validation = trial_validation;
+                        selected_damping = damping;
+                        selected_correction_mode =
+                            "reactive_feasibility_band";
+                        return true;
+                    };
 
                     // Once this combined correction has selected a full step
                     // twice consecutively, that full step usually remains
@@ -3557,6 +3585,17 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     // A 0.1-percent gate still rejects numerical stagnation;
                     // final acceptance continues to require the complete
                     // independent validator below the configured tolerance.
+                    if (!active_block_dominant &&
+                        !active_flow_bound_dominant &&
+                        prior_selected_correction_mode ==
+                            "reactive_feasibility_band" &&
+                        prior_selected_damping > 0.0 &&
+                        try_reactive_band(
+                            prior_selected_damping, true)) {
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "continuation_correction_selected"] = true;
+                        return;
+                    }
                     if (!active_block_dominant &&
                         !active_flow_bound_dominant &&
                         prior_selected_correction_mode ==
@@ -3720,6 +3759,23 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     best_redispatch_damping = damping;
                                     if (strongly_improving_full_damping(
                                             damping, trial_validation)) {
+                                        break;
+                                    }
+                                    if (damping == 1.0 &&
+                                        prior_selected_correction_mode ==
+                                            "active_branch_flow_redispatch" &&
+                                        std::abs(
+                                            prior_selected_damping - 1.0) <=
+                                            1e-12 &&
+                                        trial_validation.max_residual <=
+                                            0.9999 *
+                                                predictor_validation
+                                                    .max_residual) {
+                                        output
+                                            .fixed_jacobian_predictor_trace
+                                            .back()[
+                                                "redispatch_continuation_"
+                                                "selected"] = true;
                                         break;
                                     }
                                 }
@@ -3894,23 +3950,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (active_block_dominant) {
                             break;
                         }
-                        auto trial = correction_reference;
-                        if (!cache.apply_reactive_band_correction(
-                                data_, q_balance_by_bus,
-                                trial.vm, damping)) {
-                            continue;
-                        }
-                        const auto trial_validation =
-                            project_trial_reactive_and_validate(trial);
-                        if (trial_validation.max_residual + 1e-10 <
-                            selected_validation.max_residual) {
-                            selected_correction = std::move(trial);
-                            selected_validation = trial_validation;
-                            selected_damping = damping;
-                            selected_correction_mode =
-                                "reactive_feasibility_band";
+                        if (try_reactive_band(damping, false)) {
                             if (strongly_improving_full_damping(
-                                    damping, trial_validation)) {
+                                    damping, selected_validation)) {
                                 break;
                             }
                         }
@@ -4138,7 +4180,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 std::abs(
                                     voltage_change -
                                     continuation_voltage_changes[0]) <=
-                                    1e-12) {
+                                1e-12) {
                                 continue;
                             }
                             const double proposed_voltage =

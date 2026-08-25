@@ -2545,6 +2545,10 @@ int run_contingency_worker(
         gravityx::FastPowerFlowOptions fast_options;
         fast_options.fixed_jacobian_screen_only =
             fast_only && data.buses.size() >= 16000;
+        const char* fast_diagnostics =
+            std::getenv("GRAVITYX_FAST_PF_DIAGNOSTICS");
+        fast_options.capture_diagnostics = fast_diagnostics != nullptr &&
+            std::string(fast_diagnostics) != "0";
         fast_power_flow = std::make_unique<gravityx::FastContingencyPowerFlow>(
             data, base.state, base.commitment, fast_options);
     }

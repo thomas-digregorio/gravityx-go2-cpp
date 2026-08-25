@@ -14,6 +14,7 @@ namespace gravityx {
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool fixed_jacobian_screen_only{false};
+    bool capture_diagnostics{false};
     int max_newton_iterations{50};
     int max_active_redispatch_passes{20};
     int max_reactive_limit_passes{8};

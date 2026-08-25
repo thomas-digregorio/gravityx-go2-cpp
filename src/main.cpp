@@ -1533,6 +1533,8 @@ bool solve_loaded_contingency(
     std::optional<gravityx::FastPowerFlowResult> fast_result;
     const bool reused_fast_screen_reference = precomputed_fast_state != nullptr;
     bool rolling_seed_fast_screen_selected = false;
+    bool bounded_fast_newton_rescue_selected = false;
+    std::optional<std::string> selected_direct_seed_label;
     if (precomputed_fast_state) {
         fast_result.emplace();
         fast_result->solve.state = *precomputed_fast_state;
@@ -1572,14 +1574,67 @@ bool solve_loaded_contingency(
             fast_result = fast_power_flow->screen_candidate(
                 *match, translated_rolling_seed);
             rolling_seed_fast_screen_selected = fast_result->feasible;
+            if (rolling_seed_fast_screen_selected &&
+                rolling_corrective_seed_label != nullptr) {
+                selected_direct_seed_label =
+                    *rolling_corrective_seed_label;
+            }
         }
         if (!rolling_seed_fast_screen_selected) {
             fast_result = fast_power_flow->solve(*match);
         }
+        // A failed predictor is rare and the exact corrective fallback is
+        // expensive on the largest cases.  Before escalating, direct-screen
+        // the small resident bank of previously verified corrective states.
+        // This does not transfer feasibility: screen_candidate rebuilds the
+        // requested outage and applies the complete independent validator.
+        if (!fast_result->feasible && corrective_seed_bank != nullptr) {
+            for (const auto& seed : *corrective_seed_bank) {
+                if (rolling_corrective_seed_label != nullptr &&
+                    seed.label == *rolling_corrective_seed_label) {
+                    continue;
+                }
+                auto bank_screen = fast_power_flow->screen_candidate(
+                    *match, seed.state);
+                if (!bank_screen.feasible) {
+                    continue;
+                }
+                fast_result = std::move(bank_screen);
+                selected_direct_seed_label = seed.label;
+                break;
+            }
+        }
+        if (fast_only && !fast_result->feasible &&
+            fast_result->validation.worst_category == "active_balance" &&
+            fast_result->validation.max_residual <= 0.2) {
+            const double prior_screen_seconds = fast_result->wall_seconds;
+            const auto rescue_start = std::chrono::steady_clock::now();
+            gravityx::FastPowerFlowOptions rescue_options;
+            rescue_options.max_newton_iterations = 12;
+            rescue_options.max_active_redispatch_passes = 4;
+            rescue_options.max_reactive_limit_passes = 4;
+            gravityx::FastContingencyPowerFlow rescue_solver(
+                data, base.state, base.commitment, rescue_options);
+            auto rescue_result = rescue_solver.solve(
+                *match, fast_result->solve.state);
+            const double combined_wall_seconds = prior_screen_seconds +
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - rescue_start).count();
+            rescue_result.wall_seconds = combined_wall_seconds;
+            rescue_result.solve.wall_seconds = combined_wall_seconds;
+            if (rescue_result.feasible) {
+                fast_result = std::move(rescue_result);
+                bounded_fast_newton_rescue_selected = true;
+            }
+        }
         if (fast_result->feasible) {
             const std::string solution_method =
-                rolling_seed_fast_screen_selected
+                bounded_fast_newton_rescue_selected
+                ? "bounded_fast_newton_rescue"
+                : rolling_seed_fast_screen_selected
                 ? "rolling_corrective_seed_direct_screen"
+                : selected_direct_seed_label
+                ? "corrective_seed_bank_direct_screen"
                 : fast_result->direct_candidate_selected
                 ? "direct_base_state_outage_candidate"
                 : fast_result->fixed_jacobian_predictor_selected
@@ -1597,9 +1652,8 @@ bool solve_loaded_contingency(
                 {"fast_power_flow_screen", true},
                 {"fast_screen", fast_result->to_json()},
                 {"rolling_corrective_seed_label",
-                 rolling_seed_fast_screen_selected &&
-                         rolling_corrective_seed_label != nullptr
-                     ? nlohmann::json(*rolling_corrective_seed_label)
+                 selected_direct_seed_label
+                     ? nlohmann::json(*selected_direct_seed_label)
                      : nlohmann::json(nullptr)},
                 {"resident_parametric_model", false},
                 {"acceptable_termination_enabled", false},
@@ -2510,7 +2564,8 @@ int run_contingency_worker(
             precomputed_fast_state ? &*precomputed_fast_state : nullptr,
             rolling_corrective_seed ? &*rolling_corrective_seed : nullptr,
             rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr,
-            linearized_fallback ? &corrective_seed_bank : nullptr);
+            (linearized_fallback || fast_only)
+                ? &corrective_seed_bank : nullptr);
         std::optional<nlohmann::json> completed_result;
         double result_read_seconds = 0.0;
         if (success &&

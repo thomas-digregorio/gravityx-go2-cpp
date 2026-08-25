@@ -390,6 +390,13 @@ class CompetitionTimingTests(unittest.TestCase):
             self.assertTrue(
                 all(item["fast_screen_affinity_size"] == len(group) for item in group)
             )
+        easy_first_groups = fast_screen_affinity_groups(
+            case, state, records, difficult_groups_first=False
+        )
+        self.assertLessEqual(
+            easy_first_groups[0][0]["fast_screen_affinity_score"],
+            easy_first_groups[-1][0]["fast_screen_affinity_score"],
+        )
 
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)

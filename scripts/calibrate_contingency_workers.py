@@ -40,6 +40,8 @@ def run_trial(
     fast_power_flow_screen: bool,
     fast_only: bool = False,
     task_groups: list[list[dict[str, Any]]] | None = None,
+    linearized_fallback: bool = False,
+    precomputed_fast_screen_dir: Path | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     task_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
@@ -74,6 +76,8 @@ def run_trial(
             worker_arguments.append("fast-pf")
         if fast_only:
             worker_arguments.append("fast-only")
+        if linearized_fallback:
+            worker_arguments.append("linearized")
         command = cpp_command(
             executable,
             distro,
@@ -124,12 +128,18 @@ def run_trial(
                         output_dir / "results" / f"{safe_label(label)}.json"
                     )
                     assert process.stdin is not None
+                    task = {
+                        "label": label,
+                        "output_path": to_wsl(result_path),
+                    }
+                    if precomputed_fast_screen_dir is not None:
+                        task["fast_screen_path"] = to_wsl(
+                            precomputed_fast_screen_dir
+                            / f"{safe_label(label)}.json"
+                        )
                     process.stdin.write(
                         json.dumps(
-                            {
-                                "label": label,
-                                "output_path": to_wsl(result_path),
-                            },
+                            task,
                             separators=(",", ":"),
                         )
                         + "\n"
@@ -277,7 +287,12 @@ def main() -> int:
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--fast-only", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
+    parser.add_argument("--fast-screen-easy-first", action="store_true")
+    parser.add_argument("--additional-easy-task-count", type=int, default=0)
     parser.add_argument("--selection-offset", type=int, default=0)
+    parser.add_argument("--labels", nargs="+")
+    parser.add_argument("--linearized-fallback", action="store_true")
+    parser.add_argument("--precomputed-fast-screen-dir", type=Path)
     args = parser.parse_args()
 
     for path in (args.case_json, args.base_json, args.output_dir, args.executable):
@@ -288,10 +303,25 @@ def main() -> int:
         raise ValueError("worker counts must be positive")
     if args.fast_only and not args.fast_power_flow_screen:
         parser.error("--fast-only requires --fast-power-flow-screen")
+    if args.fast_only and args.linearized_fallback:
+        parser.error("--fast-only cannot be combined with --linearized-fallback")
+    if args.precomputed_fast_screen_dir is not None:
+        reject_onedrive(args.precomputed_fast_screen_dir)
+        if not args.linearized_fallback:
+            parser.error(
+                "--precomputed-fast-screen-dir requires --linearized-fallback"
+            )
     if args.fast_screen_affinity_schedule and not args.fast_only:
         parser.error("--fast-screen-affinity-schedule requires --fast-only")
+    if args.fast_screen_easy_first and not args.fast_screen_affinity_schedule:
+        parser.error(
+            "--fast-screen-easy-first requires "
+            "--fast-screen-affinity-schedule"
+        )
     if args.selection_offset < 0:
         parser.error("--selection-offset must be nonnegative")
+    if args.additional_easy_task_count < 0:
+        parser.error("--additional-easy-task-count must be nonnegative")
 
     case = read_json(args.case_json)
     base = read_json(args.base_json)
@@ -300,15 +330,39 @@ def main() -> int:
         base["selected_state"],
         contingency_records(case),
     )
-    records = ordered_records[
-        args.selection_offset : args.selection_offset + args.task_count
-    ]
-    if len(records) != args.task_count:
-        parser.error("selection offset and task count exceed contingency count")
+    if args.labels:
+        records_by_label = {
+            str(item["label"]): item for item in ordered_records
+        }
+        missing = [label for label in args.labels if label not in records_by_label]
+        if missing:
+            parser.error(f"unknown contingency labels: {missing}")
+        records = [records_by_label[label] for label in args.labels]
+    else:
+        records = ordered_records[
+            args.selection_offset : args.selection_offset + args.task_count
+        ]
+        if len(records) != args.task_count:
+            parser.error(
+                "selection offset and task count exceed contingency count"
+            )
+    if args.additional_easy_task_count:
+        primary_labels = {str(item["label"]) for item in records}
+        easy_records = [
+            item
+            for item in reversed(ordered_records)
+            if str(item["label"]) not in primary_labels
+        ][: args.additional_easy_task_count]
+        if len(easy_records) != args.additional_easy_task_count:
+            parser.error("not enough distinct easy contingencies to add")
+        records.extend(easy_records)
     task_groups: list[list[dict[str, Any]]] | None = None
     if args.fast_screen_affinity_schedule:
         task_groups = fast_screen_affinity_groups(
-            case, base["selected_state"], records
+            case,
+            base["selected_state"],
+            records,
+            difficult_groups_first=not args.fast_screen_easy_first,
         )
         records = [item for group in task_groups for item in group]
     args.output_dir.mkdir(parents=True)
@@ -318,6 +372,14 @@ def main() -> int:
         "selection_offset": args.selection_offset,
         "fast_only": args.fast_only,
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
+        "fast_screen_easy_first": args.fast_screen_easy_first,
+        "additional_easy_task_count": args.additional_easy_task_count,
+        "linearized_fallback": args.linearized_fallback,
+        "precomputed_fast_screen_dir": (
+            str(args.precomputed_fast_screen_dir)
+            if args.precomputed_fast_screen_dir is not None
+            else None
+        ),
         "schedule": [item["label"] for item in records],
         "trials": [],
     }
@@ -342,6 +404,8 @@ def main() -> int:
             args.fast_power_flow_screen,
             args.fast_only,
             task_groups,
+            args.linearized_fallback,
+            args.precomputed_fast_screen_dir,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

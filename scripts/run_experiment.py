@@ -814,6 +814,7 @@ def fast_screen_affinity_groups(
     case: dict[str, Any],
     base_state: dict[str, Any],
     records: list[dict[str, Any]],
+    difficult_groups_first: bool = True,
 ) -> list[list[dict[str, Any]]]:
     """Group related outages for rolling corrective-state reuse.
 
@@ -876,11 +877,16 @@ def fast_screen_affinity_groups(
             item["fast_screen_affinity_position"] = position
             item["fast_screen_affinity_size"] = len(group)
 
-    # Put the groups whose easiest seed is still most disturbed first.  This
-    # reduces the chance that one difficult group becomes the final straggler.
+    # Difficult-first avoids final stragglers; easy-first is an explicit
+    # alternative that builds each resident worker's corrective-state bank
+    # before it reaches the largest disturbances.
     groups.sort(
         key=lambda group: (
-            -float(group[0]["fast_screen_affinity_score"]),
+            (
+                -float(group[0]["fast_screen_affinity_score"])
+                if difficult_groups_first
+                else float(group[0]["fast_screen_affinity_score"])
+            ),
             -len(group),
             str(group[0]["fast_screen_affinity_type"]),
             int(group[0]["fast_screen_affinity_value"]),
@@ -1012,6 +1018,7 @@ def main() -> int:
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
+    parser.add_argument("--fast-screen-easy-first", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
     parser.add_argument("--robust-contingency-base", action="store_true")
@@ -1038,6 +1045,12 @@ def main() -> int:
         parser.error(
             "--fast-screen-affinity-schedule requires "
             "--two-stage-contingency-screen"
+        )
+    if (args.fast_screen_easy_first and
+            not args.fast_screen_affinity_schedule):
+        parser.error(
+            "--fast-screen-easy-first requires "
+            "--fast-screen-affinity-schedule"
         )
     if (args.defer_fallback_until_screen_complete and
             not args.two_stage_contingency_screen):
@@ -1154,6 +1167,7 @@ def main() -> int:
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "cpp_solution_writer": args.cpp_solution_writer,
+        "fast_screen_easy_first": args.fast_screen_easy_first,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
@@ -1305,13 +1319,21 @@ def main() -> int:
     fast_screen_groups: list[list[dict[str, Any]]] | None = None
     if args.fast_screen_affinity_schedule:
         fast_screen_groups = fast_screen_affinity_groups(
-            case, base_state, contingencies
+            case,
+            base_state,
+            contingencies,
+            difficult_groups_first=not args.fast_screen_easy_first,
         )
         contingencies = [
             item for group in fast_screen_groups for item in group
         ]
         schedule_mode = (
-            "dynamic affinity groups with low-disturbance seed first, then "
+            "dynamic affinity groups with low-disturbance seed first within "
+            + (
+                "globally easy-first groups, then "
+                if args.fast_screen_easy_first
+                else "globally difficult-first groups, then "
+            )
             + schedule_mode
         )
     run_status.update(

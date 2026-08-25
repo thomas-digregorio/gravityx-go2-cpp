@@ -1511,8 +1511,11 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         double desired_flow_change,
         const std::vector<double>& p_lower,
         const std::vector<double>& p_upper,
+        const std::vector<double>& load_power_lower,
+        const std::vector<double>& load_power_upper,
         const AcState& reference_state,
         std::vector<double>& pg,
+        std::vector<double>& load_power,
         std::vector<double>& p_spec) {
         if (!active_valid || branch_index < 0 ||
             branch_index >= static_cast<int>(data.branches.size()) ||
@@ -1520,6 +1523,9 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             pg.size() != data.generators.size() ||
             p_lower.size() != data.generators.size() ||
             p_upper.size() != data.generators.size() ||
+            load_power.size() != data.loads.size() ||
+            load_power_lower.size() != data.loads.size() ||
+            load_power_upper.size() != data.loads.size() ||
             p_spec.size() != data.buses.size()) {
             return false;
         }
@@ -1576,16 +1582,18 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
 
         const int generator_count =
             static_cast<int>(data.generators.size());
+        const int load_count = static_cast<int>(data.loads.size());
+        const int control_count = generator_count + load_count;
         std::vector<double> sensitivity(
-            static_cast<std::size_t>(generator_count), 0.0);
+            static_cast<std::size_t>(control_count), 0.0);
         std::vector<double> lower_change(
-            static_cast<std::size_t>(generator_count), 0.0);
+            static_cast<std::size_t>(control_count), 0.0);
         std::vector<double> upper_change(
-            static_cast<std::size_t>(generator_count), 0.0);
+            static_cast<std::size_t>(control_count), 0.0);
         std::vector<double> change(
-            static_cast<std::size_t>(generator_count), 0.0);
+            static_cast<std::size_t>(control_count), 0.0);
         std::vector<unsigned char> free(
-            static_cast<std::size_t>(generator_count), 0);
+            static_cast<std::size_t>(control_count), 0);
         for (int generator = 0; generator < generator_count; ++generator) {
             const int bus = data.generators[generator].bus;
             if (angle_index[bus] >= 0) {
@@ -1599,6 +1607,24 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             free[generator] =
                 upper_change[generator] - lower_change[generator] > 1e-10;
         }
+        // A positive load-control value below is an injection increase, so it
+        // corresponds to reducing the load's consumed active power.  This
+        // keeps the common balance equality sum(change) == 0 for generators
+        // and loads while preserving each source t/ramp bound exactly.
+        for (int load = 0; load < load_count; ++load) {
+            const int control = generator_count + load;
+            const int bus = data.loads[load].bus;
+            if (angle_index[bus] >= 0) {
+                sensitivity[control] =
+                    injection_sensitivity[angle_index[bus]];
+            }
+            lower_change[control] = std::max(
+                load_power[load] - load_power_upper[load], -1.0);
+            upper_change[control] = std::min(
+                load_power[load] - load_power_lower[load], 1.0);
+            free[control] =
+                upper_change[control] - lower_change[control] > 1e-10;
+        }
 
         bool solved = false;
         for (int active_set_round = 0;
@@ -1608,17 +1634,16 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             double free_count = 0.0;
             double sensitivity_sum = 0.0;
             double sensitivity_square_sum = 0.0;
-            for (int generator = 0; generator < generator_count;
-                 ++generator) {
-                if (free[generator]) {
+            for (int control = 0; control < control_count; ++control) {
+                if (free[control]) {
                     free_count += 1.0;
-                    sensitivity_sum += sensitivity[generator];
+                    sensitivity_sum += sensitivity[control];
                     sensitivity_square_sum +=
-                        sensitivity[generator] * sensitivity[generator];
+                        sensitivity[control] * sensitivity[control];
                 } else {
-                    fixed_sum += change[generator];
+                    fixed_sum += change[control];
                     fixed_flow +=
-                        sensitivity[generator] * change[generator];
+                        sensitivity[control] * change[control];
                 }
             }
             if (free_count < 2.0) {
@@ -1640,24 +1665,23 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
                 (free_count * required_flow -
                  sensitivity_sum * required_sum) / determinant;
             bool clipped = false;
-            for (int generator = 0; generator < generator_count;
-                 ++generator) {
-                if (!free[generator]) {
+            for (int control = 0; control < control_count; ++control) {
+                if (!free[control]) {
                     continue;
                 }
                 const double proposed = constant_multiplier +
-                    sensitivity_multiplier * sensitivity[generator];
-                if (proposed < lower_change[generator] - 1e-10) {
-                    change[generator] = lower_change[generator];
-                    free[generator] = 0;
+                    sensitivity_multiplier * sensitivity[control];
+                if (proposed < lower_change[control] - 1e-10) {
+                    change[control] = lower_change[control];
+                    free[control] = 0;
                     clipped = true;
                 } else if (proposed >
-                           upper_change[generator] + 1e-10) {
-                    change[generator] = upper_change[generator];
-                    free[generator] = 0;
+                           upper_change[control] + 1e-10) {
+                    change[control] = upper_change[control];
+                    free[control] = 0;
                     clipped = true;
                 } else {
-                    change[generator] = proposed;
+                    change[control] = proposed;
                 }
             }
             if (!clipped) {
@@ -1670,9 +1694,9 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         }
         double balance_check = 0.0;
         double flow_check = 0.0;
-        for (int generator = 0; generator < generator_count; ++generator) {
-            balance_check += change[generator];
-            flow_check += sensitivity[generator] * change[generator];
+        for (int control = 0; control < control_count; ++control) {
+            balance_check += change[control];
+            flow_check += sensitivity[control] * change[control];
         }
         if (std::abs(balance_check) > 1e-7 ||
             std::abs(flow_check - desired_flow_change) > 1e-6) {
@@ -1684,6 +1708,14 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             }
             pg[generator] += change[generator];
             p_spec[data.generators[generator].bus] += change[generator];
+        }
+        for (int load = 0; load < load_count; ++load) {
+            const int control = generator_count + load;
+            if (std::abs(change[control]) <= 1e-12) {
+                continue;
+            }
+            load_power[load] -= change[control];
+            p_spec[data.loads[load].bus] += change[control];
         }
         return true;
     }
@@ -3132,10 +3164,24 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 constexpr std::array<double, 5> kDampingCandidates{
                     1.0, 0.5, 0.25, 0.125, 0.0625};
                 const auto strongly_improving_full_damping = [&]
-                    (double damping, const ValidationReport& validation) {
-                    return branch_outage_low_rank_update && damping == 1.0 &&
+                    (double damping, const ValidationReport& validation,
+                     double sufficient_decrease_ratio = 0.99) {
+                    // Use the damping loop as a backtracking line search, not
+                    // an exhaustive best-of-five search.  Once the full step
+                    // has achieved verified sufficient decrease, smaller
+                    // steps in the same correction family need not be built
+                    // and exhaustively validated.  This gate is independent
+                    // of the branch low-rank path, so generator outages get
+                    // the same shortcut.  Requiring the full step to halve
+                    // the residual avoids changing basins when a smaller
+                    // damping is only modestly better.  Callers can retain
+                    // that conservative half-residual gate for correction
+                    // families with known basin sensitivity.  A weaker full
+                    // step still executes the complete deterministic search.
+                    return damping == 1.0 &&
                         validation.max_residual <=
-                            0.5 * predictor_validation.max_residual;
+                            sufficient_decrease_ratio *
+                                predictor_validation.max_residual;
                 };
                 const bool active_block_dominant =
                     predictor_validation.worst_category ==
@@ -3144,9 +3190,21 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 int worst_active_flow_branch = -1;
                 bool worst_active_flow_from_side = true;
                 double worst_active_flow_excess = 0.0;
+                double worst_active_flow_target = 0.0;
                 int worst_reactive_flow_branch = -1;
                 bool worst_reactive_flow_from_side = true;
                 double worst_reactive_flow_excess = 0.0;
+                double worst_reactive_flow_target = 0.0;
+                const std::string sm_slack_suffix = ":sm_slack";
+                const bool apparent_slack_dominant =
+                    predictor_validation.worst_category ==
+                        "variable_bound" &&
+                    predictor_validation.worst_identity.size() >=
+                        sm_slack_suffix.size() &&
+                    predictor_validation.worst_identity.compare(
+                        predictor_validation.worst_identity.size() -
+                            sm_slack_suffix.size(),
+                        sm_slack_suffix.size(), sm_slack_suffix) == 0;
                 for (int branch_index = 0;
                      branch_index < static_cast<int>(data_.branches.size());
                      ++branch_index) {
@@ -3159,41 +3217,73 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     if (rating <= 1e-12) {
                         continue;
                     }
-                    const double from_excess =
-                        std::abs(predictor_state.pf[branch_index]) - rating;
-                    const double to_excess =
-                        std::abs(predictor_state.pt[branch_index]) - rating;
-                    const double reactive_from_excess =
-                        std::abs(predictor_state.qf[branch_index]) - rating;
-                    const double reactive_to_excess =
-                        std::abs(predictor_state.qt[branch_index]) - rating;
-                    if (from_excess > worst_active_flow_excess) {
-                        worst_active_flow_excess = from_excess;
-                        worst_active_flow_branch = branch_index;
-                        worst_active_flow_from_side = true;
-                    }
-                    if (to_excess > worst_active_flow_excess) {
-                        worst_active_flow_excess = to_excess;
-                        worst_active_flow_branch = branch_index;
-                        worst_active_flow_from_side = false;
-                    }
-                    if (reactive_from_excess >
-                        worst_reactive_flow_excess) {
-                        worst_reactive_flow_excess =
-                            reactive_from_excess;
-                        worst_reactive_flow_branch = branch_index;
-                        worst_reactive_flow_from_side = true;
-                    }
-                    if (reactive_to_excess >
-                        worst_reactive_flow_excess) {
-                        worst_reactive_flow_excess = reactive_to_excess;
-                        worst_reactive_flow_branch = branch_index;
-                        worst_reactive_flow_from_side = false;
-                    }
+                    const auto& branch = data_.branches[branch_index];
+                    const auto consider_terminal = [&]
+                        (double active_flow, double reactive_flow,
+                         double voltage, bool from_side) {
+                        double active_limit = rating;
+                        double reactive_limit = rating;
+                        if (apparent_slack_dominant) {
+                            const double allowed_magnitude = rating *
+                                (branch.transformer
+                                     ? 1.0 + data_.sm_vio_limit
+                                     : voltage + data_.sm_vio_limit);
+                            active_limit = std::min(
+                                rating,
+                                std::sqrt(std::max(
+                                    0.0,
+                                    allowed_magnitude * allowed_magnitude -
+                                        reactive_flow * reactive_flow)));
+                            reactive_limit = std::min(
+                                rating,
+                                std::sqrt(std::max(
+                                    0.0,
+                                    allowed_magnitude * allowed_magnitude -
+                                        active_flow * active_flow)));
+                        }
+                        const double active_excess =
+                            std::abs(active_flow) - active_limit;
+                        const double reactive_excess =
+                            std::abs(reactive_flow) - reactive_limit;
+                        if (active_excess > worst_active_flow_excess) {
+                            worst_active_flow_excess = active_excess;
+                            worst_active_flow_branch = branch_index;
+                            worst_active_flow_from_side = from_side;
+                            worst_active_flow_target = std::copysign(
+                                std::max(0.0, active_limit - 1e-4),
+                                active_flow);
+                        }
+                        if (reactive_excess >
+                            worst_reactive_flow_excess) {
+                            worst_reactive_flow_excess = reactive_excess;
+                            worst_reactive_flow_branch = branch_index;
+                            worst_reactive_flow_from_side = from_side;
+                            worst_reactive_flow_target = std::copysign(
+                                std::max(0.0, reactive_limit - 1e-4),
+                                reactive_flow);
+                        }
+                    };
+                    consider_terminal(
+                        predictor_state.pf[branch_index],
+                        predictor_state.qf[branch_index],
+                        predictor_state.vm[branch.from], true);
+                    consider_terminal(
+                        predictor_state.pt[branch_index],
+                        predictor_state.qt[branch_index],
+                        predictor_state.vm[branch.to], false);
                 }
-                const bool active_flow_bound_dominant =
+                const bool active_flow_blocks_balance_repair =
                     predictor_validation.worst_category ==
-                        "variable_bound" &&
+                        "active_balance" &&
+                    predictor_validation.max_active_balance_residual >
+                        1e-8 &&
+                    worst_active_flow_excess >=
+                        0.25 * predictor_validation
+                            .max_active_balance_residual;
+                const bool active_flow_bound_dominant =
+                    (predictor_validation.worst_category ==
+                         "variable_bound" ||
+                     active_flow_blocks_balance_repair) &&
                     worst_active_flow_branch >= 0 &&
                     worst_active_flow_excess > 1e-8 &&
                     worst_active_flow_excess >=
@@ -3436,15 +3526,19 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     // strongly improving at the next nonlinear state.  Try it
                     // as a continuation step
                     // before the ten-candidate generic search, but accept it
-                    // early only after at least a five-percent exact-residual
-                    // reduction.  Otherwise retain it as one candidate and
-                    // run the complete search.
+                    // early once it gives a material exact-residual reduction.
+                    // Requiring five percent here made slowly contracting but
+                    // strictly monotone reactive repairs repeat the complete
+                    // ten-candidate search for more than a hundred iterations.
+                    // A 0.1-percent gate still rejects numerical stagnation;
+                    // final acceptance continues to require the complete
+                    // independent validator below the configured tolerance.
                     if (!active_block_dominant &&
                         !active_flow_bound_dominant &&
                         consecutive_full_local_reactive_active_angle >= 2 &&
                         try_local_reactive_then_active(1.0) &&
                         selected_validation.max_residual <=
-                            0.95 * predictor_validation.max_residual) {
+                            0.999 * predictor_validation.max_residual) {
                         output.fixed_jacobian_predictor_trace.back()[
                             "continuation_correction_selected"] = true;
                         return;
@@ -3498,11 +3592,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 -cosine_coefficient * std::sin(angle) -
                                 sine_coefficient * std::cos(angle);
                         }
-                        const double target_flow = std::copysign(
-                            std::max(0.0, branch.rate_c - 1e-4), flow);
+                        const double target_flow =
+                            worst_active_flow_target;
                         const bool prefer_redispatch_over_endpoint_angle =
                             worst_reactive_flow_excess <= 1e-6 ||
-                            (predictor_iteration >= 6 &&
+                            (predictor_iteration >= 5 &&
                              predictor_validation.max_residual > 0.02);
                         const auto try_endpoint_angle = [&]() {
                             if (std::abs(derivative) <= 1e-10) {
@@ -3597,14 +3691,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         }
                         if (best_redispatch_damping == 0.0) {
                             auto distributed_pg = correction_reference.pg;
+                            const int distributed_load_count =
+                                static_cast<int>(data_.loads.size());
+                            std::vector<double> distributed_load_power(
+                                static_cast<std::size_t>(
+                                    distributed_load_count), 0.0);
+                            for (int load = 0;
+                                 load < distributed_load_count; ++load) {
+                                distributed_load_power[load] =
+                                    data_.loads[load].pd_nominal *
+                                    correction_reference
+                                        .demand_factor[load];
+                            }
+                            const auto reference_load_power =
+                                distributed_load_power;
                             auto distributed_p_spec = p_spec;
                             if (cache.apply_distributed_active_flow_redispatch(
                                     data_, worst_active_flow_branch,
                                     worst_active_flow_from_side,
                                     target_flow - flow,
                                     p_lower, p_upper,
+                                    predictor_load_power_lower,
+                                    predictor_load_power_upper,
                                     correction_reference,
                                     distributed_pg,
+                                    distributed_load_power,
                                     distributed_p_spec)) {
                                 for (const double damping :
                                      kDampingCandidates) {
@@ -3621,6 +3732,23 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         trial_p_spec[bus] += damping *
                                             (distributed_p_spec[bus] -
                                              p_spec[bus]);
+                                    }
+                                    for (int load = 0;
+                                         load < distributed_load_count;
+                                         ++load) {
+                                        if (std::abs(
+                                                data_.loads[load]
+                                                    .pd_nominal) <= 1e-12) {
+                                            continue;
+                                        }
+                                        const double trial_load_power =
+                                            reference_load_power[load] +
+                                            damping *
+                                                (distributed_load_power[load] -
+                                                 reference_load_power[load]);
+                                        trial.demand_factor[load] =
+                                            trial_load_power /
+                                            data_.loads[load].pd_nominal;
                                     }
                                     if (!cache.apply_active_correction(
                                             data_, trial_p_spec, p_network,
@@ -3694,7 +3822,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_damping = damping;
                             selected_correction_mode = "active_angle";
                             if (strongly_improving_full_damping(
-                                    damping, trial_validation)) {
+                                    damping, trial_validation, 0.5)) {
                                 break;
                             }
                         }
@@ -4086,11 +4214,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 derivative_from * balance_to_derivative -
                                 derivative_to * balance_from_derivative;
                             if (std::abs(two_by_two_determinant) > 1e-12) {
-                                const double target_flow = std::copysign(
-                                    std::max(
-                                        0.0,
-                                        reactive_branch.rate_c - 1e-4),
-                                    flow);
+                                const double target_flow =
+                                    worst_reactive_flow_target;
                                 const double desired_flow_change =
                                     target_flow - flow;
                                 const double desired_balance_change =

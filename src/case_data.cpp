@@ -39,6 +39,31 @@ std::vector<double> doubles(const json& array) {
     return values;
 }
 
+std::string source_identifier(const json& item, std::size_t position) {
+    const auto& value = item.at("source_id").at(position);
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_number_integer()) {
+        return std::to_string(value.get<long long>());
+    }
+    if (value.is_number_unsigned()) {
+        return std::to_string(value.get<unsigned long long>());
+    }
+    throw std::runtime_error("source identifier is not a string or integer");
+}
+
+int source_integer(const json& item, std::size_t position) {
+    const auto& value = item.at("source_id").at(position);
+    if (value.is_number_integer() || value.is_number_unsigned()) {
+        return value.get<int>();
+    }
+    if (value.is_string()) {
+        return std::stoi(value.get<std::string>());
+    }
+    throw std::runtime_error("source identifier is not an integer");
+}
+
 }  // namespace
 
 CaseData CaseData::load(const std::string& path) {
@@ -71,6 +96,7 @@ CaseData CaseData::load(const std::string& path) {
         bus.vmax = item.at("vmax").get<double>();
         bus.vm_start = value_or(item, "vm_start", value_or(item, "vm", 1.0));
         bus.va_start = value_or(item, "va_start", value_or(item, "va", 0.0));
+        bus.present = item.value("present", true);
         return bus;
     });
     for (int position = 0; position < static_cast<int>(data.buses.size()); ++position) {
@@ -109,6 +135,9 @@ CaseData CaseData::load(const std::string& path) {
         gen.sdcost = item.at("sdcost").get<double>();
         gen.ncost = item.at("ncost").get<int>();
         gen.cost = doubles(item.at("cost"));
+        gen.present = item.value("present", true);
+        gen.source_bus = source_integer(item, 1);
+        gen.source_id = source_identifier(item, 2);
         return gen;
     });
 
@@ -133,6 +162,9 @@ CaseData CaseData::load(const std::string& path) {
         load.z_start = std::abs(load.pd_nominal) > 1e-12 ? pd / load.pd_nominal : 1.0;
         load.ncost = item.at("ncost").get<int>();
         load.cost = doubles(item.at("cost"));
+        load.present = item.value("present", true);
+        load.source_bus = source_integer(item, 1);
+        load.source_id = source_identifier(item, 2);
         return load;
     });
 
@@ -163,6 +195,8 @@ CaseData CaseData::load(const std::string& path) {
         if (shunt.steps.size() < shunt.block_maximum_steps.size()) {
             shunt.steps.resize(shunt.block_maximum_steps.size(), 0);
         }
+        shunt.present = item.value("present", true);
+        shunt.source_bus = source_integer(item, 1);
         return shunt;
     });
 
@@ -192,6 +226,14 @@ CaseData CaseData::load(const std::string& path) {
         branch.rate_a = item.at("rate_a").get<double>();
         branch.rate_b = item.value("rate_b", branch.rate_a);
         branch.rate_c = item.value("rate_c", branch.rate_a);
+        branch.present = item.value("present", true);
+        branch.source_from = source_integer(item, 1);
+        branch.source_to = source_integer(item, 2);
+        branch.source_id = source_identifier(
+            item, branch.transformer ? 4 : 3);
+        branch.control_mode = item.value("control_mode", 0);
+        branch.tm_step = item.value("tm_step", 0);
+        branch.ta_step = item.value("ta_step", 0);
         return branch;
     });
 

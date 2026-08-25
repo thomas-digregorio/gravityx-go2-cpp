@@ -721,6 +721,7 @@ def main() -> int:
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
+    parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
@@ -857,6 +858,7 @@ def main() -> int:
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
+        "cpp_solution_writer": args.cpp_solution_writer,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
@@ -1144,13 +1146,20 @@ def main() -> int:
         execution_phase: str,
     ) -> None:
         label = str(item["label"])
-        write_solution(
-            args.output_dir / f"solution_{label}.txt",
-            case,
-            result["solve"]["state"],
-            commitment,
-            item,
-        )
+        solution_path = args.output_dir / f"solution_{label}.txt"
+        if args.cpp_solution_writer:
+            if not solution_path.is_file() or solution_path.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"C++ worker did not write a complete solution for {label}"
+                )
+        else:
+            write_solution(
+                solution_path,
+                case,
+                result["solve"]["state"],
+                commitment,
+                item,
+            )
         record = contingency_record(item, result, worker_id, execution_phase)
         with progress_lock:
             records.append(record)
@@ -1259,15 +1268,16 @@ def main() -> int:
                             internal / "contingencies" / f"{safe_label(label)}.json"
                         )
                         assert process.stdin is not None
-                        process.stdin.write(
-                            json.dumps(
-                                {
-                                    "label": label,
-                                    "output_path": to_wsl(result_path),
-                                },
-                                separators=(",", ":"),
+                        task = {
+                            "label": label,
+                            "output_path": to_wsl(result_path),
+                        }
+                        if args.cpp_solution_writer:
+                            task["solution_path"] = to_wsl(
+                                args.output_dir / f"solution_{label}.txt"
                             )
-                            + "\n"
+                        process.stdin.write(
+                            json.dumps(task, separators=(",", ":")) + "\n"
                         )
                         process.stdin.flush()
                         acknowledgement = json.loads(
@@ -1284,7 +1294,15 @@ def main() -> int:
                                 f"fast screen {label} finished after the "
                                 f"{contingency_deadline_name}"
                             )
-                        result = read_json(result_path)
+                        if args.cpp_solution_writer:
+                            result = acknowledgement.get("result_summary")
+                            if not isinstance(result, dict):
+                                raise RuntimeError(
+                                    f"fast screen {label} returned no compact "
+                                    "result summary"
+                                )
+                        else:
+                            result = read_json(result_path)
                         if result.get("success", False):
                             save_secure_result(item, result, worker_id, "fast_screen")
                         elif result.get("screen_completed", False):
@@ -1472,6 +1490,10 @@ def main() -> int:
                     "label": label,
                     "output_path": to_wsl(result_path),
                 }
+                if args.cpp_solution_writer:
+                    task["solution_path"] = to_wsl(
+                        args.output_dir / f"solution_{label}.txt"
+                    )
                 if args.two_stage_contingency_screen:
                     task["fast_screen_path"] = to_wsl(result_path)
                 assert process.stdin is not None
@@ -1511,7 +1533,14 @@ def main() -> int:
                         f"contingency {label} finished after the "
                         f"{contingency_deadline_name}"
                     )
-                result = read_json(result_path)
+                if args.cpp_solution_writer:
+                    result = acknowledgement.get("result_summary")
+                    if not isinstance(result, dict):
+                        raise RuntimeError(
+                            f"contingency {label} returned no compact result summary"
+                        )
+                else:
+                    result = read_json(result_path)
                 if not result.get("success", False):
                     raise RuntimeError(
                         f"contingency {label} did not pass independent validation"

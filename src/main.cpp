@@ -4,6 +4,7 @@
 #include "gravityx/case_data.hpp"
 #include "gravityx/fast_power_flow.hpp"
 #include "gravityx/linearized_ac_seed.hpp"
+#include "gravityx/solution_writer.hpp"
 #include "gravityx/state_io.hpp"
 #include "gravityx/validation.hpp"
 
@@ -185,6 +186,85 @@ int run_component_tests() {
         seed_case, generator_outage, 0.5, 0.0);
     require_near(generator_seed.active[0], 0.4, 1e-12, "generator-outage active seed");
     require_near(generator_seed.reactive[0], 0.1, 1e-12, "generator-outage reactive seed");
+
+    gravityx::CaseData writer_case;
+    writer_case.buses.resize(2);
+    writer_case.buses[0].index = 101;
+    writer_case.buses[0].bus_i = 101;
+    writer_case.buses[1].index = 202;
+    writer_case.buses[1].bus_i = 202;
+    gravityx::Load writer_load;
+    writer_load.index = 3;
+    writer_load.bus = 1;
+    writer_load.source_bus = 202;
+    writer_load.source_id = "L1";
+    writer_case.loads.push_back(writer_load);
+    gravityx::Generator writer_generator;
+    writer_generator.index = 7;
+    writer_generator.bus = 0;
+    writer_generator.source_bus = 101;
+    writer_generator.source_id = "G1";
+    writer_case.generators.push_back(writer_generator);
+    gravityx::Branch writer_line;
+    writer_line.index = 11;
+    writer_line.from = 0;
+    writer_line.to = 1;
+    writer_line.source_from = 101;
+    writer_line.source_to = 202;
+    writer_line.source_id = "1";
+    writer_line.status = 1;
+    writer_case.branches.push_back(writer_line);
+    gravityx::Branch writer_transformer = writer_line;
+    writer_transformer.index = 12;
+    writer_transformer.transformer = true;
+    writer_transformer.source_id = "T1";
+    writer_transformer.control_mode = 3;
+    writer_transformer.ta_step = 2;
+    writer_case.branches.push_back(writer_transformer);
+    gravityx::Shunt writer_shunt;
+    writer_shunt.index = 5;
+    writer_shunt.bus = 0;
+    writer_shunt.source_bus = 101;
+    writer_shunt.dispatchable = true;
+    writer_shunt.steps = {0, 0};
+    writer_case.shunts.push_back(writer_shunt);
+    gravityx::AcState writer_state;
+    writer_state.vm = {1.0, 0.5};
+    writer_state.va = {0.0, -0.125};
+    writer_state.demand_factor = {1.0};
+    writer_state.pg = {0.75};
+    writer_state.qg = {0.25};
+    writer_state.shunt_steps = {{2, 0}};
+    gravityx::Contingency writer_outage;
+    writer_outage.label = "line-outage";
+    writer_outage.type = gravityx::ContingencyType::Branch;
+    writer_outage.source_index = 11;
+    writer_outage.component = 0;
+    const std::string expected_solution =
+        "--bus section\n"
+        "i, v, theta\n"
+        "101, 1, 0\n"
+        "202, 0.5, -0.125\n"
+        "--load section\n"
+        "i, id, t\n"
+        "202, L1, 1\n"
+        "--generator section\n"
+        "i, id, p, q, x\n"
+        "101, G1, 0.75, 0.25, 1\n"
+        "--line section\n"
+        "iorig, idest, id, x\n"
+        "--transformer section\n"
+        "iorig, idest, id, x, xst\n"
+        "101, 202, T1, 1, 2\n"
+        "--switched shunt section\n"
+        "i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8\n"
+        "101, 2, 0\n";
+    if (gravityx::go_solution_text(
+            writer_case, writer_state, {1}, &writer_outage) !=
+        expected_solution) {
+        throw std::runtime_error(
+            "component test failed: official solution text schema");
+    }
     std::cout << "component tests passed\n";
     return 0;
 }
@@ -2398,6 +2478,14 @@ int run_contingency_worker(
         }
         const auto label = task.at("label").get<std::string>();
         const auto output_path = task.at("output_path").get<std::string>();
+        const std::optional<std::string> solution_path =
+            task.contains("solution_path")
+            ? std::make_optional(
+                  task.at("solution_path").get<std::string>())
+            : std::nullopt;
+        if (solution_path) {
+            reject_onedrive(*solution_path);
+        }
         std::optional<gravityx::AcState> precomputed_fast_state;
         if (task.contains("fast_screen_path")) {
             const auto fast_screen_path =
@@ -2423,10 +2511,51 @@ int run_contingency_worker(
             rolling_corrective_seed ? &*rolling_corrective_seed : nullptr,
             rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr,
             linearized_fallback ? &corrective_seed_bank : nullptr);
+        std::optional<nlohmann::json> completed_result;
+        double result_read_seconds = 0.0;
+        if (success &&
+            (solution_path.has_value() ||
+             ((linearized_fallback || fast_only) &&
+              data.buses.size() >= 16000))) {
+            const auto result_read_start = std::chrono::steady_clock::now();
+            completed_result = read_json_file(output_path);
+            result_read_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - result_read_start).count();
+        }
+        bool solution_written = false;
+        double solution_write_seconds = 0.0;
+        if (solution_path && completed_result &&
+            completed_result->value("success", false) &&
+            completed_result->contains("solve") &&
+            completed_result->at("solve").contains("state")) {
+            const auto contingency = std::find_if(
+                data.contingencies.begin(), data.contingencies.end(),
+                [&](const gravityx::Contingency& item) {
+                    return item.label == label;
+                });
+            if (contingency == data.contingencies.end()) {
+                throw std::runtime_error(
+                    "cannot write solution for unknown contingency " + label);
+            }
+            const auto verified_state = gravityx::ac_state_from_json(
+                completed_result->at("solve").at("state"));
+            const auto solution_write_start =
+                std::chrono::steady_clock::now();
+            gravityx::write_go_solution(
+                *solution_path, data, verified_state, base.commitment,
+                &*contingency);
+            solution_write_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - solution_write_start)
+                .count();
+            solution_written = true;
+        }
         bool rolling_corrective_seed_updated = false;
         if (success && (linearized_fallback || fast_only) &&
             data.buses.size() >= 16000) {
-            const auto result_json = read_json_file(output_path);
+            if (!completed_result) {
+                completed_result = read_json_file(output_path);
+            }
+            const auto& result_json = *completed_result;
             if (result_json.value("success", false) &&
                 result_json.contains("solve") &&
                 result_json.at("solve").contains("state")) {
@@ -2454,6 +2583,59 @@ int run_contingency_worker(
                 rolling_corrective_seed_updated = true;
             }
         }
+        nlohmann::json result_summary = nullptr;
+        if (completed_result) {
+            const auto& result_json = *completed_result;
+            const auto& solve_json = result_json.at("solve");
+            const auto& validation_json = result_json.at("validation");
+            std::string fast_screen_failure_reason;
+            if (result_json.contains("fast_screen") &&
+                result_json.at("fast_screen").is_object()) {
+                fast_screen_failure_reason = result_json.at("fast_screen")
+                    .value("failure_reason", std::string());
+            }
+            result_summary = {
+                {"success", result_json.value("success", false)},
+                {"screen_completed",
+                 result_json.value("screen_completed", false)},
+                {"requires_exact_fallback",
+                 result_json.value("requires_exact_fallback", false)},
+                {"solver_status_success",
+                 result_json.value("solver_status_success", false)},
+                {"accepted_feasible_nonconverged",
+                 result_json.value(
+                     "accepted_feasible_nonconverged", false)},
+                {"solution_method",
+                 result_json.value("solution_method", std::string())},
+                {"fast_power_flow_screen",
+                 result_json.value("fast_power_flow_screen", false)},
+                {"precomputed_fast_screen_reference",
+                 result_json.value(
+                     "precomputed_fast_screen_reference", false)},
+                {"model_preparation_wall_seconds",
+                 result_json.value(
+                     "model_preparation_wall_seconds", 0.0)},
+                {"solve", {
+                    {"status", solve_json.value("status", -1)},
+                    {"objective", solve_json.value("objective", 0.0)},
+                    {"wall_seconds",
+                     solve_json.value("wall_seconds", 0.0)},
+                    {"iterations", solve_json.value("iterations", -1)},
+                    {"resident_reoptimization",
+                     solve_json.value("resident_reoptimization", false)},
+                    {"acceptable_termination_enabled",
+                     solve_json.value(
+                         "acceptable_termination_enabled", false)},
+                }},
+                {"validation", {
+                    {"max_residual",
+                     validation_json.value("max_residual", 0.0)},
+                }},
+                {"fast_screen", {
+                    {"failure_reason", fast_screen_failure_reason},
+                }},
+            };
+        }
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
@@ -2466,6 +2648,10 @@ int run_contingency_worker(
                  ? nlohmann::json(rolling_corrective_seed_label)
                  : nlohmann::json(nullptr)},
             {"corrective_seed_bank_size", corrective_seed_bank.size()},
+            {"solution_written", solution_written},
+            {"result_read_seconds", result_read_seconds},
+            {"solution_write_seconds", solution_write_seconds},
+            {"result_summary", result_summary},
         }).dump() << std::endl;
         if (!success) {
             return 1;

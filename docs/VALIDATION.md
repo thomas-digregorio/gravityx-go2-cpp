@@ -75,6 +75,13 @@ increased isolated corrective solves from roughly 10 seconds to as much as
 count changes only process scheduling, not the mathematical model or the cold
 start supplied to any contingency.
 
+With `--cpp-solution-writer`, each resident worker writes its independently
+verified contingency state directly in the official text format.  The runner
+will not count the task unless that file exists and is nonempty.  Component
+tests cover section ordering and outage omission, and the large-case gate
+requires byte-for-byte equality with the original Python writer before the
+mode is used in a retained run.
+
 Each corrective model starts from the verified base state with the outaged
 component removed.  Its active- and reactive-balance slack variables are
 initialized from the independently recomputed nodal mismatch of that adjusted

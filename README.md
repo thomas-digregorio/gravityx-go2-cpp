@@ -107,3 +107,10 @@ The registered Final-617 settings are in `config/final_617_005.json`.
 
 See `docs/VALIDATION.md` for the independent checks and tiny-case equivalence
 evidence.
+
+Large-case runs may add `--cpp-solution-writer`.  A resident C++ worker then
+writes the official text file only after the existing independent nonlinear
+validation passes.  The complete JSON result remains available for audit and
+fallback, while the Python orchestrator consumes a compact state-free summary.
+This changes serialization placement, not the solved model or acceptance
+tolerance.

@@ -27,6 +27,7 @@ struct Bus {
     std::vector<int> shunts;
     std::vector<int> branches_from;
     std::vector<int> branches_to;
+    bool present{true};
 };
 
 struct Generator {
@@ -52,6 +53,9 @@ struct Generator {
     double sdcost{};
     int ncost{};
     std::vector<double> cost;
+    bool present{true};
+    int source_bus{};
+    std::string source_id;
 };
 
 struct Load {
@@ -73,6 +77,9 @@ struct Load {
     double z_start{};
     int ncost{};
     std::vector<double> cost;
+    bool present{true};
+    int source_bus{};
+    std::string source_id;
 };
 
 struct Shunt {
@@ -85,6 +92,8 @@ struct Shunt {
     std::vector<int> steps;
     std::vector<int> block_maximum_steps;
     std::vector<double> block_susceptance;
+    bool present{true};
+    int source_bus{};
 };
 
 struct Branch {
@@ -107,6 +116,13 @@ struct Branch {
     double rate_a{};
     double rate_b{};
     double rate_c{};
+    bool present{true};
+    int source_from{};
+    int source_to{};
+    std::string source_id;
+    int control_mode{};
+    int tm_step{};
+    int ta_step{};
 };
 
 enum class ContingencyType {

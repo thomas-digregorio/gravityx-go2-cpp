@@ -39,6 +39,7 @@ add_executable(gravityx_go2
     src/linearized_ac_seed.cpp
     src/validation.cpp
     src/state_io.cpp
+    src/solution_writer.cpp
 )
 target_include_directories(gravityx_go2 PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

@@ -591,6 +591,15 @@ bool allocate_total(
         target > total_upper + kAllocationTolerance) {
         return false;
     }
+    // Callers frequently allocate the generators or loads at one bus while
+    // the full case contains thousands of controls.  Keep this operation
+    // transactional over only the touched indices so callers do not need to
+    // copy the entire case-wide vector before every local projection.
+    std::vector<double> original;
+    original.reserve(indices.size());
+    for (int index : indices) {
+        original.push_back(values[index]);
+    }
     for (int index : indices) {
         values[index] = std::clamp(preferred[index], lower[index], upper[index]);
     }
@@ -624,7 +633,13 @@ bool allocate_total(
     for (int index : indices) {
         current += values[index];
     }
-    return std::abs(target - current) <= 1e-7;
+    if (std::abs(target - current) <= 1e-7) {
+        return true;
+    }
+    for (std::size_t position = 0; position < indices.size(); ++position) {
+        values[indices[position]] = original[position];
+    }
+    return false;
 }
 
 std::vector<double> interpolation_weights(
@@ -2445,6 +2460,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             std::unique_ptr<FixedJacobianPredictorCache>
                 contingency_predictor_cache;
             int active_feasibility_repair_attempts = 0;
+            int consecutive_full_local_reactive_active_angle = 0;
             // Difficult generator outages can enter a late, monotonically
             // shrinking cycle between active- and reactive-flow limits after
             // the global feasibility repair.  Keep the inexpensive local
@@ -2454,6 +2470,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             for (int predictor_iteration = 0;
                  predictor_iteration <= kMaximumFixedJacobianIterations;
                  ++predictor_iteration) {
+                const auto projection_validation_start =
+                    std::chrono::steady_clock::now();
                 rebuild_contingency_state_derived_fields(
                     data_, base_state_, commitment_, *contingency,
                     predictor_state);
@@ -2508,15 +2526,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     }
                     const double q_balance =
                         q_network[bus] - generated_q + load_at_bus_q;
-                    auto proposed_qg = predictor_state.qg;
-                    if (allocate_total(
-                            active_at_bus[bus], q_lower, q_upper,
-                            initial_state.qg,
-                            generated_q + q_balance -
-                                std::clamp(q_balance, -0.49, 0.49),
-                            proposed_qg)) {
-                        predictor_state.qg = std::move(proposed_qg);
-                    }
+                    static_cast<void>(allocate_total(
+                        active_at_bus[bus], q_lower, q_upper,
+                        initial_state.qg,
+                        generated_q + q_balance -
+                            std::clamp(q_balance, -0.49, 0.49),
+                        predictor_state.qg));
                 }
 
                 // A PQ load is also a source-authorized corrective control.
@@ -2628,13 +2643,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         const double target_generation = std::clamp(
                             generated_p + p_excess,
                             total_lower, total_upper);
-                        const auto preferred_pg = predictor_state.pg;
-                        auto proposed_pg = predictor_state.pg;
                         if (allocate_total(
                                 active_at_bus[bus], p_lower, p_upper,
-                                preferred_pg, target_generation,
-                                proposed_pg)) {
-                            predictor_state.pg = std::move(proposed_pg);
+                                predictor_state.pg, target_generation,
+                                predictor_state.pg)) {
                             generated_p = 0.0;
                             for (int generator : active_at_bus[bus]) {
                                 generated_p += predictor_state.pg[generator];
@@ -2660,12 +2672,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     }
                     const double target_load = std::clamp(
                         loaded_p - p_excess, total_lower, total_upper);
-                    const auto preferred_load = predictor_load_active;
                     if (!allocate_total(
                             data_.buses[bus].loads,
                             predictor_load_power_lower,
                             predictor_load_power_upper,
-                            preferred_load, target_load,
+                            predictor_load_active, target_load,
                             predictor_load_active)) {
                         continue;
                     }
@@ -2708,6 +2719,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     {"generation_total", predictor_generation_total},
                     {"load_total", predictor_load_total},
                     {"validation", predictor_validation.to_json()},
+                    {"projection_validation_seconds",
+                     std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() -
+                         projection_validation_start).count()},
                 });
                 retain_best_intermediate(
                     predictor_state, predictor_validation,
@@ -2731,6 +2746,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     kMaximumFixedJacobianIterations) {
                     break;
                 }
+                const auto correction_search_start =
+                    std::chrono::steady_clock::now();
                 if (predictor_iteration == 0 && outaged_branch >= 0) {
                     branch_outage_low_rank_update =
                         predictor_cache_->configure_branch_outage_update(
@@ -2996,13 +3013,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             const double target_generation = std::clamp(
                                 generated_p + p_excess,
                                 total_lower, total_upper);
-                            const auto preferred_pg = trial.pg;
-                            auto proposed_pg = trial.pg;
                             if (allocate_total(
                                     active_at_bus[bus], p_lower, p_upper,
-                                    preferred_pg, target_generation,
-                                    proposed_pg)) {
-                                trial.pg = std::move(proposed_pg);
+                                    trial.pg, target_generation,
+                                    trial.pg)) {
                                 generated_p = 0.0;
                                 for (int generator : active_at_bus[bus]) {
                                     generated_p += trial.pg[generator];
@@ -3031,12 +3045,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         const double target_load = std::clamp(
                             loaded_p - p_excess,
                             total_lower, total_upper);
-                        const auto preferred_load = trial_load_active;
                         if (!allocate_total(
                                 data_.buses[bus].loads,
                                 predictor_load_power_lower,
                                 predictor_load_power_upper,
-                                preferred_load, target_load,
+                                trial_load_active, target_load,
                                 trial_load_active)) {
                             continue;
                         }
@@ -3065,15 +3078,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         const double q_balance =
                             trial_q_network[bus] - generated_q +
                             load_at_bus_q;
-                        auto projected_qg = trial.qg;
-                        if (allocate_total(
-                                active_at_bus[bus], q_lower, q_upper,
-                                initial_state.qg,
-                                generated_q + q_balance -
-                                    std::clamp(q_balance, -0.49, 0.49),
-                                projected_qg)) {
-                            trial.qg = std::move(projected_qg);
-                        }
+                        static_cast<void>(allocate_total(
+                            active_at_bus[bus], q_lower, q_upper,
+                            initial_state.qg,
+                            generated_q + q_balance -
+                                std::clamp(q_balance, -0.49, 0.49),
+                            trial.qg));
                     }
                     rebuild_contingency_state_derived_fields(
                         data_, base_state_, commitment_, *contingency, trial);
@@ -3083,6 +3093,77 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 };
                 const auto try_damped_corrections = [&]
                     (FixedJacobianPredictorCache& cache) {
+                    const auto try_local_reactive_then_active =
+                        [&](double damping) {
+                        auto trial = correction_reference;
+                        if (!cache.apply_local_reactive_least_squares(
+                                data_, q_balance_by_bus,
+                                trial.vm, damping)) {
+                            return false;
+                        }
+                        rebuild_contingency_state_derived_fields(
+                            data_, base_state_, commitment_, *contingency,
+                            trial);
+                        std::vector<double> trial_p_network(
+                            static_cast<std::size_t>(nb), 0.0);
+                        for (int branch_index = 0;
+                             branch_index <
+                                 static_cast<int>(data_.branches.size());
+                             ++branch_index) {
+                            if (branch_index == outaged_branch ||
+                                data_.branches[branch_index].status == 0) {
+                                continue;
+                            }
+                            const auto& branch =
+                                data_.branches[branch_index];
+                            trial_p_network[branch.from] +=
+                                trial.pf[branch_index];
+                            trial_p_network[branch.to] +=
+                                trial.pt[branch_index];
+                        }
+                        for (const auto& shunt : data_.shunts) {
+                            trial_p_network[shunt.bus] +=
+                                shunt.gs * trial.vm[shunt.bus] *
+                                trial.vm[shunt.bus];
+                        }
+                        if (!cache.apply_active_correction(
+                                data_, p_spec, trial_p_network,
+                                trial.va, 1.0)) {
+                            return false;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 >=
+                            selected_validation.max_residual) {
+                            return false;
+                        }
+                        selected_correction = std::move(trial);
+                        selected_validation = trial_validation;
+                        selected_damping = damping;
+                        selected_correction_mode =
+                            "local_reactive_least_squares_then_"
+                            "active_angle";
+                        return true;
+                    };
+
+                    // Once this combined correction has selected a full step
+                    // twice consecutively, that full step usually remains
+                    // strongly improving at the next nonlinear state.  Try it
+                    // as a continuation step
+                    // before the ten-candidate generic search, but accept it
+                    // early only after at least a five-percent exact-residual
+                    // reduction.  Otherwise retain it as one candidate and
+                    // run the complete search.
+                    if (!active_block_dominant &&
+                        !active_flow_bound_dominant &&
+                        consecutive_full_local_reactive_active_angle >= 2 &&
+                        try_local_reactive_then_active(1.0) &&
+                        selected_validation.max_residual <=
+                            0.95 * predictor_validation.max_residual) {
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "continuation_correction_selected"] = true;
+                        return;
+                    }
                     if (active_flow_bound_dominant) {
                         const auto& branch =
                             data_.branches[worst_active_flow_branch];
@@ -3306,56 +3387,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (active_block_dominant) {
                             break;
                         }
-                        auto trial = correction_reference;
-                        if (!cache.apply_local_reactive_least_squares(
-                                data_, q_balance_by_bus,
-                                trial.vm, damping)) {
-                            continue;
-                        }
-                        rebuild_contingency_state_derived_fields(
-                            data_, base_state_, commitment_, *contingency,
-                            trial);
-                        std::vector<double> trial_p_network(
-                            static_cast<std::size_t>(nb), 0.0);
-                        for (int branch_index = 0;
-                             branch_index <
-                                 static_cast<int>(data_.branches.size());
-                             ++branch_index) {
-                            if (branch_index == outaged_branch ||
-                                data_.branches[branch_index].status == 0) {
-                                continue;
-                            }
-                            const auto& branch =
-                                data_.branches[branch_index];
-                            trial_p_network[branch.from] +=
-                                trial.pf[branch_index];
-                            trial_p_network[branch.to] +=
-                                trial.pt[branch_index];
-                        }
-                        for (const auto& shunt : data_.shunts) {
-                            trial_p_network[shunt.bus] +=
-                                shunt.gs * trial.vm[shunt.bus] *
-                                trial.vm[shunt.bus];
-                        }
-                        if (!cache.apply_active_correction(
-                                data_, p_spec, trial_p_network,
-                                trial.va, 1.0)) {
-                            continue;
-                        }
-                        const auto trial_validation =
-                            project_trial_reactive_and_validate(trial);
-                        if (trial_validation.max_residual + 1e-10 <
-                            selected_validation.max_residual) {
-                            selected_correction = std::move(trial);
-                            selected_validation = trial_validation;
-                            selected_damping = damping;
-                            selected_correction_mode =
-                                "local_reactive_least_squares_then_"
-                                "active_angle";
-                            if (strongly_improving_full_damping(
-                                    damping, trial_validation)) {
-                                break;
-                            }
+                        if (try_local_reactive_then_active(damping) &&
+                            strongly_improving_full_damping(
+                                damping, selected_validation)) {
+                            break;
                         }
                     }
                     if (selected_damping != 0.0) {
@@ -4104,8 +4139,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         "selected_next_validation"] =
                         selected_validation.to_json();
                 }
+                output.fixed_jacobian_predictor_trace.back()[
+                    "correction_search_seconds"] =
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        correction_search_start).count();
                 if (selected_damping == 0.0) {
                     break;
+                }
+                if (selected_correction_mode ==
+                        "local_reactive_least_squares_then_active_angle" &&
+                    selected_damping == 1.0) {
+                    ++consecutive_full_local_reactive_active_angle;
+                } else {
+                    consecutive_full_local_reactive_active_angle = 0;
                 }
                 predictor_state = std::move(selected_correction);
             }
@@ -4267,22 +4314,16 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             }
             const double p_target = std::clamp(p_balance, -0.49, 0.49);
             const double q_target = std::clamp(q_balance, -0.49, 0.49);
-            auto proposed_pg = candidate.pg;
-            if (allocate_total(
-                    active_at_bus[bus], p_lower, p_upper,
-                    initial_state.pg,
-                    current_pg + p_balance - p_target,
-                    proposed_pg)) {
-                candidate.pg = std::move(proposed_pg);
-            }
-            auto proposed_qg = candidate.qg;
-            if (allocate_total(
-                    active_at_bus[bus], q_lower, q_upper,
-                    initial_state.qg,
-                    current_qg + q_balance - q_target,
-                    proposed_qg)) {
-                candidate.qg = std::move(proposed_qg);
-            }
+            static_cast<void>(allocate_total(
+                active_at_bus[bus], p_lower, p_upper,
+                initial_state.pg,
+                current_pg + p_balance - p_target,
+                candidate.pg));
+            static_cast<void>(allocate_total(
+                active_at_bus[bus], q_lower, q_upper,
+                initial_state.qg,
+                current_qg + q_balance - q_target,
+                candidate.qg));
         }
         const auto balance = nodal_balance_slack_seed(
             data_, candidate, 0.5, 1e-7);

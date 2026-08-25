@@ -167,8 +167,11 @@ def validate_and_normalize_evaluation_details(
     expected_contingency_labels: set[str],
     summary: dict[str, Any],
     parallel_processes: int,
+    parallel_mode: str = "mpi",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Require exhaustive official details and repair stale MPI bookkeeping."""
+    if parallel_mode not in {"serial", "mpi", "serial_shards"}:
+        raise ValueError(f"invalid evaluation parallel mode: {parallel_mode}")
     expected_labels = {"BASECASE", *expected_contingency_labels}
     detail_paths = {
         path.stem.removeprefix("eval_detail_"): path
@@ -240,7 +243,7 @@ def validate_and_normalize_evaluation_details(
 
     normalized = dict(summary)
     repaired_fields: list[str] = []
-    if parallel_processes > 1:
+    if parallel_processes > 1 and parallel_mode == "mpi":
         internal_dir.mkdir(parents=True, exist_ok=True)
         write_json(internal_dir / "eval_summary.vendor_mpi.json", summary)
         vendor_csv = output_dir / "eval_summary.csv"
@@ -275,6 +278,7 @@ def validate_and_normalize_evaluation_details(
     certificate = {
         "schema_version": 1,
         "parallel_processes": parallel_processes,
+        "parallel_mode": parallel_mode,
         "expected_contingency_count": contingency_count,
         "expected_detail_count": contingency_count + 1,
         "observed_detail_count": len(detail_paths),
@@ -288,6 +292,290 @@ def validate_and_normalize_evaluation_details(
     }
     write_json(internal_dir / "official_evaluation_certificate.json", certificate)
     return normalized, certificate
+
+
+def read_contingency_blocks(path: Path) -> dict[str, list[str]]:
+    """Read source CON blocks without treating the final END as a contingency."""
+    blocks: dict[str, list[str]] = {}
+    active_label: str | None = None
+    active_lines: list[str] = []
+    with path.open("r", encoding="utf-8") as stream:
+        for raw_line in stream:
+            line = raw_line.rstrip("\r\n")
+            stripped = line.strip()
+            if stripped.startswith("CONTINGENCY "):
+                if active_label is not None:
+                    raise RuntimeError(
+                        f"CON contingency {active_label} is missing END"
+                    )
+                fields = stripped.split()
+                if len(fields) != 2 or not fields[1]:
+                    raise RuntimeError(f"invalid CON contingency row: {line}")
+                active_label = fields[1]
+                if active_label in blocks:
+                    raise RuntimeError(
+                        f"duplicate CON contingency label: {active_label}"
+                    )
+                active_lines = [line]
+                continue
+            if active_label is None:
+                continue
+            active_lines.append(line)
+            if stripped == "END":
+                blocks[active_label] = active_lines
+                active_label = None
+                active_lines = []
+    if active_label is not None:
+        raise RuntimeError(f"CON contingency {active_label} is missing END")
+    return blocks
+
+
+def write_contingency_subset(
+    source_con: Path,
+    destination_con: Path,
+    labels: list[str],
+) -> None:
+    """Write a deterministic valid CON file for exactly the requested labels."""
+    blocks = read_contingency_blocks(source_con)
+    missing = [label for label in labels if label not in blocks]
+    if missing:
+        raise RuntimeError(f"CON source is missing contingency labels: {missing}")
+    destination_con.parent.mkdir(parents=True, exist_ok=True)
+    with destination_con.open("w", encoding="utf-8", newline="\n") as stream:
+        for label in labels:
+            for line in blocks[label]:
+                stream.write(line)
+                stream.write("\n")
+        stream.write("END\n")
+
+
+def link_or_copy(source: Path, destination: Path) -> str:
+    """Prefer a same-volume hard link and fall back to a byte-for-byte copy."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+        return "hardlink"
+    except OSError:
+        shutil.copy2(source, destination)
+        return "copy"
+
+
+def run_serial_evaluation_shards(
+    python: Path,
+    evaluator: Path,
+    case_dir: Path,
+    output_dir: Path,
+    internal_dir: Path,
+    contingency_labels: set[str],
+    shard_count: int,
+    deadline: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run unchanged vendor evaluation in independent serial shards.
+
+    The vendor MPI dispatcher uses nonblocking object sends without retaining
+    their request buffers and can corrupt messages on large jobs.  Independent
+    serial processes avoid that transport layer while preserving the exact
+    vendor parser and per-case equations.  Every detail is required and merged
+    by label before the ordinary exhaustive certificate is applied.
+    """
+    labels = sorted(contingency_labels)
+    if shard_count < 2:
+        raise ValueError("serial evaluation sharding requires at least two shards")
+    if not labels:
+        raise ValueError("serial evaluation sharding requires contingencies")
+    active_shards = min(shard_count, len(labels))
+    groups = [labels[index::active_shards] for index in range(active_shards)]
+    shard_root = internal_dir / "serial_evaluation_shards"
+    if shard_root.exists():
+        raise RuntimeError(f"serial evaluation shard directory already exists: {shard_root}")
+    shard_root.mkdir(parents=True)
+
+    case_files = [case_dir / name for name in ("case.raw", "case.json")]
+    for path in [*case_files, case_dir / "case.con"]:
+        if not path.is_file():
+            raise RuntimeError(f"official evaluation input is missing: {path}")
+    base_solution = output_dir / "solution_BASECASE.txt"
+    if not base_solution.is_file():
+        raise RuntimeError("official evaluation base solution is missing")
+
+    shard_records: list[dict[str, Any]] = []
+    for shard_index, group in enumerate(groups):
+        shard_dir = shard_root / f"shard_{shard_index:03d}"
+        shard_case = shard_dir / "case"
+        shard_solutions = shard_dir / "solutions"
+        shard_case.mkdir(parents=True)
+        shard_solutions.mkdir(parents=True)
+        input_materialization: dict[str, str] = {}
+        for source in case_files:
+            input_materialization[source.name] = link_or_copy(
+                source, shard_case / source.name
+            )
+        write_contingency_subset(
+            case_dir / "case.con", shard_case / "case.con", group
+        )
+        input_materialization["solution_BASECASE.txt"] = link_or_copy(
+            base_solution, shard_solutions / "solution_BASECASE.txt"
+        )
+        for label in group:
+            solution = output_dir / f"solution_{label}.txt"
+            if not solution.is_file():
+                raise RuntimeError(
+                    f"official evaluation solution is missing: {solution}"
+                )
+            link_or_copy(solution, shard_solutions / solution.name)
+        shard_records.append(
+            {
+                "shard_index": shard_index,
+                "labels": group,
+                "case_dir": shard_case,
+                "solution_dir": shard_solutions,
+                "console_log": shard_dir / "evaluation.console.log",
+                "input_materialization": input_materialization,
+            }
+        )
+
+    def evaluate_shard(record: dict[str, Any]) -> dict[str, Any]:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.0:
+            raise CompetitionTimeout(
+                "serial official-evaluation shard deadline has expired"
+            )
+        command = [
+            str(python),
+            str(evaluator),
+            "1",
+            str(record["case_dir"]),
+            str(record["solution_dir"]),
+        ]
+        started = time.perf_counter()
+        try:
+            with record["console_log"].open("w", encoding="utf-8") as log:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    text=True,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=remaining,
+                )
+        except subprocess.TimeoutExpired as error:
+            raise CompetitionTimeout(
+                f"official evaluator shard {record['shard_index']} reached the deadline"
+            ) from error
+        wall_seconds = time.perf_counter() - started
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "official evaluator shard failed: "
+                f"index={record['shard_index']}, returncode={completed.returncode}"
+            )
+        summary_path = record["solution_dir"] / "eval_summary.json"
+        if not summary_path.is_file():
+            raise RuntimeError(
+                f"official evaluator shard {record['shard_index']} wrote no summary"
+            )
+        summary = read_json(summary_path)
+        normalized, certificate = validate_and_normalize_evaluation_details(
+            record["solution_dir"],
+            record["solution_dir"] / "internal_validation",
+            set(record["labels"]),
+            summary,
+            1,
+            "serial",
+        )
+        return {
+            **record,
+            "returncode": completed.returncode,
+            "wall_seconds": wall_seconds,
+            "summary": normalized,
+            "certificate": certificate,
+        }
+
+    completed_records: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=active_shards
+    ) as executor:
+        futures = [executor.submit(evaluate_shard, record) for record in shard_records]
+        for future in concurrent.futures.as_completed(futures):
+            completed_records.append(future.result())
+    completed_records.sort(key=lambda record: int(record["shard_index"]))
+
+    base_detail_hash: str | None = None
+    base_detail_source: Path | None = None
+    for record in completed_records:
+        detail = record["solution_dir"] / "eval_detail_BASECASE.json"
+        detail_hash = sha256(detail)
+        if base_detail_hash is None:
+            base_detail_hash = detail_hash
+            base_detail_source = detail
+        elif detail_hash != base_detail_hash:
+            raise RuntimeError(
+                "serial official-evaluation shards disagree on BASECASE detail"
+            )
+    assert base_detail_source is not None
+    link_or_copy(base_detail_source, output_dir / "eval_detail_BASECASE.json")
+    base_log_source = completed_records[0]["solution_dir"] / "BASECASE.eval.log"
+    if base_log_source.is_file():
+        link_or_copy(base_log_source, output_dir / "BASECASE.eval.log")
+
+    for record in completed_records:
+        for label in record["labels"]:
+            detail = record["solution_dir"] / f"eval_detail_{label}.json"
+            link_or_copy(detail, output_dir / detail.name)
+            case_log = record["solution_dir"] / f"{label}.eval.log"
+            if case_log.is_file():
+                link_or_copy(case_log, output_dir / case_log.name)
+
+    detail_paths = {
+        path.stem.removeprefix("eval_detail_"): path
+        for path in output_dir.glob("eval_detail_*.json")
+    }
+    objectives: dict[str, float] = {}
+    infeasibilities: dict[str, bool] = {}
+    for label in ["BASECASE", *labels]:
+        detail = read_json(detail_paths[label])
+        objectives[label] = float(detail["obj"]["val"])
+        infeasibilities[label] = bool(detail["infeas"]["val"])
+    objective = objectives["BASECASE"] + math.fsum(
+        objectives[label] for label in labels
+    ) / len(labels)
+    infeasible_labels = [
+        label for label in ["BASECASE", *labels] if infeasibilities[label]
+    ]
+    summary = {
+        "solutions_exist": True,
+        "num_ctg": len(labels),
+        "obj": objective,
+        "infeas": float(len(infeasible_labels)),
+        "obj_cumulative": objective,
+        "obj_all_cases": objectives,
+        "infeas_cumulative": float(len(infeasible_labels)),
+        "infeas_all_cases": infeasibilities,
+    }
+    write_json(output_dir / "eval_summary.json", summary)
+    shard_metadata = {
+        "mode": "independent_serial_shards",
+        "requested_shards": shard_count,
+        "active_shards": active_shards,
+        "base_detail_sha256": base_detail_hash,
+        "shards": [
+            {
+                "shard_index": int(record["shard_index"]),
+                "contingency_count": len(record["labels"]),
+                "first_label": record["labels"][0],
+                "last_label": record["labels"][-1],
+                "wall_seconds": float(record["wall_seconds"]),
+                "returncode": int(record["returncode"]),
+                "complete_label_set": bool(
+                    record["certificate"]["complete_label_set"]
+                ),
+            }
+            for record in completed_records
+        ],
+    }
+    write_json(
+        internal_dir / "serial_evaluation_shards.json", shard_metadata
+    )
+    return summary, shard_metadata
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:
@@ -716,6 +1004,7 @@ def main() -> int:
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--evaluation-processes", type=int, default=1)
+    parser.add_argument("--serial-evaluation-shards", type=int, default=1)
     parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
@@ -793,6 +1082,12 @@ def main() -> int:
         )
     if args.evaluation_processes < 1:
         raise ValueError("evaluation processes must be positive")
+    if args.serial_evaluation_shards < 1:
+        raise ValueError("serial evaluation shards must be positive")
+    if args.serial_evaluation_shards > 1 and args.evaluation_processes > 1:
+        parser.error(
+            "--serial-evaluation-shards cannot be combined with MPI evaluation"
+        )
     if args.evaluation_processes > 1 and args.mpiexec is None:
         parser.error("--evaluation-processes greater than one requires --mpiexec")
     if args.mpiexec is not None:
@@ -875,6 +1170,7 @@ def main() -> int:
         "fallback_schedule_profile": fallback_schedule_metadata,
         "profiled_fallback_global_priority": bool(fallback_schedule),
         "evaluation_processes": args.evaluation_processes,
+        "serial_evaluation_shards": args.serial_evaluation_shards,
     }
 
     def checkpoint() -> None:
@@ -1727,6 +2023,7 @@ def main() -> int:
     evaluation_wall = 0.0
     evaluation_summary: dict[str, Any] | None = None
     evaluation_certificate: dict[str, Any] | None = None
+    serial_evaluation_metadata: dict[str, Any] | None = None
     if not args.skip_evaluation:
         for path in (args.python, args.evaluator):
             reject_onedrive(path)
@@ -1751,40 +2048,68 @@ def main() -> int:
                 + ", ".join(sorted(path.name for path in stale_evaluation_outputs))
             )
         evaluation_start = time.perf_counter()
-        evaluator_timeout = effective_process_timeout(
-            args.total_time_limit,
-            evaluation_deadline,
-        )
-        evaluator_command = [
-            str(args.python),
-            str(args.evaluator),
-            "1",
-            str(args.case_dir),
-            str(args.output_dir),
-        ]
-        if args.evaluation_processes > 1:
-            evaluator_command = [
-                str(args.mpiexec),
-                "-np",
-                str(args.evaluation_processes),
-                *evaluator_command,
-            ]
+        expected_evaluation_labels = {
+            str(item["label"]) for item in contingencies
+        }
         try:
-            completed = subprocess.run(
-                evaluator_command,
-                check=False,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=evaluator_timeout,
-            )
-        except subprocess.TimeoutExpired as error:
-            output = error.stdout or ""
-            if isinstance(output, bytes):
-                output = output.decode(errors="replace")
-            (internal / "evaluation.console.log").write_text(
-                output + "\nEND_TO_END_TIMEOUT\n", encoding="utf-8"
-            )
+            if args.serial_evaluation_shards > 1:
+                evaluation_summary, serial_evaluation_metadata = (
+                    run_serial_evaluation_shards(
+                        args.python,
+                        args.evaluator,
+                        args.case_dir,
+                        args.output_dir,
+                        internal,
+                        expected_evaluation_labels,
+                        args.serial_evaluation_shards,
+                        evaluation_deadline,
+                    )
+                )
+            else:
+                evaluator_timeout = effective_process_timeout(
+                    args.total_time_limit,
+                    evaluation_deadline,
+                )
+                evaluator_command = [
+                    str(args.python),
+                    str(args.evaluator),
+                    "1",
+                    str(args.case_dir),
+                    str(args.output_dir),
+                ]
+                if args.evaluation_processes > 1:
+                    evaluator_command = [
+                        str(args.mpiexec),
+                        "-np",
+                        str(args.evaluation_processes),
+                        *evaluator_command,
+                    ]
+                completed = subprocess.run(
+                    evaluator_command,
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=evaluator_timeout,
+                )
+                (internal / "evaluation.console.log").write_text(
+                    completed.stdout, encoding="utf-8"
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        "official evaluator failed; see internal/evaluation.console.log"
+                    )
+                evaluation_summary = read_json(
+                    args.output_dir / "eval_summary.json"
+                )
+        except (subprocess.TimeoutExpired, CompetitionTimeout) as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                (internal / "evaluation.console.log").write_text(
+                    output + "\nEND_TO_END_TIMEOUT\n", encoding="utf-8"
+                )
             run_status.update(
                 {
                     "stage": "evaluation",
@@ -1797,27 +2122,25 @@ def main() -> int:
             checkpoint()
             raise CompetitionTimeout(run_status["error"]) from error
         evaluation_wall = time.perf_counter() - evaluation_start
-        (internal / "evaluation.console.log").write_text(completed.stdout, encoding="utf-8")
-        if completed.returncode != 0:
-            run_status.update(
-                {
-                    "stage": "evaluation",
-                    "error": "official evaluator failed",
-                    "end_to_end_within_limit": time.perf_counter() <= total_deadline,
-                    "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                    "total_wall_seconds": time.perf_counter() - wall_start,
-                }
-            )
-            checkpoint()
-            raise RuntimeError("official evaluator failed; see internal/evaluation.console.log")
-        evaluation_summary = read_json(args.output_dir / "eval_summary.json")
+        assert evaluation_summary is not None
+        evaluation_mode = (
+            "serial_shards"
+            if args.serial_evaluation_shards > 1
+            else ("mpi" if args.evaluation_processes > 1 else "serial")
+        )
+        certificate_parallel_processes = (
+            min(args.serial_evaluation_shards, len(contingencies))
+            if args.serial_evaluation_shards > 1
+            else args.evaluation_processes
+        )
         evaluation_summary, evaluation_certificate = (
             validate_and_normalize_evaluation_details(
                 args.output_dir,
                 internal,
-                {str(item["label"]) for item in contingencies},
+                expected_evaluation_labels,
                 evaluation_summary,
-                args.evaluation_processes,
+                certificate_parallel_processes,
+                evaluation_mode,
             )
         )
         evaluation_certificate.update(
@@ -1831,6 +2154,7 @@ def main() -> int:
                 "mpiexec_sha256": (
                     sha256(args.mpiexec) if args.mpiexec is not None else None
                 ),
+                "serial_evaluation_shards": serial_evaluation_metadata,
             }
         )
         write_json(
@@ -1974,6 +2298,7 @@ def main() -> int:
         ),
         "evaluation_wall_seconds": evaluation_wall,
         "evaluation_processes": args.evaluation_processes,
+        "serial_evaluation_shards": args.serial_evaluation_shards,
         "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),

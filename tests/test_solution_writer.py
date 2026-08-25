@@ -25,6 +25,8 @@ from run_experiment import (  # noqa: E402
     progress_checkpoint_due,
     streamed_queue_get,
     validate_and_normalize_evaluation_details,
+    read_contingency_blocks,
+    write_contingency_subset,
     write_json,
     write_solution,
 )
@@ -163,6 +165,68 @@ class CompetitionTimingTests(unittest.TestCase):
                     {"num_ctg": 1, "obj": 10.0, "infeas": 0.0},
                     2,
                 )
+
+    def test_contingency_subset_is_exact_and_terminated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.con"
+            destination = root / "subset.con"
+            source.write_text(
+                "CONTINGENCY CTG_B\n"
+                "OPEN BRANCH FROM BUS 1 TO BUS 2 CIRCUIT 1\n"
+                "END\n"
+                "CONTINGENCY CTG_A\n"
+                "REMOVE UNIT 1 FROM BUS 3\n"
+                "END\n"
+                "END\n",
+                encoding="utf-8",
+            )
+            write_contingency_subset(source, destination, ["CTG_A"])
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "CONTINGENCY CTG_A\n"
+                "REMOVE UNIT 1 FROM BUS 3\n"
+                "END\n"
+                "END\n",
+            )
+            self.assertEqual(
+                set(read_contingency_blocks(destination)), {"CTG_A"}
+            )
+
+    def test_serial_shard_certificate_does_not_repair_mpi_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            internal = output / "internal"
+            for label, objective in (("BASECASE", 10.0), ("CTG_A", 4.0)):
+                write_json(
+                    output / f"eval_detail_{label}.json",
+                    {"obj": {"val": objective}, "infeas": {"val": False}},
+                )
+            summary = {
+                "solutions_exist": True,
+                "num_ctg": 1,
+                "obj": 14.0,
+                "infeas": 0.0,
+                "obj_cumulative": 14.0,
+                "obj_all_cases": {"BASECASE": 10.0, "CTG_A": 4.0},
+                "infeas_cumulative": 0.0,
+                "infeas_all_cases": {"BASECASE": False, "CTG_A": False},
+            }
+            _, certificate = validate_and_normalize_evaluation_details(
+                output,
+                internal,
+                {"CTG_A"},
+                summary,
+                4,
+                "serial_shards",
+            )
+            self.assertEqual(certificate["parallel_mode"], "serial_shards")
+            self.assertEqual(
+                certificate["repaired_vendor_mpi_bookkeeping_fields"], []
+            )
+            self.assertFalse(
+                (internal / "eval_summary.vendor_mpi.json").exists()
+            )
 
     def test_profiled_schedule_prioritizes_measured_fallbacks(self):
         contingencies = [

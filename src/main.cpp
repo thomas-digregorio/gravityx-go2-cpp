@@ -892,6 +892,11 @@ struct BasePoint {
     gravityx::AcState state;
 };
 
+struct CorrectiveSeed {
+    std::string label;
+    gravityx::AcState state;
+};
+
 BasePoint load_base_point(const std::string& base_result_path) {
     const auto base_json = read_json_file(base_result_path);
     if (!base_json.value("success", false)) {
@@ -920,7 +925,8 @@ bool solve_loaded_contingency(
     bool linearized_only = false,
     const gravityx::AcState* precomputed_fast_state = nullptr,
     const gravityx::AcState* rolling_corrective_seed = nullptr,
-    const std::string* rolling_corrective_seed_label = nullptr) {
+    const std::string* rolling_corrective_seed_label = nullptr,
+    const std::vector<CorrectiveSeed>* corrective_seed_bank = nullptr) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -1014,6 +1020,8 @@ bool solve_loaded_contingency(
     std::optional<gravityx::AcState> linearized_seed;
     std::optional<gravityx::FastPowerFlowResult> prelinear_fast_repair;
     std::optional<gravityx::FastPowerFlowResult> rolling_fast_repair;
+    nlohmann::json corrective_seed_fast_repair_attempts =
+        nlohmann::json::array();
     nlohmann::json linearized_attempts = nlohmann::json::array();
     if (linearized_fallback) {
         auto best_state = fast_result
@@ -1037,15 +1045,18 @@ bool solve_loaded_contingency(
         if (data.buses.size() >= 16000 && fast_power_flow != nullptr &&
             fast_result.has_value()) {
             double fast_repair_wall_seconds = fast_result->wall_seconds;
-            const nlohmann::json rolling_seed_source =
-                rolling_corrective_seed_label != nullptr
-                ? nlohmann::json(*rolling_corrective_seed_label)
-                : nlohmann::json(nullptr);
             auto evaluate_fast_repair = [&](
                 gravityx::FastPowerFlowResult& repair,
-                const std::string& solution_method) {
+                const std::string& solution_method,
+                const std::string* corrective_seed_label) {
                 fast_repair_wall_seconds += repair.wall_seconds;
                 if (repair.solve.state.vm.empty()) {
+                    if (corrective_seed_label != nullptr) {
+                        corrective_seed_fast_repair_attempts.push_back({
+                            {"seed_label", *corrective_seed_label},
+                            {"result", repair.to_json()},
+                        });
+                    }
                     return false;
                 }
                 auto repaired_state = repair.solve.state;
@@ -1060,6 +1071,12 @@ bool solve_loaded_contingency(
                 repair.solve.objective = repaired_objective;
                 repair.validation = repaired_validation;
                 repair.feasible = repaired_validation.max_residual <= 1e-5;
+                if (corrective_seed_label != nullptr) {
+                    corrective_seed_fast_repair_attempts.push_back({
+                        {"seed_label", *corrective_seed_label},
+                        {"result", repair.to_json()},
+                    });
+                }
                 if (repaired_validation.max_residual <
                     best_validation.max_residual) {
                     best_state = repaired_state;
@@ -1071,6 +1088,10 @@ bool solve_loaded_contingency(
                 }
                 auto solve = repair.solve;
                 solve.wall_seconds = fast_repair_wall_seconds;
+                const nlohmann::json selected_corrective_seed =
+                    corrective_seed_label != nullptr
+                    ? nlohmann::json(*corrective_seed_label)
+                    : nlohmann::json(nullptr);
                 const nlohmann::json output = {
                     {"success", true},
                     {"solver_status_success", true},
@@ -1085,7 +1106,8 @@ bool solve_loaded_contingency(
                     {"fast_screen", fast_result->to_json()},
                     {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"rolling_fast_repair", rolling_fast_repair ? rolling_fast_repair->to_json() : nlohmann::json(nullptr)},
-                    {"rolling_corrective_seed_label", rolling_seed_source},
+                    {"rolling_corrective_seed_label", selected_corrective_seed},
+                    {"corrective_seed_fast_repair_attempts", corrective_seed_fast_repair_attempts},
                     {"linearized_attempts", linearized_attempts},
                     {"resident_parametric_model", false},
                     {"acceptable_termination_enabled", false},
@@ -1105,7 +1127,7 @@ bool solve_loaded_contingency(
                     {"iterations", solve.iterations},
                     {"max_residual", repaired_validation.max_residual},
                     {"solution_method", solution_method},
-                    {"rolling_corrective_seed_label", rolling_seed_source},
+                    {"corrective_seed_label", selected_corrective_seed},
                 }).dump(2) << '\n';
                 return true;
             };
@@ -1114,7 +1136,7 @@ bool solve_loaded_contingency(
                 fast_power_flow->solve(*match, best_state);
             if (evaluate_fast_repair(
                     *prelinear_fast_repair,
-                    "iterated_fast_newton_power_flow")) {
+                    "iterated_fast_newton_power_flow", nullptr)) {
                 return true;
             }
 
@@ -1130,8 +1152,34 @@ bool solve_loaded_contingency(
                     *match, *rolling_corrective_seed);
                 if (evaluate_fast_repair(
                         *rolling_fast_repair,
-                        "rolling_corrective_seed_fast_newton")) {
+                        "rolling_corrective_seed_fast_newton",
+                        rolling_corrective_seed_label)) {
                     return true;
+                }
+            }
+            if (corrective_seed_bank != nullptr) {
+                for (const auto& seed : *corrective_seed_bank) {
+                    if (rolling_corrective_seed_label != nullptr &&
+                        seed.label == *rolling_corrective_seed_label) {
+                        continue;
+                    }
+                    const bool seed_dimensions_match =
+                        seed.state.vm.size() == data.buses.size() &&
+                        seed.state.va.size() == data.buses.size() &&
+                        seed.state.pg.size() == data.generators.size() &&
+                        seed.state.qg.size() == data.generators.size() &&
+                        seed.state.demand_factor.size() == data.loads.size();
+                    if (!seed_dimensions_match) {
+                        continue;
+                    }
+                    auto bank_repair = fast_power_flow->solve(
+                        *match, seed.state);
+                    if (evaluate_fast_repair(
+                            bank_repair,
+                            "corrective_seed_bank_fast_newton",
+                            &seed.label)) {
+                        return true;
+                    }
                 }
             }
         }
@@ -1346,6 +1394,7 @@ bool solve_loaded_contingency(
                     {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"rolling_fast_repair", rolling_fast_repair ? rolling_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"rolling_corrective_seed_label", rolling_corrective_seed_label ? nlohmann::json(*rolling_corrective_seed_label) : nlohmann::json(nullptr)},
+                    {"corrective_seed_fast_repair_attempts", corrective_seed_fast_repair_attempts},
                     {"linearized_attempts", linearized_attempts},
                     {"resident_parametric_model", false},
                     {"acceptable_termination_enabled", false},
@@ -1466,6 +1515,7 @@ bool solve_loaded_contingency(
                     {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"rolling_fast_repair", rolling_fast_repair ? rolling_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"rolling_corrective_seed_label", rolling_corrective_seed_label ? nlohmann::json(*rolling_corrective_seed_label) : nlohmann::json(nullptr)},
+                    {"corrective_seed_fast_repair_attempts", corrective_seed_fast_repair_attempts},
                     {"linearized_attempts", linearized_attempts},
                     {"resident_parametric_model", false},
                     {"acceptable_termination_enabled", false},
@@ -1522,6 +1572,7 @@ bool solve_loaded_contingency(
                 {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                 {"rolling_fast_repair", rolling_fast_repair ? rolling_fast_repair->to_json() : nlohmann::json(nullptr)},
                 {"rolling_corrective_seed_label", rolling_corrective_seed_label ? nlohmann::json(*rolling_corrective_seed_label) : nlohmann::json(nullptr)},
+                {"corrective_seed_fast_repair_attempts", corrective_seed_fast_repair_attempts},
                 {"linearized_attempts", linearized_attempts},
                 {"resident_parametric_model", false},
                 {"acceptable_termination_enabled", false},
@@ -1583,6 +1634,7 @@ bool solve_loaded_contingency(
         {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
         {"rolling_fast_repair", rolling_fast_repair ? rolling_fast_repair->to_json() : nlohmann::json(nullptr)},
         {"rolling_corrective_seed_label", rolling_corrective_seed_label ? nlohmann::json(*rolling_corrective_seed_label) : nlohmann::json(nullptr)},
+        {"corrective_seed_fast_repair_attempts", corrective_seed_fast_repair_attempts},
         {"linearized_attempts", linearized_attempts},
         {"resident_parametric_model", reusable_model != nullptr},
         {"acceptable_termination_enabled", acceptable_termination},
@@ -1729,6 +1781,7 @@ int run_contingency_worker(
     }
     std::optional<gravityx::AcState> rolling_corrective_seed;
     std::string rolling_corrective_seed_label;
+    std::vector<CorrectiveSeed> corrective_seed_bank;
     std::cout << "GRAVITYX_WORKER_READY" << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -1764,16 +1817,35 @@ int run_contingency_worker(
             linearized_fallback, linearized_only,
             precomputed_fast_state ? &*precomputed_fast_state : nullptr,
             rolling_corrective_seed ? &*rolling_corrective_seed : nullptr,
-            rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr);
+            rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr,
+            linearized_fallback ? &corrective_seed_bank : nullptr);
         bool rolling_corrective_seed_updated = false;
         if (success && linearized_fallback && data.buses.size() >= 16000) {
             const auto result_json = read_json_file(output_path);
             if (result_json.value("success", false) &&
                 result_json.contains("solve") &&
                 result_json.at("solve").contains("state")) {
-                rolling_corrective_seed = gravityx::ac_state_from_json(
+                auto verified_corrective_state = gravityx::ac_state_from_json(
                     result_json.at("solve").at("state"));
+                rolling_corrective_seed = verified_corrective_state;
                 rolling_corrective_seed_label = label;
+                corrective_seed_bank.erase(
+                    std::remove_if(
+                        corrective_seed_bank.begin(),
+                        corrective_seed_bank.end(),
+                        [&](const CorrectiveSeed& seed) {
+                            return seed.label == label;
+                        }),
+                    corrective_seed_bank.end());
+                corrective_seed_bank.insert(
+                    corrective_seed_bank.begin(),
+                    CorrectiveSeed{label, std::move(verified_corrective_state)});
+                constexpr std::size_t kMaximumCorrectiveSeedBankSize = 16;
+                if (corrective_seed_bank.size() >
+                    kMaximumCorrectiveSeedBankSize) {
+                    corrective_seed_bank.resize(
+                        kMaximumCorrectiveSeedBankSize);
+                }
                 rolling_corrective_seed_updated = true;
             }
         }
@@ -1788,6 +1860,7 @@ int run_contingency_worker(
              rolling_corrective_seed
                  ? nlohmann::json(rolling_corrective_seed_label)
                  : nlohmann::json(nullptr)},
+            {"corrective_seed_bank_size", corrective_seed_bank.size()},
         }).dump() << std::endl;
         if (!success) {
             return 1;

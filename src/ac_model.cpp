@@ -314,7 +314,7 @@ void AcModel::build_availability_parameters() {
         generator_available_->set_val(i, 1.0);
     }
     for (std::size_t i = 0; i < data_.branches.size(); ++i) {
-        branch_available_->set_val(i, 1.0);
+        branch_available_->set_val(i, data_.branches[i].status);
     }
 
     // Keep both parameters symbolically variable over [0, 1].  Gravity uses
@@ -349,7 +349,7 @@ void AcModel::update_availability_parameters(const ContingencyContext& contingen
         generator_available_->set_val(i, 1.0);
     }
     for (std::size_t i = 0; i < data_.branches.size(); ++i) {
-        branch_available_->set_val(i, 1.0);
+        branch_available_->set_val(i, data_.branches[i].status);
     }
     if (generator_outage) {
         generator_available_->set_val(contingency.outaged_generator, 0.0);
@@ -459,11 +459,12 @@ void AcModel::build_variables() {
     for (std::size_t i = 0; i < nl; ++i) {
         const bool outaged = !reusable_contingencies_ && contingency_ &&
             contingency_->outaged_branch == static_cast<int>(i);
+        const bool unavailable = data_.branches[i].status == 0 || outaged;
         const double rating = mode_ == ModelMode::ContingencySoft
             ? data_.branches[i].rate_c : data_.branches[i].rate_a;
-        flow_lower[i] = outaged ? 0.0 : -rating;
-        flow_upper[i] = outaged ? 0.0 : rating;
-        if (outaged) {
+        flow_lower[i] = unavailable ? 0.0 : -rating;
+        flow_upper[i] = unavailable ? 0.0 : rating;
+        if (unavailable) {
             slack_upper[i] = 0.0;
         }
     }
@@ -693,7 +694,7 @@ void AcModel::build_constraints_and_objective() {
                 return (*branch_available_)(i);
             }
             param<double> unit("branch_available_unit_" + std::to_string(i));
-            unit = 1.0;
+            unit = branch.status;
             return unit;
         }();
 
@@ -743,7 +744,8 @@ void AcModel::build_constraints_and_objective() {
         const double start_delta = mode_ == ModelMode::ContingencySoft
             ? contingency_->base_state.va[f] - contingency_->base_state.va[t]
             : data_.buses[f].va_start - data_.buses[t].va_start;
-        if (start_delta >= branch.angmin && start_delta <= branch.angmax) {
+        if (start_delta >= branch.angmin && start_delta <= branch.angmax &&
+            (reusable_contingencies_ || branch.status != 0)) {
             if (reusable_contingencies_) {
                 const auto available = (*branch_available_)(i);
                 add_le(model_, "angle_upper_" + std::to_string(i),
@@ -900,14 +902,16 @@ void AcModel::initialize_source_point() {
     }
 
     for (std::size_t i = 0; i < data_.branches.size(); ++i) {
-        const bool outaged = contingency_ && contingency_->outaged_branch == static_cast<int>(i);
-        const double pf = mode_ == ModelMode::ContingencySoft && !outaged
+        const bool outaged = contingency_ &&
+            contingency_->outaged_branch == static_cast<int>(i);
+        const bool unavailable = data_.branches[i].status == 0 || outaged;
+        const double pf = mode_ == ModelMode::ContingencySoft && !unavailable
             ? contingency_->base_state.pf[i] : 0.0;
-        const double qf = mode_ == ModelMode::ContingencySoft && !outaged
+        const double qf = mode_ == ModelMode::ContingencySoft && !unavailable
             ? contingency_->base_state.qf[i] : 0.0;
-        const double pt = mode_ == ModelMode::ContingencySoft && !outaged
+        const double pt = mode_ == ModelMode::ContingencySoft && !unavailable
             ? contingency_->base_state.pt[i] : 0.0;
-        const double qt = mode_ == ModelMode::ContingencySoft && !outaged
+        const double qt = mode_ == ModelMode::ContingencySoft && !unavailable
             ? contingency_->base_state.qt[i] : 0.0;
         pf_->initialize(i, pf);
         qf_->initialize(i, qf);

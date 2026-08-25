@@ -150,6 +150,12 @@ CaseData CaseData::load(const std::string& path) {
         Branch branch;
         branch.source_key = key;
         branch.index = item.at("index").get<int>();
+        branch.status = item.value(
+            "br_status", item.value("status_prev", 1));
+        if (branch.status != 0 && branch.status != 1) {
+            throw std::runtime_error(
+                "branch status is not binary: " + branch.source_key);
+        }
         branch.from = bus_pos(item.at("f_bus").get<int>());
         branch.to = bus_pos(item.at("t_bus").get<int>());
         branch.transformer = item.at("transformer").get<bool>();

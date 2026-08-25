@@ -35,7 +35,7 @@ YRows build_ybus(const CaseData& data, int outaged_branch) {
         add_admittance(rows, shunt.bus, shunt.bus, {shunt.gs, shunt.bs});
     }
     for (int i = 0; i < static_cast<int>(data.branches.size()); ++i) {
-        if (i == outaged_branch) {
+        if (i == outaged_branch || data.branches[i].status == 0) {
             continue;
         }
         const auto& branch = data.branches[i];
@@ -653,7 +653,7 @@ void compute_branch_flows(
     state.qt.assign(nl, 0.0);
     state.sm_slack.assign(nl, 0.0);
     for (int i = 0; i < nl; ++i) {
-        if (i == outaged_branch) {
+        if (i == outaged_branch || data.branches[i].status == 0) {
             continue;
         }
         const auto& branch = data.branches[i];
@@ -712,7 +712,7 @@ std::vector<std::vector<int>> connected_components(
     const int nb = static_cast<int>(data.buses.size());
     std::vector<std::vector<int>> adjacency(nb);
     for (int i = 0; i < static_cast<int>(data.branches.size()); ++i) {
-        if (i == outaged_branch) {
+        if (i == outaged_branch || data.branches[i].status == 0) {
             continue;
         }
         const auto& branch = data.branches[i];
@@ -1341,41 +1341,38 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     std::vector<double> fixed_q_bus(nb, 0.0);
     std::vector<double> active_slack_target(nb, 0.0);
     std::vector<double> reactive_slack_target(nb, 0.0);
-    if (!base_mode) {
-        for (int bus = 0; bus < nb; ++bus) {
-            double p_balance = 0.0;
-            double q_balance = 0.0;
-            for (int branch : data_.buses[bus].branches_from) {
-                p_balance += direct_state.pf[branch];
-                q_balance += direct_state.qf[branch];
-            }
-            for (int branch : data_.buses[bus].branches_to) {
-                p_balance += direct_state.pt[branch];
-                q_balance += direct_state.qt[branch];
-            }
-            for (int gen : data_.buses[bus].generators) {
-                p_balance -= direct_state.pg[gen];
-                q_balance -= direct_state.qg[gen];
-            }
-            for (int load : data_.buses[bus].loads) {
-                p_balance += data_.loads[load].pd_nominal
-                    * direct_state.demand_factor[load];
-                q_balance += data_.loads[load].qd_nominal
-                    * direct_state.demand_factor[load];
-            }
-            for (int shunt : data_.buses[bus].shunts) {
-                const double vm2 = direct_state.vm[bus] * direct_state.vm[bus];
-                p_balance += data_.shunts[shunt].gs * vm2;
-                q_balance -= data_.shunts[shunt].bs * vm2;
-            }
-            // The GO2 corrective model permits bounded nodal imbalance.  Use
-            // the post-outage direct candidate's signed balance, clipped to an
-            // interior feasible target, so Newton corrects only the amount
-            // beyond the allowed band.  Solving every bus to zero needlessly
-            // displaced a valid soft-balance operating point and diverged.
-            active_slack_target[bus] = std::clamp(p_balance, -0.49, 0.49);
-            reactive_slack_target[bus] = std::clamp(q_balance, -0.49, 0.49);
+    for (int bus = 0; bus < nb; ++bus) {
+        double p_balance = 0.0;
+        double q_balance = 0.0;
+        for (int branch : data_.buses[bus].branches_from) {
+            p_balance += direct_state.pf[branch];
+            q_balance += direct_state.qf[branch];
         }
+        for (int branch : data_.buses[bus].branches_to) {
+            p_balance += direct_state.pt[branch];
+            q_balance += direct_state.qt[branch];
+        }
+        for (int gen : data_.buses[bus].generators) {
+            p_balance -= direct_state.pg[gen];
+            q_balance -= direct_state.qg[gen];
+        }
+        for (int load : data_.buses[bus].loads) {
+            p_balance += data_.loads[load].pd_nominal
+                * direct_state.demand_factor[load];
+            q_balance += data_.loads[load].qd_nominal
+                * direct_state.demand_factor[load];
+        }
+        for (int shunt : data_.buses[bus].shunts) {
+            const double vm2 = direct_state.vm[bus] * direct_state.vm[bus];
+            p_balance += data_.shunts[shunt].gs * vm2;
+            q_balance -= data_.shunts[shunt].bs * vm2;
+        }
+        // Both GO2 base and corrective models permit bounded nodal imbalance.
+        // Keep the direct candidate's signed balance when it is already inside
+        // the source limit and correct only the excess.  The independent full
+        // validator still checks the exact source bound before acceptance.
+        active_slack_target[bus] = std::clamp(p_balance, -0.49, 0.49);
+        reactive_slack_target[bus] = std::clamp(q_balance, -0.49, 0.49);
     }
     for (int bus = 0; bus < nb; ++bus) {
         for (int gen : active_at_bus[bus]) {
@@ -1590,7 +1587,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             double maximum_component_ratio = 1.0;
             for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
                 const double rating = branch_rating(i);
-                if (i == outaged_branch || rating <= 1e-12) {
+                if (i == outaged_branch || data_.branches[i].status == 0 ||
+                    rating <= 1e-12) {
                     continue;
                 }
                 maximum_component_ratio = std::max(
@@ -2201,7 +2199,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         double maximum_component_ratio = 1.0;
         for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
             const double rating = branch_rating(i);
-            if (i == outaged_branch || rating <= 1e-12) {
+            if (i == outaged_branch || data_.branches[i].status == 0 ||
+                rating <= 1e-12) {
                 continue;
             }
             maximum_component_ratio = std::max(maximum_component_ratio,
@@ -2443,7 +2442,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             double maximum_component_ratio = 1.0;
             for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
                 const double rating = branch_rating(i);
-                if (i == outaged_branch || rating <= 1e-12) {
+                if (i == outaged_branch || data_.branches[i].status == 0 ||
+                    rating <= 1e-12) {
                     continue;
                 }
                 maximum_component_ratio = std::max(maximum_component_ratio,

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -177,6 +178,19 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"branch_security_rows_omitted", branch_security_rows_omitted},
         {"branch_security_subset_count", branch_security_subset_count},
         {"feasibility_only", feasibility_only},
+        {"elastic_balance_phase_one", elastic_balance_phase_one},
+        {"primal_start_attempted", primal_start_attempted},
+        {"primal_start_accepted", primal_start_accepted},
+        {"primal_start_status", primal_start_status},
+        {"primal_basis_attempted", primal_basis_attempted},
+        {"primal_basis_accepted", primal_basis_accepted},
+        {"primal_basis_status", primal_basis_status},
+        {"simplex_strategy", simplex_strategy},
+        {"maximum_column_scale", maximum_column_scale},
+        {"voltage_trust_radius", voltage_trust_radius},
+        {"angle_trust_radius", angle_trust_radius},
+        {"maximum_balance_slack", maximum_balance_slack},
+        {"total_balance_slack", total_balance_slack},
         {"solution_value_valid", solution_value_valid},
         {"info_valid", info_valid},
         {"accepted_feasible_nonoptimal_phase_one",
@@ -232,10 +246,10 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
         throw std::runtime_error("linearized AC time limit must be positive");
     }
-    if (omit_branch_security_rows && !contingency) {
-        throw std::runtime_error(
-            "branch-security-row omission is only valid for contingency seeds");
-    }
+    // A caller may omit all but a selected set of branch-security rows for
+    // either a base or contingency Phase-I model.  Such a reduced model is
+    // candidate generation only; callers must rebuild nonlinear branch flows
+    // and apply the complete independent validator before acceptance.
     std::vector<unsigned char> selected_branch_security(
         static_cast<std::size_t>(nl), 0);
     int branch_security_subset_count = 0;
@@ -274,9 +288,30 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const bool lightweight_large_seed = !force_full_seed &&
         ((contingency.has_value() && nb >= 8000) ||
          request_lightweight_large_seed);
+    // A zero-objective feasibility LP gave large-case simplex no useful
+    // direction and no readily available feasible basis.  Give the 19k-bus
+    // Phase-I model explicit positive/negative balance violations instead.
+    // Their L1 objective measures progress, and their identity columns let us
+    // construct a valid primal start analytically.  The elastic solution is
+    // only a nonlinear-repair seed; the unchanged complete validator remains
+    // the sole acceptance gate.
+    // Use an elastic objective only when balance itself is the unresolved
+    // large-case defect.  Once exact violated security rows are supplied, the
+    // reference already satisfies the soft balance band; a much smaller local
+    // zero-objective feasibility model is sufficient and avoids the large
+    // elastic simplex system.
+    const bool elastic_balance_phase_one = feasibility_only && nb >= 16000 &&
+        branch_security_subset.empty();
+    const bool targeted_security_repair = feasibility_only && nb >= 16000 &&
+        !branch_security_subset.empty();
+    const double voltage_trust_radius = targeted_security_repair ? 0.01 : 0.05;
+    const double angle_trust_radius = targeted_security_repair ? 0.006 : 0.15;
     const bool projected_balance_slack =
         project_balance_slack &&
-        (lightweight_large_seed || feasibility_only);
+        (lightweight_large_seed || feasibility_only) &&
+        !elastic_balance_phase_one;
+    const int balance_slack_column_count =
+        (!feasibility_only || elastic_balance_phase_one) ? nb : 0;
 
     const int vm_offset = 0;
     const int va_offset = vm_offset + nb;
@@ -284,13 +319,13 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const int qg_offset = pg_offset + ng;
     const int demand_offset = qg_offset + ng;
     const int p_pos_offset = demand_offset + nd;
-    const int p_neg_offset = p_pos_offset + nb;
-    const int q_pos_offset = p_neg_offset + nb;
-    const int q_neg_offset = q_pos_offset + nb;
-    const int dpg_offset = q_neg_offset + nb;
-    const int dqg_offset = dpg_offset + ng;
-    const int dload_offset = dqg_offset + ng;
-    const int column_count = dload_offset + nd;
+    const int p_neg_offset = p_pos_offset + balance_slack_column_count;
+    const int q_pos_offset = p_neg_offset + balance_slack_column_count;
+    const int q_neg_offset = q_pos_offset + balance_slack_column_count;
+    const int dpg_offset = q_neg_offset + balance_slack_column_count;
+    const int dqg_offset = dpg_offset + (feasibility_only ? 0 : ng);
+    const int dload_offset = dqg_offset + (feasibility_only ? 0 : ng);
+    const int column_count = dload_offset + (feasibility_only ? 0 : nd);
 
     std::vector<double> lower(column_count, 0.0);
     std::vector<double> upper(column_count, kHighsInf);
@@ -299,39 +334,46 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         lower[vm_offset + i] = lightweight_large_seed
             ? std::max(
                 data.buses[i].vmin,
-                reference.vm[i] - 0.05)
+                reference.vm[i] - voltage_trust_radius)
             : data.buses[i].vmin;
         upper[vm_offset + i] = lightweight_large_seed
             ? std::min(
                 data.buses[i].vmax,
-                reference.vm[i] + 0.05)
+                reference.vm[i] + voltage_trust_radius)
             : data.buses[i].vmax;
         lower[va_offset + i] = lightweight_large_seed
             ? std::max(
                 -10.0,
-                reference.va[i] - 0.15)
+                reference.va[i] - angle_trust_radius)
             : -10.0;
         upper[va_offset + i] = lightweight_large_seed
             ? std::min(
                 10.0,
-                reference.va[i] + 0.15)
+                reference.va[i] + angle_trust_radius)
             : 10.0;
         if (data.buses[i].type == 3) {
             lower[va_offset + i] = 0.0;
             upper[va_offset + i] = 0.0;
         }
-        const double explicit_slack_upper =
-            (lightweight_large_seed || feasibility_only)
-            ? 0.0 : balance_slack_limit;
-        upper[p_pos_offset + i] = explicit_slack_upper;
-        upper[p_neg_offset + i] = explicit_slack_upper;
-        upper[q_pos_offset + i] = explicit_slack_upper;
-        upper[q_neg_offset + i] = explicit_slack_upper;
-        if (!lightweight_large_seed && !feasibility_only) {
-            cost[p_pos_offset + i] = 1e6;
-            cost[p_neg_offset + i] = 1e6;
-            cost[q_pos_offset + i] = 1e6;
-            cost[q_neg_offset + i] = 1e6;
+        if (!feasibility_only || elastic_balance_phase_one) {
+            const double explicit_slack_upper = elastic_balance_phase_one
+                ? kHighsInf
+                : (lightweight_large_seed ? 0.0 : balance_slack_limit);
+            upper[p_pos_offset + i] = explicit_slack_upper;
+            upper[p_neg_offset + i] = explicit_slack_upper;
+            upper[q_pos_offset + i] = explicit_slack_upper;
+            upper[q_neg_offset + i] = explicit_slack_upper;
+            if (elastic_balance_phase_one) {
+                cost[p_pos_offset + i] = 1.0;
+                cost[p_neg_offset + i] = 1.0;
+                cost[q_pos_offset + i] = 1.0;
+                cost[q_neg_offset + i] = 1.0;
+            } else if (!lightweight_large_seed) {
+                cost[p_pos_offset + i] = 1e6;
+                cost[p_neg_offset + i] = 1e6;
+                cost[q_pos_offset + i] = 1e6;
+                cost[q_neg_offset + i] = 1e6;
+            }
         }
     }
     for (int i = 0; i < ng; ++i) {
@@ -404,7 +446,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
 
     std::vector<LinearizedBranch> linearized(nl);
     for (int i = 0; i < nl; ++i) {
-        if (i == outaged_branch) {
+        if (i == outaged_branch || data.branches[i].status == 0) {
             continue;
         }
         const auto& branch = data.branches[i];
@@ -422,7 +464,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         double active_constant = 0.0;
         double reactive_constant = 0.0;
         for (int branch_index : data.buses[bus].branches_from) {
-            if (branch_index == outaged_branch) {
+            if (branch_index == outaged_branch ||
+                data.branches[branch_index].status == 0) {
                 continue;
             }
             const auto& branch = data.branches[branch_index];
@@ -440,7 +483,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             append(reactive, va_offset + branch.to, q.va_to);
         }
         for (int branch_index : data.buses[bus].branches_to) {
-            if (branch_index == outaged_branch) {
+            if (branch_index == outaged_branch ||
+                data.branches[branch_index].status == 0) {
                 continue;
             }
             const auto& branch = data.branches[branch_index];
@@ -484,11 +528,17 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             active.upper = -active_constant + balance_slack_limit;
             reactive.lower = -reactive_constant - balance_slack_limit;
             reactive.upper = -reactive_constant + balance_slack_limit;
-        } else {
+        } else if (!feasibility_only || elastic_balance_phase_one) {
             append(active, p_pos_offset + bus, -1.0);
             append(active, p_neg_offset + bus, 1.0);
             append(reactive, q_pos_offset + bus, -1.0);
             append(reactive, q_neg_offset + bus, 1.0);
+            active.lower = active.upper = -active_constant;
+            reactive.lower = reactive.upper = -reactive_constant;
+        } else {
+            // Feasibility-only mode has no explicit balance-slack columns.
+            // Without projection, this is the same zero-slack equality that
+            // the previous fixed-zero columns represented.
             active.lower = active.upper = -active_constant;
             reactive.lower = reactive.upper = -reactive_constant;
         }
@@ -524,7 +574,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             !selected_branch_security[static_cast<std::size_t>(i)]) {
             continue;
         }
-        if (i == outaged_branch) {
+        if (i == outaged_branch || data.branches[i].status == 0) {
             continue;
         }
         const auto& branch = data.branches[i];
@@ -572,47 +622,89 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         }
     }
 
-    for (int i = 0; i < ng; ++i) {
-        SparseRow pg_positive;
-        pg_positive.lower = -kHighsInf;
-        pg_positive.upper = reference.pg[i];
-        append(pg_positive, pg_offset + i, 1.0);
-        append(pg_positive, dpg_offset + i, -1.0);
-        rows.push_back(std::move(pg_positive));
-        SparseRow pg_negative;
-        pg_negative.lower = -kHighsInf;
-        pg_negative.upper = -reference.pg[i];
-        append(pg_negative, pg_offset + i, -1.0);
-        append(pg_negative, dpg_offset + i, -1.0);
-        rows.push_back(std::move(pg_negative));
-        SparseRow qg_positive;
-        qg_positive.lower = -kHighsInf;
-        qg_positive.upper = reference.qg[i];
-        append(qg_positive, qg_offset + i, 1.0);
-        append(qg_positive, dqg_offset + i, -1.0);
-        rows.push_back(std::move(qg_positive));
-        SparseRow qg_negative;
-        qg_negative.lower = -kHighsInf;
-        qg_negative.upper = -reference.qg[i];
-        append(qg_negative, qg_offset + i, -1.0);
-        append(qg_negative, dqg_offset + i, -1.0);
-        rows.push_back(std::move(qg_negative));
+    // Absolute deviation variables and their epigraph rows define the
+    // ordinary seed objective.  They have no mathematical role in the
+    // zero-objective Phase-I problem and substantially enlarge its normal
+    // equations at 19k buses, so omit the rows entirely in feasibility mode.
+    // Their now-isolated zero-cost columns are removed by HiGHS presolve.
+    if (!feasibility_only) {
+        for (int i = 0; i < ng; ++i) {
+            SparseRow pg_positive;
+            pg_positive.lower = -kHighsInf;
+            pg_positive.upper = reference.pg[i];
+            append(pg_positive, pg_offset + i, 1.0);
+            append(pg_positive, dpg_offset + i, -1.0);
+            rows.push_back(std::move(pg_positive));
+            SparseRow pg_negative;
+            pg_negative.lower = -kHighsInf;
+            pg_negative.upper = -reference.pg[i];
+            append(pg_negative, pg_offset + i, -1.0);
+            append(pg_negative, dpg_offset + i, -1.0);
+            rows.push_back(std::move(pg_negative));
+            SparseRow qg_positive;
+            qg_positive.lower = -kHighsInf;
+            qg_positive.upper = reference.qg[i];
+            append(qg_positive, qg_offset + i, 1.0);
+            append(qg_positive, dqg_offset + i, -1.0);
+            rows.push_back(std::move(qg_positive));
+            SparseRow qg_negative;
+            qg_negative.lower = -kHighsInf;
+            qg_negative.upper = -reference.qg[i];
+            append(qg_negative, qg_offset + i, -1.0);
+            append(qg_negative, dqg_offset + i, -1.0);
+            rows.push_back(std::move(qg_negative));
+        }
+        for (int i = 0; i < nd; ++i) {
+            const double coefficient = data.loads[i].pd_nominal;
+            const double reference_power =
+                coefficient * reference.demand_factor[i];
+            SparseRow positive;
+            positive.lower = -kHighsInf;
+            positive.upper = reference_power;
+            append(positive, demand_offset + i, coefficient);
+            append(positive, dload_offset + i, -1.0);
+            rows.push_back(std::move(positive));
+            SparseRow negative;
+            negative.lower = -kHighsInf;
+            negative.upper = -reference_power;
+            append(negative, demand_offset + i, -coefficient);
+            append(negative, dload_offset + i, -1.0);
+            rows.push_back(std::move(negative));
+        }
     }
-    for (int i = 0; i < nd; ++i) {
-        const double coefficient = data.loads[i].pd_nominal;
-        const double reference_power = coefficient * reference.demand_factor[i];
-        SparseRow positive;
-        positive.lower = -kHighsInf;
-        positive.upper = reference_power;
-        append(positive, demand_offset + i, coefficient);
-        append(positive, dload_offset + i, -1.0);
-        rows.push_back(std::move(positive));
-        SparseRow negative;
-        negative.lower = -kHighsInf;
-        negative.upper = -reference_power;
-        append(negative, demand_offset + i, -coefficient);
-        append(negative, dload_offset + i, -1.0);
-        rows.push_back(std::move(negative));
+
+    std::vector<double> column_scale(
+        static_cast<std::size_t>(column_count), 1.0);
+    if (elastic_balance_phase_one) {
+        // The 19k cases contain near-zero-impedance circuits whose angle
+        // derivatives reach roughly 2e5.  Long primal-simplex pivot sequences
+        // on the unscaled columns eventually violated nonnegative elastic
+        // bounds.  Scale only the zero-cost physical Phase-I columns, capped
+        // at 1e4 so small but meaningful coefficients remain above HiGHS'
+        // minimum accepted matrix value.  This is an exact variable change:
+        // y_j = scale_j * x_j.
+        constexpr double kMaximumPhysicalColumnScale = 1e4;
+        for (const auto& row : rows) {
+            for (const auto& [column, coefficient] : row.entries) {
+                if (column >= p_pos_offset) {
+                    continue;
+                }
+                column_scale[column] = std::min(
+                    kMaximumPhysicalColumnScale,
+                    std::max(column_scale[column], std::abs(coefficient)));
+            }
+        }
+        for (int column = 0; column < p_pos_offset; ++column) {
+            lower[column] *= column_scale[column];
+            upper[column] *= column_scale[column];
+        }
+        for (auto& row : rows) {
+            for (auto& [column, coefficient] : row.entries) {
+                if (column < p_pos_offset) {
+                    coefficient /= column_scale[column];
+                }
+            }
+        }
     }
 
     std::vector<double> row_lower;
@@ -641,6 +733,9 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
     highs.setOptionValue("threads", 1);
     highs.setOptionValue("presolve", "on");
+    if (elastic_balance_phase_one) {
+        highs.setOptionValue("small_matrix_value", 1e-12);
+    }
     // The 8k-bus trust-region seed has a much smaller, better-scaled presolved
     // system than the original full contingency LP.  IPM solves this form in
     // less than half the measured dual-simplex time and returns a candidate
@@ -648,8 +743,21 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const char* solver_override = std::getenv("GRAVITYX_LINEAR_SEED_SOLVER");
     const std::string solver = solver_override != nullptr
         ? std::string(solver_override)
-        : "ipm";
+        : (feasibility_only && nb >= 16000 ? "simplex" : "ipm");
     highs.setOptionValue("solver", solver);
+    int simplex_strategy = elastic_balance_phase_one ? 1 : 4;
+    const char* simplex_strategy_override =
+        std::getenv("GRAVITYX_LINEAR_SEED_SIMPLEX_STRATEGY");
+    if (simplex_strategy_override != nullptr) {
+        simplex_strategy = std::stoi(simplex_strategy_override);
+    }
+    if (solver == "simplex" && feasibility_only) {
+        // The large elastic Phase I defaults to numerically stable serial dual
+        // simplex. Diagnostics showed that a long primal pivot sequence can
+        // violate nonnegative elastic bounds on the 19k coefficient range.
+        // Smaller zero-objective feasibility models retain primal simplex.
+        highs.setOptionValue("simplex_strategy", simplex_strategy);
+    }
     highs.setOptionValue("run_crossover", "off");
     highs.setOptionValue("time_limit", time_limit_seconds);
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
@@ -676,6 +784,80 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             indices.data(), values.data()) != HighsStatus::kOk) {
         throw std::runtime_error("failed to construct the linearized AC HiGHS model");
     }
+    bool primal_start_attempted = false;
+    HighsStatus primal_start_status = HighsStatus::kOk;
+    bool primal_basis_attempted = false;
+    HighsStatus primal_basis_status = HighsStatus::kOk;
+    const char* elastic_start_override =
+        std::getenv("GRAVITYX_ELASTIC_PHASE_ONE_START");
+    const bool elastic_start_enabled =
+        elastic_start_override != nullptr &&
+        std::string(elastic_start_override) != "0";
+    if (elastic_balance_phase_one && elastic_start_enabled) {
+        primal_start_attempted = true;
+        std::vector<double> primal_start(
+            static_cast<std::size_t>(column_count), 0.0);
+        HighsBasis primal_basis;
+        primal_basis.alien = true;
+        primal_basis.useful = true;
+        primal_basis.col_status.assign(
+            static_cast<std::size_t>(column_count),
+            HighsBasisStatus::kLower);
+        primal_basis.row_status.assign(
+            rows.size(), HighsBasisStatus::kBasic);
+        const auto initialize_nonbasic_column = [&](int column) {
+            if (std::isfinite(lower[column])) {
+                primal_start[column] = lower[column];
+                primal_basis.col_status[column] = HighsBasisStatus::kLower;
+            } else if (std::isfinite(upper[column])) {
+                primal_start[column] = upper[column];
+                primal_basis.col_status[column] = HighsBasisStatus::kUpper;
+            } else {
+                primal_start[column] = 0.0;
+                primal_basis.col_status[column] = HighsBasisStatus::kZero;
+            }
+        };
+        for (int column = 0; column < column_count; ++column) {
+            initialize_nonbasic_column(column);
+        }
+        const auto set_balance_slack = [&](int row_index,
+                                           int positive_column,
+                                           int negative_column) {
+            double activity = 0.0;
+            for (const auto& [column, coefficient] : rows[row_index].entries) {
+                activity += coefficient * primal_start[column];
+            }
+            const double residual = activity - rows[row_index].lower;
+            if (residual >= 0.0) {
+                // The positive column has coefficient -1.
+                primal_start[positive_column] = residual;
+                primal_basis.col_status[positive_column] =
+                    HighsBasisStatus::kBasic;
+            } else {
+                // The negative column has coefficient +1.
+                primal_start[negative_column] = -residual;
+                primal_basis.col_status[negative_column] =
+                    HighsBasisStatus::kBasic;
+            }
+            // A basic elastic column replaces the implicit row slack.
+            primal_basis.row_status[row_index] = HighsBasisStatus::kLower;
+        };
+        for (int bus = 0; bus < nb; ++bus) {
+            set_balance_slack(
+                2 * bus, p_pos_offset + bus, p_neg_offset + bus);
+            set_balance_slack(
+                2 * bus + 1, q_pos_offset + bus, q_neg_offset + bus);
+        }
+        std::vector<HighsInt> start_indices(
+            static_cast<std::size_t>(column_count));
+        std::iota(start_indices.begin(), start_indices.end(), HighsInt{0});
+        primal_start_status = highs.setSolution(
+            static_cast<HighsInt>(column_count),
+            start_indices.data(), primal_start.data());
+        primal_basis_attempted = true;
+        primal_basis_status = highs.setBasis(
+            primal_basis, "elastic_balance_diagonal");
+    }
     const auto run_status = highs.run();
     const auto model_status = highs.getModelStatus();
     const auto& solution = highs.getSolution();
@@ -686,6 +868,22 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     output.branch_security_rows_omitted = omit_branch_security_rows;
     output.branch_security_subset_count = branch_security_subset_count;
     output.feasibility_only = feasibility_only;
+    output.elastic_balance_phase_one = elastic_balance_phase_one;
+    output.primal_start_attempted = primal_start_attempted;
+    output.primal_start_status = static_cast<int>(primal_start_status);
+    output.primal_start_accepted =
+        primal_start_attempted && primal_start_status == HighsStatus::kOk;
+    output.primal_basis_attempted = primal_basis_attempted;
+    output.primal_basis_status = static_cast<int>(primal_basis_status);
+    output.primal_basis_accepted =
+        primal_basis_attempted && primal_basis_status == HighsStatus::kOk;
+    output.simplex_strategy = simplex_strategy;
+    output.maximum_column_scale = *std::max_element(
+        column_scale.begin(), column_scale.end());
+    output.voltage_trust_radius = lightweight_large_seed
+        ? voltage_trust_radius : 0.0;
+    output.angle_trust_radius = lightweight_large_seed
+        ? angle_trust_radius : 0.0;
     output.time_limit_seconds = time_limit_seconds;
     output.ipm_optimality_tolerance = ipm_optimality_tolerance;
     output.row_count = static_cast<int>(rows.size());
@@ -709,6 +907,22 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     constexpr double kRequiredPrimalFeasibilityTolerance = 1e-8;
     const bool solution_shape_valid = solution.value_valid &&
         solution.col_value.size() == static_cast<std::size_t>(column_count);
+    if (elastic_balance_phase_one && solution_shape_valid) {
+        for (int bus = 0; bus < nb; ++bus) {
+            const double active_slack =
+                solution.col_value[p_pos_offset + bus] +
+                solution.col_value[p_neg_offset + bus];
+            const double reactive_slack =
+                solution.col_value[q_pos_offset + bus] +
+                solution.col_value[q_neg_offset + bus];
+            output.maximum_balance_slack = std::max({
+                output.maximum_balance_slack,
+                active_slack,
+                reactive_slack,
+            });
+            output.total_balance_slack += active_slack + reactive_slack;
+        }
+    }
     const bool optimal_solution = run_status != HighsStatus::kError &&
         model_status == HighsModelStatus::kOptimal && solution_shape_valid;
     // Phase I is used only to generate a candidate for the exact nonlinear
@@ -729,12 +943,16 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     output.state = reference;
     if (output.success) {
         for (int i = 0; i < nb; ++i) {
-            output.state.vm[i] = solution.col_value[vm_offset + i];
-            output.state.va[i] = solution.col_value[va_offset + i];
+            output.state.vm[i] = solution.col_value[vm_offset + i] /
+                column_scale[vm_offset + i];
+            output.state.va[i] = solution.col_value[va_offset + i] /
+                column_scale[va_offset + i];
         }
         for (int i = 0; i < ng; ++i) {
-            output.state.pg[i] = solution.col_value[pg_offset + i];
-            output.state.qg[i] = solution.col_value[qg_offset + i];
+            output.state.pg[i] = solution.col_value[pg_offset + i] /
+                column_scale[pg_offset + i];
+            output.state.qg[i] = solution.col_value[qg_offset + i] /
+                column_scale[qg_offset + i];
         }
         if (outaged_generator >= 0) {
             output.state.pg[outaged_generator] = 0.0;
@@ -742,7 +960,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         }
         for (int i = 0; i < nd; ++i) {
             output.state.demand_factor[i] =
-                solution.col_value[demand_offset + i];
+                solution.col_value[demand_offset + i] /
+                column_scale[demand_offset + i];
         }
     }
     output.wall_seconds = std::chrono::duration<double>(

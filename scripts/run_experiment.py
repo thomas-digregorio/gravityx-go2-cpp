@@ -781,6 +781,13 @@ def main() -> int:
             min(args.base_timeout, args.code1_time_limit),
             base_deadline,
         )
+        run_status.update(
+            {
+                "stage": "code1",
+                "base_effective_timeout_seconds": base_timeout,
+            }
+        )
+        checkpoint()
         if args.validated_source_base:
             base_arguments = [
                 "validated-source-base-json",
@@ -826,13 +833,25 @@ def main() -> int:
         }
     )
     if base_process.returncode != 0:
+        base_timed_out = bool(getattr(base_process, "timed_out", False))
         run_status["error"] = (
             "Code1 reached its competition or end-to-end work deadline"
-            if getattr(base_process, "timed_out", False)
+            if base_timed_out
             else "cold C++ base/IBR solve failed"
         )
+        run_status.update(
+            {
+                "code1_within_limit": (
+                    not base_timed_out and base_wall <= args.code1_time_limit
+                ),
+                "code1_timed_out": base_timed_out,
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
         checkpoint()
-        if getattr(base_process, "timed_out", False):
+        if base_timed_out:
             raise CompetitionTimeout(run_status["error"])
         raise RuntimeError(f"{run_status['error']}; see internal/base.console.log")
     if base_wall > args.code1_time_limit:

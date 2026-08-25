@@ -86,6 +86,7 @@ struct Shunt {
 struct Branch {
     std::string source_key;
     int index{};
+    int status{1};
     int from{};
     int to{};
     bool transformer{};

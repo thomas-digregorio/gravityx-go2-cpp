@@ -263,6 +263,41 @@ int run_parallel_circuit_regression() {
             "validated source-base regression failed with residual " +
             std::to_string(source_base.validation.max_residual));
     }
+    auto inactive_branch_data = data;
+    inactive_branch_data.branches[0].status = 0;
+    // Deliberately make the inactive circuit electrically extreme.  Every
+    // model layer must still keep it at exactly zero flow and exclude it from
+    // the network equations.
+    inactive_branch_data.branches[0].r = 1e-10;
+    inactive_branch_data.branches[0].x = 1e-10;
+    const auto inactive_source = gravityx::build_validated_source_base(
+        inactive_branch_data, {1});
+    if (!inactive_source.feasible ||
+        inactive_source.validation.max_residual > 1e-5 ||
+        std::abs(inactive_source.solve.state.pf[0]) > 1e-12 ||
+        std::abs(inactive_source.solve.state.qf[0]) > 1e-12 ||
+        std::abs(inactive_source.solve.state.pt[0]) > 1e-12 ||
+        std::abs(inactive_source.solve.state.qt[0]) > 1e-12 ||
+        std::abs(inactive_source.solve.state.sm_slack[0]) > 1e-12) {
+        throw std::runtime_error(
+            "inactive-branch source-topology regression failed");
+    }
+    gravityx::AcModel inactive_model(
+        inactive_branch_data, gravityx::ModelMode::BaseSoft, {1});
+    const auto inactive_solve = inactive_model.solve(0, 1e-7);
+    const auto inactive_validation = gravityx::validate_state(
+        inactive_branch_data, gravityx::ModelMode::BaseSoft,
+        inactive_solve.state, {1});
+    if ((inactive_solve.status != 0 && inactive_solve.status != 1) ||
+        inactive_validation.max_residual > 1e-5 ||
+        std::abs(inactive_solve.state.pf[0]) > 1e-12 ||
+        std::abs(inactive_solve.state.qf[0]) > 1e-12 ||
+        std::abs(inactive_solve.state.pt[0]) > 1e-12 ||
+        std::abs(inactive_solve.state.qt[0]) > 1e-12 ||
+        std::abs(inactive_solve.state.sm_slack[0]) > 1e-12) {
+        throw std::runtime_error(
+            "inactive-branch exact-topology regression failed");
+    }
     const auto linear_seed = gravityx::solve_linearized_ac_seed(
         data, source_base.solve.state, {1});
     if (!linear_seed.success) {
@@ -292,6 +327,19 @@ int run_parallel_circuit_regression() {
             throw std::runtime_error(
                 "lightweight linearized AC seed left its trust region");
         }
+    }
+    const auto balance_only_base_seed = gravityx::solve_linearized_ac_seed(
+        data, source_base.solve.state, {1}, 0.25, std::nullopt,
+        true, true, 60.0, true, true);
+    if (!balance_only_base_seed.success ||
+        !balance_only_base_seed.projected_balance_slack ||
+        !balance_only_base_seed.branch_security_rows_omitted ||
+        !balance_only_base_seed.feasibility_only ||
+        balance_only_base_seed.branch_security_subset_count != 0 ||
+        balance_only_base_seed.row_count >= linear_seed.row_count ||
+        balance_only_base_seed.column_count >= linear_seed.column_count) {
+        throw std::runtime_error(
+            "balance-only base Phase-I regression failed");
     }
 
     gravityx::AcModel model(data, gravityx::ModelMode::BaseSoft, {1});
@@ -462,11 +510,13 @@ int run_inspect(const std::string& path) {
     reject_onedrive(path);
     const auto data = gravityx::CaseData::load(path);
     int transformers = 0;
+    int source_active_branches = 0;
     int initially_on = 0;
     int startup_eligible = 0;
     int shutdown_eligible = 0;
     for (const auto& branch : data.branches) {
         transformers += branch.transformer ? 1 : 0;
+        source_active_branches += branch.status;
     }
     for (const auto& gen : data.generators) {
         initially_on += gen.status_prev;
@@ -480,6 +530,9 @@ int run_inspect(const std::string& path) {
         {"loads", data.loads.size()},
         {"shunts", data.shunts.size()},
         {"branches", data.branches.size()},
+        {"source_active_branches", source_active_branches},
+        {"source_inactive_branches",
+         static_cast<int>(data.branches.size()) - source_active_branches},
         {"contingencies", data.contingencies.size()},
         {"transformers", transformers},
         {"lines", static_cast<int>(data.branches.size()) - transformers},
@@ -558,13 +611,42 @@ int run_validated_source_base_json(
     bool allow_large_base_newton_restart = true) {
     reject_onedrive(path);
     reject_onedrive(output_path);
+    const auto command_start = std::chrono::steady_clock::now();
+    const char* base_log_value = std::getenv("GRAVITYX_BASE_LOG");
+    const bool base_log_enabled = base_log_value != nullptr &&
+        std::string(base_log_value) != "0";
+    const auto log_base_phase = [&](const std::string& phase,
+                                    const nlohmann::json& detail) {
+        if (!base_log_enabled) {
+            return;
+        }
+        auto message = detail;
+        message["phase"] = phase;
+        message["elapsed_seconds"] = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - command_start).count();
+        std::cerr << "GRAVITYX_BASE_PHASE " << message.dump() << '\n';
+        std::cerr.flush();
+    };
     const auto data = gravityx::CaseData::load(path);
+    log_base_phase("case_loaded", {
+        {"buses", data.buses.size()},
+        {"generators", data.generators.size()},
+        {"loads", data.loads.size()},
+        {"branches", data.branches.size()},
+        {"contingencies", data.contingencies.size()},
+    });
     std::vector<int> commitment;
     commitment.reserve(data.generators.size());
     for (const auto& generator : data.generators) {
         commitment.push_back(generator.status_prev);
     }
     const auto source = gravityx::build_validated_source_base(data, commitment);
+    log_base_phase("source_candidate", {
+        {"feasible", source.feasible},
+        {"max_residual", source.validation.max_residual},
+        {"worst_category", source.validation.worst_category},
+        {"wall_seconds", source.wall_seconds},
+    });
     gravityx::SolveResult selected_solve = source.solve;
     gravityx::ValidationReport selected_validation = source.validation;
     bool success = source.feasible;
@@ -578,6 +660,13 @@ int run_validated_source_base_json(
         gravityx::FastContingencyPowerFlow repair(
             data, source.solve.state, commitment);
         auto repaired = repair.solve_base();
+        log_base_phase("source_voltage_repair", {
+            {"feasible", repaired.feasible},
+            {"converged", repaired.converged},
+            {"max_residual", repaired.validation.max_residual},
+            {"worst_category", repaired.validation.worst_category},
+            {"wall_seconds", repaired.wall_seconds},
+        });
         auto source_repair_json = repaired.to_json();
         source_repair_json["start"] = "source_voltage";
         repair_json.push_back(std::move(source_repair_json));
@@ -587,7 +676,8 @@ int run_validated_source_base_json(
             selected_validation = repaired.validation;
         }
         success = repaired.feasible;
-        if (!success) {
+        if (!success && !(data.buses.size() >= 16000 &&
+                          selected_validation.max_residual <= 0.25)) {
             auto flat_state = source.solve.state;
             for (int i = 0; i < static_cast<int>(data.buses.size()); ++i) {
                 flat_state.vm[i] = std::clamp(
@@ -597,6 +687,13 @@ int run_validated_source_base_json(
             gravityx::FastContingencyPowerFlow flat_repair(
                 data, flat_state, commitment);
             const auto flat = flat_repair.solve_base();
+            log_base_phase("flat_voltage_repair", {
+                {"feasible", flat.feasible},
+                {"converged", flat.converged},
+                {"max_residual", flat.validation.max_residual},
+                {"worst_category", flat.validation.worst_category},
+                {"wall_seconds", flat.wall_seconds},
+            });
             auto flat_json = flat.to_json();
             flat_json["start"] = "flat_voltage";
             repair_json.push_back(std::move(flat_json));
@@ -607,7 +704,8 @@ int run_validated_source_base_json(
             }
             success = flat.feasible;
         }
-        if (!success) {
+        if (!success && !(data.buses.size() >= 16000 &&
+                          selected_validation.max_residual <= 0.25)) {
             const std::vector<double> load_fractions{
                 0.95, 0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4, 0.25, 0.0};
             auto continuation_state = selected_solve.state;
@@ -688,6 +786,16 @@ int run_validated_source_base_json(
                 gravityx::FastContingencyPowerFlow reduced_repair(
                     data, seed, commitment);
                 const auto reduced = reduced_repair.solve_base();
+                const double prior_continuation_residual =
+                    continuation_residual;
+                log_base_phase("reduced_load_repair", {
+                    {"load_fraction_from_lower_to_source", fraction},
+                    {"feasible", reduced.feasible},
+                    {"converged", reduced.converged},
+                    {"max_residual", reduced.validation.max_residual},
+                    {"worst_category", reduced.validation.worst_category},
+                    {"wall_seconds", reduced.wall_seconds},
+                });
                 auto reduced_json = reduced.to_json();
                 reduced_json["start"] = "reduced_load_continuation";
                 reduced_json["load_fraction_from_lower_to_source"] = fraction;
@@ -710,6 +818,23 @@ int run_validated_source_base_json(
                     success = true;
                     break;
                 }
+                // The 19k-bus source cases reach their best continuation
+                // center near the 70% load point, then spend roughly another
+                // minute walking toward lower loads while the independently
+                // measured residual worsens.  Stop at the first non-improving
+                // point.  This changes only seed selection; no candidate is
+                // accepted without the unchanged exact validator.
+                if (data.buses.size() >= 16000 &&
+                    reduced.validation.max_residual + 1e-8 >=
+                        prior_continuation_residual) {
+                    log_base_phase("reduced_load_stagnation_stop", {
+                        {"load_fraction_from_lower_to_source", fraction},
+                        {"prior_residual", prior_continuation_residual},
+                        {"current_residual",
+                         reduced.validation.max_residual},
+                    });
+                    break;
+                }
                 // On the 8k-bus cases this continuation is only a way to find
                 // a useful center for the linearized feasibility LP.  Once a
                 // sub-0.1 p.u. candidate exists, the lower-load points were
@@ -725,16 +850,338 @@ int run_validated_source_base_json(
         }
         base_method = "validated_sparse_newton_source_point_repair";
     }
-    if (!success) {
+    if (!success && data.buses.size() >= 16000 && !allow_exact_fallback) {
+        std::vector<int> dynamic_security_branches;
+        std::vector<unsigned char> dynamic_security_selected(
+            data.branches.size(), 0);
+        const auto collect_violated_base_security_branches =
+            [&](const gravityx::AcState& state) {
+                nlohmann::json added = nlohmann::json::array();
+                if (state.pf.size() != data.branches.size() ||
+                    state.qf.size() != data.branches.size() ||
+                    state.pt.size() != data.branches.size() ||
+                    state.qt.size() != data.branches.size() ||
+                    state.sm_slack.size() != data.branches.size()) {
+                    return added;
+                }
+                constexpr double kSecurityCollectionTolerance = 1e-5;
+                for (std::size_t i = 0; i < data.branches.size(); ++i) {
+                    const auto& branch = data.branches[i];
+                    if (branch.status == 0) {
+                        continue;
+                    }
+                    const double rating = branch.rate_a;
+                    const double box_violation = std::max({
+                        std::abs(state.pf[i]) - rating,
+                        std::abs(state.qf[i]) - rating,
+                        std::abs(state.pt[i]) - rating,
+                        std::abs(state.qt[i]) - rating,
+                    });
+                    const double source_delta =
+                        data.buses[branch.from].va_start -
+                        data.buses[branch.to].va_start;
+                    double angle_violation = 0.0;
+                    if (source_delta >= branch.angmin &&
+                        source_delta <= branch.angmax) {
+                        const double angle =
+                            state.va[branch.from] - state.va[branch.to];
+                        angle_violation = std::max(
+                            angle - branch.angmax,
+                            branch.angmin - angle);
+                    }
+                    const double slack = state.sm_slack[i];
+                    const double from_scale = branch.transformer
+                        ? 1.0 + slack : state.vm[branch.from] + slack;
+                    const double to_scale = branch.transformer
+                        ? 1.0 + slack : state.vm[branch.to] + slack;
+                    const double apparent_violation = std::max(
+                        state.pf[i] * state.pf[i] +
+                            state.qf[i] * state.qf[i] -
+                            rating * rating * from_scale * from_scale,
+                        state.pt[i] * state.pt[i] +
+                            state.qt[i] * state.qt[i] -
+                            rating * rating * to_scale * to_scale);
+                    if (std::max({box_violation, angle_violation,
+                                  apparent_violation}) <=
+                            kSecurityCollectionTolerance ||
+                        dynamic_security_selected[i]) {
+                        continue;
+                    }
+                    dynamic_security_selected[i] = 1;
+                    dynamic_security_branches.push_back(
+                        static_cast<int>(i));
+                    added.push_back({
+                        {"component_position", static_cast<int>(i)},
+                        {"source_key", branch.source_key},
+                        {"box_violation", std::max(0.0, box_violation)},
+                        {"angle_violation", std::max(0.0, angle_violation)},
+                        {"apparent_flow_violation",
+                         std::max(0.0, apparent_violation)},
+                    });
+                }
+                std::sort(dynamic_security_branches.begin(),
+                          dynamic_security_branches.end());
+                return added;
+            };
+
+        auto linear_reference = selected_solve.state;
+        double linear_reference_residual = selected_validation.max_residual;
+        // Flow variables retain explicit component bounds independently of
+        // the apparent-flow soft slack.  Seed the restricted Phase I with the
+        // exact branches that violate those bounds (or angle/apparent-flow
+        // constraints), then add newly exposed rows after nonlinear repair.
+        const nlohmann::json initial_dynamic_security_branches =
+            collect_violated_base_security_branches(linear_reference);
+        log_base_phase("dynamic_base_phase_one_initialized", {
+            {"initial_security_branch_count",
+             dynamic_security_branches.size()},
+            {"reference_residual", linear_reference_residual},
+        });
+        constexpr int kMaximumDynamicBaseRounds = 16;
+        for (int round = 1; round <= kMaximumDynamicBaseRounds; ++round) {
+            const double phase_one_time_limit_seconds =
+                dynamic_security_branches.empty() ? 60.0 : 90.0;
+            log_base_phase("dynamic_base_phase_one_start", {
+                {"round", round},
+                {"reference_residual", linear_reference_residual},
+                {"security_branch_count", dynamic_security_branches.size()},
+                {"time_limit_seconds", phase_one_time_limit_seconds},
+            });
+            bool lightweight = true;
+            auto linear = gravityx::solve_linearized_ac_seed(
+                data, linear_reference, commitment, 0.49, std::nullopt,
+                true, lightweight, phase_one_time_limit_seconds, true, true,
+                dynamic_security_branches);
+            if (!linear.success && linear.status == "Infeasible") {
+                // A local voltage/angle trust box may not contain a balance
+                // repair when the source point is several p.u. infeasible.
+                // Retry the same reduced Phase-I rows without that box.
+                lightweight = false;
+                linear = gravityx::solve_linearized_ac_seed(
+                    data, linear_reference, commitment, 0.49, std::nullopt,
+                    true, lightweight, phase_one_time_limit_seconds,
+                    true, true,
+                    dynamic_security_branches);
+            }
+            wall_seconds += linear.wall_seconds;
+            auto round_json = linear.to_json(false);
+            round_json["round"] = round;
+            round_json["dynamic_base_phase_one"] = true;
+            round_json["lightweight_large_base_seed"] = lightweight;
+            round_json["initial_dynamic_security_branches"] =
+                initial_dynamic_security_branches;
+            round_json["active_dynamic_security_branch_positions"] =
+                dynamic_security_branches;
+            log_base_phase("dynamic_base_phase_one_complete", {
+                {"round", round},
+                {"success", linear.success},
+                {"status", linear.status},
+                {"rows", linear.row_count},
+                {"columns", linear.column_count},
+                {"nonzeros", linear.nonzero_count},
+                {"iterations", linear.iterations},
+                {"wall_seconds", linear.wall_seconds},
+                {"lightweight_large_base_seed", lightweight},
+                {"security_branch_count", dynamic_security_branches.size()},
+            });
+            if (!linear.success) {
+                round_json["nonlinear_repair"] = nullptr;
+                linearized_repair_json.push_back(std::move(round_json));
+                break;
+            }
+
+            auto linear_state = linear.state;
+            const double linear_objective =
+                gravityx::rebuild_base_state_derived_fields(
+                    data, commitment, linear_state);
+            const auto linear_validation = gravityx::validate_state(
+                data, gravityx::ModelMode::BaseSoft,
+                linear_state, commitment);
+            round_json["linear_objective"] = linear_objective;
+            round_json["linear_validation"] = linear_validation.to_json();
+            const auto security_branches_from_full_linear_point =
+                collect_violated_base_security_branches(linear_state);
+            round_json["new_dynamic_security_branches_from_full_linear_point"] =
+                security_branches_from_full_linear_point;
+            round_json["active_dynamic_security_branch_positions_after_full_linear_point"] =
+                dynamic_security_branches;
+            if (linear_validation.max_residual <
+                selected_validation.max_residual) {
+                selected_solve.status = 0;
+                selected_solve.objective = linear_objective;
+                selected_solve.wall_seconds = linear.wall_seconds;
+                selected_solve.iterations = linear.iterations;
+                selected_solve.state = linear_state;
+                selected_validation = linear_validation;
+            }
+            if (linear_validation.max_residual <= 1e-5) {
+                selected_solve.status = 0;
+                selected_solve.objective = linear_objective;
+                selected_solve.wall_seconds = linear.wall_seconds;
+                selected_solve.iterations = linear.iterations;
+                selected_solve.state = std::move(linear_state);
+                selected_validation = linear_validation;
+                success = true;
+                base_method = "highs_dynamic_security_base_phase_one";
+                round_json["nonlinear_repair"] = nullptr;
+                linearized_repair_json.push_back(std::move(round_json));
+                break;
+            }
+
+            auto repair_seed = linear_state;
+            auto repair_seed_validation = linear_validation;
+            double repair_seed_objective = linear_objective;
+            double repair_seed_fraction = 1.0;
+            const bool full_step_is_security_feasible =
+                linear_validation.max_variable_bound_violation <= 1e-5 &&
+                linear_validation.max_angle_violation <= 1e-5 &&
+                linear_validation.max_flow_limit_violation <= 1e-5;
+            nlohmann::json blend_candidates = nlohmann::json::array({{
+                {"fraction", 1.0},
+                {"objective", linear_objective},
+                {"validation", linear_validation.to_json()},
+            }});
+            for (const double fraction : {0.75, 0.5, 0.25}) {
+                auto blended = linear_reference;
+                const auto interpolate = [fraction](
+                    const std::vector<double>& reference_values,
+                    const std::vector<double>& linear_values,
+                    std::vector<double>& output_values) {
+                    output_values.resize(reference_values.size());
+                    for (std::size_t i = 0; i < reference_values.size(); ++i) {
+                        output_values[i] = reference_values[i] + fraction *
+                            (linear_values[i] - reference_values[i]);
+                    }
+                };
+                interpolate(
+                    linear_reference.vm, linear_state.vm, blended.vm);
+                interpolate(
+                    linear_reference.va, linear_state.va, blended.va);
+                interpolate(
+                    linear_reference.pg, linear_state.pg, blended.pg);
+                interpolate(
+                    linear_reference.qg, linear_state.qg, blended.qg);
+                interpolate(
+                    linear_reference.demand_factor,
+                    linear_state.demand_factor,
+                    blended.demand_factor);
+                const double blended_objective =
+                    gravityx::rebuild_base_state_derived_fields(
+                        data, commitment, blended);
+                const auto blended_validation = gravityx::validate_state(
+                    data, gravityx::ModelMode::BaseSoft,
+                    blended, commitment);
+                blend_candidates.push_back({
+                    {"fraction", fraction},
+                    {"objective", blended_objective},
+                    {"validation", blended_validation.to_json()},
+                });
+                if (!full_step_is_security_feasible &&
+                    blended_validation.max_residual + 1e-12 <
+                     repair_seed_validation.max_residual) {
+                    repair_seed = std::move(blended);
+                    repair_seed_validation = blended_validation;
+                    repair_seed_objective = blended_objective;
+                    repair_seed_fraction = fraction;
+                }
+            }
+            round_json["blend_candidates"] = std::move(blend_candidates);
+            round_json["selected_blend_fraction"] = repair_seed_fraction;
+            round_json["full_step_is_security_feasible"] =
+                full_step_is_security_feasible;
+            round_json["selected_blend_validation"] =
+                repair_seed_validation.to_json();
+            log_base_phase("dynamic_base_blend_selected", {
+                {"round", round},
+                {"fraction", repair_seed_fraction},
+                {"max_residual", repair_seed_validation.max_residual},
+                {"worst_category", repair_seed_validation.worst_category},
+                {"worst_identity", repair_seed_validation.worst_identity},
+            });
+            if (repair_seed_validation.max_residual <
+                selected_validation.max_residual) {
+                selected_solve.status = 0;
+                selected_solve.objective = repair_seed_objective;
+                selected_solve.wall_seconds = linear.wall_seconds;
+                selected_solve.iterations = linear.iterations;
+                selected_solve.state = repair_seed;
+                selected_validation = repair_seed_validation;
+            }
+            if (repair_seed_validation.max_residual <= 1e-5) {
+                success = true;
+                base_method =
+                    "highs_dynamic_security_base_phase_one_blended";
+                round_json["nonlinear_repair"] = nullptr;
+                linearized_repair_json.push_back(std::move(round_json));
+                break;
+            }
+
+            gravityx::FastContingencyPowerFlow nonlinear_repair(
+                data, repair_seed, commitment);
+            auto nonlinear = nonlinear_repair.solve_base();
+            wall_seconds += nonlinear.wall_seconds;
+            round_json["nonlinear_repair"] = nonlinear.to_json();
+            const auto new_security_branches =
+                collect_violated_base_security_branches(
+                    nonlinear.solve.state);
+            round_json["new_dynamic_security_branches"] =
+                new_security_branches;
+            round_json["active_dynamic_security_branch_positions_after_repair"] =
+                dynamic_security_branches;
+            linearized_repair_json.push_back(std::move(round_json));
+            if (nonlinear.validation.max_residual <
+                selected_validation.max_residual) {
+                selected_solve = nonlinear.solve;
+                selected_validation = nonlinear.validation;
+            }
+            if (nonlinear.feasible) {
+                selected_solve = nonlinear.solve;
+                selected_validation = nonlinear.validation;
+                success = true;
+                base_method =
+                    "highs_dynamic_security_base_phase_one_plus_validated_sparse_newton";
+                break;
+            }
+            if (nonlinear.converged ||
+                nonlinear.validation.max_residual <
+                    linear_reference_residual) {
+                linear_reference = nonlinear.solve.state;
+                linear_reference_residual =
+                    nonlinear.validation.max_residual;
+            } else {
+                linear_reference = repair_seed;
+                linear_reference_residual =
+                    repair_seed_validation.max_residual;
+            }
+        }
+    }
+    if (!success && data.buses.size() < 16000) {
         auto linear_reference = selected_solve.state;
         double linear_reference_residual = selected_validation.max_residual;
         for (int round = 1; round <= 4; ++round) {
             const bool lightweight_large_base_seed =
-                data.buses.size() >= 8000 && round >= 2 &&
-                !allow_large_base_newton_restart;
+                data.buses.size() >= 16000 ||
+                (data.buses.size() >= 8000 && round >= 2 &&
+                 !allow_large_base_newton_restart);
+            log_base_phase("linearized_seed_start", {
+                {"round", round},
+                {"reference_residual", linear_reference_residual},
+                {"lightweight_large_base_seed", lightweight_large_base_seed},
+            });
             const auto linear = gravityx::solve_linearized_ac_seed(
                 data, linear_reference, commitment, 0.49, std::nullopt,
                 false, lightweight_large_base_seed);
+            log_base_phase("linearized_seed_complete", {
+                {"round", round},
+                {"success", linear.success},
+                {"status", linear.status},
+                {"rows", linear.row_count},
+                {"columns", linear.column_count},
+                {"nonzeros", linear.nonzero_count},
+                {"iterations", linear.iterations},
+                {"wall_seconds", linear.wall_seconds},
+                {"lightweight_large_base_seed", lightweight_large_base_seed},
+            });
             auto round_json = linear.to_json(false);
             round_json["round"] = round;
             round_json["lightweight_large_base_seed"] =
@@ -834,6 +1281,11 @@ int run_validated_source_base_json(
     }
     if (!success && allow_exact_fallback) {
         const double exact_initial_residual = selected_validation.max_residual;
+        log_base_phase("exact_fallback_start", {
+            {"initial_max_residual", exact_initial_residual},
+            {"initial_worst_category", selected_validation.worst_category},
+            {"initial_worst_identity", selected_validation.worst_identity},
+        });
         const auto exact_start = std::chrono::steady_clock::now();
         gravityx::AcModel exact_model(
             data, gravityx::ModelMode::BaseSoft, commitment);
@@ -858,6 +1310,15 @@ int run_validated_source_base_json(
         };
         base_optimization_performed = true;
         base_method = "gravity_ipopt_from_validated_fast_ac_seed";
+        log_base_phase("exact_fallback_complete", {
+            {"success", success},
+            {"solve_status", exact.status},
+            {"iterations", exact.iterations},
+            {"max_residual", exact_validation.max_residual},
+            {"worst_category", exact_validation.worst_category},
+            {"worst_identity", exact_validation.worst_identity},
+            {"wall_seconds", exact_total_seconds},
+        });
     }
     gravityx::IbrResult result;
     result.success = success;
@@ -1198,7 +1659,8 @@ bool solve_loaded_contingency(
                 }
                 constexpr double kSecurityCollectionTolerance = 1e-5;
                 for (std::size_t i = 0; i < data.branches.size(); ++i) {
-                    if (static_cast<int>(i) == context.outaged_branch) {
+                    if (static_cast<int>(i) == context.outaged_branch ||
+                        data.branches[i].status == 0) {
                         continue;
                     }
                     const auto& branch = data.branches[i];

@@ -362,10 +362,11 @@ ValidationReport validate_state(
         const auto& branch = data.branches[i];
         const bool outaged = contingency &&
             contingency->outaged_branch == static_cast<int>(i);
+        const bool unavailable = branch.status == 0 || outaged;
         const double rating = mode == ModelMode::ContingencySoft
             ? branch.rate_c : branch.rate_a;
-        const double flow_lower = outaged ? 0.0 : -rating;
-        const double flow_upper = outaged ? 0.0 : rating;
+        const double flow_lower = unavailable ? 0.0 : -rating;
+        const double flow_upper = unavailable ? 0.0 : rating;
         for (const auto& item : std::vector<std::pair<std::string, double>>{
                  {"pf", state.pf[i]}, {"qf", state.qf[i]},
                  {"pt", state.pt[i]}, {"qt", state.qt[i]}}) {
@@ -374,9 +375,11 @@ ValidationReport validate_state(
                 "variable_bound", "branch:" + branch.source_key + ":" + item.first);
         }
         update_category(report.max_variable_bound_violation,
-            bound_violation(state.sm_slack[i], 0.0, outaged ? 0.0 : data.sm_vio_limit),
+            bound_violation(
+                state.sm_slack[i], 0.0,
+                unavailable ? 0.0 : data.sm_vio_limit),
             "variable_bound", "branch:" + branch.source_key + ":sm_slack");
-        if (outaged) {
+        if (unavailable) {
             continue;
         }
         const double denominator = branch.r * branch.r + branch.x * branch.x;

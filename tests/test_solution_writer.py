@@ -20,6 +20,7 @@ from run_experiment import (  # noqa: E402
     code2_completed_within_limit,
     code2_time_limit,
     effective_process_timeout,
+    fast_screen_affinity_groups,
     longest_first_contingencies,
     progress_checkpoint_due,
     streamed_queue_get,
@@ -275,6 +276,56 @@ class CompetitionTimingTests(unittest.TestCase):
         self.assertAlmostEqual(
             scheduled[0]["schedule_score_base_apparent_power"], 1.0
         )
+
+    def test_fast_screen_affinity_groups_keep_related_outages_together(self):
+        case = {
+            "gen": {
+                "1": {"index": 1, "gen_bus": 10},
+                "2": {"index": 2, "gen_bus": 10},
+                "3": {"index": 3, "gen_bus": 20},
+            },
+            "branch": {
+                "1": {"index": 1, "f_bus": 30},
+                "2": {"index": 2, "f_bus": 30},
+                "3": {"index": 3, "f_bus": 40},
+            },
+        }
+        state = {
+            "pg": [0.8, 0.2, 0.6],
+            "qg": [0.0, 0.0, 0.0],
+            "pf": [0.7, 0.1, 0.4],
+            "qf": [0.0, 0.0, 0.0],
+            "pt": [-0.7, -0.1, -0.4],
+            "qt": [0.0, 0.0, 0.0],
+        }
+        records = [
+            {"label": "G1", "type": "gen", "idx": 1, "schedule_rank": 1},
+            {"label": "B1", "type": "branch", "idx": 1, "schedule_rank": 2},
+            {"label": "G2", "type": "gen", "idx": 2, "schedule_rank": 3},
+            {"label": "B2", "type": "branch", "idx": 2, "schedule_rank": 4},
+            {"label": "G3", "type": "gen", "idx": 3, "schedule_rank": 5},
+            {"label": "B3", "type": "branch", "idx": 3, "schedule_rank": 6},
+        ]
+        groups = fast_screen_affinity_groups(case, state, records)
+        labels = [[item["label"] for item in group] for group in groups]
+        self.assertIn(["G2", "G1"], labels)
+        self.assertIn(["B2", "B1"], labels)
+        self.assertIn(["G3"], labels)
+        self.assertIn(["B3"], labels)
+        flattened = [item for group in groups for item in group]
+        self.assertEqual(len(flattened), len(records))
+        self.assertEqual(
+            {item["label"] for item in flattened},
+            {item["label"] for item in records},
+        )
+        for group in groups:
+            self.assertEqual(
+                [item["fast_screen_affinity_position"] for item in group],
+                list(range(1, len(group) + 1)),
+            )
+            self.assertTrue(
+                all(item["fast_screen_affinity_size"] == len(group) for item in group)
+            )
 
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)

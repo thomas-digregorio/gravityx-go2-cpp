@@ -522,6 +522,88 @@ def longest_first_contingencies(
     return scheduled
 
 
+def fast_screen_affinity_groups(
+    case: dict[str, Any],
+    base_state: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group related outages for rolling corrective-state reuse.
+
+    Generator outages at the same bus can translate a verified corrective
+    state between colocated units.  Branch outages sharing a from-bus tend to
+    perturb the same local equations, so they can also benefit from the prior
+    verified state.  Groups remain independent queue entries, preserving
+    dynamic load balancing between persistent workers.
+    """
+    generators = ordered(case, "gen")
+    branches = ordered(case, "branch")
+    generator_position = {
+        int(item["index"]): position for position, item in enumerate(generators)
+    }
+    branch_position = {
+        int(item["index"]): position for position, item in enumerate(branches)
+    }
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for source in records:
+        item = dict(source)
+        component = int(item["idx"])
+        if item["type"] == "gen":
+            position = generator_position[component]
+            component_data = generators[position]
+            affinity_key = ("gen_bus", int(component_data["gen_bus"]))
+            score = math.hypot(
+                float(base_state["pg"][position]),
+                float(base_state["qg"][position]),
+            )
+        else:
+            position = branch_position[component]
+            component_data = branches[position]
+            affinity_key = ("branch_from_bus", int(component_data["f_bus"]))
+            score = max(
+                math.hypot(
+                    float(base_state["pf"][position]),
+                    float(base_state["qf"][position]),
+                ),
+                math.hypot(
+                    float(base_state["pt"][position]),
+                    float(base_state["qt"][position]),
+                ),
+            )
+        item["fast_screen_affinity_type"] = affinity_key[0]
+        item["fast_screen_affinity_value"] = affinity_key[1]
+        item["fast_screen_affinity_score"] = score
+        grouped.setdefault(affinity_key, []).append(item)
+
+    groups = list(grouped.values())
+    for group in groups:
+        # Establish a low-disturbance verified seed first, then translate it
+        # through progressively larger colocated/local outages.
+        group.sort(
+            key=lambda item: (
+                float(item["fast_screen_affinity_score"]),
+                str(item["label"]),
+            )
+        )
+        for position, item in enumerate(group, start=1):
+            item["fast_screen_affinity_position"] = position
+            item["fast_screen_affinity_size"] = len(group)
+
+    # Put the groups whose easiest seed is still most disturbed first.  This
+    # reduces the chance that one difficult group becomes the final straggler.
+    groups.sort(
+        key=lambda group: (
+            -float(group[0]["fast_screen_affinity_score"]),
+            -len(group),
+            str(group[0]["fast_screen_affinity_type"]),
+            int(group[0]["fast_screen_affinity_value"]),
+        )
+    )
+    for rank, group in enumerate(groups, start=1):
+        for item in group:
+            item["fast_screen_affinity_group_rank"] = rank
+    return groups
+
+
 def load_fallback_schedule_profile(
     path: Path,
     case_sha256: str,
@@ -639,6 +721,7 @@ def main() -> int:
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
+    parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
     parser.add_argument("--robust-contingency-base", action="store_true")
@@ -659,6 +742,12 @@ def main() -> int:
     if args.two_stage_contingency_screen and not args.fast_power_flow_screen:
         parser.error(
             "--two-stage-contingency-screen requires --fast-power-flow-screen"
+        )
+    if (args.fast_screen_affinity_schedule and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--fast-screen-affinity-schedule requires "
+            "--two-stage-contingency-screen"
         )
     if (args.defer_fallback_until_screen_complete and
             not args.two_stage_contingency_screen):
@@ -915,6 +1004,18 @@ def main() -> int:
             "global descending profiled fallback wall time, then "
             + schedule_mode
         )
+    fast_screen_groups: list[list[dict[str, Any]]] | None = None
+    if args.fast_screen_affinity_schedule:
+        fast_screen_groups = fast_screen_affinity_groups(
+            case, base_state, contingencies
+        )
+        contingencies = [
+            item for group in fast_screen_groups for item in group
+        ]
+        schedule_mode = (
+            "dynamic affinity groups with low-disturbance seed first, then "
+            + schedule_mode
+        )
     run_status.update(
         {
             "stage": "code2",
@@ -931,6 +1032,21 @@ def main() -> int:
                     ),
                     "profiled_fallback_wall_seconds": item.get(
                         "profiled_fallback_wall_seconds"
+                    ),
+                    "fast_screen_affinity_type": item.get(
+                        "fast_screen_affinity_type"
+                    ),
+                    "fast_screen_affinity_value": item.get(
+                        "fast_screen_affinity_value"
+                    ),
+                    "fast_screen_affinity_group_rank": item.get(
+                        "fast_screen_affinity_group_rank"
+                    ),
+                    "fast_screen_affinity_position": item.get(
+                        "fast_screen_affinity_position"
+                    ),
+                    "fast_screen_affinity_size": item.get(
+                        "fast_screen_affinity_size"
                     ),
                 }
                 for item in contingencies
@@ -972,6 +1088,21 @@ def main() -> int:
             "profiled_fallback_worker": item.get("profiled_fallback_worker"),
             "profiled_fallback_wall_seconds": item.get(
                 "profiled_fallback_wall_seconds"
+            ),
+            "fast_screen_affinity_type": item.get(
+                "fast_screen_affinity_type"
+            ),
+            "fast_screen_affinity_value": item.get(
+                "fast_screen_affinity_value"
+            ),
+            "fast_screen_affinity_group_rank": item.get(
+                "fast_screen_affinity_group_rank"
+            ),
+            "fast_screen_affinity_position": item.get(
+                "fast_screen_affinity_position"
+            ),
+            "fast_screen_affinity_size": item.get(
+                "fast_screen_affinity_size"
             ),
             "profiled_fallback_stolen": (
                 item.get("profiled_fallback_worker") is not None
@@ -1048,9 +1179,14 @@ def main() -> int:
     ] = {}
     if args.two_stage_contingency_screen:
         fast_screen_start = time.perf_counter()
-        screen_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        for item in contingencies:
-            screen_queue.put(item)
+        screen_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+        if args.fast_screen_affinity_schedule:
+            assert fast_screen_groups is not None
+            screen_groups = fast_screen_groups
+        else:
+            screen_groups = [[item] for item in contingencies]
+        for group in screen_groups:
+            screen_queue.put(group)
         fallback_items: list[dict[str, Any]] = []
         fast_worker_count = min(args.fast_workers, len(contingencies))
 
@@ -1111,81 +1247,83 @@ def main() -> int:
                 read_until("GRAVITYX_WORKER_READY")
                 while not abort_contingencies.is_set():
                     try:
-                        item = screen_queue.get_nowait()
+                        group = screen_queue.get_nowait()
                     except queue.Empty:
                         break
-                    label = str(item["label"])
-                    assigned_labels.append(label)
-                    result_path = (
-                        internal / "contingencies" / f"{safe_label(label)}.json"
-                    )
-                    assert process.stdin is not None
-                    process.stdin.write(
-                        json.dumps(
-                            {
-                                "label": label,
-                                "output_path": to_wsl(result_path),
-                            },
-                            separators=(",", ":"),
+                    for item in group:
+                        if abort_contingencies.is_set():
+                            break
+                        label = str(item["label"])
+                        assigned_labels.append(label)
+                        result_path = (
+                            internal / "contingencies" / f"{safe_label(label)}.json"
                         )
-                        + "\n"
-                    )
-                    process.stdin.flush()
-                    acknowledgement = json.loads(
-                        read_until("GRAVITYX_TASK_RESULT ")
-                    )
-                    if acknowledgement.get("label") != label or not acknowledgement.get(
-                        "success", False
-                    ):
-                        raise RuntimeError(
-                            f"fast screen {label} failed to execute on worker "
-                            f"{worker_id}; see {log_path}"
+                        assert process.stdin is not None
+                        process.stdin.write(
+                            json.dumps(
+                                {
+                                    "label": label,
+                                    "output_path": to_wsl(result_path),
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
                         )
-                    if time.perf_counter() > contingency_deadline:
-                        raise CompetitionTimeout(
-                            f"fast screen {label} finished after the "
-                            f"{contingency_deadline_name}"
+                        process.stdin.flush()
+                        acknowledgement = json.loads(
+                            read_until("GRAVITYX_TASK_RESULT ")
                         )
-                    result = read_json(result_path)
-                    if result.get("success", False):
-                        save_secure_result(item, result, worker_id, "fast_screen")
-                    elif result.get("screen_completed", False):
-                        with progress_lock:
-                            fallback_items.append(item)
-                            assignment = fallback_schedule.get(label)
-                            if assignment is None:
-                                task_queue.put(item)
-                            else:
-                                profiled_task_queue.put(
-                                    (
-                                        -float(
-                                            assignment["predicted_wall_seconds"]
-                                        ),
-                                        int(item["schedule_rank"]),
-                                        label,
-                                        item,
+                        if (acknowledgement.get("label") != label or
+                                not acknowledgement.get("success", False)):
+                            raise RuntimeError(
+                                f"fast screen {label} failed to execute on worker "
+                                f"{worker_id}; see {log_path}"
+                            )
+                        if time.perf_counter() > contingency_deadline:
+                            raise CompetitionTimeout(
+                                f"fast screen {label} finished after the "
+                                f"{contingency_deadline_name}"
+                            )
+                        result = read_json(result_path)
+                        if result.get("success", False):
+                            save_secure_result(item, result, worker_id, "fast_screen")
+                        elif result.get("screen_completed", False):
+                            with progress_lock:
+                                fallback_items.append(item)
+                                assignment = fallback_schedule.get(label)
+                                if assignment is None:
+                                    task_queue.put(item)
+                                else:
+                                    profiled_task_queue.put(
+                                        (
+                                            -float(
+                                                assignment["predicted_wall_seconds"]
+                                            ),
+                                            int(item["schedule_rank"]),
+                                            label,
+                                            item,
+                                        )
                                     )
-                                )
-                    else:
-                        raise RuntimeError(
-                            f"fast screen {label} returned an incomplete result"
-                        )
-                    with progress_lock:
-                        screen_records.append(
-                            {
-                                "label": label,
-                                "worker_id": worker_id,
-                                "feasible": bool(result.get("success", False)),
-                                "wall_seconds": result["solve"]["wall_seconds"],
-                                "max_residual": result["validation"]["max_residual"],
-                                "failure_reason": (
-                                    result.get("fast_screen") or {}
-                                ).get("failure_reason", ""),
-                            }
-                        )
-                        run_status["screened_contingency_count"] = len(screen_records)
-                        run_status["fast_screen_fallback_count"] = len(fallback_items)
-                        progress_checkpoint()
+                        else:
+                            raise RuntimeError(
+                                f"fast screen {label} returned an incomplete result"
+                            )
+                        with progress_lock:
+                            screen_records.append(
+                                {
+                                    "label": label,
+                                    "worker_id": worker_id,
+                                    "feasible": bool(result.get("success", False)),
+                                    "wall_seconds": result["solve"]["wall_seconds"],
+                                    "max_residual": result["validation"]["max_residual"],
+                                    "failure_reason": (
+                                        result.get("fast_screen") or {}
+                                    ).get("failure_reason", ""),
+                                }
+                            )
+                            run_status["screened_contingency_count"] = len(screen_records)
+                            run_status["fast_screen_fallback_count"] = len(fallback_items)
+                            progress_checkpoint()
                     screen_queue.task_done()
                 if process.poll() is None:
                     assert process.stdin is not None
@@ -1738,6 +1876,7 @@ def main() -> int:
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
+        "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,

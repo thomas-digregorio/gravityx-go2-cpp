@@ -81,6 +81,10 @@ struct Shunt {
     int bus{};
     double gs{};
     double bs{};
+    bool dispatchable{};
+    std::vector<int> steps;
+    std::vector<int> block_maximum_steps;
+    std::vector<double> block_susceptance;
 };
 
 struct Branch {

@@ -226,7 +226,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     double time_limit_seconds,
     bool omit_branch_security_rows,
     bool feasibility_only,
-    const std::vector<int>& branch_security_subset) {
+    const std::vector<int>& branch_security_subset,
+    bool force_projected_balance_phase_one) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -301,7 +302,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     // zero-objective feasibility model is sufficient and avoids the large
     // elastic simplex system.
     const bool elastic_balance_phase_one = feasibility_only && nb >= 16000 &&
-        branch_security_subset.empty();
+        branch_security_subset.empty() &&
+        !force_projected_balance_phase_one;
     const bool targeted_security_repair = feasibility_only && nb >= 16000 &&
         !branch_security_subset.empty();
     const double voltage_trust_radius = targeted_security_repair ? 0.01 : 0.05;

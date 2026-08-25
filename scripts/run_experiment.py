@@ -364,10 +364,18 @@ def write_solution(
             "i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8",
         ]
     )
-    for shunt in shunts:
+    state_shunt_steps = state.get("shunt_steps")
+    for position, shunt in enumerate(shunts):
         if shunt.get("present", True) and shunt.get("dispatchable", False):
             source = shunt["source_id"]
-            values = [str(source[1]), *(str(int(value)) for value in shunt.get("xst", []))]
+            steps = shunt.get("xst", [])
+            if (
+                isinstance(state_shunt_steps, list)
+                and position < len(state_shunt_steps)
+                and isinstance(state_shunt_steps[position], list)
+            ):
+                steps = state_shunt_steps[position]
+            values = [str(source[1]), *(str(int(value)) for value in steps)]
             lines.append(", ".join(values))
 
     destination.parent.mkdir(parents=True, exist_ok=True)

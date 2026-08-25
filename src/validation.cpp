@@ -67,6 +67,7 @@ void require_finite_state(const AcState& state, const std::string& prefix) {
     require_finite_vector(state.pg, prefix + "pg");
     require_finite_vector(state.qg, prefix + "qg");
     require_finite_vector(state.demand_factor, prefix + "demand_factor");
+    require_finite_vector(state.shunt_bs, prefix + "shunt_bs");
     require_finite_vector(state.pf, prefix + "pf");
     require_finite_vector(state.qf, prefix + "qf");
     require_finite_vector(state.pt, prefix + "pt");
@@ -121,6 +122,13 @@ ValidationReport validate_state(
         state.sm_slack.size() != nl) {
         throw std::runtime_error("state dimensions do not match case dimensions");
     }
+    if ((!state.shunt_bs.empty() &&
+         state.shunt_bs.size() != data.shunts.size()) ||
+        (!state.shunt_steps.empty() &&
+         state.shunt_steps.size() != data.shunts.size())) {
+        throw std::runtime_error(
+            "switched-shunt state dimensions do not match case dimensions");
+    }
     if (mode != ModelMode::UnitCommitmentRelaxation &&
         (state.p_delta.size() != nb || state.q_delta.size() != nb)) {
         throw std::runtime_error("soft-balance state dimensions do not match case dimensions");
@@ -166,6 +174,43 @@ ValidationReport validate_state(
             update_category(report.max_reference_angle_residual, state.va[i],
                 "reference_angle", "bus:" + data.buses[i].source_key);
         }
+    }
+
+    for (std::size_t i = 0; i < data.shunts.size(); ++i) {
+        const auto& shunt = data.shunts[i];
+        if (state.shunt_steps.empty()) {
+            continue;
+        }
+        if (state.shunt_steps[i].size() <
+            shunt.block_maximum_steps.size()) {
+            throw std::runtime_error(
+                "switched-shunt block vector is too short: " +
+                shunt.source_key);
+        }
+        double expected_bs = 0.0;
+        for (std::size_t block = 0;
+             block < shunt.block_maximum_steps.size(); ++block) {
+            const int step = state.shunt_steps[i][block];
+            update_category(
+                report.max_variable_bound_violation,
+                bound_violation(
+                    static_cast<double>(step), 0.0,
+                    static_cast<double>(
+                        shunt.block_maximum_steps[block])),
+                "variable_bound",
+                "shunt:" + shunt.source_key + ":block:" +
+                    std::to_string(block));
+            expected_bs += static_cast<double>(step) *
+                shunt.block_susceptance[block];
+        }
+        if (!shunt.dispatchable) {
+            expected_bs = shunt.bs;
+        }
+        update_category(
+            report.max_variable_bound_violation,
+            effective_shunt_susceptance(data, state, static_cast<int>(i)) -
+                expected_bs,
+            "variable_bound", "shunt:" + shunt.source_key + ":bs");
     }
 
     int gen_lambda_offset = 0;
@@ -336,7 +381,8 @@ ValidationReport validate_state(
         }
         for (int shunt : bus.shunts) {
             p += data.shunts[shunt].gs * state.vm[i] * state.vm[i];
-            q -= data.shunts[shunt].bs * state.vm[i] * state.vm[i];
+            q -= effective_shunt_susceptance(data, state, shunt) *
+                state.vm[i] * state.vm[i];
         }
         const double p_residual = mode != ModelMode::UnitCommitmentRelaxation
             ? positive_part(std::abs(p) - state.p_delta[i])

@@ -1,6 +1,8 @@
+#include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <Eigen/SparseLU>
 
+#include "gravityx/active_feasibility_repair.hpp"
 #include "gravityx/fast_power_flow.hpp"
 #include "gravityx/state_io.hpp"
 
@@ -29,10 +31,34 @@ void add_admittance(YRows& rows, int row, int column, Complex value) {
     rows[row][column] += value;
 }
 
-YRows build_ybus(const CaseData& data, int outaged_branch) {
+void ensure_shunt_control_state(const CaseData& data, AcState& state) {
+    if (state.shunt_steps.size() != data.shunts.size()) {
+        state.shunt_steps.clear();
+        state.shunt_steps.reserve(data.shunts.size());
+        for (const auto& shunt : data.shunts) {
+            state.shunt_steps.push_back(shunt.steps);
+        }
+    }
+    if (state.shunt_bs.size() != data.shunts.size()) {
+        state.shunt_bs.clear();
+        state.shunt_bs.reserve(data.shunts.size());
+        for (const auto& shunt : data.shunts) {
+            state.shunt_bs.push_back(shunt.bs);
+        }
+    }
+}
+
+YRows build_ybus(
+    const CaseData& data,
+    int outaged_branch,
+    const AcState* state = nullptr) {
     YRows rows(data.buses.size());
-    for (const auto& shunt : data.shunts) {
-        add_admittance(rows, shunt.bus, shunt.bus, {shunt.gs, shunt.bs});
+    for (int i = 0; i < static_cast<int>(data.shunts.size()); ++i) {
+        const auto& shunt = data.shunts[i];
+        const double bs = state != nullptr
+            ? effective_shunt_susceptance(data, *state, i)
+            : shunt.bs;
+        add_admittance(rows, shunt.bus, shunt.bus, {shunt.gs, bs});
     }
     for (int i = 0; i < static_cast<int>(data.branches.size()); ++i) {
         if (i == outaged_branch || data.branches[i].status == 0) {
@@ -747,6 +773,689 @@ std::vector<std::vector<int>> connected_components(
 
 }  // namespace
 
+struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
+    bool valid{};
+    double preparation_seconds{};
+    std::vector<int> angle_index;
+    std::vector<int> voltage_index;
+    int angle_count{};
+    int voltage_count{};
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
+    bool active_valid{};
+    SparseMatrix active_jacobian;
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>>
+        active_factorization;
+    bool reactive_valid{};
+    SparseMatrix reactive_jacobian;
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>>
+        reactive_factorization;
+
+    FixedJacobianPredictorCache(
+        const CaseData& data,
+        const AcState& reference_state,
+        const std::vector<int>& commitment,
+        int outaged_branch = -1) {
+        const auto started = std::chrono::steady_clock::now();
+        const int nb = static_cast<int>(data.buses.size());
+        std::vector<bool> slack(static_cast<std::size_t>(nb), false);
+        for (const auto& component :
+             connected_components(data, outaged_branch)) {
+            int reference = -1;
+            for (int bus : component) {
+                bool has_committed_generator = false;
+                for (int generator : data.buses[bus].generators) {
+                    has_committed_generator = has_committed_generator ||
+                        commitment[generator] == 1;
+                }
+                if (has_committed_generator && data.buses[bus].type == 3) {
+                    reference = bus;
+                    break;
+                }
+            }
+            if (reference < 0) {
+                for (int bus : component) {
+                    for (int generator : data.buses[bus].generators) {
+                        if (commitment[generator] == 1) {
+                            reference = bus;
+                            break;
+                        }
+                    }
+                    if (reference >= 0) {
+                        break;
+                    }
+                }
+            }
+            if (reference < 0) {
+                preparation_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count();
+                return;
+            }
+            slack[reference] = true;
+        }
+
+        angle_index.assign(static_cast<std::size_t>(nb), -1);
+        voltage_index.assign(static_cast<std::size_t>(nb), -1);
+        for (int bus = 0; bus < nb; ++bus) {
+            if (!slack[bus]) {
+                angle_index[bus] = angle_count++;
+            }
+            // The reference angle removes one active-balance equation and
+            // one angle variable per connected component.  Voltage magnitude
+            // remains corrective at that bus, so its reactive-balance
+            // equation and voltage variable must stay in the square system.
+            voltage_index[bus] = voltage_count++;
+        }
+        const int dimension = angle_count + voltage_count;
+        if (dimension <= 0) {
+            preparation_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            return;
+        }
+
+        const auto ybus = build_ybus(
+            data, outaged_branch, &reference_state);
+        std::vector<double> p;
+        std::vector<double> q;
+        network_injections(
+            ybus, reference_state.vm, reference_state.va, p, q);
+        std::vector<Triplet> entries;
+        entries.reserve(static_cast<std::size_t>(dimension) * 8);
+        std::vector<Triplet> active_entries;
+        active_entries.reserve(static_cast<std::size_t>(angle_count) * 4);
+        std::vector<Triplet> reactive_entries;
+        reactive_entries.reserve(static_cast<std::size_t>(voltage_count) * 4);
+        for (int i = 0; i < nb; ++i) {
+            const double vi = reference_state.vm[i];
+            if (vi <= 1e-8) {
+                preparation_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started).count();
+                return;
+            }
+            const auto diagonal = ybus[i].find(i);
+            const double gii = diagonal == ybus[i].end()
+                ? 0.0 : diagonal->second.real();
+            const double bii = diagonal == ybus[i].end()
+                ? 0.0 : diagonal->second.imag();
+            if (angle_index[i] >= 0) {
+                const int row = angle_index[i];
+                const double active_angle_diagonal =
+                    -q[i] - bii * vi * vi;
+                entries.emplace_back(
+                    row, angle_index[i], active_angle_diagonal);
+                active_entries.emplace_back(
+                    row, angle_index[i], active_angle_diagonal);
+                entries.emplace_back(
+                    row, angle_count + voltage_index[i],
+                    p[i] / vi + gii * vi);
+                for (const auto& [j, admittance] : ybus[i]) {
+                    if (j == i) {
+                        continue;
+                    }
+                    const double delta =
+                        reference_state.va[i] - reference_state.va[j];
+                    const double gij = admittance.real();
+                    const double bij = admittance.imag();
+                    if (angle_index[j] >= 0) {
+                        const double active_angle_off_diagonal =
+                            vi * reference_state.vm[j] *
+                            (gij * std::sin(delta) -
+                             bij * std::cos(delta));
+                        entries.emplace_back(
+                            row, angle_index[j],
+                            active_angle_off_diagonal);
+                        active_entries.emplace_back(
+                            row, angle_index[j],
+                            active_angle_off_diagonal);
+                    }
+                    if (voltage_index[j] >= 0) {
+                        entries.emplace_back(
+                            row, angle_count + voltage_index[j],
+                            vi * (gij * std::cos(delta) +
+                                  bij * std::sin(delta)));
+                    }
+                }
+            }
+            if (voltage_index[i] >= 0) {
+                const int row = angle_count + voltage_index[i];
+                if (angle_index[i] >= 0) {
+                    entries.emplace_back(
+                        row, angle_index[i], p[i] - gii * vi * vi);
+                }
+                const double reactive_voltage_diagonal =
+                    q[i] / vi - bii * vi;
+                entries.emplace_back(
+                    row, angle_count + voltage_index[i],
+                    reactive_voltage_diagonal);
+                reactive_entries.emplace_back(
+                    voltage_index[i], voltage_index[i],
+                    reactive_voltage_diagonal);
+                for (const auto& [j, admittance] : ybus[i]) {
+                    if (j == i) {
+                        continue;
+                    }
+                    const double delta =
+                        reference_state.va[i] - reference_state.va[j];
+                    const double gij = admittance.real();
+                    const double bij = admittance.imag();
+                    if (angle_index[j] >= 0) {
+                        entries.emplace_back(
+                            row, angle_index[j],
+                            -vi * reference_state.vm[j] *
+                                (gij * std::cos(delta) +
+                                 bij * std::sin(delta)));
+                    }
+                    if (voltage_index[j] >= 0) {
+                        const double reactive_voltage_off_diagonal =
+                            vi * (gij * std::sin(delta) -
+                                  bij * std::cos(delta));
+                        entries.emplace_back(
+                            row, angle_count + voltage_index[j],
+                            reactive_voltage_off_diagonal);
+                        reactive_entries.emplace_back(
+                            voltage_index[i], voltage_index[j],
+                            reactive_voltage_off_diagonal);
+                    }
+                }
+            }
+        }
+        SparseMatrix jacobian(dimension, dimension);
+        jacobian.setFromTriplets(entries.begin(), entries.end());
+        factorization.analyzePattern(jacobian);
+        factorization.factorize(jacobian);
+        valid = factorization.info() == Eigen::Success;
+        active_jacobian.resize(angle_count, angle_count);
+        active_jacobian.setFromTriplets(
+            active_entries.begin(), active_entries.end());
+        active_factorization.analyzePattern(active_jacobian);
+        active_factorization.factorize(active_jacobian);
+        active_valid = active_factorization.info() == Eigen::Success;
+        reactive_jacobian.resize(voltage_count, voltage_count);
+        reactive_jacobian.setFromTriplets(
+            reactive_entries.begin(), reactive_entries.end());
+        reactive_factorization.analyzePattern(reactive_jacobian);
+        reactive_factorization.factorize(reactive_jacobian);
+        reactive_valid = reactive_factorization.info() == Eigen::Success;
+        preparation_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    }
+
+    bool apply_correction(
+        const CaseData& data,
+        const std::vector<double>& p_spec,
+        const std::vector<double>& q_spec,
+        const std::vector<double>& p_network,
+        const std::vector<double>& q_network,
+        std::vector<double>& vm,
+        std::vector<double>& va,
+        double damping = 1.0) {
+        if (!valid) {
+            return false;
+        }
+        Eigen::VectorXd mismatch(angle_count + voltage_count);
+        mismatch.setZero();
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (angle_index[bus] >= 0) {
+                mismatch[angle_index[bus]] =
+                    p_spec[bus] - p_network[bus];
+            }
+            if (voltage_index[bus] >= 0) {
+                mismatch[angle_count + voltage_index[bus]] =
+                    q_spec[bus] - q_network[bus];
+            }
+        }
+        const Eigen::VectorXd step = factorization.solve(mismatch);
+        if (factorization.info() != Eigen::Success || !step.allFinite()) {
+            return false;
+        }
+        double scale = 1.0;
+        double maximum_angle_step = 0.0;
+        double maximum_voltage_step = 0.0;
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (angle_index[bus] >= 0) {
+                maximum_angle_step = std::max(
+                    maximum_angle_step,
+                    std::abs(step[angle_index[bus]]));
+            }
+            if (voltage_index[bus] >= 0) {
+                maximum_voltage_step = std::max(
+                    maximum_voltage_step,
+                    std::abs(step[angle_count + voltage_index[bus]]));
+            }
+        }
+        if (maximum_angle_step > 0.35) {
+            scale = std::min(scale, 0.35 / maximum_angle_step);
+        }
+        if (maximum_voltage_step > 0.08) {
+            scale = std::min(scale, 0.08 / maximum_voltage_step);
+        }
+        scale = std::clamp(scale * damping, 1e-4, 1.0);
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (angle_index[bus] >= 0) {
+                va[bus] += scale * step[angle_index[bus]];
+            }
+            if (voltage_index[bus] >= 0) {
+                vm[bus] = std::clamp(
+                    vm[bus] +
+                        scale * step[angle_count + voltage_index[bus]],
+                    data.buses[bus].vmin, data.buses[bus].vmax);
+            }
+        }
+        return true;
+    }
+
+    bool apply_active_correction(
+        const CaseData& data,
+        const std::vector<double>& p_spec,
+        const std::vector<double>& p_network,
+        std::vector<double>& va,
+        double damping = 1.0) {
+        if (!active_valid) {
+            return false;
+        }
+        Eigen::VectorXd mismatch(angle_count);
+        mismatch.setZero();
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (angle_index[bus] >= 0) {
+                mismatch[angle_index[bus]] =
+                    p_spec[bus] - p_network[bus];
+            }
+        }
+        const Eigen::VectorXd step = active_factorization.solve(mismatch);
+        if (active_factorization.info() != Eigen::Success ||
+            !step.allFinite()) {
+            return false;
+        }
+        double scale = 1.0;
+        double maximum_angle_step = 0.0;
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (angle_index[bus] >= 0) {
+                maximum_angle_step = std::max(
+                    maximum_angle_step,
+                    std::abs(step[angle_index[bus]]));
+            }
+        }
+        if (maximum_angle_step > 0.35) {
+            scale = 0.35 / maximum_angle_step;
+        }
+        scale = std::clamp(scale * damping, 1e-4, 1.0);
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (angle_index[bus] >= 0) {
+                va[bus] += scale * step[angle_index[bus]];
+            }
+        }
+        return true;
+    }
+
+    bool apply_active_flow_redispatch(
+        const CaseData& data,
+        int branch_index,
+        bool from_side,
+        double desired_flow_change,
+        const std::vector<double>& p_lower,
+        const std::vector<double>& p_upper,
+        const AcState& reference_state,
+        std::vector<double>& pg,
+        std::vector<double>& p_spec) {
+        if (!active_valid || branch_index < 0 ||
+            branch_index >= static_cast<int>(data.branches.size()) ||
+            pg.size() != data.generators.size() ||
+            p_lower.size() != data.generators.size() ||
+            p_upper.size() != data.generators.size() ||
+            p_spec.size() != data.buses.size()) {
+            return false;
+        }
+        const auto& branch = data.branches[branch_index];
+        const double denominator =
+            branch.r * branch.r + branch.x * branch.x;
+        if (denominator <= 1e-20 || branch.tap <= 1e-12) {
+            return false;
+        }
+        const int from = branch.from;
+        const int to = branch.to;
+        const double g = branch.r / denominator;
+        const double b = -branch.x / denominator;
+        const double tm2 = branch.tap * branch.tap;
+        const double tr = branch.tap * std::cos(branch.shift);
+        const double ti = branch.tap * std::sin(branch.shift);
+        const double angle =
+            reference_state.va[from] - reference_state.va[to];
+        const double voltage_product =
+            reference_state.vm[from] * reference_state.vm[to];
+        double derivative = 0.0;
+        if (from_side) {
+            const double cosine_coefficient =
+                ((-g * tr + b * ti) / tm2) * voltage_product;
+            const double sine_coefficient =
+                ((-b * tr - g * ti) / tm2) * voltage_product;
+            derivative =
+                -cosine_coefficient * std::sin(angle) +
+                sine_coefficient * std::cos(angle);
+        } else {
+            const double cosine_coefficient =
+                ((-g * tr - b * ti) / tm2) * voltage_product;
+            const double sine_coefficient =
+                ((-b * tr + g * ti) / tm2) * voltage_product;
+            derivative =
+                -cosine_coefficient * std::sin(angle) -
+                sine_coefficient * std::cos(angle);
+        }
+        if (std::abs(derivative) <= 1e-10) {
+            return false;
+        }
+        Eigen::VectorXd flow_angle_gradient(angle_count);
+        flow_angle_gradient.setZero();
+        if (angle_index[from] >= 0) {
+            flow_angle_gradient[angle_index[from]] += derivative;
+        }
+        if (angle_index[to] >= 0) {
+            flow_angle_gradient[angle_index[to]] -= derivative;
+        }
+        const Eigen::VectorXd injection_sensitivity =
+            active_factorization.transpose().solve(flow_angle_gradient);
+        if (active_factorization.info() != Eigen::Success ||
+            !injection_sensitivity.allFinite()) {
+            return false;
+        }
+        const auto generator_sensitivity = [&](int generator) {
+            const int bus = data.generators[generator].bus;
+            return angle_index[bus] >= 0
+                ? injection_sensitivity[angle_index[bus]] : 0.0;
+        };
+        int selected_up = -1;
+        int selected_down = -1;
+        double selected_coefficient = 0.0;
+        for (int up = 0;
+             up < static_cast<int>(data.generators.size()); ++up) {
+            if (p_upper[up] - pg[up] <= 1e-8) {
+                continue;
+            }
+            const double up_sensitivity = generator_sensitivity(up);
+            for (int down = 0;
+                 down < static_cast<int>(data.generators.size()); ++down) {
+                if (down == up || pg[down] - p_lower[down] <= 1e-8) {
+                    continue;
+                }
+                const double coefficient =
+                    up_sensitivity - generator_sensitivity(down);
+                if (std::abs(coefficient) <= 1e-10 ||
+                    desired_flow_change / coefficient <= 0.0) {
+                    continue;
+                }
+                if (selected_up < 0 ||
+                    std::abs(coefficient) >
+                        std::abs(selected_coefficient)) {
+                    selected_up = up;
+                    selected_down = down;
+                    selected_coefficient = coefficient;
+                }
+            }
+        }
+        if (selected_up < 0 || selected_down < 0) {
+            return false;
+        }
+        const double requested_change =
+            desired_flow_change / selected_coefficient;
+        const double redispatch = std::min({
+            requested_change,
+            p_upper[selected_up] - pg[selected_up],
+            pg[selected_down] - p_lower[selected_down],
+            1.0,
+        });
+        if (redispatch <= 1e-8) {
+            return false;
+        }
+        pg[selected_up] += redispatch;
+        pg[selected_down] -= redispatch;
+        p_spec[data.generators[selected_up].bus] += redispatch;
+        p_spec[data.generators[selected_down].bus] -= redispatch;
+        return true;
+    }
+
+    bool apply_reactive_correction(
+        const CaseData& data,
+        const std::vector<double>& q_spec,
+        const std::vector<double>& q_network,
+        std::vector<double>& vm,
+        double damping = 1.0) {
+        if (!reactive_valid) {
+            return false;
+        }
+        Eigen::VectorXd mismatch(voltage_count);
+        mismatch.setZero();
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                mismatch[voltage_index[bus]] =
+                    q_spec[bus] - q_network[bus];
+            }
+        }
+        const Eigen::VectorXd step = reactive_factorization.solve(mismatch);
+        if (reactive_factorization.info() != Eigen::Success ||
+            !step.allFinite()) {
+            return false;
+        }
+        double scale = 1.0;
+        double maximum_voltage_step = 0.0;
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                maximum_voltage_step = std::max(
+                    maximum_voltage_step,
+                    std::abs(step[voltage_index[bus]]));
+            }
+        }
+        if (maximum_voltage_step > 0.08) {
+            scale = 0.08 / maximum_voltage_step;
+        }
+        scale = std::clamp(scale * damping, 1e-4, 1.0);
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                vm[bus] = std::clamp(
+                    vm[bus] + scale * step[voltage_index[bus]],
+                    data.buses[bus].vmin, data.buses[bus].vmax);
+            }
+        }
+        return true;
+    }
+
+    bool apply_local_reactive_correction(
+        const CaseData& data,
+        int target_bus,
+        double target_network_q_change,
+        std::vector<double>& vm,
+        double damping = 1.0) {
+        if (!reactive_valid || target_bus < 0 ||
+            target_bus >= static_cast<int>(data.buses.size()) ||
+            voltage_index[target_bus] < 0) {
+            return false;
+        }
+        Eigen::VectorXd mismatch(voltage_count);
+        mismatch.setZero();
+        mismatch[voltage_index[target_bus]] = target_network_q_change;
+        const Eigen::VectorXd step = reactive_factorization.solve(mismatch);
+        if (reactive_factorization.info() != Eigen::Success ||
+            !step.allFinite()) {
+            return false;
+        }
+        double scale = 1.0;
+        double maximum_voltage_step = 0.0;
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                maximum_voltage_step = std::max(
+                    maximum_voltage_step,
+                    std::abs(step[voltage_index[bus]]));
+            }
+        }
+        if (maximum_voltage_step > 0.08) {
+            scale = 0.08 / maximum_voltage_step;
+        }
+        scale = std::clamp(scale * damping, 1e-4, 1.0);
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                vm[bus] = std::clamp(
+                    vm[bus] + scale * step[voltage_index[bus]],
+                    data.buses[bus].vmin, data.buses[bus].vmax);
+            }
+        }
+        return true;
+    }
+
+    bool apply_reactive_band_correction(
+        const CaseData& data,
+        const std::vector<double>& q_balance,
+        std::vector<double>& vm,
+        double damping = 1.0) {
+        if (!reactive_valid ||
+            q_balance.size() != data.buses.size()) {
+            return false;
+        }
+        Eigen::VectorXd mismatch(voltage_count);
+        mismatch.setZero();
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                mismatch[voltage_index[bus]] =
+                    std::clamp(q_balance[bus], -0.49, 0.49) -
+                    q_balance[bus];
+            }
+        }
+        if (mismatch.lpNorm<Eigen::Infinity>() <= 1e-12) {
+            return false;
+        }
+        const Eigen::VectorXd step = reactive_factorization.solve(mismatch);
+        if (reactive_factorization.info() != Eigen::Success ||
+            !step.allFinite()) {
+            return false;
+        }
+        double scale = 1.0;
+        double maximum_voltage_step = 0.0;
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                maximum_voltage_step = std::max(
+                    maximum_voltage_step,
+                    std::abs(step[voltage_index[bus]]));
+            }
+        }
+        if (maximum_voltage_step > 0.08) {
+            scale = 0.08 / maximum_voltage_step;
+        }
+        scale = std::clamp(scale * damping, 1e-4, 1.0);
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            if (voltage_index[bus] >= 0) {
+                vm[bus] = std::clamp(
+                    vm[bus] + scale * step[voltage_index[bus]],
+                    data.buses[bus].vmin, data.buses[bus].vmax);
+            }
+        }
+        return true;
+    }
+
+    bool apply_local_reactive_least_squares(
+        const CaseData& data,
+        const std::vector<double>& q_balance,
+        std::vector<double>& vm,
+        double damping = 1.0) {
+        if (!reactive_valid ||
+            q_balance.size() != data.buses.size()) {
+            return false;
+        }
+        std::vector<std::pair<double, int>> ranked_violations;
+        for (int bus = 0; bus < static_cast<int>(data.buses.size()); ++bus) {
+            const double excess = std::abs(q_balance[bus]) - 0.49;
+            if (excess > 1e-8) {
+                ranked_violations.emplace_back(excess, bus);
+            }
+        }
+        if (ranked_violations.empty()) {
+            return false;
+        }
+        std::sort(
+            ranked_violations.begin(), ranked_violations.end(),
+            [](const auto& left, const auto& right) {
+                if (left.first != right.first) {
+                    return left.first > right.first;
+                }
+                return left.second < right.second;
+            });
+        constexpr std::size_t kMaximumViolationRows = 32;
+        if (ranked_violations.size() > kMaximumViolationRows) {
+            ranked_violations.resize(kMaximumViolationRows);
+        }
+
+        std::vector<int> control_buses;
+        for (const auto& [unused_excess, bus] : ranked_violations) {
+            static_cast<void>(unused_excess);
+            control_buses.push_back(bus);
+            for (int branch : data.buses[bus].branches_from) {
+                if (data.branches[branch].status != 0) {
+                    control_buses.push_back(data.branches[branch].to);
+                }
+            }
+            for (int branch : data.buses[bus].branches_to) {
+                if (data.branches[branch].status != 0) {
+                    control_buses.push_back(data.branches[branch].from);
+                }
+            }
+        }
+        std::sort(control_buses.begin(), control_buses.end());
+        control_buses.erase(
+            std::unique(control_buses.begin(), control_buses.end()),
+            control_buses.end());
+        constexpr std::size_t kMaximumControlBuses = 256;
+        if (control_buses.size() > kMaximumControlBuses) {
+            control_buses.resize(kMaximumControlBuses);
+        }
+        if (control_buses.empty()) {
+            return false;
+        }
+
+        Eigen::MatrixXd sensitivity(
+            static_cast<Eigen::Index>(ranked_violations.size()),
+            static_cast<Eigen::Index>(control_buses.size()));
+        Eigen::VectorXd target(
+            static_cast<Eigen::Index>(ranked_violations.size()));
+        for (std::size_t row = 0; row < ranked_violations.size(); ++row) {
+            const int bus = ranked_violations[row].second;
+            target[static_cast<Eigen::Index>(row)] =
+                std::clamp(q_balance[bus], -0.49, 0.49) -
+                q_balance[bus];
+            for (std::size_t column = 0;
+                 column < control_buses.size(); ++column) {
+                sensitivity(
+                    static_cast<Eigen::Index>(row),
+                    static_cast<Eigen::Index>(column)) =
+                    reactive_jacobian.coeff(
+                        voltage_index[bus],
+                        voltage_index[control_buses[column]]);
+            }
+        }
+        Eigen::MatrixXd normal =
+            sensitivity.transpose() * sensitivity;
+        const double maximum_diagonal =
+            std::max(1e-12, normal.diagonal().maxCoeff());
+        normal.diagonal().array() += 1e-6 * maximum_diagonal;
+        const Eigen::VectorXd right_hand_side =
+            sensitivity.transpose() * target;
+        const Eigen::VectorXd step =
+            normal.ldlt().solve(right_hand_side);
+        if (!step.allFinite()) {
+            return false;
+        }
+        double scale = 1.0;
+        const double maximum_step = step.lpNorm<Eigen::Infinity>();
+        if (maximum_step > 0.02) {
+            scale = 0.02 / maximum_step;
+        }
+        scale = std::clamp(scale * damping, 1e-4, 1.0);
+        for (std::size_t column = 0;
+             column < control_buses.size(); ++column) {
+            const int bus = control_buses[column];
+            vm[bus] = std::clamp(
+                vm[bus] +
+                    scale * step[static_cast<Eigen::Index>(column)],
+                data.buses[bus].vmin, data.buses[bus].vmax);
+        }
+        return true;
+    }
+};
+
 nlohmann::json FastPowerFlowResult::to_json() const {
     return {
         {"converged", converged},
@@ -754,6 +1463,18 @@ nlohmann::json FastPowerFlowResult::to_json() const {
         {"direct_candidate_attempted", direct_candidate_attempted},
         {"direct_candidate_selected", direct_candidate_selected},
         {"direct_candidate_validation", direct_candidate_validation.to_json()},
+        {"fixed_jacobian_predictor_attempted",
+         fixed_jacobian_predictor_attempted},
+        {"fixed_jacobian_predictor_selected",
+         fixed_jacobian_predictor_selected},
+        {"fixed_jacobian_predictor_iterations",
+         fixed_jacobian_predictor_iterations},
+        {"fixed_jacobian_predictor_preparation_seconds",
+         fixed_jacobian_predictor_preparation_seconds},
+        {"fixed_jacobian_predictor_validation",
+         fixed_jacobian_predictor_validation.to_json()},
+        {"fixed_jacobian_predictor_trace",
+         fixed_jacobian_predictor_trace},
         {"newton_candidate_selected", newton_candidate_selected},
         {"newton_candidate_validation", newton_candidate_validation.to_json()},
         {"active_only_newton_attempted", active_only_newton_attempted},
@@ -815,6 +1536,7 @@ double rebuild_base_state_derived_fields(
         balance_slack_upper < 0.0 || balance_slack_upper > 0.5) {
         throw std::runtime_error("invalid base-state balance slack upper bound");
     }
+    ensure_shunt_control_state(data, state);
 
     double objective = 0.0;
     state.gen_lambda.clear();
@@ -895,6 +1617,7 @@ double rebuild_contingency_state_derived_fields(
         throw std::runtime_error(
             "invalid contingency-state balance slack upper bound");
     }
+    ensure_shunt_control_state(data, state);
     const int outaged_generator =
         contingency.type == ContingencyType::Generator
         ? contingency.component : -1;
@@ -1104,6 +1827,8 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
     }
 }
 
+FastContingencyPowerFlow::~FastContingencyPowerFlow() = default;
+
 FastPowerFlowResult FastContingencyPowerFlow::solve(
     const Contingency& contingency) const {
     return solve_impl(&contingency);
@@ -1115,13 +1840,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
     return solve_impl(&contingency, &initial_state);
 }
 
+FastPowerFlowResult FastContingencyPowerFlow::screen_candidate(
+    const Contingency& contingency,
+    const AcState& candidate_state) const {
+    return solve_impl(&contingency, &candidate_state, true);
+}
+
 FastPowerFlowResult FastContingencyPowerFlow::solve_base() const {
     return solve_impl(nullptr);
 }
 
 FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     const Contingency* contingency,
-    const AcState* supplied_initial_state) const {
+    const AcState* supplied_initial_state,
+    bool supplied_candidate_direct_only) const {
     const auto wall_start = std::chrono::steady_clock::now();
     FastPowerFlowResult output;
     const int nb = static_cast<int>(data_.buses.size());
@@ -1249,10 +1981,34 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         output.feasible = true;
         output.direct_candidate_selected = true;
         output.solve.status = 0;
-        output.solve.objective = 0.0;
+        output.solve.objective = base_mode
+            ? rebuild_base_state_derived_fields(
+                data_, commitment_, direct_state, 0.5)
+            : rebuild_contingency_state_derived_fields(
+                data_, base_state_, commitment_, *contingency,
+                direct_state);
         output.solve.iterations = 0;
         output.solve.state = std::move(direct_state);
         output.validation = output.direct_candidate_validation;
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        output.solve.wall_seconds = output.wall_seconds;
+        return output;
+    }
+    if (supplied_candidate_direct_only) {
+        output.solve.status = 2;
+        output.solve.iterations = 0;
+        output.solve.state = direct_state;
+        output.solve.objective = rebuild_contingency_state_derived_fields(
+            data_, base_state_, commitment_, *contingency,
+            output.solve.state);
+        output.validation = validate_state(
+            data_, ModelMode::ContingencySoft, output.solve.state,
+            commitment_, direct_context);
+        output.failure_reason =
+            "supplied corrective candidate failed independent validation: "
+            + output.validation.worst_category + " at "
+            + output.validation.worst_identity;
         output.wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - wall_start).count();
         output.solve.wall_seconds = output.wall_seconds;
@@ -1297,34 +2053,1814 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         slack[reference] = true;
     }
 
+    std::vector<double> predictor_demand_factor =
+        initial_state.demand_factor;
+    std::vector<double> predictor_load_power_lower(data_.loads.size(), 0.0);
+    std::vector<double> predictor_load_power_upper(data_.loads.size(), 0.0);
+    std::vector<double> predictor_load_power_preferred(data_.loads.size(), 0.0);
+    std::vector<double> predictor_load_power(data_.loads.size(), 0.0);
+    std::vector<double> predictor_load_reactive_lower(
+        data_.loads.size(), 0.0);
+    std::vector<double> predictor_load_reactive_upper(
+        data_.loads.size(), 0.0);
+    for (int load_index = 0;
+         load_index < static_cast<int>(data_.loads.size()); ++load_index) {
+        const auto& load = data_.loads[load_index];
+        predictor_load_power_preferred[load_index] =
+            load.pd_nominal * initial_state.demand_factor[load_index];
+        predictor_load_power[load_index] =
+            predictor_load_power_preferred[load_index];
+        if (std::abs(load.pd_nominal) <= 1e-12) {
+            predictor_load_power_lower[load_index] =
+                predictor_load_power_preferred[load_index];
+            predictor_load_power_upper[load_index] =
+                predictor_load_power_preferred[load_index];
+            const double reactive = load.qd_nominal *
+                initial_state.demand_factor[load_index];
+            predictor_load_reactive_lower[load_index] = reactive;
+            predictor_load_reactive_upper[load_index] = reactive;
+            continue;
+        }
+        const double prior = predictor_load_power_preferred[load_index];
+        const double factor_lower = std::max(
+            load.tmin,
+            (prior - data_.delta_r_ctg * load.prdmaxctg) /
+                load.pd_nominal);
+        const double factor_upper = std::min(
+            load.tmax,
+            (prior + data_.delta_r_ctg * load.prumaxctg) /
+                load.pd_nominal);
+        const double lower_power = load.pd_nominal * factor_lower;
+        const double upper_power = load.pd_nominal * factor_upper;
+        predictor_load_power_lower[load_index] =
+            std::min(lower_power, upper_power);
+        predictor_load_power_upper[load_index] =
+            std::max(lower_power, upper_power);
+        predictor_load_reactive_lower[load_index] = std::min(
+            load.qd_nominal * factor_lower,
+            load.qd_nominal * factor_upper);
+        predictor_load_reactive_upper[load_index] = std::max(
+            load.qd_nominal * factor_lower,
+            load.qd_nominal * factor_upper);
+    }
+
     for (const auto& component : components) {
         std::vector<int> participants;
-        double target = 0.0;
-        double lower = 0.0;
-        double upper = 0.0;
+        std::vector<int> participating_loads;
+        double active_target = 0.0;
+        double active_lower = 0.0;
+        double active_upper = 0.0;
+        double reactive_target = 0.0;
+        double reactive_lower = 0.0;
+        double reactive_upper = 0.0;
+        double prior_load_total = 0.0;
+        double load_lower_total = 0.0;
+        double load_upper_total = 0.0;
         for (int bus : component) {
             for (int gen : data_.buses[bus].generators) {
                 if (commitment_[gen] == 1) {
-                    target += initial_state.pg[gen];
+                    active_target += initial_state.pg[gen];
+                    reactive_target += initial_state.qg[gen];
                 }
                 if (active[gen]) {
                     participants.push_back(gen);
-                    lower += p_lower[gen];
-                    upper += p_upper[gen];
+                    active_lower += p_lower[gen];
+                    active_upper += p_upper[gen];
+                    reactive_lower += q_lower[gen];
+                    reactive_upper += q_upper[gen];
+                }
+            }
+            for (int load_index : data_.buses[bus].loads) {
+                prior_load_total +=
+                    predictor_load_power_preferred[load_index];
+                if (std::abs(data_.loads[load_index].pd_nominal) > 1e-12) {
+                    participating_loads.push_back(load_index);
+                    load_lower_total +=
+                        predictor_load_power_lower[load_index];
+                    load_upper_total +=
+                        predictor_load_power_upper[load_index];
                 }
             }
         }
         if (!participants.empty()) {
-            target = std::clamp(target, lower, upper);
+            const double prior_generation_total = active_target;
+            active_target = std::clamp(
+                active_target, active_lower, active_upper);
             allocate_total(
                 participants, p_lower, p_upper,
-                initial_state.pg, target, pg);
+                initial_state.pg, active_target, pg);
+            reactive_target = std::clamp(
+                reactive_target, reactive_lower, reactive_upper);
+            allocate_total(
+                participants, q_lower, q_upper,
+                initial_state.qg, reactive_target, qg);
+            double adjusted_generation_total = 0.0;
+            for (int generator : participants) {
+                adjusted_generation_total += pg[generator];
+            }
+            if (!participating_loads.empty()) {
+                const double desired_load_total = std::clamp(
+                    prior_load_total + adjusted_generation_total -
+                        prior_generation_total,
+                    load_lower_total, load_upper_total);
+                allocate_total(
+                    participating_loads,
+                    predictor_load_power_lower,
+                    predictor_load_power_upper,
+                    predictor_load_power_preferred, desired_load_total,
+                    predictor_load_power);
+            }
+        }
+    }
+    for (int load_index = 0;
+         load_index < static_cast<int>(data_.loads.size()); ++load_index) {
+        if (std::abs(data_.loads[load_index].pd_nominal) > 1e-12) {
+            predictor_demand_factor[load_index] =
+                predictor_load_power[load_index] /
+                    data_.loads[load_index].pd_nominal;
         }
     }
 
-    const YRows ybus = build_ybus(data_, outaged_branch);
-    std::vector<double> vm = initial_state.vm;
-    std::vector<double> va = initial_state.va;
+    if (!base_mode && nb >= 16000) {
+        output.fixed_jacobian_predictor_attempted = true;
+        if (!predictor_cache_) {
+            predictor_cache_ = std::make_unique<FixedJacobianPredictorCache>(
+                data_, base_state_, commitment_);
+            output.fixed_jacobian_predictor_preparation_seconds =
+                predictor_cache_->preparation_seconds;
+        }
+        if (predictor_cache_ && predictor_cache_->valid) {
+            AcState predictor_state = initial_state;
+            predictor_state.pg = pg;
+            predictor_state.qg = qg;
+            predictor_state.demand_factor = predictor_demand_factor;
+            ValidationReport predictor_validation =
+                output.direct_candidate_validation;
+            std::unique_ptr<FixedJacobianPredictorCache>
+                contingency_predictor_cache;
+            int active_feasibility_repair_attempts = 0;
+            // Difficult generator outages can enter a late, monotonically
+            // shrinking cycle between active- and reactive-flow limits after
+            // the global feasibility repair.  Keep the inexpensive local
+            // corrections alive long enough to cross the exact validator's
+            // tolerance instead of stopping at an arbitrary 48-step edge.
+            constexpr int kMaximumFixedJacobianIterations = 96;
+            for (int predictor_iteration = 0;
+                 predictor_iteration <= kMaximumFixedJacobianIterations;
+                 ++predictor_iteration) {
+                rebuild_contingency_state_derived_fields(
+                    data_, base_state_, commitment_, *contingency,
+                    predictor_state);
+
+                std::vector<double> p_network(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> q_network(
+                    static_cast<std::size_t>(nb), 0.0);
+                for (int branch_index = 0;
+                     branch_index < static_cast<int>(data_.branches.size());
+                     ++branch_index) {
+                    if (branch_index == outaged_branch ||
+                        data_.branches[branch_index].status == 0) {
+                        continue;
+                    }
+                    const auto& branch = data_.branches[branch_index];
+                    p_network[branch.from] += predictor_state.pf[branch_index];
+                    q_network[branch.from] += predictor_state.qf[branch_index];
+                    p_network[branch.to] += predictor_state.pt[branch_index];
+                    q_network[branch.to] += predictor_state.qt[branch_index];
+                }
+                for (int shunt_index = 0;
+                     shunt_index < static_cast<int>(data_.shunts.size());
+                     ++shunt_index) {
+                    const auto& shunt = data_.shunts[shunt_index];
+                    const double vm2 =
+                        predictor_state.vm[shunt.bus] *
+                        predictor_state.vm[shunt.bus];
+                    p_network[shunt.bus] += shunt.gs * vm2;
+                    q_network[shunt.bus] -= effective_shunt_susceptance(
+                        data_, predictor_state, shunt_index) * vm2;
+                }
+
+                // Keep the component-wide active redispatch fixed while the
+                // chord step routes it through the network.  Re-projecting P
+                // independently at every generator bus changes the component
+                // total and leaves that drift at the omitted reference-bus
+                // equation.  Reactive generation can still be projected
+                // locally because each Q equation remains in the predictor.
+                for (int bus = 0; bus < nb; ++bus) {
+                    if (active_at_bus[bus].empty()) {
+                        continue;
+                    }
+                    double generated_q = 0.0;
+                    double load_at_bus_q = 0.0;
+                    for (int generator : active_at_bus[bus]) {
+                        generated_q += predictor_state.qg[generator];
+                    }
+                    for (int load : data_.buses[bus].loads) {
+                        load_at_bus_q += data_.loads[load].qd_nominal *
+                            predictor_state.demand_factor[load];
+                    }
+                    const double q_balance =
+                        q_network[bus] - generated_q + load_at_bus_q;
+                    auto proposed_qg = predictor_state.qg;
+                    if (allocate_total(
+                            active_at_bus[bus], q_lower, q_upper,
+                            initial_state.qg,
+                            generated_q + q_balance -
+                                std::clamp(q_balance, -0.49, 0.49),
+                            proposed_qg)) {
+                        predictor_state.qg = std::move(proposed_qg);
+                    }
+                }
+
+                // A PQ load is also a source-authorized corrective control.
+                // If local Q generation cannot put a bus inside the soft
+                // balance band, move only the loads at that bus and respect
+                // the exact contingency ramp and tmin/tmax bounds computed
+                // above. This is especially important for voltage-limited
+                // load buses where a voltage correction has no remaining
+                // feasible direction.
+                std::vector<double> predictor_load_reactive(
+                    data_.loads.size(), 0.0);
+                for (int load_index = 0;
+                     load_index < static_cast<int>(data_.loads.size());
+                     ++load_index) {
+                    predictor_load_reactive[load_index] =
+                        data_.loads[load_index].qd_nominal *
+                        predictor_state.demand_factor[load_index];
+                }
+                const auto predictor_load_reactive_preferred =
+                    predictor_load_reactive;
+                for (int bus = 0; bus < nb; ++bus) {
+                    if (data_.buses[bus].loads.empty()) {
+                        continue;
+                    }
+                    double generated_q = 0.0;
+                    double loaded_q = 0.0;
+                    double total_lower = 0.0;
+                    double total_upper = 0.0;
+                    for (int generator : active_at_bus[bus]) {
+                        generated_q += predictor_state.qg[generator];
+                    }
+                    for (int load : data_.buses[bus].loads) {
+                        loaded_q += predictor_load_reactive[load];
+                        total_lower +=
+                            predictor_load_reactive_lower[load];
+                        total_upper +=
+                            predictor_load_reactive_upper[load];
+                    }
+                    const double q_balance =
+                        q_network[bus] - generated_q + loaded_q;
+                    const double q_excess = std::copysign(
+                        std::max(0.0, std::abs(q_balance) - 0.49),
+                        q_balance);
+                    if (std::abs(q_excess) <= 1e-12) {
+                        continue;
+                    }
+                    const double target = std::clamp(
+                        loaded_q - q_excess, total_lower, total_upper);
+                    if (!allocate_total(
+                            data_.buses[bus].loads,
+                            predictor_load_reactive_lower,
+                            predictor_load_reactive_upper,
+                            predictor_load_reactive_preferred,
+                            target, predictor_load_reactive)) {
+                        continue;
+                    }
+                    for (int load : data_.buses[bus].loads) {
+                        if (std::abs(data_.loads[load].qd_nominal) > 1e-12) {
+                            predictor_state.demand_factor[load] =
+                                predictor_load_reactive[load] /
+                                data_.loads[load].qd_nominal;
+                        }
+                    }
+                }
+
+                // Project an excessive local active-power mismatch onto the
+                // source-authorized contingency controls before asking the
+                // angle step to route power through the network.  Generation
+                // is used first within its exact contingency PMIN/PMAX and
+                // ramp bounds; any remainder is assigned to flexible load
+                // within its exact tmin/tmax and corrective-ramp bounds.  The
+                // 0.49 target stays strictly inside the source 0.5 balance
+                // slack limit and leaves a small numerical margin.
+                std::vector<double> predictor_load_active(
+                    data_.loads.size(), 0.0);
+                for (int load_index = 0;
+                     load_index < static_cast<int>(data_.loads.size());
+                     ++load_index) {
+                    predictor_load_active[load_index] =
+                        data_.loads[load_index].pd_nominal *
+                        predictor_state.demand_factor[load_index];
+                }
+                for (int bus = 0; bus < nb; ++bus) {
+                    double generated_p = 0.0;
+                    double loaded_p = 0.0;
+                    for (int generator : active_at_bus[bus]) {
+                        generated_p += predictor_state.pg[generator];
+                    }
+                    for (int load : data_.buses[bus].loads) {
+                        loaded_p += predictor_load_active[load];
+                    }
+
+                    double p_balance =
+                        p_network[bus] - generated_p + loaded_p;
+                    double p_excess = std::copysign(
+                        std::max(0.0, std::abs(p_balance) - 0.49),
+                        p_balance);
+                    if (std::abs(p_excess) <= 1e-12) {
+                        continue;
+                    }
+
+                    if (!active_at_bus[bus].empty()) {
+                        double total_lower = 0.0;
+                        double total_upper = 0.0;
+                        for (int generator : active_at_bus[bus]) {
+                            total_lower += p_lower[generator];
+                            total_upper += p_upper[generator];
+                        }
+                        const double target_generation = std::clamp(
+                            generated_p + p_excess,
+                            total_lower, total_upper);
+                        const auto preferred_pg = predictor_state.pg;
+                        auto proposed_pg = predictor_state.pg;
+                        if (allocate_total(
+                                active_at_bus[bus], p_lower, p_upper,
+                                preferred_pg, target_generation,
+                                proposed_pg)) {
+                            predictor_state.pg = std::move(proposed_pg);
+                            generated_p = 0.0;
+                            for (int generator : active_at_bus[bus]) {
+                                generated_p += predictor_state.pg[generator];
+                            }
+                            p_balance =
+                                p_network[bus] - generated_p + loaded_p;
+                            p_excess = std::copysign(
+                                std::max(
+                                    0.0, std::abs(p_balance) - 0.49),
+                                p_balance);
+                        }
+                    }
+
+                    if (std::abs(p_excess) <= 1e-12 ||
+                        data_.buses[bus].loads.empty()) {
+                        continue;
+                    }
+                    double total_lower = 0.0;
+                    double total_upper = 0.0;
+                    for (int load : data_.buses[bus].loads) {
+                        total_lower += predictor_load_power_lower[load];
+                        total_upper += predictor_load_power_upper[load];
+                    }
+                    const double target_load = std::clamp(
+                        loaded_p - p_excess, total_lower, total_upper);
+                    const auto preferred_load = predictor_load_active;
+                    if (!allocate_total(
+                            data_.buses[bus].loads,
+                            predictor_load_power_lower,
+                            predictor_load_power_upper,
+                            preferred_load, target_load,
+                            predictor_load_active)) {
+                        continue;
+                    }
+                    for (int load : data_.buses[bus].loads) {
+                        if (std::abs(data_.loads[load].pd_nominal) > 1e-12) {
+                            predictor_state.demand_factor[load] =
+                                predictor_load_active[load] /
+                                data_.loads[load].pd_nominal;
+                        }
+                    }
+                }
+
+                const double predictor_objective =
+                    rebuild_contingency_state_derived_fields(
+                        data_, base_state_, commitment_, *contingency,
+                        predictor_state);
+                predictor_validation = validate_state(
+                    data_, ModelMode::ContingencySoft,
+                    predictor_state, commitment_, direct_context);
+                output.fixed_jacobian_predictor_iterations =
+                    predictor_iteration;
+                output.fixed_jacobian_predictor_validation =
+                    predictor_validation;
+                double predictor_generation_total = 0.0;
+                for (double value : predictor_state.pg) {
+                    predictor_generation_total += value;
+                }
+                double predictor_load_total = 0.0;
+                for (int load_index = 0;
+                     load_index < static_cast<int>(data_.loads.size());
+                     ++load_index) {
+                    predictor_load_total +=
+                        data_.loads[load_index].pd_nominal *
+                        predictor_state.demand_factor[load_index];
+                }
+                output.fixed_jacobian_predictor_trace.push_back({
+                    {"iteration", predictor_iteration},
+                    {"generation_total", predictor_generation_total},
+                    {"load_total", predictor_load_total},
+                    {"validation", predictor_validation.to_json()},
+                });
+                retain_best_intermediate(
+                    predictor_state, predictor_validation,
+                    "fixed_base_jacobian_predictor");
+                if (predictor_validation.max_residual <=
+                    options_.validation_tolerance) {
+                    output.converged = true;
+                    output.feasible = true;
+                    output.fixed_jacobian_predictor_selected = true;
+                    output.solve.status = 0;
+                    output.solve.objective = predictor_objective;
+                    output.solve.iterations = predictor_iteration;
+                    output.solve.state = std::move(predictor_state);
+                    output.validation = predictor_validation;
+                    output.wall_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - wall_start).count();
+                    output.solve.wall_seconds = output.wall_seconds;
+                    return output;
+                }
+                if (predictor_iteration ==
+                    kMaximumFixedJacobianIterations) {
+                    break;
+                }
+
+                std::vector<double> p_spec(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> q_spec(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> generated_p_by_bus(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> generated_q_by_bus(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> load_p_by_bus(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> load_q_by_bus(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> p_balance_by_bus(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> q_balance_by_bus(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> p_slack_target(
+                    static_cast<std::size_t>(nb), 0.0);
+                std::vector<double> q_slack_target(
+                    static_cast<std::size_t>(nb), 0.0);
+                for (int bus = 0; bus < nb; ++bus) {
+                    for (int generator : active_at_bus[bus]) {
+                        generated_p_by_bus[bus] +=
+                            predictor_state.pg[generator];
+                        generated_q_by_bus[bus] +=
+                            predictor_state.qg[generator];
+                    }
+                    for (int load : data_.buses[bus].loads) {
+                        load_p_by_bus[bus] +=
+                            data_.loads[load].pd_nominal *
+                            predictor_state.demand_factor[load];
+                        load_q_by_bus[bus] +=
+                            data_.loads[load].qd_nominal *
+                            predictor_state.demand_factor[load];
+                    }
+                    p_balance_by_bus[bus] = p_network[bus] -
+                        generated_p_by_bus[bus] + load_p_by_bus[bus];
+                    q_balance_by_bus[bus] = q_network[bus] -
+                        generated_q_by_bus[bus] + load_q_by_bus[bus];
+                    p_slack_target[bus] = std::clamp(
+                        p_balance_by_bus[bus], -0.49, 0.49);
+                    q_slack_target[bus] = std::clamp(
+                        q_balance_by_bus[bus], -0.49, 0.49);
+                }
+                for (int bus = 0; bus < nb; ++bus) {
+                    p_slack_target[bus] = std::clamp(
+                        p_balance_by_bus[bus], -0.49, 0.49);
+                    q_slack_target[bus] = std::clamp(
+                        q_balance_by_bus[bus], -0.49, 0.49);
+                }
+                const auto distribute_slack_sum = [](
+                    const std::vector<int>& component,
+                    const std::vector<double>& balance,
+                    std::vector<double>& target) {
+                    double difference = 0.0;
+                    for (int bus : component) {
+                        difference += balance[bus] - target[bus];
+                    }
+                    for (int pass = 0;
+                         pass < 4 && std::abs(difference) > 1e-10;
+                         ++pass) {
+                        double room = 0.0;
+                        for (int bus : component) {
+                            room += difference > 0.0
+                                ? std::max(0.0, 0.49 - target[bus])
+                                : std::max(0.0, target[bus] + 0.49);
+                        }
+                        if (room <= 1e-12) {
+                            break;
+                        }
+                        const double prior_difference = difference;
+                        double applied = 0.0;
+                        for (int bus : component) {
+                            const double individual_room =
+                                prior_difference > 0.0
+                                ? std::max(0.0, 0.49 - target[bus])
+                                : std::max(0.0, target[bus] + 0.49);
+                            const double change =
+                                prior_difference * individual_room / room;
+                            target[bus] = std::clamp(
+                                target[bus] + change, -0.49, 0.49);
+                            applied += change;
+                        }
+                        difference -= applied;
+                    }
+                };
+                for (const auto& component : components) {
+                    distribute_slack_sum(
+                        component, p_balance_by_bus, p_slack_target);
+                    distribute_slack_sum(
+                        component, q_balance_by_bus, q_slack_target);
+                }
+                for (int bus = 0; bus < nb; ++bus) {
+                    p_spec[bus] = generated_p_by_bus[bus] -
+                        load_p_by_bus[bus] + p_slack_target[bus];
+                    q_spec[bus] = generated_q_by_bus[bus] -
+                        load_q_by_bus[bus] + q_slack_target[bus];
+                }
+                // A full chord step is excellent for the first outage
+                // correction but often overshoots once the nonlinear state is
+                // near the soft balance band.  Reuse the same resident
+                // factorization for a short deterministic backtracking line
+                // search and accept only a validation-improving step.
+                const AcState correction_reference = predictor_state;
+                AcState selected_correction = predictor_state;
+                ValidationReport selected_validation = predictor_validation;
+                double selected_damping = 0.0;
+                std::string selected_correction_mode = "none";
+                constexpr std::array<double, 5> kDampingCandidates{
+                    1.0, 0.5, 0.25, 0.125, 0.0625};
+                const bool active_block_dominant =
+                    predictor_validation.worst_category ==
+                        "active_balance" &&
+                    predictor_validation.max_active_balance_residual > 1e-4;
+                int worst_active_flow_branch = -1;
+                bool worst_active_flow_from_side = true;
+                double worst_active_flow_excess = 0.0;
+                int worst_reactive_flow_branch = -1;
+                bool worst_reactive_flow_from_side = true;
+                double worst_reactive_flow_excess = 0.0;
+                for (int branch_index = 0;
+                     branch_index < static_cast<int>(data_.branches.size());
+                     ++branch_index) {
+                    if (branch_index == outaged_branch ||
+                        data_.branches[branch_index].status == 0) {
+                        continue;
+                    }
+                    const double rating =
+                        data_.branches[branch_index].rate_c;
+                    const double from_excess =
+                        std::abs(predictor_state.pf[branch_index]) - rating;
+                    const double to_excess =
+                        std::abs(predictor_state.pt[branch_index]) - rating;
+                    const double reactive_from_excess =
+                        std::abs(predictor_state.qf[branch_index]) - rating;
+                    const double reactive_to_excess =
+                        std::abs(predictor_state.qt[branch_index]) - rating;
+                    if (from_excess > worst_active_flow_excess) {
+                        worst_active_flow_excess = from_excess;
+                        worst_active_flow_branch = branch_index;
+                        worst_active_flow_from_side = true;
+                    }
+                    if (to_excess > worst_active_flow_excess) {
+                        worst_active_flow_excess = to_excess;
+                        worst_active_flow_branch = branch_index;
+                        worst_active_flow_from_side = false;
+                    }
+                    if (reactive_from_excess >
+                        worst_reactive_flow_excess) {
+                        worst_reactive_flow_excess =
+                            reactive_from_excess;
+                        worst_reactive_flow_branch = branch_index;
+                        worst_reactive_flow_from_side = true;
+                    }
+                    if (reactive_to_excess >
+                        worst_reactive_flow_excess) {
+                        worst_reactive_flow_excess = reactive_to_excess;
+                        worst_reactive_flow_branch = branch_index;
+                        worst_reactive_flow_from_side = false;
+                    }
+                }
+                const bool active_flow_bound_dominant =
+                    predictor_validation.worst_category ==
+                        "variable_bound" &&
+                    worst_active_flow_branch >= 0 &&
+                    worst_active_flow_excess > 1e-8 &&
+                    worst_active_flow_excess >=
+                        worst_reactive_flow_excess - 1e-10;
+                const bool reactive_flow_bound_dominant =
+                    predictor_validation.worst_category ==
+                        "variable_bound" &&
+                    worst_reactive_flow_branch >= 0 &&
+                    worst_reactive_flow_excess > 1e-8 &&
+                    worst_reactive_flow_excess >
+                        worst_active_flow_excess + 1e-10;
+                const auto project_trial_reactive_and_validate =
+                    [&](AcState& trial) {
+                    rebuild_contingency_state_derived_fields(
+                        data_, base_state_, commitment_, *contingency, trial);
+                    std::vector<double> trial_p_network(
+                        static_cast<std::size_t>(nb), 0.0);
+                    std::vector<double> trial_q_network(
+                        static_cast<std::size_t>(nb), 0.0);
+                    for (int branch_index = 0;
+                         branch_index < static_cast<int>(data_.branches.size());
+                         ++branch_index) {
+                        if (branch_index == outaged_branch ||
+                            data_.branches[branch_index].status == 0) {
+                            continue;
+                        }
+                        const auto& branch = data_.branches[branch_index];
+                        trial_p_network[branch.from] +=
+                            trial.pf[branch_index];
+                        trial_p_network[branch.to] +=
+                            trial.pt[branch_index];
+                        trial_q_network[branch.from] +=
+                            trial.qf[branch_index];
+                        trial_q_network[branch.to] +=
+                            trial.qt[branch_index];
+                    }
+                    for (int shunt_index = 0;
+                         shunt_index < static_cast<int>(data_.shunts.size());
+                         ++shunt_index) {
+                        const auto& shunt = data_.shunts[shunt_index];
+                        trial_p_network[shunt.bus] +=
+                            shunt.gs * trial.vm[shunt.bus] *
+                            trial.vm[shunt.bus];
+                        trial_q_network[shunt.bus] -=
+                            effective_shunt_susceptance(
+                                data_, trial, shunt_index) *
+                            trial.vm[shunt.bus] *
+                            trial.vm[shunt.bus];
+                    }
+                    std::vector<double> trial_load_active(
+                        data_.loads.size(), 0.0);
+                    for (int load = 0;
+                         load < static_cast<int>(data_.loads.size());
+                         ++load) {
+                        trial_load_active[load] =
+                            data_.loads[load].pd_nominal *
+                            trial.demand_factor[load];
+                    }
+                    for (int bus = 0; bus < nb; ++bus) {
+                        double generated_p = 0.0;
+                        double loaded_p = 0.0;
+                        for (int generator : active_at_bus[bus]) {
+                            generated_p += trial.pg[generator];
+                        }
+                        for (int load : data_.buses[bus].loads) {
+                            loaded_p += trial_load_active[load];
+                        }
+                        double p_balance =
+                            trial_p_network[bus] - generated_p + loaded_p;
+                        double p_excess = std::copysign(
+                            std::max(
+                                0.0, std::abs(p_balance) - 0.49),
+                            p_balance);
+                        if (std::abs(p_excess) <= 1e-12) {
+                            continue;
+                        }
+                        if (!active_at_bus[bus].empty()) {
+                            double total_lower = 0.0;
+                            double total_upper = 0.0;
+                            for (int generator : active_at_bus[bus]) {
+                                total_lower += p_lower[generator];
+                                total_upper += p_upper[generator];
+                            }
+                            const double target_generation = std::clamp(
+                                generated_p + p_excess,
+                                total_lower, total_upper);
+                            const auto preferred_pg = trial.pg;
+                            auto proposed_pg = trial.pg;
+                            if (allocate_total(
+                                    active_at_bus[bus], p_lower, p_upper,
+                                    preferred_pg, target_generation,
+                                    proposed_pg)) {
+                                trial.pg = std::move(proposed_pg);
+                                generated_p = 0.0;
+                                for (int generator : active_at_bus[bus]) {
+                                    generated_p += trial.pg[generator];
+                                }
+                                p_balance = trial_p_network[bus] -
+                                    generated_p + loaded_p;
+                                p_excess = std::copysign(
+                                    std::max(
+                                        0.0,
+                                        std::abs(p_balance) - 0.49),
+                                    p_balance);
+                            }
+                        }
+                        if (std::abs(p_excess) <= 1e-12 ||
+                            data_.buses[bus].loads.empty()) {
+                            continue;
+                        }
+                        double total_lower = 0.0;
+                        double total_upper = 0.0;
+                        for (int load : data_.buses[bus].loads) {
+                            total_lower +=
+                                predictor_load_power_lower[load];
+                            total_upper +=
+                                predictor_load_power_upper[load];
+                        }
+                        const double target_load = std::clamp(
+                            loaded_p - p_excess,
+                            total_lower, total_upper);
+                        const auto preferred_load = trial_load_active;
+                        if (!allocate_total(
+                                data_.buses[bus].loads,
+                                predictor_load_power_lower,
+                                predictor_load_power_upper,
+                                preferred_load, target_load,
+                                trial_load_active)) {
+                            continue;
+                        }
+                        for (int load : data_.buses[bus].loads) {
+                            if (std::abs(
+                                    data_.loads[load].pd_nominal) > 1e-12) {
+                                trial.demand_factor[load] =
+                                    trial_load_active[load] /
+                                    data_.loads[load].pd_nominal;
+                            }
+                        }
+                    }
+                    for (int bus = 0; bus < nb; ++bus) {
+                        if (active_at_bus[bus].empty()) {
+                            continue;
+                        }
+                        double generated_q = 0.0;
+                        double load_at_bus_q = 0.0;
+                        for (int generator : active_at_bus[bus]) {
+                            generated_q += trial.qg[generator];
+                        }
+                        for (int load : data_.buses[bus].loads) {
+                            load_at_bus_q += data_.loads[load].qd_nominal *
+                                trial.demand_factor[load];
+                        }
+                        const double q_balance =
+                            trial_q_network[bus] - generated_q +
+                            load_at_bus_q;
+                        auto projected_qg = trial.qg;
+                        if (allocate_total(
+                                active_at_bus[bus], q_lower, q_upper,
+                                initial_state.qg,
+                                generated_q + q_balance -
+                                    std::clamp(q_balance, -0.49, 0.49),
+                                projected_qg)) {
+                            trial.qg = std::move(projected_qg);
+                        }
+                    }
+                    rebuild_contingency_state_derived_fields(
+                        data_, base_state_, commitment_, *contingency, trial);
+                    return validate_state(
+                        data_, ModelMode::ContingencySoft, trial,
+                        commitment_, direct_context);
+                };
+                const auto try_damped_corrections = [&]
+                    (FixedJacobianPredictorCache& cache) {
+                    if (active_flow_bound_dominant) {
+                        const auto& branch =
+                            data_.branches[worst_active_flow_branch];
+                        const int from = branch.from;
+                        const int to = branch.to;
+                        const double denominator =
+                            branch.r * branch.r + branch.x * branch.x;
+                        const double g = denominator > 1e-20
+                            ? branch.r / denominator : 0.0;
+                        const double b = denominator > 1e-20
+                            ? -branch.x / denominator : 0.0;
+                        const double tm2 = branch.tap * branch.tap;
+                        const double tr =
+                            branch.tap * std::cos(branch.shift);
+                        const double ti =
+                            branch.tap * std::sin(branch.shift);
+                        const double angle =
+                            correction_reference.va[from] -
+                            correction_reference.va[to];
+                        const double voltage_product =
+                            correction_reference.vm[from] *
+                            correction_reference.vm[to];
+                        const double flow = worst_active_flow_from_side
+                            ? correction_reference
+                                  .pf[worst_active_flow_branch]
+                            : correction_reference
+                                  .pt[worst_active_flow_branch];
+                        double derivative = 0.0;
+                        if (worst_active_flow_from_side) {
+                            const double cosine_coefficient =
+                                ((-g * tr + b * ti) / tm2) *
+                                voltage_product;
+                            const double sine_coefficient =
+                                ((-b * tr - g * ti) / tm2) *
+                                voltage_product;
+                            derivative =
+                                -cosine_coefficient * std::sin(angle) +
+                                sine_coefficient * std::cos(angle);
+                        } else {
+                            const double cosine_coefficient =
+                                ((-g * tr - b * ti) / tm2) *
+                                voltage_product;
+                            const double sine_coefficient =
+                                ((-b * tr + g * ti) / tm2) *
+                                voltage_product;
+                            derivative =
+                                -cosine_coefficient * std::sin(angle) -
+                                sine_coefficient * std::cos(angle);
+                        }
+                        if (std::abs(derivative) > 1e-10) {
+                            const double target_flow = std::copysign(
+                                std::max(0.0, branch.rate_c - 1e-4),
+                                flow);
+                            const double raw_angle_change = std::clamp(
+                                (target_flow - flow) / derivative,
+                                -0.05, 0.05);
+                            for (const double damping :
+                                 kDampingCandidates) {
+                                auto trial = correction_reference;
+                                const double angle_change =
+                                    damping * raw_angle_change;
+                                if (slack[from]) {
+                                    trial.va[to] -= angle_change;
+                                } else if (slack[to]) {
+                                    trial.va[from] += angle_change;
+                                } else {
+                                    trial.va[from] += 0.5 * angle_change;
+                                    trial.va[to] -= 0.5 * angle_change;
+                                }
+                                const auto trial_validation =
+                                    project_trial_reactive_and_validate(trial);
+                                if (trial_validation.max_residual + 1e-10 <
+                                    selected_validation.max_residual) {
+                                    selected_correction = std::move(trial);
+                                    selected_validation = trial_validation;
+                                    selected_damping = damping;
+                                    selected_correction_mode =
+                                        "active_branch_flow_angle";
+                                }
+                            }
+                        }
+                        const double target_flow = std::copysign(
+                            std::max(0.0, branch.rate_c - 1e-4), flow);
+                        auto full_redispatch_pg =
+                            correction_reference.pg;
+                        auto full_redispatch_p_spec = p_spec;
+                        AcState best_redispatch = correction_reference;
+                        ValidationReport best_redispatch_validation =
+                            predictor_validation;
+                        double best_redispatch_damping = 0.0;
+                        if (cache.apply_active_flow_redispatch(
+                                data_, worst_active_flow_branch,
+                                worst_active_flow_from_side,
+                                target_flow - flow,
+                                p_lower, p_upper,
+                                correction_reference,
+                                full_redispatch_pg,
+                                full_redispatch_p_spec)) {
+                            for (const double damping :
+                                 kDampingCandidates) {
+                                auto trial = correction_reference;
+                                auto trial_p_spec = p_spec;
+                                for (int generator = 0;
+                                     generator < ng; ++generator) {
+                                    trial.pg[generator] += damping *
+                                        (full_redispatch_pg[generator] -
+                                         correction_reference.pg[generator]);
+                                }
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    trial_p_spec[bus] += damping *
+                                        (full_redispatch_p_spec[bus] -
+                                         p_spec[bus]);
+                                }
+                                if (!cache.apply_active_correction(
+                                        data_, trial_p_spec, p_network,
+                                        trial.va, 1.0)) {
+                                    continue;
+                                }
+                                const auto trial_validation =
+                                    project_trial_reactive_and_validate(
+                                        trial);
+                                if (trial_validation.max_residual + 1e-10 <
+                                    best_redispatch_validation.max_residual) {
+                                    best_redispatch = std::move(trial);
+                                    best_redispatch_validation =
+                                        trial_validation;
+                                    best_redispatch_damping = damping;
+                                }
+                            }
+                        }
+                        // A network-wide redispatch is generally a more
+                        // stable continuation step than changing only the two
+                        // endpoint angles.  Prefer any independently
+                        // improving redispatch; retain the endpoint move as a
+                        // fallback when redispatch cannot improve the exact
+                        // residual.
+                        const bool prefer_redispatch_over_endpoint_angle =
+                            active_flow_bound_dominant &&
+                            (worst_reactive_flow_excess <= 1e-6 ||
+                             (predictor_iteration >= 6 &&
+                              predictor_validation.max_residual > 0.02));
+                        if (best_redispatch_damping != 0.0 &&
+                            (prefer_redispatch_over_endpoint_angle ||
+                             best_redispatch_validation.max_residual +
+                                     1e-10 <
+                                 selected_validation.max_residual)) {
+                            selected_correction =
+                                std::move(best_redispatch);
+                            selected_validation =
+                                best_redispatch_validation;
+                            selected_damping = best_redispatch_damping;
+                            selected_correction_mode =
+                                "active_branch_flow_redispatch";
+                        }
+                        if (selected_damping != 0.0 &&
+                            active_flow_bound_dominant) {
+                            return;
+                        }
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (!active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_active_correction(
+                                data_, p_spec, p_network,
+                                trial.va, damping)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode = "active_angle";
+                        }
+                    }
+                    if (active_block_dominant) {
+                        return;
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_local_reactive_least_squares(
+                                data_, q_balance_by_bus,
+                                trial.vm, damping)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode =
+                                "local_reactive_least_squares";
+                        }
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_local_reactive_least_squares(
+                                data_, q_balance_by_bus,
+                                trial.vm, damping)) {
+                            continue;
+                        }
+                        rebuild_contingency_state_derived_fields(
+                            data_, base_state_, commitment_, *contingency,
+                            trial);
+                        std::vector<double> trial_p_network(
+                            static_cast<std::size_t>(nb), 0.0);
+                        for (int branch_index = 0;
+                             branch_index <
+                                 static_cast<int>(data_.branches.size());
+                             ++branch_index) {
+                            if (branch_index == outaged_branch ||
+                                data_.branches[branch_index].status == 0) {
+                                continue;
+                            }
+                            const auto& branch =
+                                data_.branches[branch_index];
+                            trial_p_network[branch.from] +=
+                                trial.pf[branch_index];
+                            trial_p_network[branch.to] +=
+                                trial.pt[branch_index];
+                        }
+                        for (const auto& shunt : data_.shunts) {
+                            trial_p_network[shunt.bus] +=
+                                shunt.gs * trial.vm[shunt.bus] *
+                                trial.vm[shunt.bus];
+                        }
+                        if (!cache.apply_active_correction(
+                                data_, p_spec, trial_p_network,
+                                trial.va, 1.0)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode =
+                                "local_reactive_least_squares_then_"
+                                "active_angle";
+                        }
+                    }
+                    if (selected_damping != 0.0) {
+                        return;
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_reactive_band_correction(
+                                data_, q_balance_by_bus,
+                                trial.vm, damping)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode =
+                                "reactive_feasibility_band";
+                        }
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_reactive_correction(
+                                data_, q_spec, q_network,
+                                trial.vm, damping)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode = "reactive_voltage";
+                        }
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_reactive_correction(
+                                data_, q_spec, q_network,
+                                trial.vm, damping)) {
+                            continue;
+                        }
+                        rebuild_contingency_state_derived_fields(
+                            data_, base_state_, commitment_, *contingency,
+                            trial);
+                        std::vector<double> trial_p_network(
+                            static_cast<std::size_t>(nb), 0.0);
+                        for (int branch_index = 0;
+                             branch_index <
+                                 static_cast<int>(data_.branches.size());
+                             ++branch_index) {
+                            if (branch_index == outaged_branch ||
+                                data_.branches[branch_index].status == 0) {
+                                continue;
+                            }
+                            const auto& branch =
+                                data_.branches[branch_index];
+                            trial_p_network[branch.from] +=
+                                trial.pf[branch_index];
+                            trial_p_network[branch.to] +=
+                                trial.pt[branch_index];
+                        }
+                        for (const auto& shunt : data_.shunts) {
+                            trial_p_network[shunt.bus] +=
+                                shunt.gs * trial.vm[shunt.bus] *
+                                trial.vm[shunt.bus];
+                        }
+                        if (!cache.apply_active_correction(
+                                data_, p_spec, trial_p_network,
+                                trial.va, 1.0)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode =
+                                "reactive_voltage_then_active_angle";
+                        }
+                    }
+                    for (const double damping : kDampingCandidates) {
+                        if (active_block_dominant) {
+                            break;
+                        }
+                        auto trial = correction_reference;
+                        if (!cache.apply_correction(
+                                data_, p_spec, q_spec, p_network, q_network,
+                                trial.vm, trial.va, damping)) {
+                            continue;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = damping;
+                            selected_correction_mode =
+                                "coupled_angle_voltage";
+                        }
+                    }
+                };
+                // The resident base-case Jacobian is intentionally cheap and
+                // handles most outages.  A low-impedance branch outage can,
+                // however, remove a dominant Jacobian term while the stale
+                // factorization continues making small but misleading
+                // progress.  Refactor only after four clearly slow steps;
+                // this keeps the common path resident while giving hard
+                // branch outages the correct local derivatives.
+                const bool slow_branch_outage =
+                    outaged_branch >= 0 && predictor_iteration >= 4 &&
+                    predictor_validation.max_residual > 0.1 &&
+                    !output.fixed_jacobian_predictor_trace.empty() &&
+                    predictor_validation.max_residual >
+                        0.25 * output.fixed_jacobian_predictor_trace.front()
+                            .at("validation")
+                            .at("max_residual")
+                            .get<double>();
+                if (!contingency_predictor_cache && slow_branch_outage) {
+                    contingency_predictor_cache =
+                        std::make_unique<FixedJacobianPredictorCache>(
+                            data_, correction_reference, commitment_,
+                            outaged_branch);
+                    output.fixed_jacobian_predictor_preparation_seconds +=
+                        contingency_predictor_cache->preparation_seconds;
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "contingency_specific_refactorization"] = true;
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "contingency_specific_refactorization_reason"] =
+                        "slow_branch_outage_progress";
+                }
+                if (contingency_predictor_cache) {
+                    try_damped_corrections(*contingency_predictor_cache);
+                } else {
+                    try_damped_corrections(*predictor_cache_);
+                    if (selected_damping == 0.0) {
+                        contingency_predictor_cache =
+                            std::make_unique<FixedJacobianPredictorCache>(
+                                data_, correction_reference, commitment_,
+                                outaged_branch);
+                        output.fixed_jacobian_predictor_preparation_seconds +=
+                            contingency_predictor_cache->preparation_seconds;
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "contingency_specific_refactorization"] = true;
+                        if (contingency_predictor_cache->valid) {
+                            try_damped_corrections(
+                                *contingency_predictor_cache);
+                        }
+                    }
+                }
+                if (selected_damping == 0.0) {
+                    int worst_q_bus = -1;
+                    double worst_q_excess = 0.0;
+                    for (int bus = 0; bus < nb; ++bus) {
+                        const double excess =
+                            std::abs(q_balance_by_bus[bus]) - 0.49;
+                        if (excess > worst_q_excess) {
+                            worst_q_excess = excess;
+                            worst_q_bus = bus;
+                        }
+                    }
+                    std::vector<int> shunt_candidate_buses;
+                    if (worst_q_bus >= 0) {
+                        shunt_candidate_buses.push_back(worst_q_bus);
+                        for (int branch_index :
+                             data_.buses[worst_q_bus].branches_from) {
+                            if (branch_index != outaged_branch &&
+                                data_.branches[branch_index].status != 0) {
+                                shunt_candidate_buses.push_back(
+                                    data_.branches[branch_index].to);
+                            }
+                        }
+                        for (int branch_index :
+                             data_.buses[worst_q_bus].branches_to) {
+                            if (branch_index != outaged_branch &&
+                                data_.branches[branch_index].status != 0) {
+                                shunt_candidate_buses.push_back(
+                                    data_.branches[branch_index].from);
+                            }
+                        }
+                        std::sort(
+                            shunt_candidate_buses.begin(),
+                            shunt_candidate_buses.end());
+                        shunt_candidate_buses.erase(
+                            std::unique(
+                                shunt_candidate_buses.begin(),
+                                shunt_candidate_buses.end()),
+                            shunt_candidate_buses.end());
+                    }
+                    if (reactive_flow_bound_dominant) {
+                        const auto& reactive_branch =
+                            data_.branches[worst_reactive_flow_branch];
+                        shunt_candidate_buses.push_back(
+                            reactive_branch.from);
+                        shunt_candidate_buses.push_back(
+                            reactive_branch.to);
+                        std::sort(
+                            shunt_candidate_buses.begin(),
+                            shunt_candidate_buses.end());
+                        shunt_candidate_buses.erase(
+                            std::unique(
+                                shunt_candidate_buses.begin(),
+                                shunt_candidate_buses.end()),
+                            shunt_candidate_buses.end());
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "worst_reactive_flow_branch"] =
+                            reactive_branch.source_key;
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "worst_reactive_flow_side"] =
+                            worst_reactive_flow_from_side
+                            ? "from" : "to";
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "worst_reactive_flow_excess"] =
+                            worst_reactive_flow_excess;
+                    }
+                    auto* shunt_correction_cache =
+                        contingency_predictor_cache &&
+                            contingency_predictor_cache->valid
+                        ? contingency_predictor_cache.get()
+                        : predictor_cache_.get();
+                    auto shunt_trial_trace = nlohmann::json::array();
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "worst_q_bus"] = worst_q_bus >= 0
+                        ? data_.buses[worst_q_bus].bus_i : -1;
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "worst_q_balance"] = worst_q_bus >= 0
+                        ? q_balance_by_bus[worst_q_bus] : 0.0;
+                    auto reactive_flow_voltage_trace =
+                        nlohmann::json::array();
+                    if (reactive_flow_bound_dominant) {
+                        const auto& reactive_branch =
+                            data_.branches[worst_reactive_flow_branch];
+                        constexpr std::array<double, 6>
+                            kReactiveFlowVoltageChanges{
+                                -0.0005, -0.00025, -0.0001,
+                                 0.0001,  0.00025,  0.0005};
+                        for (int candidate_bus : {
+                                 reactive_branch.from,
+                                 reactive_branch.to}) {
+                            for (double voltage_change :
+                                 kReactiveFlowVoltageChanges) {
+                                const double proposed_voltage =
+                                    correction_reference.vm[candidate_bus] +
+                                    voltage_change;
+                                if (proposed_voltage <
+                                        data_.buses[candidate_bus].vmin -
+                                            1e-12 ||
+                                    proposed_voltage >
+                                        data_.buses[candidate_bus].vmax +
+                                            1e-12) {
+                                    continue;
+                                }
+                                auto trial = correction_reference;
+                                trial.vm[candidate_bus] = proposed_voltage;
+                                const auto trial_validation =
+                                    project_trial_reactive_and_validate(
+                                        trial);
+                                reactive_flow_voltage_trace.push_back({
+                                    {"candidate_bus",
+                                     data_.buses[candidate_bus].bus_i},
+                                    {"voltage_change", voltage_change},
+                                    {"validation",
+                                     trial_validation.to_json()},
+                                });
+                                if (trial_validation.max_residual +
+                                        1e-10 <
+                                    selected_validation.max_residual) {
+                                    selected_correction =
+                                        std::move(trial);
+                                    selected_validation =
+                                        trial_validation;
+                                    selected_damping = voltage_change;
+                                    selected_correction_mode =
+                                        "reactive_branch_flow_voltage";
+                                }
+                            }
+                        }
+                    }
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "reactive_flow_voltage_trials"] =
+                        std::move(reactive_flow_voltage_trace);
+                    auto local_reactive_trace = nlohmann::json::array();
+                    if (shunt_correction_cache != nullptr &&
+                        worst_q_bus >= 0) {
+                        const double desired_network_q_change =
+                            std::clamp(
+                                q_balance_by_bus[worst_q_bus],
+                                -0.48, 0.48) -
+                            q_balance_by_bus[worst_q_bus];
+                        constexpr std::array<double, 7>
+                            kLocalReactiveDamping{
+                                1.0, 0.5, 0.25, 0.125, 0.0625,
+                                0.03125, 0.015625};
+                        for (double direction : {1.0, -1.0}) {
+                        for (double damping : kLocalReactiveDamping) {
+                            auto trial = correction_reference;
+                            if (!shunt_correction_cache->
+                                    apply_local_reactive_correction(
+                                        data_, worst_q_bus,
+                                        direction *
+                                            desired_network_q_change,
+                                        trial.vm, damping)) {
+                                continue;
+                            }
+                            const auto trial_validation =
+                                project_trial_reactive_and_validate(trial);
+                            local_reactive_trace.push_back({
+                                {"damping", damping},
+                                {"direction", direction},
+                                {"desired_network_q_change",
+                                 direction *
+                                     desired_network_q_change},
+                                {"validation", trial_validation.to_json()},
+                            });
+                            if (trial_validation.max_residual + 1e-10 <
+                                selected_validation.max_residual) {
+                                selected_correction = std::move(trial);
+                                selected_validation = trial_validation;
+                                selected_damping = damping;
+                                selected_correction_mode =
+                                    "localized_reactive_voltage";
+                            }
+                        }
+                        }
+                    }
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "local_reactive_trials"] =
+                        std::move(local_reactive_trace);
+                    auto local_voltage_trace = nlohmann::json::array();
+                    constexpr std::array<double, 4>
+                        kLocalVoltageChanges{
+                            -0.005, -0.001, 0.001, 0.005};
+                    for (int candidate_bus : shunt_candidate_buses) {
+                        for (double voltage_change :
+                             kLocalVoltageChanges) {
+                            const double proposed_voltage =
+                                correction_reference.vm[candidate_bus] +
+                                voltage_change;
+                            if (proposed_voltage <
+                                    data_.buses[candidate_bus].vmin - 1e-12 ||
+                                proposed_voltage >
+                                    data_.buses[candidate_bus].vmax + 1e-12) {
+                                continue;
+                            }
+                            auto trial = correction_reference;
+                            trial.vm[candidate_bus] = proposed_voltage;
+                            const auto trial_validation =
+                                project_trial_reactive_and_validate(trial);
+                            local_voltage_trace.push_back({
+                                {"candidate_bus",
+                                 data_.buses[candidate_bus].bus_i},
+                                {"voltage_change", voltage_change},
+                                {"validation", trial_validation.to_json()},
+                            });
+                            if (trial_validation.max_residual + 1e-10 <
+                                selected_validation.max_residual) {
+                                selected_correction = std::move(trial);
+                                selected_validation = trial_validation;
+                                selected_damping = voltage_change;
+                                selected_correction_mode =
+                                    "one_hop_voltage_coordinate";
+                            }
+                        }
+                    }
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "local_voltage_trials"] =
+                        std::move(local_voltage_trace);
+                    for (int candidate_bus : shunt_candidate_buses) {
+                    for (int shunt_index :
+                         data_.buses[candidate_bus].shunts) {
+                        const auto& shunt = data_.shunts[shunt_index];
+                        if (!shunt.dispatchable ||
+                            correction_reference.shunt_steps.size() !=
+                                data_.shunts.size() ||
+                            correction_reference.shunt_bs.size() !=
+                                data_.shunts.size()) {
+                            continue;
+                        }
+                        for (int block = 0;
+                             block < static_cast<int>(
+                                 shunt.block_maximum_steps.size());
+                             ++block) {
+                            for (const int step_change : {-1, 1}) {
+                                const int current_step =
+                                    correction_reference
+                                        .shunt_steps[shunt_index][block];
+                                const int proposed_step =
+                                    current_step + step_change;
+                                if (proposed_step < 0 ||
+                                    proposed_step >
+                                        shunt.block_maximum_steps[block]) {
+                                    continue;
+                                }
+                                const double delta_bs =
+                                    static_cast<double>(step_change) *
+                                    shunt.block_susceptance[block];
+                                nlohmann::json shunt_trial = {
+                                    {"candidate_bus",
+                                     data_.buses[candidate_bus].bus_i},
+                                    {"shunt", shunt.source_key},
+                                    {"block", block},
+                                    {"current_step", current_step},
+                                    {"proposed_step", proposed_step},
+                                    {"delta_bs", delta_bs},
+                                };
+                                // q_balance includes -bs*|V|^2, so positive
+                                // excess is relieved by increasing bs and
+                                // negative excess by decreasing it.
+                                if (worst_q_bus < 0 ||
+                                    (candidate_bus == worst_q_bus &&
+                                     q_balance_by_bus[worst_q_bus] *
+                                         delta_bs <= 0.0)) {
+                                    shunt_trial["skipped"] =
+                                        "opposite_reactive_direction";
+                                    shunt_trial_trace.push_back(
+                                        std::move(shunt_trial));
+                                    continue;
+                                }
+                                auto trial = correction_reference;
+                                trial.shunt_steps[shunt_index][block] =
+                                    proposed_step;
+                                double trial_bs = 0.0;
+                                for (int candidate_block = 0;
+                                     candidate_block < static_cast<int>(
+                                         shunt.block_maximum_steps.size());
+                                     ++candidate_block) {
+                                    trial_bs += static_cast<double>(
+                                        trial.shunt_steps[shunt_index]
+                                            [candidate_block]) *
+                                        shunt.block_susceptance
+                                            [candidate_block];
+                                }
+                                trial.shunt_bs[shunt_index] = trial_bs;
+                                auto trial_validation =
+                                    project_trial_reactive_and_validate(trial);
+                                shunt_trial["direct_validation"] =
+                                    trial_validation.to_json();
+                                if (trial_validation.max_residual + 1e-10 <
+                                    selected_validation.max_residual) {
+                                    // Keep trial intact for the optional
+                                    // neighbor-shunt/reactive correction that
+                                    // follows. Moving it here leaves its state
+                                    // vectors empty and caused the fast worker
+                                    // to dereference a moved-from candidate.
+                                    selected_correction = trial;
+                                    selected_validation = trial_validation;
+                                    selected_damping = 1.0;
+                                    selected_correction_mode =
+                                        "single_switched_shunt_step";
+                                }
+                                std::vector<double> trial_q_network(
+                                    static_cast<std::size_t>(nb), 0.0);
+                                for (int branch_index = 0;
+                                     branch_index < static_cast<int>(
+                                         data_.branches.size());
+                                     ++branch_index) {
+                                    if (branch_index == outaged_branch ||
+                                        data_.branches[branch_index].status ==
+                                            0) {
+                                        continue;
+                                    }
+                                    const auto& branch =
+                                        data_.branches[branch_index];
+                                    trial_q_network[branch.from] +=
+                                        trial.qf[branch_index];
+                                    trial_q_network[branch.to] +=
+                                        trial.qt[branch_index];
+                                }
+                                for (int candidate_shunt = 0;
+                                     candidate_shunt < static_cast<int>(
+                                         data_.shunts.size());
+                                     ++candidate_shunt) {
+                                    const auto& network_shunt =
+                                        data_.shunts[candidate_shunt];
+                                    trial_q_network[network_shunt.bus] -=
+                                        effective_shunt_susceptance(
+                                            data_, trial,
+                                            candidate_shunt) *
+                                        trial.vm[network_shunt.bus] *
+                                        trial.vm[network_shunt.bus];
+                                }
+                                // The discrete shunt step changes both the
+                                // network injection and the component-wide
+                                // amount of admissible reactive-balance slack.
+                                // Rebuild the voltage-correction target from
+                                // this trial state instead of reusing the
+                                // target computed before the shunt moved.
+                                std::vector<double> trial_q_spec(
+                                    static_cast<std::size_t>(nb), 0.0);
+                                std::vector<double> trial_q_balance(
+                                    static_cast<std::size_t>(nb), 0.0);
+                                std::vector<double> trial_q_slack_target(
+                                    static_cast<std::size_t>(nb), 0.0);
+                                std::vector<double> trial_generated_q(
+                                    static_cast<std::size_t>(nb), 0.0);
+                                std::vector<double> trial_load_q(
+                                    static_cast<std::size_t>(nb), 0.0);
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    for (int generator : active_at_bus[bus]) {
+                                        trial_generated_q[bus] +=
+                                            trial.qg[generator];
+                                    }
+                                    for (int load : data_.buses[bus].loads) {
+                                        trial_load_q[bus] +=
+                                            data_.loads[load].qd_nominal *
+                                            trial.demand_factor[load];
+                                    }
+                                    trial_q_balance[bus] =
+                                        trial_q_network[bus] -
+                                        trial_generated_q[bus] +
+                                        trial_load_q[bus];
+                                    trial_q_slack_target[bus] = std::clamp(
+                                        trial_q_balance[bus], -0.49, 0.49);
+                                }
+                                for (const auto& component : components) {
+                                    distribute_slack_sum(
+                                        component, trial_q_balance,
+                                        trial_q_slack_target);
+                                }
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    trial_q_spec[bus] =
+                                        trial_generated_q[bus] -
+                                        trial_load_q[bus] +
+                                        trial_q_slack_target[bus];
+                                }
+                                constexpr std::array<double, 3>
+                                    kShuntCorrectionDamping{
+                                        1.0, 0.5, 0.25};
+                                shunt_trial["reactive_corrections"] =
+                                    nlohmann::json::array();
+                                for (double damping :
+                                     kShuntCorrectionDamping) {
+                                    auto corrected_trial = trial;
+                                    if (!shunt_correction_cache->
+                                            apply_reactive_correction(
+                                                data_, trial_q_spec,
+                                                trial_q_network,
+                                                corrected_trial.vm,
+                                                damping)) {
+                                        continue;
+                                    }
+                                    const auto corrected_validation =
+                                        project_trial_reactive_and_validate(
+                                            corrected_trial);
+                                    shunt_trial["reactive_corrections"]
+                                        .push_back({
+                                            {"damping", damping},
+                                            {"validation",
+                                             corrected_validation.to_json()},
+                                        });
+                                    if (corrected_validation.max_residual +
+                                            1e-10 <
+                                        selected_validation.max_residual) {
+                                        selected_correction =
+                                            std::move(corrected_trial);
+                                        selected_validation =
+                                            corrected_validation;
+                                        selected_damping = damping;
+                                        selected_correction_mode =
+                                            "neighbor_switched_shunt_plus_"
+                                            "reactive_voltage";
+                                    }
+                                }
+                                shunt_trial_trace.push_back(
+                                    std::move(shunt_trial));
+                            }
+                        }
+                    }
+                }
+                    auto paired_voltage_trace = nlohmann::json::array();
+                    if (selected_damping == 0.0 &&
+                        shunt_candidate_buses.size() > 1) {
+                        constexpr std::array<double, 2>
+                            kPairedVoltageChanges{-0.001, 0.001};
+                        for (std::size_t first = 0;
+                             first < shunt_candidate_buses.size(); ++first) {
+                            for (std::size_t second = first + 1;
+                                 second < shunt_candidate_buses.size();
+                                 ++second) {
+                                const int first_bus =
+                                    shunt_candidate_buses[first];
+                                const int second_bus =
+                                    shunt_candidate_buses[second];
+                                for (double first_change :
+                                     kPairedVoltageChanges) {
+                                    for (double second_change :
+                                         kPairedVoltageChanges) {
+                                        const double first_voltage =
+                                            correction_reference.vm[first_bus] +
+                                            first_change;
+                                        const double second_voltage =
+                                            correction_reference.vm[second_bus] +
+                                            second_change;
+                                        if (first_voltage <
+                                                data_.buses[first_bus].vmin -
+                                                    1e-12 ||
+                                            first_voltage >
+                                                data_.buses[first_bus].vmax +
+                                                    1e-12 ||
+                                            second_voltage <
+                                                data_.buses[second_bus].vmin -
+                                                    1e-12 ||
+                                            second_voltage >
+                                                data_.buses[second_bus].vmax +
+                                                    1e-12) {
+                                            continue;
+                                        }
+                                        auto trial = correction_reference;
+                                        trial.vm[first_bus] = first_voltage;
+                                        trial.vm[second_bus] = second_voltage;
+                                        const auto trial_validation =
+                                            project_trial_reactive_and_validate(
+                                                trial);
+                                        paired_voltage_trace.push_back({
+                                            {"first_bus",
+                                             data_.buses[first_bus].bus_i},
+                                            {"first_change", first_change},
+                                            {"second_bus",
+                                             data_.buses[second_bus].bus_i},
+                                            {"second_change", second_change},
+                                            {"validation",
+                                             trial_validation.to_json()},
+                                        });
+                                        if (trial_validation.max_residual +
+                                                1e-10 <
+                                            selected_validation.max_residual) {
+                                            selected_correction =
+                                                std::move(trial);
+                                            selected_validation =
+                                                trial_validation;
+                                            selected_damping = 1.0;
+                                            selected_correction_mode =
+                                                "paired_one_hop_voltage_"
+                                                "coordinate";
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "paired_voltage_trials"] =
+                        std::move(paired_voltage_trace);
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "shunt_trials"] = std::move(shunt_trial_trace);
+                }
+                output.fixed_jacobian_predictor_trace.back()[
+                    "selected_damping"] = selected_damping;
+                output.fixed_jacobian_predictor_trace.back()[
+                    "selected_correction_mode"] =
+                    selected_correction_mode;
+                output.fixed_jacobian_predictor_trace.back()[
+                    "selected_next_validation"] =
+                    selected_validation.to_json();
+                const bool initial_active_feasibility_repair =
+                    active_feasibility_repair_attempts == 0 &&
+                    selected_damping == 0.0 &&
+                    (predictor_validation.max_active_balance_residual >
+                         1e-4 ||
+                     worst_active_flow_excess > 1e-6);
+                const bool late_security_stagnation_repair =
+                    active_feasibility_repair_attempts == 1 &&
+                    predictor_iteration >= 28 &&
+                    predictor_validation.worst_category ==
+                        "variable_bound" &&
+                    predictor_validation.max_variable_bound_violation >
+                        1e-4 &&
+                    selected_validation.max_residual >=
+                        0.99 * predictor_validation.max_residual;
+                if (outaged_generator >= 0 &&
+                    (initial_active_feasibility_repair ||
+                     late_security_stagnation_repair)) {
+                    ++active_feasibility_repair_attempts;
+                    const double active_balance_limit =
+                        initial_active_feasibility_repair ? 0.25 : 0.20;
+                    const double active_angle_trust =
+                        initial_active_feasibility_repair ? 0.05 : 0.02;
+                    const double active_voltage_trust =
+                        initial_active_feasibility_repair ? 0.005 : 0.002;
+                    auto active_repair =
+                        solve_linearized_active_feasibility_repair(
+                            data_, correction_reference, commitment_,
+                            *direct_context, active_balance_limit,
+                            active_angle_trust, 5.0,
+                            active_voltage_trust, false);
+                    auto active_repair_json =
+                        active_repair.to_json(false);
+                    if (active_repair.success) {
+                        auto active_trial = std::move(active_repair.state);
+                        const auto active_validation =
+                            project_trial_reactive_and_validate(active_trial);
+                        active_repair_json["nonlinear_validation"] =
+                            active_validation.to_json();
+                        if (active_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction =
+                                std::move(active_trial);
+                            selected_validation = active_validation;
+                            selected_damping = 1.0;
+                            selected_correction_mode =
+                                "linearized_active_feasibility_repair";
+                        }
+                    }
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "active_feasibility_repair"] =
+                        std::move(active_repair_json);
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "selected_damping"] = selected_damping;
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "selected_correction_mode"] =
+                        selected_correction_mode;
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "selected_next_validation"] =
+                        selected_validation.to_json();
+                }
+                if (selected_damping == 0.0) {
+                    break;
+                }
+                predictor_state = std::move(selected_correction);
+            }
+        }
+    }
+
+    // The first pass of the two-stage large-case scheduler is only a
+    // classifier.  Once the reusable fixed-Jacobian predictor has failed
+    // independent validation, continuing into the legacy Newton loops spends
+    // seconds on a candidate that the exact corrective stage must solve
+    // anyway.  Return the best predictor candidate as the explicitly
+    // unverified fallback seed; solve_loaded_contingency still records this as
+    // a failed screen and never accepts it as a feasible contingency result.
+    if (!base_mode && options_.fixed_jacobian_screen_only) {
+        output.solve.status = 2;
+        output.solve.iterations = output.fixed_jacobian_predictor_iterations;
+        output.solve.state = best_intermediate_state;
+        output.solve.objective = rebuild_contingency_state_derived_fields(
+            data_, base_state_, commitment_, *contingency,
+            output.solve.state);
+        output.validation = validate_state(
+            data_, ModelMode::ContingencySoft, output.solve.state,
+            commitment_, direct_context);
+        output.best_intermediate_candidate_selected = true;
+        output.best_intermediate_candidate_source = best_intermediate_source;
+        output.best_intermediate_candidate_validation = output.validation;
+        output.feasible = false;
+        output.failure_reason =
+            "fixed-Jacobian screen requires exact corrective fallback; "
+            "independent validation failed: "
+            + output.validation.worst_category + " at "
+            + output.validation.worst_identity;
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        output.solve.wall_seconds = output.wall_seconds;
+        return output;
+    }
+
+    const bool use_predictor_newton_seed =
+        best_intermediate_source == "fixed_base_jacobian_predictor" &&
+        best_intermediate_validation.max_residual <
+            output.direct_candidate_validation.max_residual;
+    const AcState& newton_seed = use_predictor_newton_seed
+        ? best_intermediate_state : initial_state;
+    const AcState& balance_seed = use_predictor_newton_seed
+        ? best_intermediate_state : direct_state;
+    if (use_predictor_newton_seed) {
+        pg = newton_seed.pg;
+        qg = newton_seed.qg;
+    }
+    const YRows ybus = build_ybus(data_, outaged_branch, &newton_seed);
+    std::vector<double> vm = newton_seed.vm;
+    std::vector<double> va = newton_seed.va;
     for (int i = 0; i < nb; ++i) {
         vm[i] = std::clamp(vm[i], data_.buses[i].vmin, data_.buses[i].vmax);
         if (data_.buses[i].type == 3) {
@@ -1335,8 +3871,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     std::vector<double> load_p(nb, 0.0), load_q(nb, 0.0);
     for (int i = 0; i < static_cast<int>(data_.loads.size()); ++i) {
         const auto& load = data_.loads[i];
-        load_p[load.bus] += load.pd_nominal * initial_state.demand_factor[i];
-        load_q[load.bus] += load.qd_nominal * initial_state.demand_factor[i];
+        load_p[load.bus] += load.pd_nominal * newton_seed.demand_factor[i];
+        load_q[load.bus] += load.qd_nominal * newton_seed.demand_factor[i];
     }
     std::vector<double> fixed_q_bus(nb, 0.0);
     std::vector<double> active_slack_target(nb, 0.0);
@@ -1345,27 +3881,28 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         double p_balance = 0.0;
         double q_balance = 0.0;
         for (int branch : data_.buses[bus].branches_from) {
-            p_balance += direct_state.pf[branch];
-            q_balance += direct_state.qf[branch];
+            p_balance += balance_seed.pf[branch];
+            q_balance += balance_seed.qf[branch];
         }
         for (int branch : data_.buses[bus].branches_to) {
-            p_balance += direct_state.pt[branch];
-            q_balance += direct_state.qt[branch];
+            p_balance += balance_seed.pt[branch];
+            q_balance += balance_seed.qt[branch];
         }
         for (int gen : data_.buses[bus].generators) {
-            p_balance -= direct_state.pg[gen];
-            q_balance -= direct_state.qg[gen];
+            p_balance -= balance_seed.pg[gen];
+            q_balance -= balance_seed.qg[gen];
         }
         for (int load : data_.buses[bus].loads) {
-            p_balance += data_.loads[load].pd_nominal
-                * direct_state.demand_factor[load];
+                p_balance += data_.loads[load].pd_nominal
+                * balance_seed.demand_factor[load];
             q_balance += data_.loads[load].qd_nominal
-                * direct_state.demand_factor[load];
+                * balance_seed.demand_factor[load];
         }
         for (int shunt : data_.buses[bus].shunts) {
-            const double vm2 = direct_state.vm[bus] * direct_state.vm[bus];
+            const double vm2 = balance_seed.vm[bus] * balance_seed.vm[bus];
             p_balance += data_.shunts[shunt].gs * vm2;
-            q_balance -= data_.shunts[shunt].bs * vm2;
+            q_balance -= effective_shunt_susceptance(
+                data_, balance_seed, shunt) * vm2;
         }
         // Both GO2 base and corrective models permit bounded nodal imbalance.
         // Keep the direct candidate's signed balance when it is already inside
@@ -1381,7 +3918,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     }
 
     const auto evaluate_newton_candidate = [&](bool clamp_voltage) {
-        AcState candidate = initial_state;
+        AcState candidate = newton_seed;
         candidate.vm = vm;
         candidate.va = va;
         candidate.pg = pg;
@@ -1427,7 +3964,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             for (int shunt : data_.buses[bus].shunts) {
                 const double vm2 = candidate.vm[bus] * candidate.vm[bus];
                 p_balance += data_.shunts[shunt].gs * vm2;
-                q_balance -= data_.shunts[shunt].bs * vm2;
+                q_balance -= effective_shunt_susceptance(
+                    data_, candidate, shunt) * vm2;
             }
             const double p_target = std::clamp(p_balance, -0.49, 0.49);
             const double q_target = std::clamp(q_balance, -0.49, 0.49);
@@ -1949,7 +4487,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
         for (int shunt : data_.buses[bus].shunts) {
             p_balance += data_.shunts[shunt].gs * state.vm[bus] * state.vm[bus];
-            q_balance -= data_.shunts[shunt].bs * state.vm[bus] * state.vm[bus];
+            q_balance -= effective_shunt_susceptance(
+                data_, state, shunt) * state.vm[bus] * state.vm[bus];
         }
         state.p_delta[bus] = std::min(0.5, std::abs(p_balance));
         state.q_delta[bus] = std::min(0.5, std::abs(q_balance));
@@ -2043,7 +4582,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 for (int shunt : data_.buses[bus].shunts) {
                     p_balance[bus] += data_.shunts[shunt].gs
                         * state.vm[bus] * state.vm[bus];
-                    q_balance[bus] -= data_.shunts[shunt].bs
+                    q_balance[bus] -= effective_shunt_susceptance(
+                        data_, state, shunt)
                         * state.vm[bus] * state.vm[bus];
                 }
             }

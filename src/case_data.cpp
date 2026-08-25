@@ -143,6 +143,26 @@ CaseData CaseData::load(const std::string& path) {
         shunt.bus = bus_pos(item.at("shunt_bus").get<int>());
         shunt.gs = item.at("gs").get<double>();
         shunt.bs = item.at("bs").get<double>();
+        shunt.dispatchable = item.value("dispatchable", false);
+        if (item.contains("xst")) {
+            shunt.steps = item.at("xst").get<std::vector<int>>();
+        }
+        if (item.contains("blocks")) {
+            for (const auto& block : item.at("blocks")) {
+                if (!block.is_array() || block.size() != 2) {
+                    throw std::runtime_error(
+                        "invalid switched-shunt block: " +
+                        shunt.source_key);
+                }
+                shunt.block_maximum_steps.push_back(
+                    block.at(0).get<int>());
+                shunt.block_susceptance.push_back(
+                    block.at(1).get<double>());
+            }
+        }
+        if (shunt.steps.size() < shunt.block_maximum_steps.size()) {
+            shunt.steps.resize(shunt.block_maximum_steps.size(), 0);
+        }
         return shunt;
     });
 

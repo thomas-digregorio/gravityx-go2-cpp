@@ -23,6 +23,8 @@ struct AcState {
     std::vector<double> pg;
     std::vector<double> qg;
     std::vector<double> demand_factor;
+    std::vector<double> shunt_bs;
+    std::vector<std::vector<int>> shunt_steps;
     std::vector<double> pf;
     std::vector<double> qf;
     std::vector<double> pt;
@@ -63,6 +65,11 @@ BalanceSlackSeed nodal_balance_slack_seed(
     const AcState& state,
     double upper_bound = 0.5,
     double interior_margin = 1e-6);
+
+double effective_shunt_susceptance(
+    const CaseData& data,
+    const AcState& state,
+    int shunt_index);
 
 class AcModel {
 public:

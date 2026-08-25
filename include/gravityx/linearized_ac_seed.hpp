@@ -63,6 +63,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     double time_limit_seconds = 60.0,
     bool omit_branch_security_rows = false,
     bool feasibility_only = false,
-    const std::vector<int>& branch_security_subset = {});
+    const std::vector<int>& branch_security_subset = {},
+    bool force_projected_balance_phase_one = false);
 
 }  // namespace gravityx

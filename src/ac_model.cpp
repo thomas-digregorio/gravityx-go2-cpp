@@ -198,6 +198,20 @@ std::vector<double> lambda_weights(const std::vector<PwlPoint>& points, double v
 
 }  // namespace
 
+double effective_shunt_susceptance(
+    const CaseData& data,
+    const AcState& state,
+    int shunt_index) {
+    if (shunt_index < 0 ||
+        shunt_index >= static_cast<int>(data.shunts.size())) {
+        throw std::runtime_error("shunt index is out of range");
+    }
+    if (state.shunt_bs.size() == data.shunts.size()) {
+        return state.shunt_bs[shunt_index];
+    }
+    return data.shunts[shunt_index].bs;
+}
+
 BalanceSlackSeed nodal_balance_slack_seed(
     const CaseData& data,
     const AcState& state,
@@ -243,7 +257,7 @@ BalanceSlackSeed nodal_balance_slack_seed(
         for (int shunt : bus.shunts) {
             const double vm2 = state.vm[i] * state.vm[i];
             p += data.shunts.at(shunt).gs * vm2;
-            q -= data.shunts.at(shunt).bs * vm2;
+            q -= effective_shunt_susceptance(data, state, shunt) * vm2;
         }
         if (!std::isfinite(p) || !std::isfinite(q)) {
             throw std::runtime_error("cannot seed nodal slacks from a nonfinite state");

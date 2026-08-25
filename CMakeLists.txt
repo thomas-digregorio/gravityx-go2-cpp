@@ -34,6 +34,7 @@ add_executable(gravityx_go2
     src/case_data.cpp
     src/ac_model.cpp
     src/algorithm.cpp
+    src/active_feasibility_repair.cpp
     src/fast_power_flow.cpp
     src/linearized_ac_seed.cpp
     src/validation.cpp

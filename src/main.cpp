@@ -1,4 +1,5 @@
 #include "gravityx/ac_model.hpp"
+#include "gravityx/active_feasibility_repair.hpp"
 #include "gravityx/algorithm.hpp"
 #include "gravityx/case_data.hpp"
 #include "gravityx/fast_power_flow.hpp"
@@ -57,7 +58,11 @@ void write_json_file(const std::string& path, const nlohmann::json& value) {
         if (!stream) {
             throw std::runtime_error("cannot open JSON output: " + temporary);
         }
-        stream << value.dump(2) << '\n';
+        const char* pretty_json = std::getenv("GRAVITYX_PRETTY_JSON");
+        const int indentation = pretty_json != nullptr &&
+                std::string(pretty_json) != "0"
+            ? 2 : -1;
+        stream << value.dump(indentation) << '\n';
         if (!stream) {
             throw std::runtime_error("failed while writing JSON output: " + temporary);
         }
@@ -363,6 +368,17 @@ int run_parallel_circuit_regression() {
             "validated fast power-flow contingency regression failed: "
             + fast_result.failure_reason);
     }
+    auto deliberately_bad_rolling_candidate = solve.state;
+    deliberately_bad_rolling_candidate.va[1] += 0.5;
+    const auto direct_rolling_screen = fast_screen.screen_candidate(
+        branch_contingency, deliberately_bad_rolling_candidate);
+    if (direct_rolling_screen.feasible ||
+        direct_rolling_screen.fixed_jacobian_predictor_attempted ||
+        direct_rolling_screen.direct_candidate_validation.max_residual <=
+            1e-5) {
+        throw std::runtime_error(
+            "rolling corrective candidate was not screened directly");
+    }
     auto contingency_rating_data = data;
     contingency_rating_data.branches[1].rate_a = 0.1;
     contingency_rating_data.branches[1].rate_c = 2.0;
@@ -381,6 +397,37 @@ int run_parallel_circuit_regression() {
     gravityx::ContingencyContext branch_context;
     branch_context.outaged_branch = branch_contingency.component;
     branch_context.base_state = solve.state;
+    auto active_repair_reference = fast_result.solve.state;
+    active_repair_reference.va[1] += 0.35;
+    gravityx::rebuild_contingency_state_derived_fields(
+        data, solve.state, {1}, branch_contingency,
+        active_repair_reference);
+    const auto active_repair =
+        gravityx::solve_linearized_active_feasibility_repair(
+            data, active_repair_reference, {1}, branch_context,
+            0.49, 0.5, 5.0, 0.1);
+    if (!active_repair.success || active_repair.row_count < 2 ||
+        active_repair.branch_security_row_count <= 0 ||
+        active_repair.maximum_linearized_violation > 1e-7 ||
+        active_repair.maximum_angle_change > 0.5 + 1e-9) {
+        throw std::runtime_error(
+            "active feasibility repair regression failed: " +
+            active_repair.status);
+    }
+    auto active_repair_state = active_repair.state;
+    gravityx::rebuild_contingency_state_derived_fields(
+        data, solve.state, {1}, branch_contingency,
+        active_repair_state);
+    const auto active_repair_validation = gravityx::validate_state(
+        data, gravityx::ModelMode::ContingencySoft,
+        active_repair_state, {1}, branch_context);
+    if (active_repair_validation.max_generator_residual > 1e-5 ||
+        active_repair_validation.max_load_ramp_violation > 1e-5 ||
+        active_repair_validation.max_reference_angle_residual > 1e-5) {
+        throw std::runtime_error(
+            "active feasibility repair source-bound validation failed with residual " +
+            std::to_string(active_repair_validation.max_residual));
+    }
     const auto full_contingency_seed = gravityx::solve_linearized_ac_seed(
         data, solve.state, {1}, 0.49, branch_context);
     const auto balance_only_contingency_seed =
@@ -1405,16 +1452,58 @@ bool solve_loaded_contingency(
 
     std::optional<gravityx::FastPowerFlowResult> fast_result;
     const bool reused_fast_screen_reference = precomputed_fast_state != nullptr;
+    bool rolling_seed_fast_screen_selected = false;
     if (precomputed_fast_state) {
         fast_result.emplace();
         fast_result->solve.state = *precomputed_fast_state;
         fast_result->failure_reason = "precomputed_fast_screen_reference";
     } else if (fast_power_flow) {
-        fast_result = fast_power_flow->solve(*match);
+        const bool rolling_seed_dimensions_match =
+            rolling_corrective_seed != nullptr &&
+            rolling_corrective_seed->vm.size() == data.buses.size() &&
+            rolling_corrective_seed->va.size() == data.buses.size() &&
+            rolling_corrective_seed->pg.size() == data.generators.size() &&
+            rolling_corrective_seed->qg.size() == data.generators.size() &&
+            rolling_corrective_seed->demand_factor.size() == data.loads.size();
+        if (rolling_seed_dimensions_match) {
+            auto translated_rolling_seed = *rolling_corrective_seed;
+            if (rolling_corrective_seed_label != nullptr &&
+                match->type == gravityx::ContingencyType::Generator) {
+                const auto prior_match = std::find_if(
+                    data.contingencies.begin(), data.contingencies.end(),
+                    [&](const gravityx::Contingency& item) {
+                        return item.label == *rolling_corrective_seed_label;
+                    });
+                if (prior_match != data.contingencies.end() &&
+                    prior_match->type ==
+                        gravityx::ContingencyType::Generator &&
+                    data.generators[prior_match->component].bus ==
+                        data.generators[match->component].bus) {
+                    const int prior_outage = prior_match->component;
+                    const int current_outage = match->component;
+                    translated_rolling_seed.pg[prior_outage] =
+                        translated_rolling_seed.pg[current_outage];
+                    translated_rolling_seed.qg[prior_outage] =
+                        translated_rolling_seed.qg[current_outage];
+                    translated_rolling_seed.pg[current_outage] = 0.0;
+                    translated_rolling_seed.qg[current_outage] = 0.0;
+                }
+            }
+            fast_result = fast_power_flow->screen_candidate(
+                *match, translated_rolling_seed);
+            rolling_seed_fast_screen_selected = fast_result->feasible;
+        }
+        if (!rolling_seed_fast_screen_selected) {
+            fast_result = fast_power_flow->solve(*match);
+        }
         if (fast_result->feasible) {
             const std::string solution_method =
-                fast_result->direct_candidate_selected
+                rolling_seed_fast_screen_selected
+                ? "rolling_corrective_seed_direct_screen"
+                : fast_result->direct_candidate_selected
                 ? "direct_base_state_outage_candidate"
+                : fast_result->fixed_jacobian_predictor_selected
+                ? "resident_fixed_jacobian_predictor"
                 : "fast_newton_power_flow";
             const nlohmann::json output = {
                 {"success", true},
@@ -1427,6 +1516,11 @@ bool solve_loaded_contingency(
                 {"solution_method", solution_method},
                 {"fast_power_flow_screen", true},
                 {"fast_screen", fast_result->to_json()},
+                {"rolling_corrective_seed_label",
+                 rolling_seed_fast_screen_selected &&
+                         rolling_corrective_seed_label != nullptr
+                     ? nlohmann::json(*rolling_corrective_seed_label)
+                     : nlohmann::json(nullptr)},
                 {"resident_parametric_model", false},
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
@@ -1504,7 +1598,8 @@ bool solve_loaded_contingency(
         // path transfers feasibility: every candidate is rebuilt for this
         // outage and must pass the complete independent validator.
         if (data.buses.size() >= 16000 && fast_power_flow != nullptr &&
-            fast_result.has_value()) {
+            fast_result.has_value() &&
+            best_validation.max_residual > 0.1) {
             double fast_repair_wall_seconds = fast_result->wall_seconds;
             auto evaluate_fast_repair = [&](
                 gravityx::FastPowerFlowResult& repair,
@@ -1644,6 +1739,16 @@ bool solve_loaded_contingency(
                 }
             }
         }
+        const bool use_near_feasible_exact_polish =
+            data.buses.size() >= 16000 &&
+            best_validation.max_residual <= 0.1;
+        double linearized_wall_seconds = 0.0;
+        int linearized_iterations = 0;
+        std::string last_status = "not_run";
+        int last_model_status = -1;
+        if (use_near_feasible_exact_polish) {
+            linearized_seed = best_state;
+        } else {
         std::vector<int> dynamic_security_branches;
         std::vector<unsigned char> dynamic_security_selected(
             data.branches.size(), 0);
@@ -1719,10 +1824,6 @@ bool solve_loaded_contingency(
         const auto initial_dynamic_security_branches =
             collect_violated_security_branches(best_state);
         auto reference = best_state;
-        double linearized_wall_seconds = 0.0;
-        int linearized_iterations = 0;
-        std::string last_status = "not_run";
-        int last_model_status = -1;
         std::string reference_source = fast_result ? "fast_screen" : "base";
         constexpr int kMaximumLinearizedRounds = 3;
         for (int round = 1; round <= kMaximumLinearizedRounds; ++round) {
@@ -1763,9 +1864,41 @@ bool solve_loaded_contingency(
                 initial_dynamic_security_branches;
             attempt["active_dynamic_security_branch_positions"] =
                 dynamic_security_branches;
-            if (!linear.success && data.buses.size() >= 8000 &&
+            if (!linear.success && data.buses.size() >= 16000 &&
+                !dynamic_security_branches.empty() &&
                 (linear.status == "Infeasible" ||
                  linear.status == "Unknown")) {
+                // A violated security row can be unreachable inside the
+                // deliberately tight targeted trust region even though the
+                // complete corrective problem is feasible.  Retrying that
+                // identical restricted LP cannot change the answer.  First
+                // solve the elastic balance Phase I with the wider ordinary
+                // trust region; its exact nonlinear image is screened below,
+                // and any still-violated security rows remain in the dynamic
+                // set for the next round.
+                attempt["balance_phase_one_retry_scheduled"] = true;
+                attempt["delayed_security_branch_positions"] =
+                    dynamic_security_branches;
+                linearized_attempts.push_back(std::move(attempt));
+                constexpr double kLargeBalancePhaseOneTimeLimitSeconds = 90.0;
+                linear = gravityx::solve_linearized_ac_seed(
+                    data, reference, base.commitment,
+                    0.25,
+                    context, true, false,
+                    kLargeBalancePhaseOneTimeLimitSeconds,
+                    true, true, {}, true);
+                linearized_wall_seconds += linear.wall_seconds;
+                linearized_iterations += std::max(0, linear.iterations);
+                attempt = linear.to_json(false);
+                attempt["round"] = round;
+                attempt["balance_phase_one_retry"] = true;
+                attempt["delayed_security_branch_positions"] =
+                    dynamic_security_branches;
+                attempt["reference_source"] = reference_source;
+            } else if (!linear.success && data.buses.size() >= 8000 &&
+                       data.buses.size() < 16000 &&
+                       (linear.status == "Infeasible" ||
+                        linear.status == "Unknown")) {
                 attempt["projected_balance_retry_scheduled"] = true;
                 linearized_attempts.push_back(std::move(attempt));
                 // Under eight-way contention the large projected-balance IPM
@@ -2016,6 +2149,7 @@ bool solve_loaded_contingency(
             }
         }
         linearized_seed = best_state;
+        }
         if (linearized_only) {
             gravityx::SolveResult solve;
             solve.status = last_model_status;
@@ -2243,8 +2377,11 @@ int run_contingency_worker(
     std::unique_ptr<gravityx::AcModel> resident_model;
     std::unique_ptr<gravityx::FastContingencyPowerFlow> fast_power_flow;
     if (fast_power_flow_screen) {
+        gravityx::FastPowerFlowOptions fast_options;
+        fast_options.fixed_jacobian_screen_only =
+            fast_only && data.buses.size() >= 16000;
         fast_power_flow = std::make_unique<gravityx::FastContingencyPowerFlow>(
-            data, base.state, base.commitment);
+            data, base.state, base.commitment, fast_options);
     }
     std::optional<gravityx::AcState> rolling_corrective_seed;
     std::string rolling_corrective_seed_label;
@@ -2287,7 +2424,8 @@ int run_contingency_worker(
             rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr,
             linearized_fallback ? &corrective_seed_bank : nullptr);
         bool rolling_corrective_seed_updated = false;
-        if (success && linearized_fallback && data.buses.size() >= 16000) {
+        if (success && (linearized_fallback || fast_only) &&
+            data.buses.size() >= 16000) {
             const auto result_json = read_json_file(output_path);
             if (result_json.value("success", false) &&
                 result_json.contains("solve") &&

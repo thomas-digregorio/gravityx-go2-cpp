@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,7 @@ namespace gravityx {
 
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
+    bool fixed_jacobian_screen_only{false};
     int max_newton_iterations{50};
     int max_active_redispatch_passes{20};
     int max_reactive_limit_passes{8};
@@ -25,6 +27,12 @@ struct FastPowerFlowResult {
     bool direct_candidate_attempted{};
     bool direct_candidate_selected{};
     ValidationReport direct_candidate_validation;
+    bool fixed_jacobian_predictor_attempted{};
+    bool fixed_jacobian_predictor_selected{};
+    int fixed_jacobian_predictor_iterations{};
+    double fixed_jacobian_predictor_preparation_seconds{};
+    ValidationReport fixed_jacobian_predictor_validation;
+    nlohmann::json fixed_jacobian_predictor_trace = nlohmann::json::array();
     bool newton_candidate_selected{};
     ValidationReport newton_candidate_validation;
     bool active_only_newton_attempted{};
@@ -93,22 +101,32 @@ public:
         const AcState& base_state,
         std::vector<int> commitment,
         FastPowerFlowOptions options = {});
+    ~FastContingencyPowerFlow();
+
+    FastContingencyPowerFlow(const FastContingencyPowerFlow&) = delete;
+    FastContingencyPowerFlow& operator=(const FastContingencyPowerFlow&) = delete;
 
     FastPowerFlowResult solve_base() const;
     FastPowerFlowResult solve(const Contingency& contingency) const;
     FastPowerFlowResult solve(
         const Contingency& contingency,
         const AcState& initial_state) const;
+    FastPowerFlowResult screen_candidate(
+        const Contingency& contingency,
+        const AcState& candidate_state) const;
 
 private:
     const CaseData& data_;
     const AcState& base_state_;
     std::vector<int> commitment_;
     FastPowerFlowOptions options_;
+    struct FixedJacobianPredictorCache;
+    mutable std::unique_ptr<FixedJacobianPredictorCache> predictor_cache_;
 
     FastPowerFlowResult solve_impl(
         const Contingency* contingency,
-        const AcState* initial_state = nullptr) const;
+        const AcState* initial_state = nullptr,
+        bool supplied_candidate_direct_only = false) const;
 };
 
 }  // namespace gravityx

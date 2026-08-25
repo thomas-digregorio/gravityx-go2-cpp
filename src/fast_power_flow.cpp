@@ -2747,6 +2747,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 contingency_predictor_cache;
             int active_feasibility_repair_attempts = 0;
             int consecutive_full_local_reactive_active_angle = 0;
+            std::string prior_selected_correction_mode;
+            double prior_selected_damping = 0.0;
             // Difficult generator outages can enter a late, monotonically
             // shrinking cycle between active- and reactive-flow limits after
             // the global feasibility repair.  Keep the inexpensive local
@@ -3467,6 +3469,28 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 };
                 const auto try_damped_corrections = [&]
                     (FixedJacobianPredictorCache& cache) {
+                    const auto try_local_reactive =
+                        [&](double damping) {
+                        auto trial = correction_reference;
+                        if (!cache.apply_local_reactive_least_squares(
+                                data_, q_balance_by_bus,
+                                trial.vm, damping,
+                                full_reactive_active_set_allowed)) {
+                            return false;
+                        }
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (trial_validation.max_residual + 1e-10 >=
+                            selected_validation.max_residual) {
+                            return false;
+                        }
+                        selected_correction = std::move(trial);
+                        selected_validation = trial_validation;
+                        selected_damping = damping;
+                        selected_correction_mode =
+                            "local_reactive_least_squares";
+                        return true;
+                    };
                     const auto try_local_reactive_then_active =
                         [&](double damping) {
                         auto trial = correction_reference;
@@ -3535,7 +3559,19 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     // independent validator below the configured tolerance.
                     if (!active_block_dominant &&
                         !active_flow_bound_dominant &&
-                        consecutive_full_local_reactive_active_angle >= 2 &&
+                        prior_selected_correction_mode ==
+                            "local_reactive_least_squares" &&
+                        std::abs(prior_selected_damping - 1.0) <= 1e-12 &&
+                        try_local_reactive(prior_selected_damping) &&
+                        selected_validation.max_residual <=
+                            0.999 * predictor_validation.max_residual) {
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "continuation_correction_selected"] = true;
+                        return;
+                    }
+                    if (!active_block_dominant &&
+                        !active_flow_bound_dominant &&
+                        consecutive_full_local_reactive_active_angle >= 1 &&
                         try_local_reactive_then_active(1.0) &&
                         selected_validation.max_residual <=
                             0.999 * predictor_validation.max_residual) {
@@ -3834,24 +3870,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (active_block_dominant) {
                             break;
                         }
-                        auto trial = correction_reference;
-                        if (!cache.apply_local_reactive_least_squares(
-                                data_, q_balance_by_bus,
-                                trial.vm, damping,
-                                full_reactive_active_set_allowed)) {
-                            continue;
-                        }
-                        const auto trial_validation =
-                            project_trial_reactive_and_validate(trial);
-                        if (trial_validation.max_residual + 1e-10 <
-                            selected_validation.max_residual) {
-                            selected_correction = std::move(trial);
-                            selected_validation = trial_validation;
-                            selected_damping = damping;
-                            selected_correction_mode =
-                                "local_reactive_least_squares";
+                        if (try_local_reactive(damping)) {
                             if (strongly_improving_full_damping(
-                                    damping, trial_validation)) {
+                                    damping, selected_validation)) {
                                 break;
                             }
                         }
@@ -4045,6 +4066,121 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             try_damped_corrections(
                                 *contingency_predictor_cache);
                         }
+                    }
+                }
+                const bool prior_one_hop_coordinate =
+                    prior_selected_correction_mode ==
+                        "one_hop_voltage_coordinate" ||
+                    prior_selected_correction_mode ==
+                        "one_hop_voltage_coordinate_continuation";
+                if (selected_damping == 0.0 && prior_one_hop_coordinate &&
+                    std::abs(prior_selected_damping) >= 1e-12) {
+                    int continuation_worst_q_bus = -1;
+                    double continuation_worst_q_excess = 0.0;
+                    for (int bus = 0; bus < nb; ++bus) {
+                        const double excess =
+                            std::abs(q_balance_by_bus[bus]) - 0.49;
+                        if (excess > continuation_worst_q_excess) {
+                            continuation_worst_q_excess = excess;
+                            continuation_worst_q_bus = bus;
+                        }
+                    }
+                    std::vector<int> continuation_candidate_buses;
+                    if (continuation_worst_q_bus >= 0) {
+                        continuation_candidate_buses.push_back(
+                            continuation_worst_q_bus);
+                        for (int branch_index :
+                             data_.buses[continuation_worst_q_bus]
+                                 .branches_from) {
+                            if (branch_index != outaged_branch &&
+                                data_.branches[branch_index].status != 0) {
+                                continuation_candidate_buses.push_back(
+                                    data_.branches[branch_index].to);
+                            }
+                        }
+                        for (int branch_index :
+                             data_.buses[continuation_worst_q_bus]
+                                 .branches_to) {
+                            if (branch_index != outaged_branch &&
+                                data_.branches[branch_index].status != 0) {
+                                continuation_candidate_buses.push_back(
+                                    data_.branches[branch_index].from);
+                            }
+                        }
+                        std::sort(
+                            continuation_candidate_buses.begin(),
+                            continuation_candidate_buses.end());
+                        continuation_candidate_buses.erase(
+                            std::unique(
+                                continuation_candidate_buses.begin(),
+                                continuation_candidate_buses.end()),
+                            continuation_candidate_buses.end());
+                    }
+                    auto continuation_trials = nlohmann::json::array();
+                    AcState continuation_best = correction_reference;
+                    ValidationReport continuation_best_validation =
+                        predictor_validation;
+                    double continuation_best_damping = 0.0;
+                    const std::array<double, 2>
+                        continuation_voltage_changes{
+                            prior_selected_damping,
+                            std::copysign(0.005, prior_selected_damping),
+                    };
+                    for (int candidate_bus :
+                         continuation_candidate_buses) {
+                        for (std::size_t change_index = 0;
+                             change_index <
+                                 continuation_voltage_changes.size();
+                             ++change_index) {
+                            const double voltage_change =
+                                continuation_voltage_changes[change_index];
+                            if (change_index > 0 &&
+                                std::abs(
+                                    voltage_change -
+                                    continuation_voltage_changes[0]) <=
+                                    1e-12) {
+                                continue;
+                            }
+                            const double proposed_voltage =
+                                correction_reference.vm[candidate_bus] +
+                                voltage_change;
+                            if (proposed_voltage <
+                                    data_.buses[candidate_bus].vmin - 1e-12 ||
+                                proposed_voltage >
+                                    data_.buses[candidate_bus].vmax + 1e-12) {
+                                continue;
+                            }
+                            auto trial = correction_reference;
+                            trial.vm[candidate_bus] = proposed_voltage;
+                            const auto trial_validation =
+                                project_trial_reactive_and_validate(trial);
+                            continuation_trials.push_back({
+                                {"candidate_bus",
+                                 data_.buses[candidate_bus].bus_i},
+                                {"voltage_change", voltage_change},
+                                {"validation", trial_validation.to_json()},
+                            });
+                            if (trial_validation.max_residual + 1e-10 <
+                                continuation_best_validation.max_residual) {
+                                continuation_best = std::move(trial);
+                                continuation_best_validation =
+                                    trial_validation;
+                                continuation_best_damping = voltage_change;
+                            }
+                        }
+                    }
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "coordinate_continuation_trials"] =
+                        std::move(continuation_trials);
+                    if (continuation_best_validation.max_residual <=
+                        0.99 * predictor_validation.max_residual) {
+                        selected_correction =
+                            std::move(continuation_best);
+                        selected_validation =
+                            continuation_best_validation;
+                        selected_damping = continuation_best_damping;
+                        selected_correction_mode =
+                            "one_hop_voltage_coordinate_continuation";
                     }
                 }
                 if (selected_damping == 0.0) {
@@ -4851,6 +4987,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 } else {
                     consecutive_full_local_reactive_active_angle = 0;
                 }
+                prior_selected_correction_mode = selected_correction_mode;
+                prior_selected_damping = selected_damping;
                 predictor_state = std::move(selected_correction);
             }
         }

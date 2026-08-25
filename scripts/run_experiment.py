@@ -74,6 +74,18 @@ def code2_completed_within_limit(
     return not timed_out and elapsed_seconds <= limit_seconds
 
 
+def progress_checkpoint_due(
+    last_checkpoint: float,
+    now: float,
+    interval_seconds: float = 1.0,
+) -> bool:
+    if interval_seconds <= 0:
+        raise ValueError("progress checkpoint interval must be positive")
+    if now < last_checkpoint:
+        raise ValueError("progress checkpoint clock cannot move backwards")
+    return now - last_checkpoint >= interval_seconds
+
+
 def streamed_queue_get(
     task_queue: queue.Queue[dict[str, Any]],
     screening_finished: threading.Event,
@@ -777,6 +789,15 @@ def main() -> int:
     def checkpoint() -> None:
         write_json(args.output_dir / "run_status.json", run_status)
 
+    last_progress_checkpoint = wall_start
+
+    def progress_checkpoint() -> None:
+        nonlocal last_progress_checkpoint
+        now = time.perf_counter()
+        if progress_checkpoint_due(last_progress_checkpoint, now):
+            checkpoint()
+            last_progress_checkpoint = now
+
     checkpoint()
 
     base_start = time.perf_counter()
@@ -1004,7 +1025,7 @@ def main() -> int:
             records.append(record)
             run_status["completed_contingency_count"] = len(records)
             run_status["last_completed_contingency"] = label
-            checkpoint()
+            progress_checkpoint()
             print(
                 f"completed {len(records)}/{len(contingencies)}: "
                 f"{label} on {execution_phase} worker {worker_id}",
@@ -1164,7 +1185,7 @@ def main() -> int:
                         )
                         run_status["screened_contingency_count"] = len(screen_records)
                         run_status["fast_screen_fallback_count"] = len(fallback_items)
-                        checkpoint()
+                        progress_checkpoint()
                     screen_queue.task_done()
                 if process.poll() is None:
                     assert process.stdin is not None

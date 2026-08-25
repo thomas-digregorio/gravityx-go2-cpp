@@ -21,6 +21,7 @@ from run_experiment import (  # noqa: E402
     code2_time_limit,
     effective_process_timeout,
     longest_first_contingencies,
+    progress_checkpoint_due,
     streamed_queue_get,
     validate_and_normalize_evaluation_details,
     write_json,
@@ -103,6 +104,12 @@ class SolutionWriterTests(unittest.TestCase):
 
 
 class CompetitionTimingTests(unittest.TestCase):
+    def test_progress_checkpoint_is_throttled(self) -> None:
+        self.assertFalse(progress_checkpoint_due(10.0, 10.999))
+        self.assertTrue(progress_checkpoint_due(10.0, 11.0))
+        with self.assertRaises(ValueError):
+            progress_checkpoint_due(10.0, 9.0)
+
     def test_parallel_evaluation_requires_and_normalizes_every_detail(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

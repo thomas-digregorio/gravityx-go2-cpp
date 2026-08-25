@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import queue
 import subprocess
@@ -42,6 +43,7 @@ def run_trial(
     task_groups: list[list[dict[str, Any]]] | None = None,
     linearized_fallback: bool = False,
     precomputed_fast_screen_dir: Path | None = None,
+    wsl_fast_screen_scratch: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     task_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
@@ -130,8 +132,21 @@ def run_trial(
                     assert process.stdin is not None
                     task = {
                         "label": label,
-                        "output_path": to_wsl(result_path),
+                        "output_path": (
+                            f"/dev/shm/gravityx_calibrate_{os.getpid()}_"
+                            f"{worker_id:03d}.json"
+                            if wsl_fast_screen_scratch
+                            else to_wsl(result_path)
+                        ),
                     }
+                    if wsl_fast_screen_scratch:
+                        task.update(
+                            {
+                                "fallback_output_path": to_wsl(result_path),
+                                "remove_output_after_result": True,
+                                "return_result_summary": True,
+                            }
+                        )
                     if precomputed_fast_screen_dir is not None:
                         task["fast_screen_path"] = to_wsl(
                             precomputed_fast_screen_dir
@@ -156,7 +171,40 @@ def run_trial(
                         raise RuntimeError(
                             f"calibration contingency {label} failed"
                         )
-                    result = read_json(result_path)
+                    if wsl_fast_screen_scratch:
+                        result = acknowledgement.get("result_summary")
+                        if not isinstance(result, dict):
+                            raise RuntimeError(
+                                f"calibration contingency {label} returned no "
+                                "compact result summary"
+                            )
+                        if not acknowledgement.get(
+                            "transient_output_removed", False
+                        ):
+                            raise RuntimeError(
+                                f"calibration contingency {label} left its "
+                                "transient output behind"
+                            )
+                        requires_fallback = bool(
+                            result.get("requires_exact_fallback", False)
+                        )
+                        persisted = bool(
+                            acknowledgement.get(
+                                "fallback_result_persisted", False
+                            )
+                        )
+                        if requires_fallback != persisted:
+                            raise RuntimeError(
+                                f"calibration contingency {label} persistence "
+                                "does not match its fallback status"
+                            )
+                        if result_path.exists() != requires_fallback:
+                            raise RuntimeError(
+                                f"calibration contingency {label} persistent "
+                                "result presence does not match fallback status"
+                            )
+                    else:
+                        result = read_json(result_path)
                     with completed_lock:
                         completed.append(
                             {
@@ -293,6 +341,7 @@ def main() -> int:
     parser.add_argument("--labels", nargs="+")
     parser.add_argument("--linearized-fallback", action="store_true")
     parser.add_argument("--precomputed-fast-screen-dir", type=Path)
+    parser.add_argument("--wsl-fast-screen-scratch", action="store_true")
     args = parser.parse_args()
 
     for path in (args.case_json, args.base_json, args.output_dir, args.executable):
@@ -305,6 +354,8 @@ def main() -> int:
         parser.error("--fast-only requires --fast-power-flow-screen")
     if args.fast_only and args.linearized_fallback:
         parser.error("--fast-only cannot be combined with --linearized-fallback")
+    if args.wsl_fast_screen_scratch and not args.fast_only:
+        parser.error("--wsl-fast-screen-scratch requires --fast-only")
     if args.precomputed_fast_screen_dir is not None:
         reject_onedrive(args.precomputed_fast_screen_dir)
         if not args.linearized_fallback:
@@ -375,6 +426,7 @@ def main() -> int:
         "fast_screen_easy_first": args.fast_screen_easy_first,
         "additional_easy_task_count": args.additional_easy_task_count,
         "linearized_fallback": args.linearized_fallback,
+        "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
         "precomputed_fast_screen_dir": (
             str(args.precomputed_fast_screen_dir)
             if args.precomputed_fast_screen_dir is not None
@@ -406,6 +458,7 @@ def main() -> int:
             task_groups,
             args.linearized_fallback,
             args.precomputed_fast_screen_dir,
+            args.wsl_fast_screen_scratch,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

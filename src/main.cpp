@@ -1485,6 +1485,11 @@ struct CorrectiveSeed {
     gravityx::AcState state;
 };
 
+struct ContingencyComputation {
+    nlohmann::json result;
+    gravityx::AcState state;
+};
+
 BasePoint load_base_point(const std::string& base_result_path) {
     const auto base_json = read_json_file(base_result_path);
     if (!base_json.value("success", false)) {
@@ -1514,7 +1519,9 @@ bool solve_loaded_contingency(
     const gravityx::AcState* precomputed_fast_state = nullptr,
     const gravityx::AcState* rolling_corrective_seed = nullptr,
     const std::string* rolling_corrective_seed_label = nullptr,
-    const std::vector<CorrectiveSeed>* corrective_seed_bank = nullptr) {
+    const std::vector<CorrectiveSeed>* corrective_seed_bank = nullptr,
+    std::optional<ContingencyComputation>* completed_computation = nullptr,
+    bool persist_result = true) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -1529,6 +1536,23 @@ bool solve_loaded_contingency(
     } else {
         context.outaged_branch = match->component;
     }
+
+    auto complete = [&](nlohmann::json output,
+                        const gravityx::AcState& state,
+                        bool persist_full_state = false) {
+        if (persist_result) {
+            output["solve"]["state"] = persist_full_state
+                ? gravityx::ac_state_to_json(state)
+                : gravityx::ac_submission_state_to_json(state);
+            write_json_file(output_path, output);
+        }
+        if (completed_computation != nullptr) {
+            completed_computation->emplace(ContingencyComputation{
+                std::move(output),
+                state,
+            });
+        }
+    };
 
     std::optional<gravityx::FastPowerFlowResult> fast_result;
     const bool reused_fast_screen_reference = precomputed_fast_state != nullptr;
@@ -1640,7 +1664,7 @@ bool solve_loaded_contingency(
                 : fast_result->fixed_jacobian_predictor_selected
                 ? "resident_fixed_jacobian_predictor"
                 : "fast_newton_power_flow";
-            const nlohmann::json output = {
+            nlohmann::json output = {
                 {"success", true},
                 {"solver_status_success", true},
                 {"accepted_feasible_nonconverged", false},
@@ -1650,7 +1674,12 @@ bool solve_loaded_contingency(
                 {"component_position", match->component},
                 {"solution_method", solution_method},
                 {"fast_power_flow_screen", true},
-                {"fast_screen", fast_result->to_json()},
+                {"fast_screen", persist_result
+                    ? fast_result->to_json()
+                    : nlohmann::json({
+                          {"failure_reason", fast_result->failure_reason},
+                          {"wall_seconds", fast_result->wall_seconds},
+                      })},
                 {"rolling_corrective_seed_label",
                  selected_direct_seed_label
                      ? nlohmann::json(*selected_direct_seed_label)
@@ -1659,10 +1688,11 @@ bool solve_loaded_contingency(
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
                 {"model_preparation_wall_seconds", 0.0},
-                {"solve", gravityx::solve_result_to_submission_json(fast_result->solve)},
+                {"solve", gravityx::solve_result_to_json(
+                    fast_result->solve, false)},
                 {"validation", fast_result->validation.to_json()},
             };
-            write_json_file(output_path, output);
+            complete(std::move(output), fast_result->solve.state);
             std::cout << nlohmann::json({
                 {"output", output_path},
                 {"success", true},
@@ -1681,7 +1711,7 @@ bool solve_loaded_contingency(
             return true;
         }
         if (fast_only) {
-            const nlohmann::json output = {
+            nlohmann::json output = {
                 {"success", false},
                 {"screen_completed", true},
                 {"requires_exact_fallback", true},
@@ -1698,10 +1728,11 @@ bool solve_loaded_contingency(
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
                 {"model_preparation_wall_seconds", 0.0},
-                {"solve", gravityx::solve_result_to_submission_json(fast_result->solve)},
+                {"solve", gravityx::solve_result_to_json(
+                    fast_result->solve, false)},
                 {"validation", fast_result->validation.to_json()},
             };
-            write_json_file(output_path, output);
+            complete(std::move(output), fast_result->solve.state);
             return true;
         }
     }
@@ -1782,7 +1813,7 @@ bool solve_loaded_contingency(
                     corrective_seed_label != nullptr
                     ? nlohmann::json(*corrective_seed_label)
                     : nlohmann::json(nullptr);
-                const nlohmann::json output = {
+                nlohmann::json output = {
                     {"success", true},
                     {"solver_status_success", true},
                     {"accepted_feasible_nonconverged", false},
@@ -1803,10 +1834,10 @@ bool solve_loaded_contingency(
                     {"acceptable_termination_enabled", false},
                     {"resident_model_created", false},
                     {"model_preparation_wall_seconds", 0.0},
-                    {"solve", gravityx::solve_result_to_submission_json(solve)},
+                    {"solve", gravityx::solve_result_to_json(solve, false)},
                     {"validation", repaired_validation.to_json()},
                 };
-                write_json_file(output_path, output);
+                complete(std::move(output), solve.state);
                 std::cout << nlohmann::json({
                     {"output", output_path},
                     {"success", true},
@@ -2113,7 +2144,7 @@ bool solve_loaded_contingency(
                 solve.wall_seconds = linearized_wall_seconds;
                 solve.iterations = linearized_iterations;
                 solve.state = std::move(candidate);
-                const nlohmann::json output = {
+                nlohmann::json output = {
                     {"success", true},
                     {"solver_status_success", true},
                     {"accepted_feasible_nonconverged", false},
@@ -2134,10 +2165,10 @@ bool solve_loaded_contingency(
                     {"acceptable_termination_enabled", false},
                     {"resident_model_created", false},
                     {"model_preparation_wall_seconds", 0.0},
-                    {"solve", gravityx::solve_result_to_submission_json(solve)},
+                    {"solve", gravityx::solve_result_to_json(solve, false)},
                     {"validation", validation.to_json()},
                 };
-                write_json_file(output_path, output);
+                complete(std::move(output), solve.state);
                 std::cout << nlohmann::json({
                     {"output", output_path},
                     {"success", true},
@@ -2234,7 +2265,7 @@ bool solve_loaded_contingency(
                 solve.wall_seconds = linearized_wall_seconds;
                 solve.iterations = linearized_iterations;
                 solve.state = std::move(nonlinear_candidate);
-                const nlohmann::json output = {
+                nlohmann::json output = {
                     {"success", true},
                     {"solver_status_success", true},
                     {"accepted_feasible_nonconverged", false},
@@ -2255,10 +2286,10 @@ bool solve_loaded_contingency(
                     {"acceptable_termination_enabled", false},
                     {"resident_model_created", false},
                     {"model_preparation_wall_seconds", 0.0},
-                    {"solve", gravityx::solve_result_to_submission_json(solve)},
+                    {"solve", gravityx::solve_result_to_json(solve, false)},
                     {"validation", nonlinear_validation.to_json()},
                 };
-                write_json_file(output_path, output);
+                complete(std::move(output), solve.state);
                 std::cout << nlohmann::json({
                     {"output", output_path},
                     {"success", true},
@@ -2291,7 +2322,7 @@ bool solve_loaded_contingency(
             solve.wall_seconds = linearized_wall_seconds;
             solve.iterations = linearized_iterations;
             solve.state = std::move(best_state);
-            const nlohmann::json output = {
+            nlohmann::json output = {
                 {"success", false},
                 {"solver_status_success", false},
                 {"accepted_feasible_nonconverged", false},
@@ -2313,10 +2344,10 @@ bool solve_loaded_contingency(
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},
                 {"model_preparation_wall_seconds", 0.0},
-                {"solve", gravityx::solve_result_to_json(solve, true)},
+                {"solve", gravityx::solve_result_to_json(solve, false)},
                 {"validation", best_validation.to_json()},
             };
-            write_json_file(output_path, output);
+            complete(std::move(output), solve.state, true);
             return false;
         }
     }
@@ -2354,7 +2385,7 @@ bool solve_loaded_contingency(
     const bool success = gravityx::validated_candidate_is_feasible(
         solve, validation, 1e-5);
     const bool accepted_feasible_nonconverged = success && !solver_status_success;
-    const nlohmann::json output = {
+    nlohmann::json output = {
         {"success", success},
         {"solver_status_success", solver_status_success},
         {"accepted_feasible_nonconverged", accepted_feasible_nonconverged},
@@ -2375,10 +2406,10 @@ bool solve_loaded_contingency(
         {"acceptable_termination_enabled", acceptable_termination},
         {"resident_model_created", resident_model_created},
         {"model_preparation_wall_seconds", preparation_seconds},
-        {"solve", gravityx::solve_result_to_submission_json(solve)},
+        {"solve", gravityx::solve_result_to_json(solve, false)},
         {"validation", validation.to_json()},
     };
-    write_json_file(output_path, output);
+    complete(std::move(output), solve.state);
     std::cout << nlohmann::json({
         {"output", output_path},
         {"success", success},
@@ -2532,6 +2563,16 @@ int run_contingency_worker(
         }
         const auto label = task.at("label").get<std::string>();
         const auto output_path = task.at("output_path").get<std::string>();
+        const std::optional<std::string> fallback_output_path =
+            task.contains("fallback_output_path")
+            ? std::make_optional(
+                  task.at("fallback_output_path").get<std::string>())
+            : std::nullopt;
+        const bool remove_output_after_result =
+            task.value("remove_output_after_result", false);
+        if (fallback_output_path) {
+            reject_onedrive(*fallback_output_path);
+        }
         const std::optional<std::string> solution_path =
             task.contains("solution_path")
             ? std::make_optional(
@@ -2556,6 +2597,7 @@ int run_contingency_worker(
             precomputed_fast_state = gravityx::ac_state_from_json(
                 fast_screen_json.at("solve").at("state"));
         }
+        std::optional<ContingencyComputation> completed_computation;
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
             reusable_model ? &resident_model : nullptr,
@@ -2565,24 +2607,17 @@ int run_contingency_worker(
             rolling_corrective_seed ? &*rolling_corrective_seed : nullptr,
             rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr,
             (linearized_fallback || fast_only)
-                ? &corrective_seed_bank : nullptr);
-        std::optional<nlohmann::json> completed_result;
+                ? &corrective_seed_bank : nullptr,
+            &completed_computation, !remove_output_after_result);
         double result_read_seconds = 0.0;
-        if (success &&
-            (solution_path.has_value() ||
-             ((linearized_fallback || fast_only) &&
-              data.buses.size() >= 16000))) {
-            const auto result_read_start = std::chrono::steady_clock::now();
-            completed_result = read_json_file(output_path);
-            result_read_seconds += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - result_read_start).count();
+        if (success && !completed_computation) {
+            throw std::runtime_error(
+                "contingency worker produced no in-memory result for " + label);
         }
         bool solution_written = false;
         double solution_write_seconds = 0.0;
-        if (solution_path && completed_result &&
-            completed_result->value("success", false) &&
-            completed_result->contains("solve") &&
-            completed_result->at("solve").contains("state")) {
+        if (solution_path && completed_computation &&
+            completed_computation->result.value("success", false)) {
             const auto contingency = std::find_if(
                 data.contingencies.begin(), data.contingencies.end(),
                 [&](const gravityx::Contingency& item) {
@@ -2592,30 +2627,40 @@ int run_contingency_worker(
                 throw std::runtime_error(
                     "cannot write solution for unknown contingency " + label);
             }
-            const auto verified_state = gravityx::ac_state_from_json(
-                completed_result->at("solve").at("state"));
             const auto solution_write_start =
                 std::chrono::steady_clock::now();
             gravityx::write_go_solution(
-                *solution_path, data, verified_state, base.commitment,
+                *solution_path, data, completed_computation->state,
+                base.commitment,
                 &*contingency);
             solution_write_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - solution_write_start)
                 .count();
             solution_written = true;
         }
+        bool fallback_result_persisted = false;
+        double fallback_result_persist_seconds = 0.0;
+        if (fallback_output_path && completed_computation &&
+            completed_computation->result.value(
+                "requires_exact_fallback", false)) {
+            const auto persist_start = std::chrono::steady_clock::now();
+            auto fallback_result = completed_computation->result;
+            fallback_result["solve"]["state"] =
+                gravityx::ac_submission_state_to_json(
+                    completed_computation->state);
+            write_json_file(*fallback_output_path, fallback_result);
+            fallback_result_persist_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - persist_start)
+                    .count();
+            fallback_result_persisted = true;
+        }
         bool rolling_corrective_seed_updated = false;
         if (success && (linearized_fallback || fast_only) &&
-            data.buses.size() >= 16000) {
-            if (!completed_result) {
-                completed_result = read_json_file(output_path);
-            }
-            const auto& result_json = *completed_result;
-            if (result_json.value("success", false) &&
-                result_json.contains("solve") &&
-                result_json.at("solve").contains("state")) {
-                auto verified_corrective_state = gravityx::ac_state_from_json(
-                    result_json.at("solve").at("state"));
+            data.buses.size() >= 16000 && completed_computation) {
+            const auto& result_json = completed_computation->result;
+            if (result_json.value("success", false)) {
+                auto verified_corrective_state = completed_computation->state;
                 rolling_corrective_seed = verified_corrective_state;
                 rolling_corrective_seed_label = label;
                 corrective_seed_bank.erase(
@@ -2639,8 +2684,8 @@ int run_contingency_worker(
             }
         }
         nlohmann::json result_summary = nullptr;
-        if (completed_result) {
-            const auto& result_json = *completed_result;
+        if (completed_computation) {
+            const auto& result_json = completed_computation->result;
             const auto& solve_json = result_json.at("solve");
             const auto& validation_json = result_json.at("validation");
             std::string fast_screen_failure_reason;
@@ -2664,6 +2709,10 @@ int run_contingency_worker(
                  result_json.value("solution_method", std::string())},
                 {"fast_power_flow_screen",
                  result_json.value("fast_power_flow_screen", false)},
+                {"rolling_corrective_seed_label",
+                 result_json.contains("rolling_corrective_seed_label")
+                     ? result_json.at("rolling_corrective_seed_label")
+                     : nlohmann::json(nullptr)},
                 {"precomputed_fast_screen_reference",
                  result_json.value(
                      "precomputed_fast_screen_reference", false)},
@@ -2691,6 +2740,25 @@ int run_contingency_worker(
                 }},
             };
         }
+        bool transient_output_removed = false;
+        if (remove_output_after_result) {
+            std::error_code remove_error;
+            if (std::filesystem::exists(output_path, remove_error)) {
+                std::filesystem::remove(output_path, remove_error);
+            }
+            if (remove_error) {
+                throw std::runtime_error(
+                    "cannot remove transient contingency result " +
+                    output_path + ": " + remove_error.message());
+            }
+            transient_output_removed =
+                !std::filesystem::exists(output_path, remove_error);
+            if (remove_error) {
+                throw std::runtime_error(
+                    "cannot verify transient contingency cleanup " +
+                    output_path + ": " + remove_error.message());
+            }
+        }
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
@@ -2706,6 +2774,10 @@ int run_contingency_worker(
             {"solution_written", solution_written},
             {"result_read_seconds", result_read_seconds},
             {"solution_write_seconds", solution_write_seconds},
+            {"fallback_result_persisted", fallback_result_persisted},
+            {"fallback_result_persist_seconds",
+             fallback_result_persist_seconds},
+            {"transient_output_removed", transient_output_removed},
             {"result_summary", result_summary},
         }).dump() << std::endl;
         if (!success) {

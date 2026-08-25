@@ -1019,6 +1019,7 @@ def main() -> int:
     parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
+    parser.add_argument("--wsl-fast-screen-scratch", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
     parser.add_argument("--robust-contingency-base", action="store_true")
@@ -1051,6 +1052,13 @@ def main() -> int:
         parser.error(
             "--fast-screen-easy-first requires "
             "--fast-screen-affinity-schedule"
+        )
+    if args.wsl_fast_screen_scratch and not (
+        args.two_stage_contingency_screen and args.cpp_solution_writer
+    ):
+        parser.error(
+            "--wsl-fast-screen-scratch requires "
+            "--two-stage-contingency-screen and --cpp-solution-writer"
         )
     if (args.defer_fallback_until_screen_complete and
             not args.two_stage_contingency_screen):
@@ -1168,6 +1176,7 @@ def main() -> int:
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "cpp_solution_writer": args.cpp_solution_writer,
         "fast_screen_easy_first": args.fast_screen_easy_first,
+        "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
@@ -1588,8 +1597,18 @@ def main() -> int:
                         assert process.stdin is not None
                         task = {
                             "label": label,
-                            "output_path": to_wsl(result_path),
+                            "output_path": (
+                                f"/dev/shm/gravityx_go2_{os.getpid()}_"
+                                f"{worker_id:03d}.json"
+                                if args.wsl_fast_screen_scratch
+                                else to_wsl(result_path)
+                            ),
                         }
+                        if args.wsl_fast_screen_scratch:
+                            task["fallback_output_path"] = to_wsl(
+                                result_path
+                            )
+                            task["remove_output_after_result"] = True
                         if args.cpp_solution_writer:
                             task["solution_path"] = to_wsl(
                                 args.output_dir / f"solution_{label}.txt"
@@ -1624,6 +1643,14 @@ def main() -> int:
                         if result.get("success", False):
                             save_secure_result(item, result, worker_id, "fast_screen")
                         elif result.get("screen_completed", False):
+                            if (args.wsl_fast_screen_scratch and
+                                    not acknowledgement.get(
+                                        "fallback_result_persisted", False
+                                    )):
+                                raise RuntimeError(
+                                    f"fast screen {label} did not persist its "
+                                    "fallback seed"
+                                )
                             with progress_lock:
                                 fallback_items.append(item)
                                 assignment = fallback_schedule.get(label)

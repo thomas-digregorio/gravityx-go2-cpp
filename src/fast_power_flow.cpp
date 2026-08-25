@@ -774,6 +774,12 @@ std::vector<std::vector<int>> connected_components(
 }  // namespace
 
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
+    struct LowRankUpdate {
+        bool enabled{};
+        Eigen::MatrixXd difference_rows;
+        Eigen::MatrixXd correction;
+    };
+
     bool valid{};
     double preparation_seconds{};
     std::vector<int> angle_index;
@@ -789,6 +795,8 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     SparseMatrix reactive_jacobian;
     Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>>
         reactive_factorization;
+    LowRankUpdate active_outage_update;
+    LowRankUpdate reactive_outage_update;
 
     FixedJacobianPredictorCache(
         const CaseData& data,
@@ -960,23 +968,252 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         }
         SparseMatrix jacobian(dimension, dimension);
         jacobian.setFromTriplets(entries.begin(), entries.end());
-        factorization.analyzePattern(jacobian);
-        factorization.factorize(jacobian);
-        valid = factorization.info() == Eigen::Success;
         active_jacobian.resize(angle_count, angle_count);
         active_jacobian.setFromTriplets(
             active_entries.begin(), active_entries.end());
-        active_factorization.analyzePattern(active_jacobian);
-        active_factorization.factorize(active_jacobian);
-        active_valid = active_factorization.info() == Eigen::Success;
         reactive_jacobian.resize(voltage_count, voltage_count);
         reactive_jacobian.setFromTriplets(
             reactive_entries.begin(), reactive_entries.end());
+        factorization.analyzePattern(jacobian);
+        factorization.factorize(jacobian);
+        valid = factorization.info() == Eigen::Success;
+        active_factorization.analyzePattern(active_jacobian);
+        active_factorization.factorize(active_jacobian);
+        active_valid = active_factorization.info() == Eigen::Success;
         reactive_factorization.analyzePattern(reactive_jacobian);
         reactive_factorization.factorize(reactive_jacobian);
         reactive_valid = reactive_factorization.info() == Eigen::Success;
         preparation_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started).count();
+    }
+
+    template <typename Factorization>
+    static bool prepare_low_rank_update(
+        const SparseMatrix& difference,
+        Factorization& base_factorization,
+        LowRankUpdate& update) {
+        update = {};
+        const int dimension = difference.rows();
+        if (dimension <= 0 || difference.cols() != dimension) {
+            return false;
+        }
+        using RowSparseMatrix =
+            Eigen::SparseMatrix<double, Eigen::RowMajor>;
+        const RowSparseMatrix row_difference = difference;
+        std::vector<int> changed_rows;
+        for (int row = 0; row < row_difference.outerSize(); ++row) {
+            bool changed = false;
+            for (RowSparseMatrix::InnerIterator entry(row_difference, row);
+                 entry; ++entry) {
+                if (std::abs(entry.value()) > 1e-12) {
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) {
+                changed_rows.push_back(row);
+            }
+        }
+        // Removing one AC branch changes only the P/Q equations at its two
+        // terminal buses. More rows indicate an island/reference change, for
+        // which the base factorization is not a valid Woodbury parent.
+        if (changed_rows.size() > 4) {
+            return false;
+        }
+        const int rank = static_cast<int>(changed_rows.size());
+        update.enabled = true;
+        if (rank == 0) {
+            return true;
+        }
+        update.difference_rows = Eigen::MatrixXd::Zero(rank, dimension);
+        Eigen::MatrixXd row_selector = Eigen::MatrixXd::Zero(dimension, rank);
+        for (int position = 0; position < rank; ++position) {
+            const int row = changed_rows[position];
+            row_selector(row, position) = 1.0;
+            for (RowSparseMatrix::InnerIterator entry(row_difference, row);
+                 entry; ++entry) {
+                update.difference_rows(position, entry.col()) = entry.value();
+            }
+        }
+        const Eigen::MatrixXd inverse_rows =
+            base_factorization.solve(row_selector);
+        if (base_factorization.info() != Eigen::Success ||
+            !inverse_rows.allFinite()) {
+            update = {};
+            return false;
+        }
+        const Eigen::MatrixXd small_system =
+            Eigen::MatrixXd::Identity(rank, rank) +
+            update.difference_rows * inverse_rows;
+        Eigen::FullPivLU<Eigen::MatrixXd> small_factorization(small_system);
+        small_factorization.setThreshold(1e-10);
+        if (!small_factorization.isInvertible()) {
+            update = {};
+            return false;
+        }
+        update.correction = inverse_rows * small_factorization.inverse();
+        if (!update.correction.allFinite()) {
+            update = {};
+            return false;
+        }
+        return true;
+    }
+
+    bool configure_branch_outage_update(
+        const CaseData& data,
+        const AcState& reference_state,
+        int outaged_branch) {
+        active_outage_update = {};
+        reactive_outage_update = {};
+        if (outaged_branch < 0 || !valid || !active_valid ||
+            !reactive_valid) {
+            return false;
+        }
+        if (outaged_branch >= static_cast<int>(data.branches.size())) {
+            return false;
+        }
+        const auto& branch = data.branches[outaged_branch];
+        if (branch.status == 0 || branch.from == branch.to ||
+            std::abs(branch.tap) <= 1e-12) {
+            return false;
+        }
+        const double denominator =
+            branch.r * branch.r + branch.x * branch.x;
+        if (denominator <= 1e-20) {
+            return false;
+        }
+        const double g = branch.r / denominator;
+        const double b = -branch.x / denominator;
+        const double tm2 = branch.tap * branch.tap;
+        const double tr = branch.tap * std::cos(branch.shift);
+        const double ti = branch.tap * std::sin(branch.shift);
+        const double from_g_self = branch.transformer
+            ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
+        const double from_b_self = branch.transformer
+            ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
+        const auto terminal_flows = [&](const std::array<double, 4>& point) {
+            const double vf = point[0];
+            const double af = point[1];
+            const double vt = point[2];
+            const double at = point[3];
+            const double cross_cos_ft =
+                vf * vt * std::cos(af - at);
+            const double cross_sin_ft =
+                vf * vt * std::sin(af - at);
+            const double cross_cos_tf =
+                vt * vf * std::cos(at - af);
+            const double cross_sin_tf =
+                vt * vf * std::sin(at - af);
+            return std::array<double, 4>{
+                from_g_self * vf * vf +
+                    ((-g * tr + b * ti) / tm2) * cross_cos_ft +
+                    ((-b * tr - g * ti) / tm2) * cross_sin_ft,
+                -from_b_self * vf * vf -
+                    ((-b * tr - g * ti) / tm2) * cross_cos_ft +
+                    ((-g * tr + b * ti) / tm2) * cross_sin_ft,
+                (g + branch.g_to) * vt * vt +
+                    ((-g * tr - b * ti) / tm2) * cross_cos_tf +
+                    ((-b * tr + g * ti) / tm2) * cross_sin_tf,
+                -(b + branch.b_to) * vt * vt -
+                    ((-b * tr + g * ti) / tm2) * cross_cos_tf +
+                    ((-g * tr - b * ti) / tm2) * cross_sin_tf,
+            };
+        };
+        const int from = branch.from;
+        const int to = branch.to;
+        const std::array<double, 4> reference{
+            reference_state.vm[from], reference_state.va[from],
+            reference_state.vm[to], reference_state.va[to]};
+        Eigen::Matrix<double, 4, 4> derivative;
+        constexpr double kDifferenceStep = 1e-6;
+        for (int variable = 0; variable < 4; ++variable) {
+            auto lower = reference;
+            auto upper = reference;
+            lower[variable] -= kDifferenceStep;
+            upper[variable] += kDifferenceStep;
+            const auto lower_flow = terminal_flows(lower);
+            const auto upper_flow = terminal_flows(upper);
+            for (int flow = 0; flow < 4; ++flow) {
+                derivative(flow, variable) =
+                    (upper_flow[flow] - lower_flow[flow]) /
+                    (2.0 * kDifferenceStep);
+            }
+        }
+
+        std::vector<Triplet> active_difference_entries;
+        const std::array<int, 2> terminal_buses{from, to};
+        const std::array<int, 2> active_flow_rows{0, 2};
+        for (int terminal = 0; terminal < 2; ++terminal) {
+            const int row = angle_index[terminal_buses[terminal]];
+            if (row < 0) {
+                continue;
+            }
+            for (int variable_terminal = 0; variable_terminal < 2;
+                 ++variable_terminal) {
+                const int column = angle_index[
+                    terminal_buses[variable_terminal]];
+                if (column >= 0) {
+                    active_difference_entries.emplace_back(
+                        row, column,
+                        -derivative(
+                            active_flow_rows[terminal],
+                            1 + 2 * variable_terminal));
+                }
+            }
+        }
+        SparseMatrix active_difference(angle_count, angle_count);
+        active_difference.setFromTriplets(
+            active_difference_entries.begin(),
+            active_difference_entries.end());
+
+        std::vector<Triplet> reactive_difference_entries;
+        const std::array<int, 2> reactive_flow_rows{1, 3};
+        for (int terminal = 0; terminal < 2; ++terminal) {
+            const int row = voltage_index[terminal_buses[terminal]];
+            for (int variable_terminal = 0; variable_terminal < 2;
+                 ++variable_terminal) {
+                const int column = voltage_index[
+                    terminal_buses[variable_terminal]];
+                reactive_difference_entries.emplace_back(
+                    row, column,
+                    -derivative(
+                        reactive_flow_rows[terminal],
+                        2 * variable_terminal));
+            }
+        }
+        SparseMatrix reactive_difference(voltage_count, voltage_count);
+        reactive_difference.setFromTriplets(
+            reactive_difference_entries.begin(),
+            reactive_difference_entries.end());
+
+        const bool active_ready = prepare_low_rank_update(
+            active_difference, active_factorization, active_outage_update);
+        const bool reactive_ready = prepare_low_rank_update(
+            reactive_difference, reactive_factorization,
+            reactive_outage_update);
+        if (!active_ready || !reactive_ready) {
+            active_outage_update = {};
+            reactive_outage_update = {};
+            return false;
+        }
+        return true;
+    }
+
+    template <typename Factorization>
+    static Eigen::VectorXd solve_with_update(
+        Factorization& base_factorization,
+        const Eigen::VectorXd& right_hand_side,
+        const LowRankUpdate& update) {
+        Eigen::VectorXd solution =
+            base_factorization.solve(right_hand_side);
+        if (base_factorization.info() != Eigen::Success ||
+            !solution.allFinite() || !update.enabled ||
+            update.difference_rows.rows() == 0) {
+            return solution;
+        }
+        solution -= update.correction *
+            (update.difference_rows * solution);
+        return solution;
     }
 
     bool apply_correction(
@@ -1060,7 +1297,8 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
                     p_spec[bus] - p_network[bus];
             }
         }
-        const Eigen::VectorXd step = active_factorization.solve(mismatch);
+        const Eigen::VectorXd step = solve_with_update(
+            active_factorization, mismatch, active_outage_update);
         if (active_factorization.info() != Eigen::Success ||
             !step.allFinite()) {
             return false;
@@ -1228,7 +1466,8 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
                     q_spec[bus] - q_network[bus];
             }
         }
-        const Eigen::VectorXd step = reactive_factorization.solve(mismatch);
+        const Eigen::VectorXd step = solve_with_update(
+            reactive_factorization, mismatch, reactive_outage_update);
         if (reactive_factorization.info() != Eigen::Success ||
             !step.allFinite()) {
             return false;
@@ -1270,7 +1509,8 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         Eigen::VectorXd mismatch(voltage_count);
         mismatch.setZero();
         mismatch[voltage_index[target_bus]] = target_network_q_change;
-        const Eigen::VectorXd step = reactive_factorization.solve(mismatch);
+        const Eigen::VectorXd step = solve_with_update(
+            reactive_factorization, mismatch, reactive_outage_update);
         if (reactive_factorization.info() != Eigen::Success ||
             !step.allFinite()) {
             return false;
@@ -1319,7 +1559,8 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         if (mismatch.lpNorm<Eigen::Infinity>() <= 1e-12) {
             return false;
         }
-        const Eigen::VectorXd step = reactive_factorization.solve(mismatch);
+        const Eigen::VectorXd step = solve_with_update(
+            reactive_factorization, mismatch, reactive_outage_update);
         if (reactive_factorization.info() != Eigen::Success ||
             !step.allFinite()) {
             return false;
@@ -2189,6 +2430,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             output.fixed_jacobian_predictor_preparation_seconds =
                 predictor_cache_->preparation_seconds;
         }
+        bool branch_outage_low_rank_update = false;
+        if (predictor_cache_ && outaged_branch < 0) {
+            predictor_cache_->configure_branch_outage_update(
+                data_, base_state_, -1);
+        }
         if (predictor_cache_ && predictor_cache_->valid) {
             AcState predictor_state = initial_state;
             predictor_state.pg = pg;
@@ -2457,6 +2703,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 }
                 output.fixed_jacobian_predictor_trace.push_back({
                     {"iteration", predictor_iteration},
+                    {"branch_outage_low_rank_update",
+                     branch_outage_low_rank_update},
                     {"generation_total", predictor_generation_total},
                     {"load_total", predictor_load_total},
                     {"validation", predictor_validation.to_json()},
@@ -2482,6 +2730,14 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 if (predictor_iteration ==
                     kMaximumFixedJacobianIterations) {
                     break;
+                }
+                if (predictor_iteration == 0 && outaged_branch >= 0) {
+                    branch_outage_low_rank_update =
+                        predictor_cache_->configure_branch_outage_update(
+                            data_, base_state_, outaged_branch);
+                    output.fixed_jacobian_predictor_trace.back()[
+                        "branch_outage_low_rank_prepared"] =
+                        branch_outage_low_rank_update;
                 }
 
                 std::vector<double> p_spec(
@@ -2594,6 +2850,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 std::string selected_correction_mode = "none";
                 constexpr std::array<double, 5> kDampingCandidates{
                     1.0, 0.5, 0.25, 0.125, 0.0625};
+                const auto strongly_improving_full_damping = [&]
+                    (double damping, const ValidationReport& validation) {
+                    return branch_outage_low_rank_update && damping == 1.0 &&
+                        validation.max_residual <=
+                            0.5 * predictor_validation.max_residual;
+                };
                 const bool active_block_dominant =
                     predictor_validation.worst_category ==
                         "active_balance" &&
@@ -2899,6 +3161,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     selected_damping = damping;
                                     selected_correction_mode =
                                         "active_branch_flow_angle";
+                                    if (strongly_improving_full_damping(
+                                            damping, trial_validation)) {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -2948,6 +3214,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     best_redispatch_validation =
                                         trial_validation;
                                     best_redispatch_damping = damping;
+                                    if (strongly_improving_full_damping(
+                                            damping, trial_validation)) {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -2998,6 +3268,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_validation = trial_validation;
                             selected_damping = damping;
                             selected_correction_mode = "active_angle";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                     if (active_block_dominant) {
@@ -3022,6 +3296,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_damping = damping;
                             selected_correction_mode =
                                 "local_reactive_least_squares";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                     for (const double damping : kDampingCandidates) {
@@ -3074,6 +3352,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_correction_mode =
                                 "local_reactive_least_squares_then_"
                                 "active_angle";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                     if (selected_damping != 0.0) {
@@ -3098,6 +3380,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_damping = damping;
                             selected_correction_mode =
                                 "reactive_feasibility_band";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                     for (const double damping : kDampingCandidates) {
@@ -3118,6 +3404,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_validation = trial_validation;
                             selected_damping = damping;
                             selected_correction_mode = "reactive_voltage";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                     for (const double damping : kDampingCandidates) {
@@ -3169,6 +3459,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_damping = damping;
                             selected_correction_mode =
                                 "reactive_voltage_then_active_angle";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                     for (const double damping : kDampingCandidates) {
@@ -3190,6 +3484,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_damping = damping;
                             selected_correction_mode =
                                 "coupled_angle_voltage";
+                            if (strongly_improving_full_damping(
+                                    damping, trial_validation)) {
+                                break;
+                            }
                         }
                     }
                 };

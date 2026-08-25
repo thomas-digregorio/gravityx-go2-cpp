@@ -64,6 +64,16 @@ def effective_process_timeout(
     return min(per_process_timeout, remaining)
 
 
+def code2_completed_within_limit(
+    elapsed_seconds: float,
+    limit_seconds: float,
+    timed_out: bool,
+) -> bool:
+    if elapsed_seconds < 0 or limit_seconds <= 0:
+        raise ValueError("Code2 elapsed and limit values must be positive")
+    return not timed_out and elapsed_seconds <= limit_seconds
+
+
 def streamed_queue_get(
     task_queue: queue.Queue[dict[str, Any]],
     screening_finished: threading.Event,
@@ -1269,6 +1279,11 @@ def main() -> int:
                     + "\n"
                 )
                 process.stdin.flush()
+                print(
+                    f"started fallback: {label} on corrective worker "
+                    f"{worker_id}",
+                    flush=True,
+                )
                 acknowledgement = json.loads(
                     read_until("GRAVITYX_TASK_RESULT ")
                 )
@@ -1431,10 +1446,14 @@ def main() -> int:
             fast_pool.shutdown(wait=True, cancel_futures=True)
         pool.shutdown(wait=True, cancel_futures=True)
         contingency_wall = time.perf_counter() - contingency_start
+        timed_out = isinstance(error, CompetitionTimeout)
         run_status.update(
             {
                 "stage": "code2",
-                "code2_within_limit": contingency_wall <= code2_limit,
+                "code2_within_limit": code2_completed_within_limit(
+                    contingency_wall, code2_limit, timed_out
+                ),
+                "code2_timed_out": timed_out,
                 "end_to_end_within_limit": time.perf_counter() <= total_deadline,
                 "contingency_parallel_wall_seconds": contingency_wall,
                 "error": str(error),

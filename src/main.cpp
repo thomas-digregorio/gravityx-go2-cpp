@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -332,6 +333,26 @@ int run_parallel_circuit_regression() {
     gravityx::ContingencyContext branch_context;
     branch_context.outaged_branch = branch_contingency.component;
     branch_context.base_state = solve.state;
+    const auto full_contingency_seed = gravityx::solve_linearized_ac_seed(
+        data, solve.state, {1}, 0.49, branch_context);
+    const auto balance_only_contingency_seed =
+        gravityx::solve_linearized_ac_seed(
+            data, solve.state, {1}, 0.49, branch_context,
+            true, false, 60.0, true, true);
+    if (!full_contingency_seed.success ||
+        !balance_only_contingency_seed.success ||
+        !balance_only_contingency_seed.projected_balance_slack ||
+        !balance_only_contingency_seed.branch_security_rows_omitted ||
+        !balance_only_contingency_seed.feasibility_only ||
+        std::abs(balance_only_contingency_seed.ipm_optimality_tolerance -
+                 1e-4) > 1e-12 ||
+        std::abs(full_contingency_seed.ipm_optimality_tolerance -
+                 1e-8) > 1e-14 ||
+        balance_only_contingency_seed.row_count >=
+            full_contingency_seed.row_count) {
+        throw std::runtime_error(
+            "balance-only contingency Phase-I regression failed");
+    }
     const auto contingency_rating_validation = gravityx::validate_state(
         contingency_rating_data, gravityx::ModelMode::ContingencySoft,
         fast_result.solve.state, {1}, branch_context);
@@ -981,6 +1002,7 @@ bool solve_loaded_contingency(
     }
 
     std::optional<gravityx::AcState> linearized_seed;
+    std::optional<gravityx::FastPowerFlowResult> prelinear_fast_repair;
     nlohmann::json linearized_attempts = nlohmann::json::array();
     if (linearized_fallback) {
         auto best_state = fast_result
@@ -994,6 +1016,76 @@ bool solve_loaded_contingency(
             fast_result->solve.objective = best_objective;
             fast_result->validation = best_validation;
         }
+        // The large-case fast solver can discover a much better intermediate
+        // AC state than its terminal iterate.  After preserving that state,
+        // give Newton one inexpensive restart before constructing a 121k-
+        // column LP.  This remains an exact acceptance path: the rebuilt state
+        // must pass the complete independent contingency validator.
+        if (data.buses.size() >= 16000 && fast_power_flow != nullptr &&
+            fast_result.has_value()) {
+            prelinear_fast_repair =
+                fast_power_flow->solve(*match, best_state);
+            if (!prelinear_fast_repair->solve.state.vm.empty()) {
+                auto repaired_state = prelinear_fast_repair->solve.state;
+                const double repaired_objective =
+                    gravityx::rebuild_contingency_state_derived_fields(
+                        data, base.state, base.commitment, *match,
+                        repaired_state);
+                const auto repaired_validation = gravityx::validate_state(
+                    data, gravityx::ModelMode::ContingencySoft,
+                    repaired_state, base.commitment, context);
+                prelinear_fast_repair->solve.state = repaired_state;
+                prelinear_fast_repair->solve.objective = repaired_objective;
+                prelinear_fast_repair->validation = repaired_validation;
+                prelinear_fast_repair->feasible =
+                    repaired_validation.max_residual <= 1e-5;
+                if (repaired_validation.max_residual <
+                    best_validation.max_residual) {
+                    best_state = repaired_state;
+                    best_objective = repaired_objective;
+                    best_validation = repaired_validation;
+                }
+                if (prelinear_fast_repair->feasible) {
+                    auto solve = prelinear_fast_repair->solve;
+                    solve.wall_seconds = prelinear_fast_repair->wall_seconds +
+                        (fast_result ? fast_result->wall_seconds : 0.0);
+                    const nlohmann::json output = {
+                        {"success", true},
+                        {"solver_status_success", true},
+                        {"accepted_feasible_nonconverged", false},
+                        {"label", match->label},
+                        {"type", match->type == gravityx::ContingencyType::Generator ? "gen" : "branch"},
+                        {"source_index", match->source_index},
+                        {"component_position", match->component},
+                        {"solution_method", "iterated_fast_newton_power_flow"},
+                        {"precomputed_fast_screen_reference", reused_fast_screen_reference},
+                        {"fast_power_flow_screen", true},
+                        {"fast_screen", fast_result->to_json()},
+                        {"prelinear_fast_repair", prelinear_fast_repair->to_json()},
+                        {"linearized_attempts", linearized_attempts},
+                        {"resident_parametric_model", false},
+                        {"acceptable_termination_enabled", false},
+                        {"resident_model_created", false},
+                        {"model_preparation_wall_seconds", 0.0},
+                        {"solve", gravityx::solve_result_to_submission_json(solve)},
+                        {"validation", repaired_validation.to_json()},
+                    };
+                    write_json_file(output_path, output);
+                    std::cout << nlohmann::json({
+                        {"output", output_path},
+                        {"success", true},
+                        {"label", match->label},
+                        {"status", solve.status},
+                        {"objective", repaired_objective},
+                        {"wall_seconds", solve.wall_seconds},
+                        {"iterations", solve.iterations},
+                        {"max_residual", repaired_validation.max_residual},
+                        {"solution_method", "iterated_fast_newton_power_flow"},
+                    }).dump(2) << '\n';
+                    return true;
+                }
+            }
+        }
         auto reference = best_state;
         double linearized_wall_seconds = 0.0;
         int linearized_iterations = 0;
@@ -1002,13 +1094,34 @@ bool solve_loaded_contingency(
         std::string reference_source = fast_result ? "fast_screen" : "base";
         constexpr int kMaximumLinearizedRounds = 3;
         for (int round = 1; round <= kMaximumLinearizedRounds; ++round) {
+            // At 16k-bus scale the full security-row seed exceeds 120k rows
+            // and repeatedly exhausts its 60-second LP limit before producing
+            // a candidate.  Start with network balance, operating bounds, and
+            // trust regions only.  This is candidate generation, not an
+            // acceptance relaxation: sparse nonlinear repair and the complete
+            // validator still check every source branch rating and angle row.
+            const bool balance_only_phase_one =
+                data.buses.size() >= 16000 && round == 1;
+            // Keep a 0.25-p.u. interior margin below the source model's
+            // 0.5-p.u. corrective balance limit.  The previous 0.49 target
+            // left only 0.01 p.u. for AC linearization error; CTG_000005's
+            // returned linear point was LP-feasible but 0.115 p.u. outside
+            // the exact nonlinear balance envelope.
+            const double linearized_balance_slack =
+                balance_only_phase_one ? 0.25 : 0.49;
             auto linear = gravityx::solve_linearized_ac_seed(
-                data, reference, base.commitment, 0.49, context);
+                data, reference, base.commitment,
+                linearized_balance_slack, context,
+                balance_only_phase_one, false, 60.0, balance_only_phase_one,
+                balance_only_phase_one);
             linearized_wall_seconds += linear.wall_seconds;
             linearized_iterations += std::max(0, linear.iterations);
             auto attempt = linear.to_json(false);
             attempt["round"] = round;
             attempt["reference_source"] = reference_source;
+            attempt["balance_only_phase_one"] = balance_only_phase_one;
+            attempt["linearized_balance_slack"] =
+                linearized_balance_slack;
             if (!linear.success && data.buses.size() >= 8000 &&
                 (linear.status == "Infeasible" ||
                  linear.status == "Unknown")) {
@@ -1100,6 +1213,7 @@ bool solve_loaded_contingency(
                     {"precomputed_fast_screen_reference", reused_fast_screen_reference},
                     {"fast_power_flow_screen", fast_power_flow != nullptr},
                     {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
+                    {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"linearized_attempts", linearized_attempts},
                     {"resident_parametric_model", false},
                     {"acceptable_termination_enabled", false},
@@ -1157,6 +1271,38 @@ bool solve_loaded_contingency(
                     best_validation = nonlinear_validation;
                 }
             }
+            const char* linearized_log = std::getenv("GRAVITYX_HIGHS_LOG");
+            if (linearized_log != nullptr &&
+                std::string(linearized_log) != "0") {
+                std::cerr << "GRAVITYX_LINEARIZED_ROUND_RESULT "
+                          << nlohmann::json({
+                                 {"label", match->label},
+                                 {"round", round},
+                                 {"reference_source", reference_source},
+                                 {"linear_status", linear.status},
+                                 {"linearized_balance_slack",
+                                  linearized_balance_slack},
+                                 {"linear_validation", validation.to_json()},
+                                 {"linear_max_residual", validation.max_residual},
+                                 {"linear_worst_category", validation.worst_category},
+                                 {"linear_worst_identity", validation.worst_identity},
+                                 {"nonlinear_converged", nonlinear->converged},
+                                 {"nonlinear_feasible", nonlinear->feasible},
+                                 {"nonlinear_failure_reason", nonlinear->failure_reason},
+                                 {"nonlinear_validation",
+                                  nonlinear_validation.to_json()},
+                                 {"nonlinear_max_residual",
+                                  nonlinear_validation.max_residual},
+                                 {"nonlinear_worst_category",
+                                  nonlinear_validation.worst_category},
+                                 {"nonlinear_worst_identity",
+                                  nonlinear_validation.worst_identity},
+                                 {"nonlinear_wall_seconds", nonlinear->wall_seconds},
+                                 {"nonlinear_iterations",
+                                  nonlinear->solve.iterations},
+                             }).dump()
+                          << '\n';
+            }
             linearized_attempts.push_back(std::move(attempt));
             if (!nonlinear_candidate.vm.empty() &&
                 nonlinear_validation.max_residual <= 1e-5) {
@@ -1178,6 +1324,7 @@ bool solve_loaded_contingency(
                     {"precomputed_fast_screen_reference", reused_fast_screen_reference},
                     {"fast_power_flow_screen", fast_power_flow != nullptr},
                     {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
+                    {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                     {"linearized_attempts", linearized_attempts},
                     {"resident_parametric_model", false},
                     {"acceptable_termination_enabled", false},
@@ -1231,6 +1378,7 @@ bool solve_loaded_contingency(
                 {"linearized_status", last_status},
                 {"fast_power_flow_screen", fast_power_flow != nullptr},
                 {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
+                {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
                 {"linearized_attempts", linearized_attempts},
                 {"resident_parametric_model", false},
                 {"acceptable_termination_enabled", false},
@@ -1289,6 +1437,7 @@ bool solve_loaded_contingency(
         {"precomputed_fast_screen_reference", reused_fast_screen_reference},
         {"fast_power_flow_screen", fast_power_flow != nullptr},
         {"fast_screen", fast_result ? fast_result->to_json() : nlohmann::json(nullptr)},
+        {"prelinear_fast_repair", prelinear_fast_repair ? prelinear_fast_repair->to_json() : nlohmann::json(nullptr)},
         {"linearized_attempts", linearized_attempts},
         {"resident_parametric_model", reusable_model != nullptr},
         {"acceptable_termination_enabled", acceptable_termination},

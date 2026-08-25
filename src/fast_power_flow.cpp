@@ -772,6 +772,12 @@ nlohmann::json FastPowerFlowResult::to_json() const {
         {"distributed_balance_voltage_projections", distributed_balance_voltage_projections},
         {"distributed_balance_polish_failure_reason", distributed_balance_polish_failure_reason},
         {"distributed_balance_polish_validation", distributed_balance_polish_validation.to_json()},
+        {"best_intermediate_candidate_selected",
+         best_intermediate_candidate_selected},
+        {"best_intermediate_candidate_source",
+         best_intermediate_candidate_source},
+        {"best_intermediate_candidate_validation",
+         best_intermediate_candidate_validation.to_json()},
         {"newton_iterations", newton_iterations},
         {"initial_newton_residual", initial_newton_residual},
         {"active_redispatch_passes", active_redispatch_passes},
@@ -1220,6 +1226,23 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         data_,
         base_mode ? ModelMode::BaseSoft : ModelMode::ContingencySoft,
         direct_state, commitment_, direct_context);
+    AcState best_intermediate_state = direct_state;
+    ValidationReport best_intermediate_validation =
+        output.direct_candidate_validation;
+    std::string best_intermediate_source = "direct_candidate";
+    const auto retain_best_intermediate = [&best_intermediate_state,
+                                           &best_intermediate_validation,
+                                           &best_intermediate_source](
+                                              const AcState& candidate,
+                                              const ValidationReport& validation,
+                                              const std::string& source) {
+        if (validation.max_residual + 1e-12 <
+            best_intermediate_validation.max_residual) {
+            best_intermediate_state = candidate;
+            best_intermediate_validation = validation;
+            best_intermediate_source = source;
+        }
+    };
     if (output.direct_candidate_validation.max_residual <=
         options_.validation_tolerance) {
         output.converged = true;
@@ -1484,6 +1507,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         auto [active_only_state, active_only_validation] =
             evaluate_newton_candidate(false);
         output.active_only_newton_validation = active_only_validation;
+        retain_best_intermediate(
+            active_only_state, active_only_validation,
+            "active_only_newton");
         if (active_only_validation.max_residual <=
             options_.validation_tolerance) {
             output.converged = active_only.converged;
@@ -1605,6 +1631,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             }
         }
         output.reactive_only_newton_validation = reactive_validation;
+        retain_best_intermediate(
+            reactive_state, reactive_validation,
+            "reactive_only_newton");
         if (reactive_validation.max_residual <=
             options_.validation_tolerance) {
             output.converged = reactive_only.converged;
@@ -1694,6 +1723,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 }
             }
             output.newton_candidate_validation = newton_validation;
+            retain_best_intermediate(
+                newton_state, newton_validation,
+                "full_newton");
             if (newton_validation.max_residual <=
                 options_.validation_tolerance) {
                 output.converged = newton.converged;
@@ -2443,6 +2475,16 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         } else {
             state = original_state;
         }
+    }
+    output.best_intermediate_candidate_validation =
+        best_intermediate_validation;
+    if (best_intermediate_validation.max_residual + 1e-12 <
+        output.validation.max_residual) {
+        output.solve.state = std::move(best_intermediate_state);
+        output.validation = best_intermediate_validation;
+        output.best_intermediate_candidate_selected = true;
+        output.best_intermediate_candidate_source =
+            best_intermediate_source;
     }
     output.feasible = output.validation.max_residual <= options_.validation_tolerance;
     if (!output.feasible) {

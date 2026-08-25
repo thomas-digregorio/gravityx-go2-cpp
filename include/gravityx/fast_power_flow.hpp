@@ -43,6 +43,9 @@ struct FastPowerFlowResult {
     int distributed_balance_voltage_projections{};
     std::string distributed_balance_polish_failure_reason;
     ValidationReport distributed_balance_polish_validation;
+    bool best_intermediate_candidate_selected{};
+    std::string best_intermediate_candidate_source;
+    ValidationReport best_intermediate_candidate_validation;
     int newton_iterations{};
     double initial_newton_residual{};
     int active_redispatch_passes{};

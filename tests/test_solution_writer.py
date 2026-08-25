@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 from run_experiment import (  # noqa: E402
     CompetitionTimeout,
     apply_fallback_schedule_profile,
+    code2_completed_within_limit,
     code2_time_limit,
     effective_process_timeout,
     longest_first_contingencies,
@@ -275,6 +276,10 @@ class CompetitionTimingTests(unittest.TestCase):
     def test_process_timeout_is_bounded_by_stage_deadline(self):
         self.assertEqual(effective_process_timeout(300.0, 120.0, now=100.0), 20.0)
         self.assertEqual(effective_process_timeout(5.0, 120.0, now=100.0), 5.0)
+
+    def test_code2_timeout_is_not_reported_within_limit(self):
+        self.assertFalse(code2_completed_within_limit(475.9, 476.0, True))
+        self.assertTrue(code2_completed_within_limit(475.9, 476.0, False))
 
     def test_expired_stage_is_rejected_before_launch(self):
         with self.assertRaises(CompetitionTimeout):

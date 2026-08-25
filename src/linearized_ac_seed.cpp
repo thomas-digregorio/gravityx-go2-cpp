@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -173,8 +174,22 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"success", success},
         {"wall_seconds", wall_seconds},
         {"projected_balance_slack", projected_balance_slack},
+        {"branch_security_rows_omitted", branch_security_rows_omitted},
+        {"feasibility_only", feasibility_only},
+        {"solution_value_valid", solution_value_valid},
+        {"info_valid", info_valid},
+        {"accepted_feasible_nonoptimal_phase_one",
+         accepted_feasible_nonoptimal_phase_one},
         {"time_limit_seconds", time_limit_seconds},
+        {"ipm_optimality_tolerance", ipm_optimality_tolerance},
+        {"row_count", row_count},
+        {"column_count", column_count},
+        {"nonzero_count", nonzero_count},
+        {"run_status", run_status},
         {"model_status", model_status},
+        {"primal_solution_status", primal_solution_status},
+        {"num_primal_infeasibilities", num_primal_infeasibilities},
+        {"max_primal_infeasibility", max_primal_infeasibility},
         {"status", status},
         {"iterations", iterations},
         {"objective", objective},
@@ -193,7 +208,9 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const std::optional<ContingencyContext>& contingency,
     bool project_balance_slack,
     bool request_lightweight_large_seed,
-    double time_limit_seconds) {
+    double time_limit_seconds,
+    bool omit_branch_security_rows,
+    bool feasibility_only) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -212,6 +229,10 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     }
     if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
         throw std::runtime_error("linearized AC time limit must be positive");
+    }
+    if (omit_branch_security_rows && !contingency) {
+        throw std::runtime_error(
+            "branch-security-row omission is only valid for contingency seeds");
     }
     if (contingency) {
         const auto& base = contingency->base_state;
@@ -239,7 +260,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         ((contingency.has_value() && nb >= 8000) ||
          request_lightweight_large_seed);
     const bool projected_balance_slack =
-        lightweight_large_seed && project_balance_slack;
+        project_balance_slack &&
+        (lightweight_large_seed || feasibility_only);
 
     const int vm_offset = 0;
     const int va_offset = vm_offset + nb;
@@ -284,12 +306,13 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             upper[va_offset + i] = 0.0;
         }
         const double explicit_slack_upper =
-            lightweight_large_seed ? 0.0 : balance_slack_limit;
+            (lightweight_large_seed || feasibility_only)
+            ? 0.0 : balance_slack_limit;
         upper[p_pos_offset + i] = explicit_slack_upper;
         upper[p_neg_offset + i] = explicit_slack_upper;
         upper[q_pos_offset + i] = explicit_slack_upper;
         upper[q_neg_offset + i] = explicit_slack_upper;
-        if (!lightweight_large_seed) {
+        if (!lightweight_large_seed && !feasibility_only) {
             cost[p_pos_offset + i] = 1e6;
             cost[p_neg_offset + i] = 1e6;
             cost[q_pos_offset + i] = 1e6;
@@ -327,8 +350,10 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             lower[qg_offset + i] = gen.qmin;
             upper[qg_offset + i] = gen.qmax;
         }
-        cost[dpg_offset + i] = 1.0;
-        cost[dqg_offset + i] = 0.1;
+        if (!feasibility_only) {
+            cost[dpg_offset + i] = 1.0;
+            cost[dqg_offset + i] = 0.1;
+        }
     }
     for (int i = 0; i < nd; ++i) {
         const auto& load = data.loads[i];
@@ -357,7 +382,9 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
                 "empty load interval in linearized AC seed: "
                 + load.source_key);
         }
-        cost[dload_offset + i] = 1.0;
+        if (!feasibility_only) {
+            cost[dload_offset + i] = 1.0;
+        }
     }
 
     std::vector<LinearizedBranch> linearized(nl);
@@ -477,52 +504,54 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         return std::pair<double, double>{minimum, maximum};
     };
 
-    for (int i = 0; i < nl; ++i) {
-        if (i == outaged_branch) {
-            continue;
-        }
-        const auto& branch = data.branches[i];
-        const double rating = contingency ? branch.rate_c : branch.rate_a;
-        const std::array<const AffineFlow*, 4> flows{
-            &linearized[i].pf, &linearized[i].qf,
-            &linearized[i].pt, &linearized[i].qt};
-        for (const auto* flow : flows) {
-            if (lightweight_large_seed) {
-                const auto [minimum, maximum] = affine_range(*flow, branch);
-                if (minimum >= -rating && maximum <= rating) {
-                    continue;
-                }
+    if (!omit_branch_security_rows) {
+        for (int i = 0; i < nl; ++i) {
+            if (i == outaged_branch) {
+                continue;
             }
-            SparseRow row;
-            row.lower = -rating - flow->constant;
-            row.upper = rating - flow->constant;
-            append(row, vm_offset + branch.from, flow->vm_from);
-            append(row, vm_offset + branch.to, flow->vm_to);
-            append(row, va_offset + branch.from, flow->va_from);
-            append(row, va_offset + branch.to, flow->va_to);
-            normalize(row);
-            rows.push_back(std::move(row));
-        }
-        const double source_delta = contingency
-            ? contingency->base_state.va[branch.from]
-                - contingency->base_state.va[branch.to]
-            : data.buses[branch.from].va_start
-                - data.buses[branch.to].va_start;
-        const double angle_minimum =
-            lower[va_offset + branch.from] - upper[va_offset + branch.to];
-        const double angle_maximum =
-            upper[va_offset + branch.from] - lower[va_offset + branch.to];
-        const bool angle_row_is_redundant =
-            lightweight_large_seed &&
-            angle_minimum >= branch.angmin && angle_maximum <= branch.angmax;
-        if (source_delta >= branch.angmin && source_delta <= branch.angmax &&
-            !angle_row_is_redundant) {
-            SparseRow angle;
-            angle.lower = branch.angmin;
-            angle.upper = branch.angmax;
-            append(angle, va_offset + branch.from, 1.0);
-            append(angle, va_offset + branch.to, -1.0);
-            rows.push_back(std::move(angle));
+            const auto& branch = data.branches[i];
+            const double rating = contingency ? branch.rate_c : branch.rate_a;
+            const std::array<const AffineFlow*, 4> flows{
+                &linearized[i].pf, &linearized[i].qf,
+                &linearized[i].pt, &linearized[i].qt};
+            for (const auto* flow : flows) {
+                if (lightweight_large_seed) {
+                    const auto [minimum, maximum] = affine_range(*flow, branch);
+                    if (minimum >= -rating && maximum <= rating) {
+                        continue;
+                    }
+                }
+                SparseRow row;
+                row.lower = -rating - flow->constant;
+                row.upper = rating - flow->constant;
+                append(row, vm_offset + branch.from, flow->vm_from);
+                append(row, vm_offset + branch.to, flow->vm_to);
+                append(row, va_offset + branch.from, flow->va_from);
+                append(row, va_offset + branch.to, flow->va_to);
+                normalize(row);
+                rows.push_back(std::move(row));
+            }
+            const double source_delta = contingency
+                ? contingency->base_state.va[branch.from]
+                    - contingency->base_state.va[branch.to]
+                : data.buses[branch.from].va_start
+                    - data.buses[branch.to].va_start;
+            const double angle_minimum =
+                lower[va_offset + branch.from] - upper[va_offset + branch.to];
+            const double angle_maximum =
+                upper[va_offset + branch.from] - lower[va_offset + branch.to];
+            const bool angle_row_is_redundant =
+                lightweight_large_seed &&
+                angle_minimum >= branch.angmin && angle_maximum <= branch.angmax;
+            if (source_delta >= branch.angmin && source_delta <= branch.angmax &&
+                !angle_row_is_redundant) {
+                SparseRow angle;
+                angle.lower = branch.angmin;
+                angle.upper = branch.angmax;
+                append(angle, va_offset + branch.from, 1.0);
+                append(angle, va_offset + branch.to, -1.0);
+                rows.push_back(std::move(angle));
+            }
         }
     }
 
@@ -608,6 +637,19 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     highs.setOptionValue("time_limit", time_limit_seconds);
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
     highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
+    // The feasibility-only LP has an identically zero objective, so every
+    // primal-feasible point is already an exact optimum for Phase I.  A looser
+    // IPM dual-gap stopping test avoids spending tens of seconds proving an
+    // economically meaningless zero-objective dual certificate.  The returned
+    // primal must still satisfy the unchanged 1e-8 HiGHS feasibility test and
+    // the exact nonlinear validator below this layer.
+    constexpr double kOrdinaryIpmOptimalityTolerance = 1e-8;
+    constexpr double kPhaseOneIpmOptimalityTolerance = 1e-4;
+    const double ipm_optimality_tolerance = feasibility_only
+        ? kPhaseOneIpmOptimalityTolerance
+        : kOrdinaryIpmOptimalityTolerance;
+    highs.setOptionValue(
+        "ipm_optimality_tolerance", ipm_optimality_tolerance);
     if (highs.addVars(column_count, lower.data(), upper.data()) != HighsStatus::kOk ||
         highs.changeColsCost(0, column_count - 1, cost.data()) != HighsStatus::kOk ||
         highs.addRows(
@@ -624,17 +666,48 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
 
     LinearizedAcSeedResult output;
     output.projected_balance_slack = projected_balance_slack;
+    output.branch_security_rows_omitted = omit_branch_security_rows;
+    output.feasibility_only = feasibility_only;
     output.time_limit_seconds = time_limit_seconds;
+    output.ipm_optimality_tolerance = ipm_optimality_tolerance;
+    output.row_count = static_cast<int>(rows.size());
+    output.column_count = column_count;
+    output.nonzero_count = static_cast<int>(indices.size());
+    output.run_status = static_cast<int>(run_status);
     output.model_status = static_cast<int>(model_status);
+    output.solution_value_valid = solution.value_valid;
+    output.info_valid = info.valid;
+    output.primal_solution_status =
+        static_cast<int>(info.primal_solution_status);
+    output.num_primal_infeasibilities =
+        static_cast<int>(info.num_primal_infeasibilities);
+    output.max_primal_infeasibility = info.max_primal_infeasibility;
     output.status = highs.modelStatusToString(model_status);
     output.iterations = static_cast<int>(
         info.ipm_iteration_count > 0
             ? info.ipm_iteration_count
             : info.simplex_iteration_count);
     output.objective = info.objective_function_value;
-    output.success = run_status == HighsStatus::kOk &&
-        model_status == HighsModelStatus::kOptimal && solution.value_valid &&
+    constexpr double kRequiredPrimalFeasibilityTolerance = 1e-8;
+    const bool solution_shape_valid = solution.value_valid &&
         solution.col_value.size() == static_cast<std::size_t>(column_count);
+    const bool optimal_solution = run_status != HighsStatus::kError &&
+        model_status == HighsModelStatus::kOptimal && solution_shape_valid;
+    // Phase I is used only to generate a candidate for the exact nonlinear
+    // repair and complete validator.  A zero-objective IPM may hit its time
+    // limit after finding a fully feasible primal but before certifying dual
+    // optimality.  Preserve that useful point only when HiGHS itself reports
+    // no primal violations at the unchanged 1e-8 LP tolerance.  Ordinary cost
+    // LPs continue to require an optimal model status.
+    const bool feasible_nonoptimal_phase_one = feasibility_only &&
+        run_status != HighsStatus::kError && solution_shape_valid && info.valid &&
+        info.primal_solution_status == kSolutionStatusFeasible &&
+        info.num_primal_infeasibilities == 0 &&
+        std::isfinite(info.max_primal_infeasibility) &&
+        info.max_primal_infeasibility <= kRequiredPrimalFeasibilityTolerance;
+    output.accepted_feasible_nonoptimal_phase_one =
+        feasible_nonoptimal_phase_one && !optimal_solution;
+    output.success = optimal_solution || feasible_nonoptimal_phase_one;
     output.state = reference;
     if (output.success) {
         for (int i = 0; i < nb; ++i) {
@@ -656,6 +729,10 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     }
     output.wall_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - wall_start).count();
+    if (highs_log != nullptr && std::string(highs_log) != "0") {
+        std::cerr << "GRAVITYX_LINEAR_SEED_RESULT "
+                  << output.to_json(false).dump() << '\n';
+    }
     return output;
 }
 

@@ -5690,7 +5690,13 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     // consistent, rather than forcing the entire loss mismatch onto one bus.
     // The original state remains the incumbent and every candidate must
     // improve independent validation.
+    const bool large_base_has_better_validated_incumbent =
+        base_mode && nb >= 16000 &&
+        std::isfinite(best_intermediate_validation.max_residual) &&
+        best_intermediate_validation.max_residual + 1e-12 <
+            output.validation.max_residual;
     if (options_.distributed_balance_polish &&
+        !large_base_has_better_validated_incumbent &&
         output.validation.max_residual > options_.validation_tolerance &&
         (output.validation.worst_category == "active_balance" ||
          output.validation.worst_category == "reactive_balance")) {

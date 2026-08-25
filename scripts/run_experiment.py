@@ -623,6 +623,9 @@ def main() -> int:
     parser.add_argument("--validated-source-base", action="store_true")
     parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
+    parser.add_argument(
+        "--defer-fallback-until-screen-complete", action="store_true"
+    )
     parser.add_argument("--linearized-contingency-fallback", action="store_true")
     parser.add_argument("--linearized-contingency-only", action="store_true")
     parser.add_argument("--longest-first-schedule", action="store_true")
@@ -636,6 +639,12 @@ def main() -> int:
     if args.two_stage_contingency_screen and not args.fast_power_flow_screen:
         parser.error(
             "--two-stage-contingency-screen requires --fast-power-flow-screen"
+        )
+    if (args.defer_fallback_until_screen_complete and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--defer-fallback-until-screen-complete requires "
+            "--two-stage-contingency-screen"
         )
     if args.robust_contingency_base and not args.validated_source_base:
         parser.error(
@@ -743,6 +752,9 @@ def main() -> int:
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "defer_fallback_until_screen_complete": (
+            args.defer_fallback_until_screen_complete
+        ),
         "initial_corrective_worker_count": args.workers,
         "post_screen_corrective_worker_count": args.post_screen_workers,
         "streaming_fallback_overlap": False,
@@ -1244,6 +1256,12 @@ def main() -> int:
 
         try:
             read_until("GRAVITYX_WORKER_READY")
+            if args.defer_fallback_until_screen_complete:
+                while not screening_finished.wait(timeout=0.1):
+                    if abort_contingencies.is_set():
+                        raise CompetitionTimeout(
+                            "corrective fallback cancelled during fast screening"
+                        )
             while not abort_contingencies.is_set():
                 item = streamed_queue_get(
                     task_queue,
@@ -1402,7 +1420,9 @@ def main() -> int:
                 bool(item["feasible"]) for item in screen_records
             )
             run_status["fast_screen_fallback_count"] = len(exact_contingencies)
-            run_status["streaming_fallback_overlap"] = True
+            run_status["streaming_fallback_overlap"] = (
+                not args.defer_fallback_until_screen_complete
+            )
             if post_screen_worker_count > worker_count:
                 for worker_id in range(worker_count, post_screen_worker_count):
                     future = pool.submit(solve_worker, worker_id)
@@ -1674,6 +1694,9 @@ def main() -> int:
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "defer_fallback_until_screen_complete": (
+            args.defer_fallback_until_screen_complete
+        ),
         "linearized_contingency_fallback": args.linearized_contingency_fallback,
         "linearized_contingency_only": args.linearized_contingency_only,
         "ipopt_acceptable_options": (

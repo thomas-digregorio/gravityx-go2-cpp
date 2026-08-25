@@ -1279,10 +1279,13 @@ bool solve_loaded_contingency(
             // the exact nonlinear balance envelope.
             const double linearized_balance_slack =
                 balance_only_phase_one ? 0.25 : 0.49;
+            const double linearized_time_limit_seconds =
+                balance_only_phase_one ? 90.0 : 60.0;
             auto linear = gravityx::solve_linearized_ac_seed(
                 data, reference, base.commitment,
                 linearized_balance_slack, context,
-                balance_only_phase_one, false, 60.0, balance_only_phase_one,
+                balance_only_phase_one, false,
+                linearized_time_limit_seconds, balance_only_phase_one,
                 balance_only_phase_one, dynamic_security_branches);
             linearized_wall_seconds += linear.wall_seconds;
             linearized_iterations += std::max(0, linear.iterations);
@@ -1292,6 +1295,8 @@ bool solve_loaded_contingency(
             attempt["balance_only_phase_one"] = balance_only_phase_one;
             attempt["linearized_balance_slack"] =
                 linearized_balance_slack;
+            attempt["linearized_time_limit_seconds"] =
+                linearized_time_limit_seconds;
             attempt["initial_dynamic_security_branches"] =
                 initial_dynamic_security_branches;
             attempt["active_dynamic_security_branch_positions"] =

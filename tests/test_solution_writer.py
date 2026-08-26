@@ -36,6 +36,7 @@ from run_experiment import (  # noqa: E402
     longest_first_contingencies,
     progress_log_due,
     progress_checkpoint_due,
+    persistent_evaluator_protocol_markers_present,
     require_minimum_free_space,
     stage_wsl_worker_inputs,
     streamed_queue_get,
@@ -836,6 +837,33 @@ class CompetitionTimingTests(unittest.TestCase):
                 "referenced_vendor_evaluator.py"
             )
         )
+
+    def test_persistent_evaluator_requires_all_protocol_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            vendor = root / "vendor.py"
+            vendor.write_text("print('ordinary evaluator')\n", encoding="utf-8")
+            persistent = root / "persistent.py"
+            persistent.write_text(
+                "\n".join(
+                    (
+                        'MODE = "--persistent-server"',
+                        'READY = "GRAVITYX_EVALUATOR_READY"',
+                        'RESULT = "GRAVITYX_EVALUATION_RESULT"',
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(
+                persistent_evaluator_protocol_markers_present(vendor)
+            )
+            self.assertTrue(
+                persistent_evaluator_protocol_markers_present(persistent)
+            )
+            self.assertFalse(
+                persistent_evaluator_protocol_markers_present(root / "missing.py")
+            )
 
     def test_fast_evaluator_parser_populates_vendor_arrays_from_canonical_text(self):
         with tempfile.TemporaryDirectory() as directory:

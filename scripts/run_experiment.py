@@ -78,6 +78,23 @@ def evaluator_subprocess_environment(
     return environment
 
 
+def persistent_evaluator_protocol_markers_present(evaluator: Path) -> bool:
+    """Return whether an evaluator advertises the persistent shard protocol."""
+
+    try:
+        source = evaluator.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return all(
+        marker in source
+        for marker in (
+            "--persistent-server",
+            "GRAVITYX_EVALUATOR_READY",
+            "GRAVITYX_EVALUATION_RESULT",
+        )
+    )
+
+
 def code2_time_limit(contingency_count: int, seconds_per_contingency: float) -> float:
     if contingency_count < 0:
         raise ValueError("contingency count cannot be negative")
@@ -1128,6 +1145,26 @@ class PersistentEvaluatorProcess:
             env=environment,
         )
         self.task_count = 0
+        try:
+            self._wait_until_ready()
+        except Exception:
+            self.terminate()
+            raise
+
+    def _wait_until_ready(self) -> None:
+        assert self.process.stdout is not None
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                returncode = self.process.wait()
+                raise RuntimeError(
+                    "persistent official evaluator exited before its ready "
+                    f"handshake: worker={self.worker_id}, returncode={returncode}"
+                )
+            self.log_handle.write(line)
+            self.log_handle.flush()
+            if line.rstrip("\r\n") == "GRAVITYX_EVALUATOR_READY":
+                return
 
     def _read_result(self, request_id: int) -> dict[str, Any]:
         assert self.process.stdout is not None
@@ -1192,6 +1229,9 @@ class PersistentEvaluatorProcess:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        for stream in (self.process.stdin, self.process.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
         if not self.log_handle.closed:
             self.log_handle.close()
 
@@ -1214,6 +1254,9 @@ class PersistentEvaluatorProcess:
             except Exception:
                 self.terminate()
                 raise
+        for stream in (self.process.stdin, self.process.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
         if not self.log_handle.closed:
             self.log_handle.close()
 
@@ -2733,6 +2776,15 @@ def main() -> int:
     parser.add_argument("--fallback-schedule-profile", type=Path)
     args = parser.parse_args()
 
+    if (
+        args.streaming_persistent_evaluator_processes
+        and not persistent_evaluator_protocol_markers_present(args.evaluator)
+    ):
+        parser.error(
+            "--streaming-persistent-evaluator-processes requires an evaluator "
+            "implementing the persistent shard protocol; pass "
+            "--evaluator scripts/fast_official_evaluator.py"
+        )
     if args.ipopt_acceptable_termination and not args.resident_contingency_model:
         parser.error(
             "--ipopt-acceptable-termination requires --resident-contingency-model"
@@ -2996,6 +3048,8 @@ def main() -> int:
         "initial_free_space_gb": initial_free_space_gb,
         "minimum_free_space_gb": args.minimum_free_space_gb,
         "git_revision": git_revision(),
+        "evaluator": str(args.evaluator.resolve()),
+        "evaluator_sha256": sha256(args.evaluator),
         "base_exact_executable": str(args.executable.resolve()),
         "base_exact_executable_sha256": sha256(args.executable),
         "fast_screen_executable": str(fast_screen_executable.resolve()),

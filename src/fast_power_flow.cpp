@@ -769,6 +769,51 @@ void compute_branch_flows(
     }
 }
 
+BalanceSlackSeed nodal_balance_slack_seed_from_network(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<double>& p_network,
+    const std::vector<double>& q_network,
+    double upper_bound,
+    double interior_margin) {
+    const std::size_t nb = data.buses.size();
+    if (p_network.size() != nb || q_network.size() != nb ||
+        state.pg.size() != data.generators.size() ||
+        state.qg.size() != data.generators.size() ||
+        state.demand_factor.size() != data.loads.size() ||
+        !std::isfinite(upper_bound) || upper_bound < 0.0 ||
+        !std::isfinite(interior_margin) || interior_margin < 0.0) {
+        throw std::runtime_error(
+            "cannot seed nodal slacks from invalid network injections");
+    }
+
+    BalanceSlackSeed seed;
+    seed.active.resize(nb);
+    seed.reactive.resize(nb);
+    for (std::size_t i = 0; i < nb; ++i) {
+        const auto& bus = data.buses[i];
+        double p = p_network[i];
+        double q = q_network[i];
+        for (int generator : bus.generators) {
+            p -= state.pg[generator];
+            q -= state.qg[generator];
+        }
+        for (int load : bus.loads) {
+            p += data.loads[load].pd_nominal * state.demand_factor[load];
+            q += data.loads[load].qd_nominal * state.demand_factor[load];
+        }
+        if (!std::isfinite(p) || !std::isfinite(q)) {
+            throw std::runtime_error(
+                "cannot seed nodal slacks from nonfinite network injections");
+        }
+        seed.active[i] =
+            std::min(upper_bound, std::abs(p) + interior_margin);
+        seed.reactive[i] =
+            std::min(upper_bound, std::abs(q) + interior_margin);
+    }
+    return seed;
+}
+
 std::vector<std::vector<int>> connected_components(
     const CaseData& data,
     int outaged_branch) {
@@ -2158,6 +2203,73 @@ double rebuild_base_state_derived_fields(
     return objective;
 }
 
+static double rebuild_contingency_economic_fields(
+    const CaseData& data,
+    const AcState& base_state,
+    const std::vector<int>& commitment,
+    const Contingency& contingency,
+    AcState& state) {
+    if (commitment.size() != data.generators.size() ||
+        base_state.pg.size() != data.generators.size() ||
+        state.pg.size() != data.generators.size() ||
+        state.demand_factor.size() != data.loads.size()) {
+        throw std::runtime_error(
+            "cannot rebuild dimensionally invalid contingency economics");
+    }
+    const int outaged_generator =
+        contingency.type == ContingencyType::Generator
+        ? contingency.component : -1;
+
+    double objective = 0.0;
+    state.gen_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data.generators.size()); ++i) {
+        const auto& gen = data.generators[i];
+        const bool active = commitment[i] == 1 && i != outaged_generator;
+        if (!active) {
+            continue;
+        }
+        const double lower = std::max(
+            gen.pmin,
+            base_state.pg[i] - data.delta_r_ctg * gen.prdmaxctg);
+        const double upper = std::min(
+            gen.pmax,
+            base_state.pg[i] + data.delta_r_ctg * gen.prumaxctg);
+        const auto points = active_pwl_points(gen.cost, gen.ncost, lower, upper);
+        const auto weights = interpolation_weights(points, state.pg[i]);
+        state.gen_lambda.insert(
+            state.gen_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective -= data.delta_ctg * points[j].cost * weights[j];
+        }
+        objective -= data.delta_ctg * gen.oncost;
+    }
+
+    state.load_lambda.clear();
+    for (int i = 0; i < static_cast<int>(data.loads.size()); ++i) {
+        const auto& load = data.loads[i];
+        const auto points = active_pwl_points(
+            load.cost, load.ncost, load.pd_min, load.pd_max);
+        const auto weights = interpolation_weights(
+            points, load.pd_nominal * state.demand_factor[i]);
+        state.load_lambda.insert(
+            state.load_lambda.end(), weights.begin(), weights.end());
+        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
+            objective += data.delta_ctg * points[j].cost * weights[j];
+        }
+    }
+
+    for (double value : state.sm_slack) {
+        objective -= data.delta_ctg * data.sm_cost_approx * value;
+    }
+    for (double value : state.p_delta) {
+        objective -= data.delta_ctg * data.p_delta_cost_approx * value;
+    }
+    for (double value : state.q_delta) {
+        objective -= data.delta_ctg * data.q_delta_cost_approx * value;
+    }
+    return objective;
+}
+
 static double rebuild_contingency_state_fields(
     const CaseData& data,
     const AcState& base_state,
@@ -2190,51 +2302,11 @@ static double rebuild_contingency_state_fields(
         contingency.type == ContingencyType::Branch
         ? contingency.component : -1;
 
-    double objective = 0.0;
-    if (rebuild_economic_fields) {
-        state.gen_lambda.clear();
-    }
     for (int i = 0; i < static_cast<int>(data.generators.size()); ++i) {
-        const auto& gen = data.generators[i];
         const bool active = commitment[i] == 1 && i != outaged_generator;
         if (!active) {
             state.pg[i] = 0.0;
             state.qg[i] = 0.0;
-            continue;
-        }
-        if (!rebuild_economic_fields) {
-            continue;
-        }
-        const double lower = std::max(
-            gen.pmin,
-            base_state.pg[i] - data.delta_r_ctg * gen.prdmaxctg);
-        const double upper = std::min(
-            gen.pmax,
-            base_state.pg[i] + data.delta_r_ctg * gen.prumaxctg);
-        const auto points = active_pwl_points(gen.cost, gen.ncost, lower, upper);
-        const auto weights = interpolation_weights(points, state.pg[i]);
-        state.gen_lambda.insert(
-            state.gen_lambda.end(), weights.begin(), weights.end());
-        for (int j = 0; j < static_cast<int>(points.size()); ++j) {
-            objective -= data.delta_ctg * points[j].cost * weights[j];
-        }
-        objective -= data.delta_ctg * gen.oncost;
-    }
-
-    if (rebuild_economic_fields) {
-        state.load_lambda.clear();
-        for (int i = 0; i < static_cast<int>(data.loads.size()); ++i) {
-            const auto& load = data.loads[i];
-            const auto points = active_pwl_points(
-                load.cost, load.ncost, load.pd_min, load.pd_max);
-            const auto weights = interpolation_weights(
-                points, load.pd_nominal * state.demand_factor[i]);
-            state.load_lambda.insert(
-                state.load_lambda.end(), weights.begin(), weights.end());
-            for (int j = 0; j < static_cast<int>(points.size()); ++j) {
-                objective +=
-                    data.delta_ctg * points[j].cost * weights[j];
-            }
         }
     }
 
@@ -2243,18 +2315,11 @@ static double rebuild_contingency_state_fields(
         data, state, balance_slack_upper, 1e-7);
     state.p_delta = balance.active;
     state.q_delta = balance.reactive;
-    if (rebuild_economic_fields) {
-        for (double value : state.sm_slack) {
-            objective -= data.delta_ctg * data.sm_cost_approx * value;
-        }
-        for (double value : state.p_delta) {
-            objective -= data.delta_ctg * data.p_delta_cost_approx * value;
-        }
-        for (double value : state.q_delta) {
-            objective -= data.delta_ctg * data.q_delta_cost_approx * value;
-        }
+    if (!rebuild_economic_fields) {
+        return 0.0;
     }
-    return objective;
+    return rebuild_contingency_economic_fields(
+        data, base_state, commitment, contingency, state);
 }
 
 double rebuild_contingency_state_derived_fields(
@@ -2799,6 +2864,24 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             std::vector<std::pair<int, double>> coordinate_history;
             double initial_predictor_validation_residual =
                 std::numeric_limits<double>::infinity();
+            // These work vectors are reused across predictor iterations and
+            // candidate line-search trials. On large cases, allocating and
+            // zero-initializing fresh case-sized vectors for every candidate
+            // creates avoidable allocator contention across resident workers.
+            std::vector<double> p_network(
+                static_cast<std::size_t>(nb), 0.0);
+            std::vector<double> q_network(
+                static_cast<std::size_t>(nb), 0.0);
+            std::vector<double> predictor_load_reactive(
+                data_.loads.size(), 0.0);
+            std::vector<double> predictor_load_active(
+                data_.loads.size(), 0.0);
+            std::vector<double> trial_p_network(
+                static_cast<std::size_t>(nb), 0.0);
+            std::vector<double> trial_q_network(
+                static_cast<std::size_t>(nb), 0.0);
+            std::vector<double> trial_load_active(
+                data_.loads.size(), 0.0);
             // Difficult generator outages can enter a late, monotonically
             // shrinking cycle between active- and reactive-flow limits after
             // the global feasibility repair.  Keep the inexpensive local
@@ -2822,10 +2905,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 compute_branch_flows(
                     data_, outaged_branch, true, predictor_state);
 
-                std::vector<double> p_network(
-                    static_cast<std::size_t>(nb), 0.0);
-                std::vector<double> q_network(
-                    static_cast<std::size_t>(nb), 0.0);
+                std::fill(p_network.begin(), p_network.end(), 0.0);
+                std::fill(q_network.begin(), q_network.end(), 0.0);
                 for (int branch_index = 0;
                      branch_index < static_cast<int>(data_.branches.size());
                      ++branch_index) {
@@ -2887,8 +2968,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 // above. This is especially important for voltage-limited
                 // load buses where a voltage correction has no remaining
                 // feasible direction.
-                std::vector<double> predictor_load_reactive(
-                    data_.loads.size(), 0.0);
                 for (int load_index = 0;
                      load_index < static_cast<int>(data_.loads.size());
                      ++load_index) {
@@ -2951,8 +3030,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 // within its exact tmin/tmax and corrective-ramp bounds.  The
                 // 0.49 target stays strictly inside the source 0.5 balance
                 // slack limit and leaves a small numerical margin.
-                std::vector<double> predictor_load_active(
-                    data_.loads.size(), 0.0);
                 for (int load_index = 0;
                      load_index < static_cast<int>(data_.loads.size());
                      ++load_index) {
@@ -3041,10 +3118,14 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 // of Pg/load and the branch flows already computed above, so
                 // recreating and rescanning them for every infeasible trial
                 // adds no acceptance protection.  A candidate that crosses
-                // the physical tolerance is rebuilt economically and passed
-                // through the complete validator before it can be accepted.
-                const auto predictor_balance = nodal_balance_slack_seed(
-                    data_, predictor_state, 0.5, 1e-7);
+                // the physical tolerance is rebuilt economically and gets
+                // exactly the omitted PWL and Ohm-law checks before it can be
+                // accepted.  The already-certified physical state is not
+                // recomputed or rescanned.
+                const auto predictor_balance =
+                    nodal_balance_slack_seed_from_network(
+                        data_, predictor_state, p_network, q_network,
+                        0.5, 1e-7);
                 predictor_state.p_delta = predictor_balance.active;
                 predictor_state.q_delta = predictor_balance.reactive;
                 predictor_validation =
@@ -3055,12 +3136,13 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 if (predictor_validation.max_residual <=
                     options_.validation_tolerance) {
                     predictor_objective =
-                        rebuild_contingency_state_derived_fields(
+                        rebuild_contingency_economic_fields(
                             data_, base_state_, commitment_, *contingency,
                             predictor_state);
-                    predictor_validation = validate_state(
-                        data_, ModelMode::ContingencySoft,
-                        predictor_state, commitment_, direct_context);
+                    predictor_validation =
+                        validate_rebuilt_contingency_economic_and_ohms(
+                            data_, predictor_state, commitment_,
+                            *direct_context, predictor_validation);
                 }
                 output.fixed_jacobian_predictor_iterations =
                     predictor_iteration;
@@ -3412,10 +3494,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     // redundant pre-projection nodal-balance pass.
                     compute_branch_flows(
                         data_, outaged_branch, true, trial);
-                    std::vector<double> trial_p_network(
-                        static_cast<std::size_t>(nb), 0.0);
-                    std::vector<double> trial_q_network(
-                        static_cast<std::size_t>(nb), 0.0);
+                    std::fill(
+                        trial_p_network.begin(), trial_p_network.end(), 0.0);
+                    std::fill(
+                        trial_q_network.begin(), trial_q_network.end(), 0.0);
                     for (int branch_index = 0;
                          branch_index < static_cast<int>(data_.branches.size());
                          ++branch_index) {
@@ -3446,8 +3528,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             trial.vm[shunt.bus] *
                             trial.vm[shunt.bus];
                     }
-                    std::vector<double> trial_load_active(
-                        data_.loads.size(), 0.0);
                     for (int load = 0;
                          load < static_cast<int>(data_.loads.size());
                          ++load) {
@@ -3555,8 +3635,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 std::clamp(q_balance, -0.49, 0.49),
                             trial.qg));
                     }
-                    const auto trial_balance = nodal_balance_slack_seed(
-                        data_, trial, 0.5, 1e-7);
+                    const auto trial_balance =
+                        nodal_balance_slack_seed_from_network(
+                            data_, trial, trial_p_network, trial_q_network,
+                            0.5, 1e-7);
                     trial.p_delta = trial_balance.active;
                     trial.q_delta = trial_balance.reactive;
                     return validate_rebuilt_contingency_trial(
@@ -3595,11 +3677,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 full_reactive_active_set_allowed)) {
                             return false;
                         }
-                        rebuild_contingency_state_fields(
-                            data_, base_state_, commitment_, *contingency,
-                            trial, 0.5, false);
-                        std::vector<double> trial_p_network(
-                            static_cast<std::size_t>(nb), 0.0);
+                        compute_branch_flows(
+                            data_, outaged_branch, true, trial);
+                        std::fill(
+                            trial_p_network.begin(),
+                            trial_p_network.end(), 0.0);
                         for (int branch_index = 0;
                              branch_index <
                                  static_cast<int>(data_.branches.size());
@@ -3675,11 +3757,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     trial.vm, damping)) {
                                 continue;
                             }
-                            rebuild_contingency_state_fields(
-                                data_, base_state_, commitment_, *contingency,
-                                trial, 0.5, false);
-                            std::vector<double> trial_p_network(
-                                static_cast<std::size_t>(nb), 0.0);
+                            compute_branch_flows(
+                                data_, outaged_branch, true, trial);
+                            std::fill(
+                                trial_p_network.begin(),
+                                trial_p_network.end(), 0.0);
                             for (int branch_index = 0;
                                  branch_index <
                                      static_cast<int>(data_.branches.size());
@@ -5030,8 +5112,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     selected_correction_mode =
                                         "single_switched_shunt_step";
                                 }
-                                std::vector<double> trial_q_network(
-                                    static_cast<std::size_t>(nb), 0.0);
+                                std::fill(
+                                    trial_q_network.begin(),
+                                    trial_q_network.end(), 0.0);
                                 for (int branch_index = 0;
                                      branch_index < static_cast<int>(
                                          data_.branches.size());

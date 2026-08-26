@@ -486,6 +486,115 @@ int run_parallel_circuit_regression() {
     gravityx::ContingencyContext branch_context;
     branch_context.outaged_branch = branch_contingency.component;
     branch_context.base_state = solve.state;
+    const auto require_same_validation_numbers = [&] (
+        const gravityx::ValidationReport& actual,
+        const gravityx::ValidationReport& expected,
+        const std::string& label) {
+        require_near(
+            actual.max_variable_bound_violation,
+            expected.max_variable_bound_violation, 1e-12,
+            label + " variable bounds");
+        require_near(
+            actual.max_pwl_sum_residual,
+            expected.max_pwl_sum_residual, 1e-12,
+            label + " PWL sum");
+        require_near(
+            actual.max_pwl_power_residual,
+            expected.max_pwl_power_residual, 1e-12,
+            label + " PWL power");
+        require_near(
+            actual.max_reference_angle_residual,
+            expected.max_reference_angle_residual, 1e-12,
+            label + " reference angle");
+        require_near(
+            actual.max_generator_residual,
+            expected.max_generator_residual, 1e-12,
+            label + " generator");
+        require_near(
+            actual.max_load_ramp_violation,
+            expected.max_load_ramp_violation, 1e-12,
+            label + " load ramp");
+        require_near(
+            actual.max_active_balance_residual,
+            expected.max_active_balance_residual, 1e-12,
+            label + " active balance");
+        require_near(
+            actual.max_reactive_balance_residual,
+            expected.max_reactive_balance_residual, 1e-12,
+            label + " reactive balance");
+        require_near(
+            actual.max_ohms_residual,
+            expected.max_ohms_residual, 1e-12,
+            label + " Ohm law");
+        require_near(
+            actual.max_angle_violation,
+            expected.max_angle_violation, 1e-12,
+            label + " angle");
+        require_near(
+            actual.max_flow_limit_violation,
+            expected.max_flow_limit_violation, 1e-12,
+            label + " flow limit");
+        require_near(
+            actual.max_residual, expected.max_residual, 1e-12,
+            label + " overall residual");
+    };
+    const auto full_rebuilt_validation = gravityx::validate_state(
+        data, gravityx::ModelMode::ContingencySoft,
+        fast_result.solve.state, {1}, branch_context);
+    const auto physical_rebuilt_validation =
+        gravityx::validate_rebuilt_contingency_predictor(
+            data, fast_result.solve.state, {1}, branch_context);
+    const auto completed_rebuilt_validation =
+        gravityx::validate_rebuilt_contingency_economic_and_ohms(
+            data, fast_result.solve.state, {1}, branch_context,
+            physical_rebuilt_validation);
+    require_same_validation_numbers(
+        completed_rebuilt_validation, full_rebuilt_validation,
+        "split rebuilt validation");
+
+    auto bad_pwl_state = fast_result.solve.state;
+    if (bad_pwl_state.gen_lambda.empty()) {
+        throw std::runtime_error(
+            "split rebuilt validation regression has no generator PWL");
+    }
+    bad_pwl_state.gen_lambda[0] += 0.125;
+    const auto bad_pwl_physical =
+        gravityx::validate_rebuilt_contingency_predictor(
+            data, bad_pwl_state, {1}, branch_context);
+    const auto bad_pwl_completed =
+        gravityx::validate_rebuilt_contingency_economic_and_ohms(
+            data, bad_pwl_state, {1}, branch_context,
+            bad_pwl_physical);
+    const auto bad_pwl_full = gravityx::validate_state(
+        data, gravityx::ModelMode::ContingencySoft,
+        bad_pwl_state, {1}, branch_context);
+    require_same_validation_numbers(
+        bad_pwl_completed, bad_pwl_full,
+        "split rebuilt PWL rejection");
+    if (bad_pwl_completed.max_pwl_sum_residual <= 0.1) {
+        throw std::runtime_error(
+            "split rebuilt validation did not reject a PWL violation");
+    }
+
+    auto bad_ohms_state = fast_result.solve.state;
+    bad_ohms_state.pf[1] += 0.25;
+    const auto bad_ohms_physical =
+        gravityx::validate_rebuilt_contingency_predictor(
+            data, bad_ohms_state, {1}, branch_context);
+    const auto bad_ohms_completed =
+        gravityx::validate_rebuilt_contingency_economic_and_ohms(
+            data, bad_ohms_state, {1}, branch_context,
+            bad_ohms_physical);
+    const auto bad_ohms_full = gravityx::validate_state(
+        data, gravityx::ModelMode::ContingencySoft,
+        bad_ohms_state, {1}, branch_context);
+    require_same_validation_numbers(
+        bad_ohms_completed, bad_ohms_full,
+        "split rebuilt Ohm rejection");
+    if (bad_ohms_completed.max_ohms_residual <= 0.2) {
+        throw std::runtime_error(
+            "split rebuilt validation did not reject an Ohm-law violation");
+    }
     const auto lightweight_trial_validation =
         gravityx::validate_rebuilt_contingency_trial(
             data, fast_result.solve.state, {1}, branch_context);

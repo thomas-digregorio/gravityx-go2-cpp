@@ -343,6 +343,132 @@ static ValidationReport validate_state_impl(
             report.max_residual + 1e-10 >= incumbent_max_residual;
     };
 
+    const auto validate_balance_bus = [&](std::size_t i) {
+        const auto& bus = data.buses[i];
+        double p = 0.0;
+        double q = 0.0;
+        for (int branch : bus.branches_from) {
+            p += state.pf[branch];
+            q += state.qf[branch];
+        }
+        for (int branch : bus.branches_to) {
+            p += state.pt[branch];
+            q += state.qt[branch];
+        }
+        for (int generator : bus.generators) {
+            p -= state.pg[generator];
+            q -= state.qg[generator];
+        }
+        for (int load : bus.loads) {
+            p += data.loads[load].pd_nominal * state.demand_factor[load];
+            q += data.loads[load].qd_nominal * state.demand_factor[load];
+        }
+        for (int shunt : bus.shunts) {
+            p += data.shunts[shunt].gs * state.vm[i] * state.vm[i];
+            q -= effective_shunt_susceptance(data, state, shunt) *
+                state.vm[i] * state.vm[i];
+        }
+        const double p_residual = mode != ModelMode::UnitCommitmentRelaxation
+            ? positive_part(std::abs(p) - state.p_delta[i])
+            : std::abs(p);
+        const double q_residual = mode != ModelMode::UnitCommitmentRelaxation
+            ? positive_part(std::abs(q) - state.q_delta[i])
+            : std::abs(q);
+        if (mode != ModelMode::UnitCommitmentRelaxation) {
+            update_category(report, report.max_variable_bound_violation,
+                bound_violation(state.p_delta[i], 0.0, 0.5),
+                "variable_bound", capture_identity,
+                [&] { return "bus:" + bus.source_key + ":p_delta"; });
+            update_category(report, report.max_variable_bound_violation,
+                bound_violation(state.q_delta[i], 0.0, 0.5),
+                "variable_bound", capture_identity,
+                [&] { return "bus:" + bus.source_key + ":q_delta"; });
+        }
+        update_category(report, report.max_active_balance_residual,
+            p_residual, "active_balance", capture_identity,
+            [&] { return "bus:" + bus.source_key; });
+        update_category(report, report.max_reactive_balance_residual,
+            q_residual, "reactive_balance", capture_identity,
+            [&] { return "bus:" + bus.source_key; });
+    };
+
+    const auto validate_branch = [&](std::size_t i) {
+        const auto& branch = data.branches[i];
+        const bool outaged = contingency &&
+            contingency->outaged_branch == static_cast<int>(i);
+        const bool unavailable = branch.status == 0 || outaged;
+        const double rating = mode == ModelMode::ContingencySoft
+            ? branch.rate_c : branch.rate_a;
+        const double flow_lower = unavailable ? 0.0 : -rating;
+        const double flow_upper = unavailable ? 0.0 : rating;
+        for (const auto& item : std::array<std::pair<const char*, double>, 4>{{
+                 {"pf", state.pf[i]}, {"qf", state.qf[i]},
+                 {"pt", state.pt[i]}, {"qt", state.qt[i]}}}) {
+            update_category(report, report.max_variable_bound_violation,
+                bound_violation(item.second, flow_lower, flow_upper),
+                "variable_bound", capture_identity,
+                [&] {
+                    return "branch:" + branch.source_key + ":" + item.first;
+                });
+        }
+        update_category(report, report.max_variable_bound_violation,
+            bound_violation(
+                state.sm_slack[i], 0.0,
+                unavailable ? 0.0 : data.sm_vio_limit),
+            "variable_bound", capture_identity,
+            [&] { return "branch:" + branch.source_key + ":sm_slack"; });
+        if (unavailable) {
+            return;
+        }
+        const int f = branch.from;
+        const int t = branch.to;
+        if (!skip_rebuilt_economic_and_ohms_checks) {
+            validate_branch_ohms(
+                report, branch, state, i, capture_identity);
+        }
+
+        const double start_delta = mode == ModelMode::ContingencySoft
+            ? contingency->base_state.va[f] - contingency->base_state.va[t]
+            : data.buses[f].va_start - data.buses[t].va_start;
+        if (start_delta >= branch.angmin && start_delta <= branch.angmax) {
+            const double angle = state.va[f] - state.va[t];
+            update_category(report, report.max_angle_violation,
+                std::max(positive_part(angle - branch.angmax), positive_part(branch.angmin - angle)),
+                "angle", capture_identity,
+                [&] { return "branch:" + branch.source_key; });
+        }
+        const double from_squared = state.pf[i] * state.pf[i] + state.qf[i] * state.qf[i];
+        const double to_squared = state.pt[i] * state.pt[i] + state.qt[i] * state.qt[i];
+        const double from_limit = branch.transformer
+            ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
+            : rating * rating * std::pow(state.vm[f] + state.sm_slack[i], 2);
+        const double to_limit = branch.transformer
+            ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
+            : rating * rating * std::pow(state.vm[t] + state.sm_slack[i], 2);
+        update_category(report, report.max_flow_limit_violation,
+            std::max(positive_part(from_squared - from_limit), positive_part(to_squared - to_limit)),
+            "flow_limit", capture_identity,
+            [&] { return "branch:" + branch.source_key; });
+    };
+
+    // Only internal trial ranking supplies preferred indices.  Check the
+    // current dominant physical locations before the invariant whole-state
+    // scans so a trial that is already unable to improve can be discarded
+    // immediately.  Complete reports still visit every remaining row below.
+    if (preferred_balance_bus >= 0 &&
+        preferred_balance_bus < static_cast<int>(nb)) {
+        validate_balance_bus(static_cast<std::size_t>(preferred_balance_bus));
+        if (rejection_proven()) {
+            return report;
+        }
+    }
+    if (preferred_branch >= 0 && preferred_branch < static_cast<int>(nl)) {
+        validate_branch(static_cast<std::size_t>(preferred_branch));
+        if (rejection_proven()) {
+            return report;
+        }
+    }
+
     for (std::size_t i = 0; i < nb; ++i) {
         update_category(report, report.max_variable_bound_violation,
             bound_violation(state.vm[i], data.buses[i].vmin, data.buses[i].vmax),
@@ -544,61 +670,6 @@ static ValidationReport validate_state_impl(
         }
     }
 
-    const auto validate_balance_bus = [&](std::size_t i) {
-        const auto& bus = data.buses[i];
-        double p = 0.0;
-        double q = 0.0;
-        for (int branch : bus.branches_from) {
-            p += state.pf[branch];
-            q += state.qf[branch];
-        }
-        for (int branch : bus.branches_to) {
-            p += state.pt[branch];
-            q += state.qt[branch];
-        }
-        for (int generator : bus.generators) {
-            p -= state.pg[generator];
-            q -= state.qg[generator];
-        }
-        for (int load : bus.loads) {
-            p += data.loads[load].pd_nominal * state.demand_factor[load];
-            q += data.loads[load].qd_nominal * state.demand_factor[load];
-        }
-        for (int shunt : bus.shunts) {
-            p += data.shunts[shunt].gs * state.vm[i] * state.vm[i];
-            q -= effective_shunt_susceptance(data, state, shunt) *
-                state.vm[i] * state.vm[i];
-        }
-        const double p_residual = mode != ModelMode::UnitCommitmentRelaxation
-            ? positive_part(std::abs(p) - state.p_delta[i])
-            : std::abs(p);
-        const double q_residual = mode != ModelMode::UnitCommitmentRelaxation
-            ? positive_part(std::abs(q) - state.q_delta[i])
-            : std::abs(q);
-        if (mode != ModelMode::UnitCommitmentRelaxation) {
-            update_category(report, report.max_variable_bound_violation,
-                bound_violation(state.p_delta[i], 0.0, 0.5),
-                "variable_bound", capture_identity,
-                [&] { return "bus:" + bus.source_key + ":p_delta"; });
-            update_category(report, report.max_variable_bound_violation,
-                bound_violation(state.q_delta[i], 0.0, 0.5),
-                "variable_bound", capture_identity,
-                [&] { return "bus:" + bus.source_key + ":q_delta"; });
-        }
-        update_category(report, report.max_active_balance_residual,
-            p_residual, "active_balance", capture_identity,
-            [&] { return "bus:" + bus.source_key; });
-        update_category(report, report.max_reactive_balance_residual,
-            q_residual, "reactive_balance", capture_identity,
-            [&] { return "bus:" + bus.source_key; });
-    };
-    if (preferred_balance_bus >= 0 &&
-        preferred_balance_bus < static_cast<int>(nb)) {
-        validate_balance_bus(static_cast<std::size_t>(preferred_balance_bus));
-        if (rejection_proven()) {
-            return report;
-        }
-    }
     for (std::size_t i = 0; i < nb; ++i) {
         if (static_cast<int>(i) == preferred_balance_bus) {
             continue;
@@ -609,70 +680,6 @@ static ValidationReport validate_state_impl(
         }
     }
 
-    const auto validate_branch = [&](std::size_t i) {
-        const auto& branch = data.branches[i];
-        const bool outaged = contingency &&
-            contingency->outaged_branch == static_cast<int>(i);
-        const bool unavailable = branch.status == 0 || outaged;
-        const double rating = mode == ModelMode::ContingencySoft
-            ? branch.rate_c : branch.rate_a;
-        const double flow_lower = unavailable ? 0.0 : -rating;
-        const double flow_upper = unavailable ? 0.0 : rating;
-        for (const auto& item : std::array<std::pair<const char*, double>, 4>{{
-                 {"pf", state.pf[i]}, {"qf", state.qf[i]},
-                 {"pt", state.pt[i]}, {"qt", state.qt[i]}}}) {
-            update_category(report, report.max_variable_bound_violation,
-                bound_violation(item.second, flow_lower, flow_upper),
-                "variable_bound", capture_identity,
-                [&] {
-                    return "branch:" + branch.source_key + ":" + item.first;
-                });
-        }
-        update_category(report, report.max_variable_bound_violation,
-            bound_violation(
-                state.sm_slack[i], 0.0,
-                unavailable ? 0.0 : data.sm_vio_limit),
-            "variable_bound", capture_identity,
-            [&] { return "branch:" + branch.source_key + ":sm_slack"; });
-        if (unavailable) {
-            return;
-        }
-        const int f = branch.from;
-        const int t = branch.to;
-        if (!skip_rebuilt_economic_and_ohms_checks) {
-            validate_branch_ohms(
-                report, branch, state, i, capture_identity);
-        }
-
-        const double start_delta = mode == ModelMode::ContingencySoft
-            ? contingency->base_state.va[f] - contingency->base_state.va[t]
-            : data.buses[f].va_start - data.buses[t].va_start;
-        if (start_delta >= branch.angmin && start_delta <= branch.angmax) {
-            const double angle = state.va[f] - state.va[t];
-            update_category(report, report.max_angle_violation,
-                std::max(positive_part(angle - branch.angmax), positive_part(branch.angmin - angle)),
-                "angle", capture_identity,
-                [&] { return "branch:" + branch.source_key; });
-        }
-        const double from_squared = state.pf[i] * state.pf[i] + state.qf[i] * state.qf[i];
-        const double to_squared = state.pt[i] * state.pt[i] + state.qt[i] * state.qt[i];
-        const double from_limit = branch.transformer
-            ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
-            : rating * rating * std::pow(state.vm[f] + state.sm_slack[i], 2);
-        const double to_limit = branch.transformer
-            ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
-            : rating * rating * std::pow(state.vm[t] + state.sm_slack[i], 2);
-        update_category(report, report.max_flow_limit_violation,
-            std::max(positive_part(from_squared - from_limit), positive_part(to_squared - to_limit)),
-            "flow_limit", capture_identity,
-            [&] { return "branch:" + branch.source_key; });
-    };
-    if (preferred_branch >= 0 && preferred_branch < static_cast<int>(nl)) {
-        validate_branch(static_cast<std::size_t>(preferred_branch));
-        if (rejection_proven()) {
-            return report;
-        }
-    }
     for (std::size_t i = 0; i < nl; ++i) {
         if (static_cast<int>(i) == preferred_branch) {
             continue;

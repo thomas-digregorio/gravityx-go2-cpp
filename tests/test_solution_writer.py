@@ -521,6 +521,36 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
             read_generated_solution(target, numeric_solution)
             np.testing.assert_allclose(target.bus_volt_mag, [1.02, 0.99])
 
+            line_outage_solution = Path(directory) / "solution_line_outage.txt"
+            line_outage_solution.write_text(
+                numeric_text.replace(
+                    "101, 102, 1, 1\n--transformer section",
+                    "--transformer section",
+                ),
+                encoding="utf-8",
+            )
+            target.num_line_read = 0
+            read_generated_solution(target, line_outage_solution)
+            np.testing.assert_allclose(target.line_xsw, [0.0])
+            np.testing.assert_allclose(target.xfmr_xsw, [1.0])
+
+            transformer_outage_solution = (
+                Path(directory) / "solution_transformer_outage.txt"
+            )
+            transformer_outage_solution.write_text(
+                numeric_text.replace(
+                    "102, 101, 3, 1, -2\n--switched shunt section",
+                    "--switched shunt section",
+                ),
+                encoding="utf-8",
+            )
+            target.num_line_read = 1
+            target.num_xfmr_read = 0
+            read_generated_solution(target, transformer_outage_solution)
+            np.testing.assert_allclose(target.line_xsw, [1.0])
+            np.testing.assert_allclose(target.xfmr_xsw, [0.0])
+            np.testing.assert_allclose(target.xfmr_xst, [0.0])
+
     def test_fast_evaluator_reuses_exact_written_summaries_in_memory(self):
         class FakeEvaluation:
             def __init__(self):

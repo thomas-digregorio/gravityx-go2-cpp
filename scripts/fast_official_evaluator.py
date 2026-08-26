@@ -221,6 +221,8 @@ def _numeric_matrix(
     columns: str,
     count: int,
     width: int,
+    cache_owner: Any | None = None,
+    cache_key: str | None = None,
 ) -> tuple[np.ndarray, int]:
     """Parse a fixed-width numeric canonical section in NumPy's C loop."""
 
@@ -239,7 +241,14 @@ def _numeric_matrix(
         raise ValueError(
             f"invalid {section} column header: {lines[cursor + 1].strip()!r}"
         )
-    block = "".join(lines[cursor + 2 : end]).replace(",", " ")
+    rows = lines[cursor + 2 : end]
+    if cache_owner is not None and cache_key is not None:
+        cache = getattr(cache_owner, "_gravityx_exact_matrix_cache", None)
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if cached is not None and cached["rows"] == rows:
+                return cached["matrix"], end
+    block = "".join(rows).replace(",", " ")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
         try:
@@ -253,7 +262,14 @@ def _numeric_matrix(
         raise _NumericParserFallback(
             f"{section} is not an all-numeric {width}-column section"
         )
-    return values.reshape((count, width)), end
+    matrix = values.reshape((count, width))
+    if cache_owner is not None and cache_key is not None:
+        cache = getattr(cache_owner, "_gravityx_exact_matrix_cache", None)
+        if cache is None:
+            cache = {}
+            cache_owner._gravityx_exact_matrix_cache = cache
+        cache[cache_key] = {"rows": rows, "matrix": matrix}
+    return matrix, end
 
 
 def _integer_key_columns(values: np.ndarray, section: str) -> np.ndarray:
@@ -298,6 +314,95 @@ def _cached_numeric_indices(
     return indices
 
 
+def _single_missing_row(
+    full_rows: list[str], subset_rows: list[str], section: str
+) -> int:
+    if len(subset_rows) + 1 != len(full_rows):
+        raise ValueError(
+            f"canonical {section} row count is not full or single-outage"
+        )
+    missing = len(subset_rows)
+    for position, (observed, expected) in enumerate(
+        zip(subset_rows, full_rows)
+    ):
+        if observed != expected:
+            missing = position
+            break
+    if subset_rows[missing:] != full_rows[missing + 1 :]:
+        raise ValueError(
+            f"canonical {section} rows are not an exact single-row subset"
+        )
+    return missing
+
+
+def _static_numeric_matrix(
+    self: Any,
+    lines: list[str],
+    cursor: int,
+    section: str,
+    columns: str,
+    count: int,
+    full_count: int,
+    width: int,
+    key_width: int,
+    cache_key: str,
+    mapping: dict[Any, int],
+    key_builder: Any,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Reuse immutable line/transformer rows across single outages."""
+
+    end = cursor + 2 + count
+    if end > len(lines):
+        raise ValueError(
+            f"truncated {section}: expected {count} rows, "
+            f"have at most {max(0, len(lines) - cursor - 2)}"
+        )
+    if lines[cursor].strip() != section:
+        raise ValueError(
+            f"expected {section} at line {cursor + 1}, "
+            f"found {lines[cursor].strip()!r}"
+        )
+    if lines[cursor + 1].strip() != columns:
+        raise ValueError(
+            f"invalid {section} column header: {lines[cursor + 1].strip()!r}"
+        )
+    rows = lines[cursor + 2 : end]
+    cache = getattr(self, "_gravityx_static_section_cache", None)
+    cached = cache.get(cache_key) if cache is not None else None
+    if cached is not None and count == full_count:
+        if cached["rows"] != rows:
+            raise ValueError(f"canonical full {section} rows changed")
+        return cached["matrix"], cached["indices"], end
+    if cached is not None and count + 1 == full_count:
+        missing = _single_missing_row(cached["rows"], rows, cache_key)
+        matrix = np.concatenate(
+            (cached["matrix"][:missing], cached["matrix"][missing + 1 :]),
+            axis=0,
+        )
+        indices = np.concatenate(
+            (cached["indices"][:missing], cached["indices"][missing + 1 :])
+        )
+        return matrix, indices, end
+
+    matrix, parsed_end = _numeric_matrix(
+        lines, cursor, section, columns, count, width
+    )
+    source_keys = _integer_key_columns(matrix[:, :key_width], cache_key)
+    indices = _cached_numeric_indices(
+        self, cache_key, source_keys, mapping, key_builder
+    )
+    if count == full_count:
+        if cache is None:
+            cache = {}
+            self._gravityx_static_section_cache = cache
+        cache[cache_key] = {
+            "rows": rows,
+            "matrix": matrix,
+            "indices": indices,
+        }
+    return matrix, indices, parsed_end
+
+
 def _read_numeric_generated_solution(
     self: Any, file_name: str | os.PathLike[str]
 ) -> None:
@@ -327,6 +432,8 @@ def _read_numeric_generated_solution(
         "i, id, t",
         self.num_load_read,
         3,
+        self,
+        "load",
     )
     load_keys = _integer_key_columns(load[:, :2], "load")
     load_indices = _cached_numeric_indices(
@@ -354,38 +461,32 @@ def _read_numeric_generated_solution(
         lambda row: (int(row[0]), str(int(row[1]))),
     )
 
-    line, cursor = _numeric_matrix(
+    line, line_indices, cursor = _static_numeric_matrix(
+        self,
         lines,
         cursor,
         "--line section",
         "iorig, idest, id, x",
         self.num_line_read,
+        len(self.line_map),
         4,
-    )
-    line_keys = _integer_key_columns(line[:, :3], "line")
-    line_indices = _cached_numeric_indices(
-        self,
+        3,
         "line",
-        line_keys,
         self.line_map,
         lambda row: (int(row[0]), int(row[1]), str(int(row[2]))),
     )
 
-    transformer, cursor = _numeric_matrix(
+    transformer, transformer_indices, cursor = _static_numeric_matrix(
+        self,
         lines,
         cursor,
         "--transformer section",
         "iorig, idest, id, x, xst",
         self.num_xfmr_read,
+        len(self.xfmr_map),
         5,
-    )
-    transformer_keys = _integer_key_columns(
-        transformer[:, :3], "transformer"
-    )
-    transformer_indices = _cached_numeric_indices(
-        self,
+        3,
         "transformer",
-        transformer_keys,
         self.xfmr_map,
         lambda row: (int(row[0]), int(row[1]), str(int(row[2]))),
     )
@@ -408,32 +509,44 @@ def _read_numeric_generated_solution(
             "invalid --switched shunt section column header: "
             f"{lines[cursor + 1].strip()!r}"
         )
-    shunt_keys = np.empty((self.num_swsh_read, 1), dtype=np.int64)
-    shunt_values = np.zeros((self.num_swsh_read, 8), dtype=np.float64)
-    for position, raw_line in enumerate(lines[cursor + 2 : shunt_end]):
-        fields = raw_line.split(",")
-        if not 1 <= len(fields) <= 9:
-            raise ValueError(
-                f"switched-shunt row has {len(fields)} fields; expected 1 to 9"
-            )
-        try:
-            shunt_keys[position, 0] = int(fields[0])
-            if len(fields) > 1:
-                shunt_values[position, : len(fields) - 1] = [
-                    float(value) if value.strip() else 0.0
-                    for value in fields[1:]
-                ]
-        except ValueError as error:
-            raise _NumericParserFallback(
-                "switched-shunt section is not all numeric"
-            ) from error
-    shunt_indices = _cached_numeric_indices(
-        self,
-        "switched shunt",
-        shunt_keys,
-        self.swsh_map,
-        lambda row: int(row[0]),
-    )
+    shunt_rows = lines[cursor + 2 : shunt_end]
+    shunt_cache = getattr(self, "_gravityx_shunt_cache", None)
+    if shunt_cache is not None and shunt_cache["rows"] == shunt_rows:
+        shunt_values = shunt_cache["values"]
+        shunt_indices = shunt_cache["indices"]
+    else:
+        shunt_keys = np.empty((self.num_swsh_read, 1), dtype=np.int64)
+        shunt_values = np.zeros((self.num_swsh_read, 8), dtype=np.float64)
+        for position, raw_line in enumerate(shunt_rows):
+            fields = raw_line.split(",")
+            if not 1 <= len(fields) <= 9:
+                raise ValueError(
+                    "switched-shunt row has "
+                    f"{len(fields)} fields; expected 1 to 9"
+                )
+            try:
+                shunt_keys[position, 0] = int(fields[0])
+                if len(fields) > 1:
+                    shunt_values[position, : len(fields) - 1] = [
+                        float(value) if value.strip() else 0.0
+                        for value in fields[1:]
+                    ]
+            except ValueError as error:
+                raise _NumericParserFallback(
+                    "switched-shunt section is not all numeric"
+                ) from error
+        shunt_indices = _cached_numeric_indices(
+            self,
+            "switched shunt",
+            shunt_keys,
+            self.swsh_map,
+            lambda row: int(row[0]),
+        )
+        self._gravityx_shunt_cache = {
+            "rows": shunt_rows,
+            "values": shunt_values,
+            "indices": shunt_indices,
+        }
     cursor = shunt_end
     if any(line.strip() for line in lines[cursor:]):
         raise ValueError(

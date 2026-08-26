@@ -531,6 +531,12 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
             )
             read_generated_solution(target, numeric_solution)
             np.testing.assert_allclose(target.bus_volt_mag, [1.02, 0.99])
+            numeric_solution.write_text(
+                numeric_text.replace("1.2, -0.3, 1", "1.3, -0.3, 1"),
+                encoding="utf-8",
+            )
+            read_generated_solution(target, numeric_solution)
+            np.testing.assert_allclose(target.gen_pow_real, [1.3])
 
             line_outage_solution = Path(directory) / "solution_line_outage.txt"
             line_outage_solution.write_text(
@@ -612,7 +618,7 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
         self.assertIs(module.marker, marker)
         self.assertIsNone(module.print("suppressed"))
 
-    def test_streaming_evaluation_runs_ready_shards_and_merges_exactly(self):
+    def test_deferred_streaming_evaluation_merges_every_shard_exactly(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             case_dir = root / "case"
@@ -675,7 +681,7 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
                 internal_dir,
                 labels,
                 2,
-                1,
+                0,
                 time.perf_counter() + 30.0,
                 1,
                 2,
@@ -685,6 +691,8 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
                     f"{label}\n", encoding="utf-8"
                 )
                 manager.mark_completed(label)
+            self.assertEqual(manager.running_records, {})
+            self.assertEqual(len(manager.ready_records), 2)
             summary, metadata = manager.finish()
 
             self.assertEqual(summary["num_ctg"], 4)
@@ -697,7 +705,7 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
                 metadata["aggregate_certificate"]["observed_unique_detail_count"],
                 5,
             )
-            self.assertEqual(metadata["initial_maximum_parallel_processes"], 1)
+            self.assertEqual(metadata["initial_maximum_parallel_processes"], 0)
             self.assertEqual(
                 metadata["post_screen_maximum_parallel_processes"], 2
             )

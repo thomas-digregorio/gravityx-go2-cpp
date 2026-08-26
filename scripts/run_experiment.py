@@ -837,10 +837,16 @@ class StreamingSerialEvaluation:
         post_screen_maximum_processes: int | None = None,
         vendor_evaluator_reference: Path | None = None,
     ) -> None:
-        if maximum_processes < 1:
-            raise ValueError("streaming evaluation processes must be positive")
+        if maximum_processes < 0:
+            raise ValueError(
+                "initial streaming evaluation processes cannot be negative"
+            )
         if post_screen_maximum_processes is None:
             post_screen_maximum_processes = maximum_processes
+        if post_screen_maximum_processes < 1:
+            raise ValueError(
+                "post-screen streaming evaluation processes must be positive"
+            )
         if post_screen_maximum_processes < maximum_processes:
             raise ValueError(
                 "post-screen streaming evaluation processes cannot be less "
@@ -1606,11 +1612,17 @@ def main() -> int:
         raise ValueError("serial evaluation shards must be positive")
     if args.streaming_serial_evaluation_shards < 1:
         raise ValueError("streaming serial evaluation shards must be positive")
-    if args.streaming_evaluation_processes < 1:
-        raise ValueError("streaming evaluation processes must be positive")
+    if args.streaming_evaluation_processes < 0:
+        raise ValueError(
+            "initial streaming evaluation processes cannot be negative"
+        )
     if args.post_screen_streaming_evaluation_processes is None:
         args.post_screen_streaming_evaluation_processes = (
-            args.streaming_evaluation_processes
+            max(1, args.streaming_evaluation_processes)
+        )
+    if args.post_screen_streaming_evaluation_processes < 1:
+        raise ValueError(
+            "post-screen streaming evaluation processes must be positive"
         )
     if (
         args.post_screen_streaming_evaluation_processes

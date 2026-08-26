@@ -419,6 +419,8 @@ def _read_numeric_generated_solution(
         "i, v, theta",
         self.num_bus_read,
         3,
+        self,
+        "bus",
     )
     bus_keys = _integer_key_columns(bus[:, :1], "bus")
     bus_indices = _cached_numeric_indices(
@@ -451,6 +453,8 @@ def _read_numeric_generated_solution(
         "i, id, p, q, x",
         self.num_gen_read,
         5,
+        self,
+        "generator",
     )
     generator_keys = _integer_key_columns(generator[:, :2], "generator")
     generator_indices = _cached_numeric_indices(

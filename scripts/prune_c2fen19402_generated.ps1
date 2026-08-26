@@ -8,31 +8,21 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $runsRoot = (Resolve-Path -LiteralPath (Join-Path $repositoryRoot 'runs')).Path
 $diagnosticsRoot = (Resolve-Path -LiteralPath (Join-Path $runsRoot 'diagnostics')).Path
-$keptParentName = 'c2fen19402_b5f65c9_20260826'
-$keptRunName = 'C2FEN19402_s006_cold_r18_measured_finalization'
-$failedSiblingName = 'C2FEN19402_s010_cold_r1'
-$keptParent = (Resolve-Path -LiteralPath (Join-Path $runsRoot $keptParentName)).Path
-$keptRun = (Resolve-Path -LiteralPath (Join-Path $keptParent $keptRunName)).Path
-$failedSibling = (Resolve-Path -LiteralPath (Join-Path $keptParent $failedSiblingName)).Path
 
 if ($repositoryRoot.IndexOf('OneDrive', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
     throw "OneDrive path is forbidden: $repositoryRoot"
 }
 
-$topLevelTargets = @(
-    Get-ChildItem -LiteralPath $runsRoot -Directory -Filter 'c2fen19402_*' |
-        Where-Object { $_.Name -ne $keptParentName }
+$retainedRunSpecs = @(
+    [pscustomobject]@{
+        ParentName = 'c2fen19402_b5f65c9_20260826'
+        RunName = 'C2FEN19402_s006_cold_r18_measured_finalization'
+    },
+    [pscustomobject]@{
+        ParentName = 'c2fen19402_52103f8_20260826'
+        RunName = 's010_cold_r24_h11'
+    }
 )
-$diagnosticTargets = @(
-    Get-ChildItem -LiteralPath $diagnosticsRoot -Directory -Filter 'c2fen19402_*'
-)
-
-if ($topLevelTargets.Count -ne 38) {
-    throw "Expected exactly 38 failed top-level run trees; found $($topLevelTargets.Count)."
-}
-if ($diagnosticTargets.Count -ne 220) {
-    throw "Expected exactly 220 diagnostic trees; found $($diagnosticTargets.Count)."
-}
 
 function Assert-ChildTarget {
     param(
@@ -51,29 +41,99 @@ function Assert-ChildTarget {
     }
 }
 
+$retainedRuns = @()
+$retainedParentNames = @()
+foreach ($spec in $retainedRunSpecs) {
+    $parent = (Resolve-Path -LiteralPath (Join-Path $runsRoot $spec.ParentName)).Path
+    $run = (Resolve-Path -LiteralPath (Join-Path $parent $spec.RunName)).Path
+    $statusPath = Join-Path $run 'run_status.json'
+    $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+    if ($status.success -ne $true -or $status.official_infeasibility -ne 0) {
+        throw "A retained result no longer passes its success guard: $statusPath"
+    }
+    $retainedRuns += [pscustomobject]@{
+        Parent = $parent
+        Run = $run
+        StatusPath = $statusPath
+        ParentName = $spec.ParentName
+        RunName = $spec.RunName
+    }
+    $retainedParentNames += $spec.ParentName
+}
+
+$allTopLevel = @(
+    Get-ChildItem -LiteralPath $runsRoot -Directory -Filter 'c2fen19402_*'
+)
+
+# Refuse to prune any newly discovered successful result. A future verified run
+# must be registered explicitly before this maintenance script can remove data.
+$unexpectedVerifiedRuns = @()
+foreach ($root in $allTopLevel) {
+    foreach ($child in @(Get-ChildItem -LiteralPath $root.FullName -Directory -ErrorAction SilentlyContinue)) {
+        $statusPath = Join-Path $child.FullName 'run_status.json'
+        if (-not (Test-Path -LiteralPath $statusPath)) {
+            continue
+        }
+        try {
+            $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+        } catch {
+            continue
+        }
+        if ($status.success -eq $true -and $status.official_infeasibility -eq 0) {
+            $isExpected = $false
+            foreach ($retained in $retainedRuns) {
+                if ($child.FullName.Equals($retained.Run, [StringComparison]::OrdinalIgnoreCase)) {
+                    $isExpected = $true
+                    break
+                }
+            }
+            if (-not $isExpected) {
+                $unexpectedVerifiedRuns += $child.FullName
+            }
+        }
+    }
+}
+if ($unexpectedVerifiedRuns.Count -gt 0) {
+    throw "Found unregistered verified result(s); add them to retainedRunSpecs before pruning: $($unexpectedVerifiedRuns -join ', ')"
+}
+
+$topLevelTargets = @(
+    $allTopLevel | Where-Object { $_.Name -notin $retainedParentNames }
+)
+$failedSiblingTargets = @()
+foreach ($retained in $retainedRuns) {
+    $failedSiblingTargets += @(
+        Get-ChildItem -LiteralPath $retained.Parent -Directory -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.FullName.Equals($retained.Run, [StringComparison]::OrdinalIgnoreCase) }
+    )
+}
+$diagnosticTargets = @(
+    Get-ChildItem -LiteralPath $diagnosticsRoot -Directory -Filter 'c2fen19402_*'
+)
+
 foreach ($target in $topLevelTargets) {
     Assert-ChildTarget -Root $runsRoot -Target $target.FullName -RequiredPrefix 'c2fen19402_'
 }
 foreach ($target in $diagnosticTargets) {
     Assert-ChildTarget -Root $diagnosticsRoot -Target $target.FullName -RequiredPrefix 'c2fen19402_'
 }
-Assert-ChildTarget -Root $keptParent -Target $failedSibling -RequiredPrefix 'C2FEN19402_s010_'
-
-$keptStatus = Join-Path $keptRun 'run_status.json'
-$keptStatusObject = Get-Content -LiteralPath $keptStatus -Raw | ConvertFrom-Json
-if ($keptStatusObject.success -ne $true -or $keptStatusObject.official_infeasibility -ne 0) {
-    throw "The retained scenario-006 result no longer passes its success guard: $keptStatus"
+foreach ($target in $failedSiblingTargets) {
+    $matchingRetained = $retainedRuns | Where-Object {
+        $target.FullName.StartsWith($_.Parent + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1
+    if ($null -eq $matchingRetained) {
+        throw "Failed sibling escaped every retained parent: $($target.FullName)"
+    }
 }
 
-$summary = [pscustomobject]@{
+[pscustomobject]@{
     RepositoryRoot = $repositoryRoot
-    RetainedVerifiedRun = $keptRun
+    RetainedVerifiedRuns = ($retainedRuns.Run -join [Environment]::NewLine)
     FailedTopLevelTrees = $topLevelTargets.Count
     DiagnosticTrees = $diagnosticTargets.Count
-    FailedSiblingTrees = 1
+    FailedSiblingTrees = $failedSiblingTargets.Count
     Execute = [bool] $Execute
-}
-$summary | Format-List
+} | Format-List
 
 if (-not $Execute) {
     Write-Host 'Dry run only. Re-run with -Execute to permanently remove these generated artifacts.'
@@ -86,10 +146,14 @@ foreach ($target in $diagnosticTargets) {
 foreach ($target in $topLevelTargets) {
     Remove-Item -LiteralPath $target.FullName -Recurse -Force
 }
-Remove-Item -LiteralPath $failedSibling -Recurse -Force
+foreach ($target in $failedSiblingTargets) {
+    Remove-Item -LiteralPath $target.FullName -Recurse -Force
+}
 
-if (-not (Test-Path -LiteralPath $keptStatus)) {
-    throw "The retained verified result was unexpectedly removed: $keptStatus"
+foreach ($retained in $retainedRuns) {
+    if (-not (Test-Path -LiteralPath $retained.StatusPath)) {
+        throw "A retained verified result was unexpectedly removed: $($retained.StatusPath)"
+    }
 }
 
 $remainingTopLevel = @(
@@ -101,7 +165,7 @@ $remainingDiagnostics = @(
 $drive = Get-PSDrive -Name ([IO.Path]::GetPathRoot($repositoryRoot).TrimEnd(':', '\'))
 
 [pscustomobject]@{
-    RetainedVerifiedRun = $keptRun
+    RetainedVerifiedRuns = ($retainedRuns.Run -join [Environment]::NewLine)
     RemainingC2FEN19402TopLevelTrees = $remainingTopLevel.Count
     RemainingC2FEN19402DiagnosticTrees = $remainingDiagnostics.Count
     FreeGB = [math]::Round($drive.Free / 1GB, 2)

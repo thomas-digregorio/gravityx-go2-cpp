@@ -3087,7 +3087,7 @@ def main() -> int:
             else None
         ),
         "evaluator_parser_mode": (
-            "canonical_vectorized_numeric_with_string_fallback_and_"
+            "canonical_binary_numeric_with_line_and_string_fallback_and_"
             "in_memory_summary_with_referenced_vendor_equations"
             if args.vendor_evaluator_reference is not None
             else "native_vendor_parser_and_equations"
@@ -4391,7 +4391,7 @@ def main() -> int:
                     else None
                 ),
                 "evaluator_parser_mode": (
-                    "canonical_vectorized_numeric_with_string_fallback_and_"
+                    "canonical_binary_numeric_with_line_and_string_fallback_and_"
                     "in_memory_summary_with_referenced_vendor_equations"
                     if args.vendor_evaluator_reference is not None
                     else "native_vendor_parser_and_equations"
@@ -4618,7 +4618,7 @@ def main() -> int:
             else None
         ),
         "evaluator_parser_mode": (
-            "canonical_vectorized_numeric_with_string_fallback_and_"
+            "canonical_binary_numeric_with_line_and_string_fallback_and_"
             "in_memory_summary_with_referenced_vendor_equations"
             if args.vendor_evaluator_reference is not None
             else "native_vendor_parser_and_equations"

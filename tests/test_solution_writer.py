@@ -918,6 +918,20 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
                 set(target._gravityx_numeric_layout),
                 {"bus", "load", "generator", "line", "transformer", "switched shunt"},
             )
+            self.assertEqual(
+                set(target._gravityx_exact_binary_matrix_cache),
+                {"bus", "load", "generator"},
+            )
+            self.assertEqual(
+                set(target._gravityx_binary_static_section_cache),
+                {"line", "transformer"},
+            )
+            numeric_solution.write_text(
+                numeric_text.replace("101, 102, 1, 1", "101, 102, 1, 0"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "full line rows changed"):
+                read_generated_solution(target, numeric_solution)
             numeric_solution.write_text(
                 numeric_text.replace("101, 1.01, 0.1", "101, 1.02, 0.1"),
                 encoding="utf-8",

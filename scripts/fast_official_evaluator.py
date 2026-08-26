@@ -588,14 +588,368 @@ def _read_numeric_generated_solution(
     self._gravityx_arrays_loaded = True
 
 
+_CANONICAL_NUMERIC_HEADERS = (
+    ("bus", b"--bus section\ni, v, theta\n"),
+    ("load", b"--load section\ni, id, t\n"),
+    ("generator", b"--generator section\ni, id, p, q, x\n"),
+    ("line", b"--line section\niorig, idest, id, x\n"),
+    (
+        "transformer",
+        b"--transformer section\niorig, idest, id, x, xst\n",
+    ),
+    (
+        "switched shunt",
+        b"--switched shunt section\n"
+        b"i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8\n",
+    ),
+)
+
+
+def _canonical_numeric_blocks(
+    file_name: str | os.PathLike[str],
+) -> dict[str, bytes]:
+    """Read one canonical solution once and return section payload bytes.
+
+    The generated 19k solutions are about 1.7 MB each.  ``readlines`` creates
+    tens of thousands of Python strings per file before the NumPy parser sees
+    them.  The C++ writer emits an ASCII-only fixed section order, so locating
+    the exact headers in one byte buffer avoids those allocations while
+    retaining strict section and trailing-content validation.
+    """
+
+    with open(file_name, "rb") as stream:
+        content = stream.read()
+    if b"\r" in content:
+        content = content.replace(b"\r\n", b"\n")
+        if b"\r" in content:
+            raise _NumericParserFallback(
+                "canonical numeric solution contains a bare carriage return"
+            )
+    first_header = _CANONICAL_NUMERIC_HEADERS[0][1]
+    if not content.startswith(first_header):
+        raise _NumericParserFallback(
+            "solution does not start with the canonical numeric bus header"
+        )
+
+    positions = [0]
+    search_start = len(first_header)
+    for section, header in _CANONICAL_NUMERIC_HEADERS[1:]:
+        position = content.find(header, search_start)
+        if position < 0:
+            raise ValueError(f"missing canonical {section} section header")
+        positions.append(position)
+        search_start = position + len(header)
+
+    blocks: dict[str, bytes] = {}
+    for index, (section, header) in enumerate(_CANONICAL_NUMERIC_HEADERS):
+        payload_start = positions[index] + len(header)
+        payload_end = (
+            positions[index + 1]
+            if index + 1 < len(positions)
+            else len(content)
+        )
+        blocks[section] = content[payload_start:payload_end]
+    return blocks
+
+
+def _binary_numeric_matrix(
+    self: Any,
+    block: bytes,
+    section: str,
+    count: int,
+    width: int,
+    cache_key: str | None = None,
+) -> np.ndarray:
+    """Parse one all-numeric byte block in NumPy's C loop."""
+
+    if count < 0:
+        raise ValueError(f"negative row count for {section}: {count}")
+    if block.count(b"\n") != count:
+        raise ValueError(
+            f"canonical {section} row count does not match {count}"
+        )
+    if cache_key is not None:
+        cache = getattr(self, "_gravityx_exact_binary_matrix_cache", None)
+        if cache is not None:
+            cached = cache.get(cache_key)
+            if cached is not None and cached["block"] == block:
+                return cached["matrix"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            values = np.fromstring(
+                block.replace(b",", b" "), dtype=np.float64, sep=" "
+            )
+        except ValueError as error:
+            raise _NumericParserFallback(
+                f"{section} is not an all-numeric section"
+            ) from error
+    expected = count * width
+    if values.size != expected:
+        raise _NumericParserFallback(
+            f"{section} is not an all-numeric {width}-column section"
+        )
+    matrix = values.reshape((count, width))
+    if cache_key is not None:
+        cache = getattr(self, "_gravityx_exact_binary_matrix_cache", None)
+        if cache is None:
+            cache = {}
+            self._gravityx_exact_binary_matrix_cache = cache
+        cache[cache_key] = {"block": block, "matrix": matrix}
+    return matrix
+
+
+def _single_missing_binary_row(
+    full_block: bytes, subset_block: bytes, section: str
+) -> tuple[int, int, int]:
+    """Return the omitted row index and byte span after exact verification."""
+
+    if len(subset_block) >= len(full_block):
+        raise ValueError(
+            f"canonical {section} byte block is not a single-row subset"
+        )
+    compared = len(subset_block)
+    if compared:
+        full_values = np.frombuffer(full_block, dtype=np.uint8, count=compared)
+        subset_values = np.frombuffer(subset_block, dtype=np.uint8)
+        differences = full_values != subset_values
+        first_difference = (
+            int(differences.argmax()) if bool(differences.any()) else compared
+        )
+    else:
+        first_difference = 0
+    row_start = full_block.rfind(b"\n", 0, first_difference) + 1
+    row_end = full_block.find(b"\n", first_difference)
+    if row_end < 0:
+        raise ValueError(f"canonical {section} omitted row is unterminated")
+    row_end += 1
+    if (
+        full_block[:row_start] != subset_block[:row_start]
+        or full_block[row_end:] != subset_block[row_start:]
+    ):
+        raise ValueError(
+            f"canonical {section} rows are not an exact single-row subset"
+        )
+    row_index = full_block[:row_start].count(b"\n")
+    return row_index, row_start, row_end
+
+
+def _binary_static_numeric_matrix(
+    self: Any,
+    block: bytes,
+    section: str,
+    count: int,
+    full_count: int,
+    width: int,
+    key_width: int,
+    cache_key: str,
+    mapping: dict[Any, int],
+    key_builder: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reuse an exactly verified static section across single outages."""
+
+    if block.count(b"\n") != count:
+        raise ValueError(
+            f"canonical {section} row count does not match {count}"
+        )
+    cache = getattr(self, "_gravityx_binary_static_section_cache", None)
+    cached = cache.get(cache_key) if cache is not None else None
+    if cached is not None and count == full_count:
+        if cached["block"] != block:
+            raise ValueError(f"canonical full {section} rows changed")
+        return cached["matrix"], cached["indices"]
+    if cached is not None and count + 1 == full_count:
+        missing, _, _ = _single_missing_binary_row(
+            cached["block"], block, cache_key
+        )
+        matrix = np.concatenate(
+            (cached["matrix"][:missing], cached["matrix"][missing + 1 :]),
+            axis=0,
+        )
+        indices = np.concatenate(
+            (cached["indices"][:missing], cached["indices"][missing + 1 :])
+        )
+        return matrix, indices
+
+    matrix = _binary_numeric_matrix(
+        self, block, section, count, width
+    )
+    source_keys = _integer_key_columns(matrix[:, :key_width], cache_key)
+    indices = _cached_numeric_indices(
+        self, cache_key, source_keys, mapping, key_builder
+    )
+    if count == full_count:
+        if cache is None:
+            cache = {}
+            self._gravityx_binary_static_section_cache = cache
+        cache[cache_key] = {
+            "block": block,
+            "matrix": matrix,
+            "indices": indices,
+        }
+    return matrix, indices
+
+
+def _binary_shunt_values(
+    self: Any, block: bytes
+) -> tuple[np.ndarray, np.ndarray]:
+    """Parse the canonical variable-width switched-shunt rows once."""
+
+    if block.count(b"\n") != self.num_swsh_read:
+        raise ValueError(
+            "canonical switched shunt row count does not match "
+            f"{self.num_swsh_read}"
+        )
+    cached = getattr(self, "_gravityx_binary_shunt_cache", None)
+    if cached is not None and cached["block"] == block:
+        return cached["values"], cached["indices"]
+    keys = np.empty((self.num_swsh_read, 1), dtype=np.int64)
+    values = np.zeros((self.num_swsh_read, 8), dtype=np.float64)
+    rows = block.splitlines()
+    for position, row in enumerate(rows):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                parsed = np.fromstring(
+                    row.replace(b",", b" "), dtype=np.float64, sep=" "
+                )
+            except ValueError as error:
+                raise _NumericParserFallback(
+                    "switched shunt section is not all numeric"
+                ) from error
+        if not 1 <= parsed.size <= 9:
+            raise _NumericParserFallback(
+                "switched shunt row does not contain 1 to 9 numeric fields"
+            )
+        integer_key = int(parsed[0])
+        if parsed[0] != integer_key:
+            raise _NumericParserFallback(
+                "switched shunt source key is not an integer"
+            )
+        keys[position, 0] = integer_key
+        values[position, : parsed.size - 1] = parsed[1:]
+    indices = _cached_numeric_indices(
+        self,
+        "switched shunt",
+        keys,
+        self.swsh_map,
+        lambda row: int(row[0]),
+    )
+    self._gravityx_binary_shunt_cache = {
+        "block": block,
+        "values": values,
+        "indices": indices,
+    }
+    return values, indices
+
+
+def _read_binary_numeric_generated_solution(
+    self: Any, file_name: str | os.PathLike[str]
+) -> None:
+    """Populate vendor arrays from canonical bytes without per-line objects."""
+
+    blocks = _canonical_numeric_blocks(file_name)
+    bus = _binary_numeric_matrix(
+        self, blocks["bus"], "bus", self.num_bus_read, 3, "bus"
+    )
+    bus_keys = _integer_key_columns(bus[:, :1], "bus")
+    bus_indices = _cached_numeric_indices(
+        self, "bus", bus_keys, self.bus_map, lambda row: int(row[0])
+    )
+
+    load = _binary_numeric_matrix(
+        self, blocks["load"], "load", self.num_load_read, 3, "load"
+    )
+    load_keys = _integer_key_columns(load[:, :2], "load")
+    load_indices = _cached_numeric_indices(
+        self,
+        "load",
+        load_keys,
+        self.load_map,
+        lambda row: (int(row[0]), str(int(row[1]))),
+    )
+
+    generator = _binary_numeric_matrix(
+        self,
+        blocks["generator"],
+        "generator",
+        self.num_gen_read,
+        5,
+        "generator",
+    )
+    generator_keys = _integer_key_columns(generator[:, :2], "generator")
+    generator_indices = _cached_numeric_indices(
+        self,
+        "generator",
+        generator_keys,
+        self.gen_map,
+        lambda row: (int(row[0]), str(int(row[1]))),
+    )
+
+    line, line_indices = _binary_static_numeric_matrix(
+        self,
+        blocks["line"],
+        "line",
+        self.num_line_read,
+        len(self.line_map),
+        4,
+        3,
+        "line",
+        self.line_map,
+        lambda row: (int(row[0]), int(row[1]), str(int(row[2]))),
+    )
+    transformer, transformer_indices = _binary_static_numeric_matrix(
+        self,
+        blocks["transformer"],
+        "transformer",
+        self.num_xfmr_read,
+        len(self.xfmr_map),
+        5,
+        3,
+        "transformer",
+        self.xfmr_map,
+        lambda row: (int(row[0]), int(row[1]), str(int(row[2]))),
+    )
+
+    shunt_values, shunt_indices = _binary_shunt_values(
+        self, blocks["switched shunt"]
+    )
+
+    self.bus_volt_mag.fill(1.0)
+    self.bus_volt_ang.fill(0.0)
+    self.bus_volt_mag[bus_indices] = bus[:, 1]
+    self.bus_volt_ang[bus_indices] = bus[:, 2]
+    self.load_t.fill(0.0)
+    self.load_t[load_indices] = load[:, 2]
+    self.gen_pow_real.fill(0.0)
+    self.gen_pow_imag.fill(0.0)
+    self.gen_xon.fill(0.0)
+    self.gen_pow_real[generator_indices] = generator[:, 2]
+    self.gen_pow_imag[generator_indices] = generator[:, 3]
+    self.gen_xon[generator_indices] = generator[:, 4]
+    self.line_xsw.fill(0.0)
+    self.line_xsw[line_indices] = line[:, 3]
+    self.xfmr_xsw.fill(0.0)
+    self.xfmr_xst.fill(0.0)
+    self.xfmr_xsw[transformer_indices] = transformer[:, 3]
+    self.xfmr_xst[transformer_indices] = transformer[:, 4]
+    self.swsh_xst.fill(0.0)
+    if shunt_indices.size:
+        self.swsh_xst[shunt_indices, :] = shunt_values
+    self._gravityx_arrays_loaded = True
+
+
 def read_generated_solution(self: Any, file_name: str | os.PathLike[str]) -> None:
     """Populate vendor arrays, using a numeric fast path with exact fallback."""
 
     self._gravityx_arrays_loaded = False
     try:
-        _read_numeric_generated_solution(self, file_name)
+        _read_binary_numeric_generated_solution(self, file_name)
     except _NumericParserFallback:
-        _read_generated_solution_csv(self, file_name)
+        try:
+            _read_numeric_generated_solution(self, file_name)
+        except _NumericParserFallback:
+            _read_generated_solution_csv(self, file_name)
 
 
 def skip_dataframe_copy(self: Any) -> None:

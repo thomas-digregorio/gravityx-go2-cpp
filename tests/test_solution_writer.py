@@ -49,6 +49,7 @@ from fast_official_evaluator import (  # noqa: E402
     skip_dataframe_copy,
 )
 from build_fast_screen_heavy_profile import (  # noqa: E402
+    existing_profile_measurements,
     merge_max_measurements,
     parse_worker_log_measurements,
 )
@@ -132,6 +133,9 @@ class CompetitionTimingTests(unittest.TestCase):
     def test_compact_summary_uses_measured_short_finalization_reserve(self) -> None:
         self.assertEqual(finalization_reserve_seconds(False), 5.0)
         self.assertEqual(finalization_reserve_seconds(True), 0.5)
+        self.assertEqual(finalization_reserve_seconds(True, 4.0), 4.0)
+        with self.assertRaisesRegex(ValueError, "positive and finite"):
+            finalization_reserve_seconds(True, 0.0)
 
     def test_progress_checkpoint_is_throttled(self) -> None:
         self.assertFalse(progress_checkpoint_due(10.0, 14.999))
@@ -715,6 +719,29 @@ class CompetitionTimingTests(unittest.TestCase):
                 [first, {"A": 8.0, "B": 6.0, "C": 5.0}]
             )
             self.assertEqual(merged, {"A": 8.0, "B": 7.5, "C": 5.0})
+
+    def test_existing_fast_screen_profile_supplies_timing_only_measurements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            write_json(
+                path,
+                {
+                    "schema_version": 1,
+                    "case_sha256": "case-hash",
+                    "contingencies": [
+                        {
+                            "label": "A",
+                            "measured_solver_wall_seconds": 7.5,
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(
+                existing_profile_measurements(path, "case-hash"),
+                {"A": 7.5},
+            )
+            with self.assertRaisesRegex(ValueError, "case hash"):
+                existing_profile_measurements(path, "different-hash")
 
     def test_idle_screen_capacity_promotes_evaluation_without_oversubscription(self):
         self.assertEqual(

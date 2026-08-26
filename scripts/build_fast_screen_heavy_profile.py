@@ -66,6 +66,35 @@ def merge_max_measurements(
     return merged
 
 
+def existing_profile_measurements(
+    path: Path,
+    expected_case_sha256: str,
+) -> dict[str, float]:
+    """Read timing-only measurements from a previously validated profile."""
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("existing heavy profile must use schema_version 1")
+    if raw.get("case_sha256") != expected_case_sha256:
+        raise ValueError("existing heavy profile case hash does not match")
+    entries = raw.get("contingencies")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("existing heavy profile contingencies must be nonempty")
+    measurements: dict[str, float] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("existing heavy profile entry must be an object")
+        label = str(entry.get("label", ""))
+        wall_seconds = float(
+            entry.get("measured_solver_wall_seconds", math.nan)
+        )
+        if not label or not math.isfinite(wall_seconds) or wall_seconds < 0.0:
+            raise ValueError(f"invalid existing heavy profile entry: {entry}")
+        if label in measurements:
+            raise ValueError(f"duplicate existing heavy profile label: {label}")
+        measurements[label] = wall_seconds
+    return measurements
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--case-json", type=Path, required=True)
@@ -76,23 +105,41 @@ def main() -> int:
         required=True,
         help="Worker-log directory; repeat to merge multiple cold runs.",
     )
+    parser.add_argument(
+        "--existing-profile",
+        type=Path,
+        action="append",
+        default=[],
+        help="Prior timing-only profile; repeat to merge conservative maxima.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--threshold", type=float, default=5.0)
     parser.add_argument("--require-complete-coverage", action="store_true")
     args = parser.parse_args()
 
-    for path in (args.case_json, *args.worker_log_dir, args.output):
+    for path in (
+        args.case_json,
+        *args.worker_log_dir,
+        *args.existing_profile,
+        args.output,
+    ):
         reject_onedrive(path)
     if args.output.exists():
         raise ValueError(f"profile output already exists: {args.output}")
     if not math.isfinite(args.threshold) or args.threshold <= 0.0:
         raise ValueError("heavy-screen threshold must be positive")
 
-    measurement_sets = [
+    case = read_json(args.case_json)
+    case_sha256 = sha256(args.case_json)
+    existing_measurement_sets = [
+        existing_profile_measurements(path, case_sha256)
+        for path in args.existing_profile
+    ]
+    worker_measurement_sets = [
         measured_screen_times(path) for path in args.worker_log_dir
     ]
+    measurement_sets = existing_measurement_sets + worker_measurement_sets
     measured = merge_max_measurements(measurement_sets)
-    case = read_json(args.case_json)
     contingency_labels = {
         str(item["label"]) for item in contingency_records(case)
     }
@@ -121,7 +168,7 @@ def main() -> int:
 
     sources: list[dict[str, Any]] = []
     for worker_log_dir, source_measurement in zip(
-        args.worker_log_dir, measurement_sets
+        args.worker_log_dir, worker_measurement_sets
     ):
         source_run_status_path = (
             worker_log_dir.parent.parent / "run_status.json"
@@ -149,11 +196,12 @@ def main() -> int:
             "primal, dual, commitment, network, or solver state. Repeated "
             "cold timings are merged by maximum measured solver time."
         ),
-        "case_sha256": sha256(args.case_json),
+        "case_sha256": case_sha256,
         "heavy_threshold_seconds": args.threshold,
         "source_measurement": {
             "complete_contingency_coverage": not missing,
             "merge_rule": "maximum measured solver wall time by label",
+            "source_profiles": [str(path) for path in args.existing_profile],
             "runs": sources,
         },
         "contingencies": selected,

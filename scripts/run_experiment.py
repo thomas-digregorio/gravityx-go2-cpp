@@ -104,7 +104,14 @@ def idle_screen_evaluation_process_target(
     return min(post_screen_processes, initial_processes + released)
 
 
-def finalization_reserve_seconds(compact_summary: bool) -> float:
+def finalization_reserve_seconds(
+    compact_summary: bool,
+    configured_seconds: float | None = None,
+) -> float:
+    if configured_seconds is not None:
+        if not math.isfinite(configured_seconds) or configured_seconds <= 0.0:
+            raise ValueError("finalization reserve must be positive and finite")
+        return configured_seconds
     return (
         COMPACT_FINALIZATION_RESERVE_SECONDS
         if compact_summary
@@ -2200,6 +2207,7 @@ def main() -> int:
     parser.add_argument("--code2-seconds-per-contingency", type=float, default=2.0)
     parser.add_argument("--total-time-limit", type=float, default=300.0)
     parser.add_argument("--evaluation-reserve", type=float, default=7.0)
+    parser.add_argument("--finalization-reserve", type=float)
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
     parser.add_argument("--evaluation-processes", type=int, default=1)
@@ -2422,7 +2430,8 @@ def main() -> int:
     if args.evaluation_reserve <= 0:
         raise ValueError("evaluation reserve must be positive")
     finalization_reserve = finalization_reserve_seconds(
-        args.compact_final_summary
+        args.compact_final_summary,
+        args.finalization_reserve,
     )
     if args.evaluation_reserve + finalization_reserve >= args.total_time_limit:
         raise ValueError("evaluation and finalization reserves exhaust the end-to-end limit")

@@ -2323,16 +2323,29 @@ bool solve_loaded_contingency(
     if (match == data.contingencies.end()) {
         throw std::runtime_error("unknown contingency label: " + label);
     }
-    gravityx::ContingencyContext context;
-    context.base_state = base.state;
-    if (match->type == gravityx::ContingencyType::Generator) {
-        context.outaged_generator = match->component;
-    } else {
-        context.outaged_branch = match->component;
-    }
+    // The fast path already owns a read-only reference to the base state and
+    // normally returns before the exact/repair fallbacks need a contingency
+    // context.  Defer this large state copy until one of those fallbacks is
+    // actually selected.  This changes neither the context contents nor any
+    // validation rule; it only avoids copying the full network state for the
+    // overwhelmingly common fast-path success.
+    std::optional<gravityx::ContingencyContext> deferred_context;
+    const auto contingency_context = [&]()
+        -> gravityx::ContingencyContext& {
+        if (!deferred_context) {
+            deferred_context.emplace();
+            deferred_context->base_state = base.state;
+            if (match->type == gravityx::ContingencyType::Generator) {
+                deferred_context->outaged_generator = match->component;
+            } else {
+                deferred_context->outaged_branch = match->component;
+            }
+        }
+        return *deferred_context;
+    };
 
     auto complete = [&](nlohmann::json output,
-                        const gravityx::AcState& state,
+                        gravityx::AcState state,
                         bool persist_full_state = false) {
         if (persist_result) {
             output["solve"]["state"] = persist_full_state
@@ -2343,7 +2356,7 @@ bool solve_loaded_contingency(
         if (completed_computation != nullptr) {
             completed_computation->emplace(ContingencyComputation{
                 std::move(output),
-                state,
+                std::move(state),
             });
         }
     };
@@ -2464,7 +2477,8 @@ bool solve_loaded_contingency(
                 fast_result->validation.max_residual <= 0.2 &&
                 match->type == gravityx::ContingencyType::Branch) {
                 auto pocket_repair = try_passive_outage_pocket_repair(
-                    data, base.state, base.commitment, *match, context,
+                    data, base.state, base.commitment, *match,
+                    contingency_context(),
                     fast_result->solve.state, fast_result->validation);
                 if (pocket_repair) {
                     passive_pocket_repair_diagnostics =
@@ -2503,7 +2517,8 @@ bool solve_loaded_contingency(
                     bounded_fast_linearized_repair =
                         gravityx::solve_linearized_active_feasibility_repair(
                             data, linearized_reference, base.commitment,
-                            context, 0.45, 0.15, 5.0, 0.1, true, true);
+                            contingency_context(), 0.45, 0.15, 5.0, 0.1,
+                            true, true);
                     wall_after_linearized_repair +=
                         bounded_fast_linearized_repair->wall_seconds;
                     auto compact_attempt =
@@ -2516,7 +2531,8 @@ bool solve_loaded_contingency(
                         bounded_fast_linearized_repair =
                             gravityx::solve_linearized_active_feasibility_repair(
                                 data, linearized_reference, base.commitment,
-                                context, 0.49, 0.5, 5.0, 0.2, true, true);
+                                contingency_context(), 0.49, 0.5, 5.0, 0.2,
+                                true, true);
                         wall_after_linearized_repair +=
                             bounded_fast_linearized_repair->wall_seconds;
                         compact_attempt =
@@ -2540,7 +2556,8 @@ bool solve_loaded_contingency(
                     const auto linearized_validation =
                         gravityx::validate_state(
                             data, gravityx::ModelMode::ContingencySoft,
-                            linearized_state, base.commitment, context);
+                            linearized_state, base.commitment,
+                            contingency_context());
                     compact_attempt["exact_objective"] =
                         linearized_objective;
                     compact_attempt["exact_validation"] =
@@ -2617,7 +2634,7 @@ bool solve_loaded_contingency(
                         bounded_fast_linearized_repair =
                             gravityx::solve_linearized_active_feasibility_repair(
                                 data, fast_result->solve.state,
-                                base.commitment, context,
+                                base.commitment, contingency_context(),
                                 0.49, 0.5, 5.0, 0.2, true, true);
                         const double wall_after_recenter =
                             fast_result->wall_seconds +
@@ -2642,7 +2659,8 @@ bool solve_loaded_contingency(
                         const auto recentered_validation =
                             gravityx::validate_state(
                                 data, gravityx::ModelMode::ContingencySoft,
-                                recentered_state, base.commitment, context);
+                                recentered_state, base.commitment,
+                                contingency_context());
                         recenter_attempt["exact_objective"] =
                             recentered_objective;
                         recenter_attempt["exact_validation"] =
@@ -2774,7 +2792,8 @@ bool solve_loaded_contingency(
                     fast_result->solve, false)},
                 {"validation", fast_result->validation.to_json()},
             };
-            complete(std::move(output), fast_result->solve.state);
+            complete(
+                std::move(output), std::move(fast_result->solve.state));
             std::cout << nlohmann::json({
                 {"output", output_path},
                 {"success", true},
@@ -2826,7 +2845,8 @@ bool solve_loaded_contingency(
                     fast_result->solve, false)},
                 {"validation", fast_result->validation.to_json()},
             };
-            complete(std::move(output), fast_result->solve.state);
+            complete(
+                std::move(output), std::move(fast_result->solve.state));
             return true;
         }
     }
@@ -2844,7 +2864,7 @@ bool solve_loaded_contingency(
             data, base.state, base.commitment, *match, best_state);
         auto best_validation = gravityx::validate_state(
             data, gravityx::ModelMode::ContingencySoft,
-            best_state, base.commitment, context);
+            best_state, base.commitment, contingency_context());
         if (reused_fast_screen_reference) {
             fast_result->solve.objective = best_objective;
             fast_result->validation = best_validation;
@@ -2881,7 +2901,8 @@ bool solve_loaded_contingency(
                         repaired_state);
                 const auto repaired_validation = gravityx::validate_state(
                     data, gravityx::ModelMode::ContingencySoft,
-                    repaired_state, base.commitment, context);
+                    repaired_state, base.commitment,
+                    contingency_context());
                 repair.solve.state = repaired_state;
                 repair.solve.objective = repaired_objective;
                 repair.validation = repaired_validation;
@@ -2931,7 +2952,7 @@ bool solve_loaded_contingency(
                     {"solve", gravityx::solve_result_to_json(solve, false)},
                     {"validation", repaired_validation.to_json()},
                 };
-                complete(std::move(output), solve.state);
+                complete(std::move(output), std::move(solve.state));
                 std::cout << nlohmann::json({
                     {"output", output_path},
                     {"success", true},
@@ -3023,7 +3044,8 @@ bool solve_loaded_contingency(
                 }
                 constexpr double kSecurityCollectionTolerance = 1e-5;
                 for (std::size_t i = 0; i < data.branches.size(); ++i) {
-                    if (static_cast<int>(i) == context.outaged_branch ||
+                    if (static_cast<int>(i) ==
+                            contingency_context().outaged_branch ||
                         data.branches[i].status == 0) {
                         continue;
                     }
@@ -3105,7 +3127,7 @@ bool solve_loaded_contingency(
                 balance_only_phase_one ? 90.0 : 60.0;
             auto linear = gravityx::solve_linearized_ac_seed(
                 data, reference, base.commitment,
-                linearized_balance_slack, context,
+                linearized_balance_slack, contingency_context(),
                 balance_only_phase_one, false,
                 linearized_time_limit_seconds, balance_only_phase_one,
                 balance_only_phase_one, dynamic_security_branches);
@@ -3143,7 +3165,7 @@ bool solve_loaded_contingency(
                 linear = gravityx::solve_linearized_ac_seed(
                     data, reference, base.commitment,
                     0.25,
-                    context, true, false,
+                    contingency_context(), true, false,
                     kLargeBalancePhaseOneTimeLimitSeconds,
                     true, true, {}, true);
                 linearized_wall_seconds += linear.wall_seconds;
@@ -3170,7 +3192,7 @@ bool solve_loaded_contingency(
                 linear = gravityx::solve_linearized_ac_seed(
                     data, reference, base.commitment,
                     balance_only_phase_one ? 0.25 : 0.49,
-                    context, true, false,
+                    contingency_context(), true, false,
                     kLargeProjectedBalanceTimeLimitSeconds,
                     balance_only_phase_one, balance_only_phase_one,
                     dynamic_security_branches);
@@ -3221,7 +3243,7 @@ bool solve_loaded_contingency(
                     data, base.state, base.commitment, *match, candidate);
             const auto validation = gravityx::validate_state(
                 data, gravityx::ModelMode::ContingencySoft,
-                candidate, base.commitment, context);
+                candidate, base.commitment, contingency_context());
             attempt["exact_objective"] = objective;
             attempt["validation"] = validation.to_json();
             if (validation.max_residual < best_validation.max_residual) {
@@ -3262,7 +3284,7 @@ bool solve_loaded_contingency(
                     {"solve", gravityx::solve_result_to_json(solve, false)},
                     {"validation", validation.to_json()},
                 };
-                complete(std::move(output), solve.state);
+                complete(std::move(output), std::move(solve.state));
                 std::cout << nlohmann::json({
                     {"output", output_path},
                     {"success", true},
@@ -3300,7 +3322,8 @@ bool solve_loaded_contingency(
                         nonlinear_candidate);
                 nonlinear_validation = gravityx::validate_state(
                     data, gravityx::ModelMode::ContingencySoft,
-                    nonlinear_candidate, base.commitment, context);
+                    nonlinear_candidate, base.commitment,
+                    contingency_context());
                 attempt["nonlinear_exact_objective"] = nonlinear_objective;
                 attempt["nonlinear_validation"] =
                     nonlinear_validation.to_json();
@@ -3383,7 +3406,7 @@ bool solve_loaded_contingency(
                     {"solve", gravityx::solve_result_to_json(solve, false)},
                     {"validation", nonlinear_validation.to_json()},
                 };
-                complete(std::move(output), solve.state);
+                complete(std::move(output), std::move(solve.state));
                 std::cout << nlohmann::json({
                     {"output", output_path},
                     {"success", true},
@@ -3441,7 +3464,7 @@ bool solve_loaded_contingency(
                 {"solve", gravityx::solve_result_to_json(solve, false)},
                 {"validation", best_validation.to_json()},
             };
-            complete(std::move(output), solve.state, true);
+            complete(std::move(output), std::move(solve.state), true);
             return false;
         }
     }
@@ -3454,15 +3477,17 @@ bool solve_loaded_contingency(
         if (!*reusable_model) {
             *reusable_model = std::make_unique<gravityx::AcModel>(
                 data, gravityx::ModelMode::ContingencySoft,
-                base.commitment, context, true, acceptable_termination);
+                base.commitment, contingency_context(), true,
+                acceptable_termination);
             resident_model_created = true;
         } else {
-            (*reusable_model)->set_contingency(context);
+            (*reusable_model)->set_contingency(contingency_context());
         }
         model = reusable_model->get();
     } else {
         fresh_model = std::make_unique<gravityx::AcModel>(
-            data, gravityx::ModelMode::ContingencySoft, base.commitment, context);
+            data, gravityx::ModelMode::ContingencySoft, base.commitment,
+            contingency_context());
         model = fresh_model.get();
     }
     if (linearized_seed) {
@@ -3474,7 +3499,7 @@ bool solve_loaded_contingency(
     const auto solve = model->solve(print_level, 1e-6);
     const auto validation = gravityx::validate_state(
         data, gravityx::ModelMode::ContingencySoft,
-        solve.state, base.commitment, context);
+        solve.state, base.commitment, contingency_context());
     const bool solver_status_success = solve.status == 0 || solve.status == 1;
     const bool success = gravityx::validated_candidate_is_feasible(
         solve, validation, 1e-5);
@@ -3698,6 +3723,7 @@ int run_contingency_worker(
         const CorrectiveSeed* rolling_corrective_seed =
             corrective_seed_bank.empty()
             ? nullptr : &corrective_seed_bank.front();
+        const auto solve_call_start = std::chrono::steady_clock::now();
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
             reusable_model ? &resident_model : nullptr,
@@ -3711,6 +3737,8 @@ int run_contingency_worker(
             (linearized_fallback || fast_only)
                 ? &corrective_seed_bank : nullptr,
             &completed_computation, !remove_output_after_result);
+        const double solve_call_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - solve_call_start).count();
         double result_read_seconds = 0.0;
         if (success && !completed_computation) {
             throw std::runtime_error(
@@ -3718,8 +3746,11 @@ int run_contingency_worker(
         }
         bool solution_written = false;
         double solution_write_seconds = 0.0;
+        double solution_lookup_seconds = 0.0;
         if (solution_path && completed_computation &&
             completed_computation->result.value("success", false)) {
+            const auto solution_lookup_start =
+                std::chrono::steady_clock::now();
             const auto contingency = std::find_if(
                 data.contingencies.begin(), data.contingencies.end(),
                 [&](const gravityx::Contingency& item) {
@@ -3729,6 +3760,9 @@ int run_contingency_worker(
                 throw std::runtime_error(
                     "cannot write solution for unknown contingency " + label);
             }
+            solution_lookup_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - solution_lookup_start)
+                .count();
             const auto solution_write_start =
                 std::chrono::steady_clock::now();
             solution_writer.write_completed(
@@ -3740,6 +3774,7 @@ int run_contingency_worker(
                 .count();
             solution_written = true;
         }
+        const auto bookkeeping_start = std::chrono::steady_clock::now();
         bool fallback_result_persisted = false;
         double fallback_result_persist_seconds = 0.0;
         if (fallback_output_path && completed_computation &&
@@ -3859,6 +3894,8 @@ int run_contingency_worker(
                     output_path + ": " + remove_error.message());
             }
         }
+        const double bookkeeping_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - bookkeeping_start).count();
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
@@ -3874,6 +3911,9 @@ int run_contingency_worker(
             {"solution_written", solution_written},
             {"result_read_seconds", result_read_seconds},
             {"solution_write_seconds", solution_write_seconds},
+            {"solve_call_seconds", solve_call_seconds},
+            {"solution_lookup_seconds", solution_lookup_seconds},
+            {"bookkeeping_seconds", bookkeeping_seconds},
             {"fallback_result_persisted", fallback_result_persisted},
             {"fallback_result_persist_seconds",
              fallback_result_persist_seconds},

@@ -1,11 +1,12 @@
 #include "gravityx/solution_writer.hpp"
 
+#include <charconv>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
-#include <sstream>
+#include <limits>
 #include <stdexcept>
+#include <system_error>
 
 namespace gravityx {
 namespace {
@@ -33,6 +34,33 @@ void reject_onedrive(const std::string& path) {
     }
 }
 
+template <typename Integer>
+void append_integer(std::string& output, Integer value) {
+    char buffer[32];
+    const auto conversion = std::to_chars(
+        buffer, buffer + sizeof(buffer), value);
+    if (conversion.ec != std::errc{}) {
+        throw std::runtime_error("failed to format submission integer");
+    }
+    output.append(buffer, conversion.ptr);
+}
+
+void append_double(std::string& output, double value) {
+    char buffer[64];
+    const auto conversion = std::to_chars(
+        buffer, buffer + sizeof(buffer), value,
+        std::chars_format::general,
+        std::numeric_limits<double>::max_digits10);
+    if (conversion.ec != std::errc{}) {
+        throw std::runtime_error("failed to format submission floating-point value");
+    }
+    output.append(buffer, conversion.ptr);
+}
+
+void append_separator(std::string& output) {
+    output.append(", ");
+}
+
 }  // namespace
 
 std::string go_solution_text(
@@ -55,30 +83,41 @@ std::string go_solution_text(
     const int outage_index = contingency != nullptr
         ? contingency->source_index : -1;
 
-    std::ostringstream stream;
-    stream << std::setprecision(17) << std::defaultfloat;
-    stream << "--bus section\n"
-           << "i, v, theta\n";
+    std::string output;
+    const std::size_t estimated_rows =
+        data.buses.size() + data.loads.size() + data.generators.size() +
+        data.branches.size() + data.shunts.size();
+    output.reserve(512 + 48 * estimated_rows);
+    output.append("--bus section\n"
+                  "i, v, theta\n");
     for (std::size_t position = 0; position < data.buses.size(); ++position) {
         const auto& bus = data.buses[position];
         if (bus.present) {
-            stream << bus.index << ", " << state.vm[position] << ", "
-                   << state.va[position] << '\n';
+            append_integer(output, bus.index);
+            append_separator(output);
+            append_double(output, state.vm[position]);
+            append_separator(output);
+            append_double(output, state.va[position]);
+            output.push_back('\n');
         }
     }
 
-    stream << "--load section\n"
-           << "i, id, t\n";
+    output.append("--load section\n"
+                  "i, id, t\n");
     for (std::size_t position = 0; position < data.loads.size(); ++position) {
         const auto& load = data.loads[position];
         if (load.present) {
-            stream << load.source_bus << ", " << load.source_id
-                   << ", " << state.demand_factor[position] << '\n';
+            append_integer(output, load.source_bus);
+            append_separator(output);
+            output.append(load.source_id);
+            append_separator(output);
+            append_double(output, state.demand_factor[position]);
+            output.push_back('\n');
         }
     }
 
-    stream << "--generator section\n"
-           << "i, id, p, q, x\n";
+    output.append("--generator section\n"
+                  "i, id, p, q, x\n");
     for (std::size_t position = 0;
          position < data.generators.size(); ++position) {
         const auto& generator = data.generators[position];
@@ -86,25 +125,37 @@ std::string go_solution_text(
             (generator_outage && generator.index == outage_index)) {
             continue;
         }
-        stream << generator.source_bus << ", "
-               << generator.source_id << ", " << state.pg[position] << ", "
-               << state.qg[position] << ", " << commitment[position] << '\n';
+        append_integer(output, generator.source_bus);
+        append_separator(output);
+        output.append(generator.source_id);
+        append_separator(output);
+        append_double(output, state.pg[position]);
+        append_separator(output);
+        append_double(output, state.qg[position]);
+        append_separator(output);
+        append_integer(output, commitment[position]);
+        output.push_back('\n');
     }
 
-    stream << "--line section\n"
-           << "iorig, idest, id, x\n";
+    output.append("--line section\n"
+                  "iorig, idest, id, x\n");
     for (const auto& branch : data.branches) {
         if (!branch.present || branch.transformer ||
             (branch_outage && branch.index == outage_index)) {
             continue;
         }
-        stream << branch.source_from << ", "
-               << branch.source_to << ", " << branch.source_id
-               << ", " << (branch.status != 0 ? 1 : 0) << '\n';
+        append_integer(output, branch.source_from);
+        append_separator(output);
+        append_integer(output, branch.source_to);
+        append_separator(output);
+        output.append(branch.source_id);
+        append_separator(output);
+        append_integer(output, branch.status != 0 ? 1 : 0);
+        output.push_back('\n');
     }
 
-    stream << "--transformer section\n"
-           << "iorig, idest, id, x, xst\n";
+    output.append("--transformer section\n"
+                  "iorig, idest, id, x, xst\n");
     for (const auto& branch : data.branches) {
         if (!branch.present || !branch.transformer ||
             (branch_outage && branch.index == outage_index)) {
@@ -117,14 +168,21 @@ std::string go_solution_text(
                    branch.control_mode == -3) {
             step = branch.ta_step;
         }
-        stream << branch.source_from << ", "
-               << branch.source_to << ", " << branch.source_id
-               << ", " << (branch.status != 0 ? 1 : 0) << ", " << step
-               << '\n';
+        append_integer(output, branch.source_from);
+        append_separator(output);
+        append_integer(output, branch.source_to);
+        append_separator(output);
+        output.append(branch.source_id);
+        append_separator(output);
+        append_integer(output, branch.status != 0 ? 1 : 0);
+        append_separator(output);
+        append_integer(output, step);
+        output.push_back('\n');
     }
 
-    stream << "--switched shunt section\n"
-           << "i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8\n";
+    output.append(
+        "--switched shunt section\n"
+        "i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8\n");
     for (std::size_t position = 0; position < data.shunts.size(); ++position) {
         const auto& shunt = data.shunts[position];
         if (!shunt.present || !shunt.dispatchable) {
@@ -134,13 +192,14 @@ std::string go_solution_text(
         if (position < state.shunt_steps.size()) {
             steps = &state.shunt_steps[position];
         }
-        stream << shunt.source_bus;
+        append_integer(output, shunt.source_bus);
         for (const int step : *steps) {
-            stream << ", " << step;
+            append_separator(output);
+            append_integer(output, step);
         }
-        stream << '\n';
+        output.push_back('\n');
     }
-    return stream.str();
+    return output;
 }
 
 void write_go_solution(

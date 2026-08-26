@@ -652,6 +652,41 @@ def contiguous_shard_groups(
     return groups
 
 
+def completion_order_shard_groups(
+    labels: list[str],
+    shard_count: int,
+    tail_sizes: list[int] | None = None,
+) -> list[list[str]]:
+    """Balance early shards and taper the completion-order validation tail."""
+
+    if not tail_sizes:
+        return contiguous_shard_groups(labels, shard_count)
+    if any(size < 1 for size in tail_sizes):
+        raise ValueError("completion-order tail shard sizes must be positive")
+    active_shards = min(shard_count, len(labels))
+    if len(tail_sizes) >= active_shards:
+        raise ValueError(
+            "completion-order tail sizes must leave at least one prefix shard"
+        )
+    tail_count = sum(tail_sizes)
+    if tail_count >= len(labels):
+        raise ValueError(
+            "completion-order tail sizes must leave labels for prefix shards"
+        )
+    prefix_shards = active_shards - len(tail_sizes)
+    prefix_count = len(labels) - tail_count
+    groups = contiguous_shard_groups(
+        labels[:prefix_count], prefix_shards
+    )
+    offset = prefix_count
+    for size in tail_sizes:
+        groups.append(labels[offset : offset + size])
+        offset += size
+    if offset != len(labels) or len(groups) != active_shards:
+        raise RuntimeError("invalid tapered completion-order shard partition")
+    return groups
+
+
 def prepare_serial_evaluation_shards(
     case_dir: Path,
     output_dir: Path,
@@ -1200,6 +1235,7 @@ class StreamingSerialEvaluation:
         post_screen_maximum_processes: int | None = None,
         vendor_evaluator_reference: Path | None = None,
         completion_order_groups: bool = False,
+        completion_order_tail_sizes: list[int] | None = None,
         persistent_evaluator_processes: bool = False,
     ) -> None:
         if maximum_processes < 0:
@@ -1229,6 +1265,13 @@ class StreamingSerialEvaluation:
         self.requested_shards = shard_count
         self.active_shards = min(shard_count, len(self.labels))
         self.completion_order_groups = completion_order_groups
+        self.completion_order_tail_sizes = list(
+            completion_order_tail_sizes or []
+        )
+        if self.completion_order_tail_sizes and not completion_order_groups:
+            raise ValueError(
+                "completion-order tail sizes require completion-order groups"
+            )
         self.initial_maximum_processes = maximum_processes
         self.post_screen_maximum_processes = post_screen_maximum_processes
         self.maximum_processes = maximum_processes
@@ -1240,7 +1283,11 @@ class StreamingSerialEvaluation:
         )
         self.vendor_evaluator_reference = vendor_evaluator_reference
         self.persistent_evaluator_processes = persistent_evaluator_processes
-        groups = contiguous_shard_groups(self.labels, shard_count)
+        groups = completion_order_shard_groups(
+            self.labels,
+            shard_count,
+            self.completion_order_tail_sizes,
+        )
         if completion_order_groups:
             self.dynamic_group_sizes = [len(group) for group in groups]
             self.dynamic_group_labels: list[str] = []
@@ -1677,6 +1724,9 @@ class StreamingSerialEvaluation:
                         "solution_completion_order"
                         if self.completion_order_groups
                         else "configured_schedule_order"
+                    ),
+                    "completion_order_tail_shard_sizes": list(
+                        self.completion_order_tail_sizes
                     ),
                     "persistent_evaluator_processes": (
                         self.persistent_evaluator_processes
@@ -2505,6 +2555,10 @@ def main() -> int:
         "--streaming-evaluation-completion-order-shards", action="store_true"
     )
     parser.add_argument(
+        "--streaming-evaluation-tail-shard-sizes",
+        help="Comma-separated final completion-order shard sizes.",
+    )
+    parser.add_argument(
         "--streaming-persistent-evaluator-processes", action="store_true"
     )
     parser.add_argument(
@@ -2697,6 +2751,25 @@ def main() -> int:
             "--streaming-evaluation-completion-order-shards requires "
             "streaming evaluation shards"
         )
+    streaming_evaluation_tail_shard_sizes: list[int] = []
+    if args.streaming_evaluation_tail_shard_sizes:
+        try:
+            streaming_evaluation_tail_shard_sizes = [
+                int(value)
+                for value in args.streaming_evaluation_tail_shard_sizes.split(",")
+            ]
+        except ValueError as error:
+            parser.error(
+                "--streaming-evaluation-tail-shard-sizes must contain integers"
+            )
+        if (
+            not args.streaming_evaluation_completion_order_shards
+            or any(size < 1 for size in streaming_evaluation_tail_shard_sizes)
+        ):
+            parser.error(
+                "--streaming-evaluation-tail-shard-sizes requires positive "
+                "sizes and completion-order shards"
+            )
     if args.streaming_persistent_evaluator_processes and (
         args.streaming_serial_evaluation_shards <= 1
         or args.vendor_evaluator_reference is None
@@ -2842,6 +2915,9 @@ def main() -> int:
         ),
         "streaming_evaluation_completion_order_shards": (
             args.streaming_evaluation_completion_order_shards
+        ),
+        "streaming_evaluation_tail_shard_sizes": (
+            streaming_evaluation_tail_shard_sizes
         ),
         "streaming_persistent_evaluator_processes": (
             args.streaming_persistent_evaluator_processes
@@ -3117,6 +3193,7 @@ def main() -> int:
             args.post_screen_streaming_evaluation_processes,
             args.vendor_evaluator_reference,
             args.streaming_evaluation_completion_order_shards,
+            streaming_evaluation_tail_shard_sizes,
             args.streaming_persistent_evaluator_processes,
         )
         run_status["streaming_evaluation_prepared"] = True
@@ -4318,6 +4395,9 @@ def main() -> int:
         ),
         "streaming_evaluation_completion_order_shards": (
             args.streaming_evaluation_completion_order_shards
+        ),
+        "streaming_evaluation_tail_shard_sizes": (
+            streaming_evaluation_tail_shard_sizes
         ),
         "streaming_persistent_evaluator_processes": (
             args.streaming_persistent_evaluator_processes

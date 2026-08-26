@@ -24,6 +24,7 @@ from run_experiment import (  # noqa: E402
     apply_fallback_schedule_profile,
     code2_completed_within_limit,
     code2_time_limit,
+    completion_order_shard_groups,
     contiguous_shard_groups,
     effective_process_timeout,
     evaluator_subprocess_environment,
@@ -806,6 +807,16 @@ class CompetitionTimingTests(unittest.TestCase):
         groups = contiguous_shard_groups(labels, 3)
         self.assertEqual([len(group) for group in groups], [3, 2, 2])
         self.assertEqual([label for group in groups for label in group], labels)
+
+    def test_completion_order_shards_can_taper_the_final_tail(self):
+        labels = [f"CTG_{index}" for index in range(30)]
+        groups = completion_order_shard_groups(
+            labels, 6, [6, 4, 2]
+        )
+        self.assertEqual([len(group) for group in groups], [6, 6, 6, 6, 4, 2])
+        self.assertEqual([label for group in groups for label in group], labels)
+        with self.assertRaisesRegex(ValueError, "leave at least one"):
+            completion_order_shard_groups(labels, 3, [6, 4, 2])
 
     def test_evaluator_environment_prevents_nested_thread_oversubscription(self):
         with mock.patch.dict(

@@ -11,6 +11,7 @@ this table.
 | 010 | `52103f80d256298864e2aee9e52fe017b66ce9b5` | 6,693 | 27.293 | 265.336 | 297.671 | 297.743 | -582,029,928.559992 | 0.0 | 9.7037211e-6 | PASS |
 | 069 | `1dd89725b25d7b5d8d6dc860b775440e5fb9e82c` | 6,620 | 31.087 | 237.030 | 276.073 | 276.812 | -594,811,182.974502 | 0.0 | 9.9198612e-6 | PASS |
 | 077 | `0e4808a045d0455244bc554b60c62536af81e69f` | 6,584 | 26.548 | 131.702 | 169.878 | 170.605 | -433,016,702.926414 | 0.0 | 8.1132918e-6 | PASS |
+| 095 | `2188d439987d7b0f46f0b5cd3cdeaea9e081928e` | 6,579 | 10.171 | 149.068 | 168.009 | 168.727 | -36,292,359.831193 | 0.0 | 9.9126974e-6 | PASS |
 
 ## Scenario 010 certificate
 
@@ -128,3 +129,46 @@ The initial scenario 077 attempt reached no contingency solve because two
 lightweight LP columns had empty voltage intervals. Revision `0e4808a`
 projects only the LP linearization voltages into source `VMIN/VMAX`, records
 the projection, and leaves the complete nonlinear acceptance checks unchanged.
+
+## Scenario 095 certificate
+
+- Local retained run:
+  `runs/c2fen19402_2188d43_20260826/s095_cold_r2_replacement`
+- Base commitment count: 921 of 921 source generators
+- Generated contingency solutions: 6,579 of 6,579
+- Unique exact-evaluation details: 6,580 (base plus every contingency)
+- Infeasible labels: none
+- Fast-screen fallbacks: zero
+- Accepted feasible nonconverged states: zero
+- Base independent residual: `1.7763568e-15`
+- Maximum independent contingency residual: `9.9126974e-6`
+- Evaluator implementation SHA-256:
+  `3a3e465b6cb023866b1288d9088fb74c25cfda9befa05c6ec864020fc40288c8`
+- Referenced vendor evaluator SHA-256:
+  `3e98ca0e5dda571fc90c2b16bc4000d652f50c02acc0c9a203d99d132aeb603e`
+- Normalized case SHA-256:
+  `11f85a7dbef5fbf9e8f34e14f7cd4df97fca9f62ea779837b3c5b6d313b3225b`
+- RAW SHA-256:
+  `bc9e819e4f34e2271e2bf9362642c01b3e7298a0c589066ddbf2c3514532daa3`
+- CON SHA-256:
+  `203f684a3ef1168040da9e1f683419924e65e5e75c8dd9b991b4ccc6e4125091`
+- Supplemental JSON SHA-256:
+  `11cd5fbd06f30024385858a549a1be5d3ccd5e10f4e06f7fb04979efeaf1f66f`
+
+Artifact hashes for the retained scenario 095 run:
+
+| Artifact | SHA-256 |
+|---|---|
+| `run_summary.json` | `662bef2854ad69f265cca57535ac72ef2256dd89132bf4d111d95c741d449f8c` |
+| `eval_summary.json` | `bd8afdbf92feab6eaa8f28bb5fe080098110b15f2e6ef18d3ec7bc16093124f1` |
+| `run_status.json` | `5ba7b294a4fc96258abfbe6c27d01079d03c37c46ba5092ee7811cee8dc3c4` |
+| `internal/base.json` | `00118147ddabe7174107f6db576cfd2c4b3dfa33bcc467f474b886137d157a9f` |
+| `internal/official_evaluation_certificate.json` | `d87eadc8a6423daac9e7ad97d2312698b643856fe87627e5284f5208e81d0d0c` |
+
+The failed run immediately preceding this replacement sent a physically secure
+generator-outage state into the exact fallback because its type-3 reference
+angle had not been re-anchored after the numerical slack bus changed. Revision
+`2188d43` restores the source reference gauge before validation and routes
+small balance or branch-bound misses through bounded candidate repair. The four
+previous fallback labels then passed targeted independent validation, and the
+replacement full run required no fallback at all.

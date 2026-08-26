@@ -29,6 +29,10 @@ $retainedRunSpecs = @(
     [pscustomobject]@{
         ParentName = 'c2fen19402_0e4808a_20260826'
         RunName = 's077_cold_r2_replacement'
+    },
+    [pscustomobject]@{
+        ParentName = 'c2fen19402_2188d43_20260826'
+        RunName = 's095_cold_r2_replacement'
     }
 )
 

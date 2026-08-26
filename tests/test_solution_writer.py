@@ -4,6 +4,7 @@ import concurrent.futures
 import json
 import numpy as np
 import queue
+import subprocess
 import tempfile
 from pathlib import Path
 import sys
@@ -36,6 +37,7 @@ from run_experiment import (  # noqa: E402
     progress_log_due,
     progress_checkpoint_due,
     require_minimum_free_space,
+    stage_wsl_worker_inputs,
     streamed_queue_get,
     validate_and_normalize_evaluation_details,
     validate_in_memory_evaluation_certificate,
@@ -1499,6 +1501,47 @@ for line in sys.stdin:
                 self.assertEqual(
                     require_minimum_free_space(destination, 1.0), 1.0
                 )
+
+    def test_wsl_worker_input_staging_verifies_both_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = root / "case.json"
+            base = root / "base.json"
+            case.write_text('{"case":1}\n', encoding="utf-8")
+            base.write_text('{"base":1}\n', encoding="utf-8")
+            case_hash = __import__("hashlib").sha256(case.read_bytes()).hexdigest()
+            base_hash = __import__("hashlib").sha256(base.read_bytes()).hexdigest()
+            registered = []
+
+            def fake_run(command, **kwargs):
+                del kwargs
+                if "sha256sum" in command:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        f"{case_hash}  {command[-2]}\n{base_hash}  {command[-1]}\n",
+                    )
+                return subprocess.CompletedProcess(command, 0, "")
+
+            with mock.patch(
+                "run_experiment.subprocess.run", side_effect=fake_run
+            ), mock.patch(
+                "run_experiment.atexit.register",
+                side_effect=lambda callback: registered.append(callback),
+            ):
+                staged_case, staged_base, metadata = stage_wsl_worker_inputs(
+                    "Test-Distro",
+                    case,
+                    base,
+                    time.perf_counter() + 10.0,
+                )
+                self.assertTrue(staged_case.startswith("/dev/shm/gravityx_go2_"))
+                self.assertTrue(staged_base.startswith("/dev/shm/gravityx_go2_"))
+                self.assertEqual(
+                    metadata["sha256"], {"case": case_hash, "base": base_hash}
+                )
+                self.assertEqual(len(registered), 1)
+                registered[0]()
 
     def test_code2_timeout_is_not_reported_within_limit(self):
         self.assertFalse(code2_completed_within_limit(475.9, 476.0, True))

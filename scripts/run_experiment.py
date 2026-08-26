@@ -9,6 +9,7 @@ official text format, records provenance, and invokes the official evaluator.
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import concurrent.futures
 import datetime as dt
@@ -1888,6 +1889,146 @@ def cpp_command(
     ]
 
 
+def stage_wsl_worker_inputs(
+    distro: str,
+    case_json: Path,
+    base_json: Path,
+    deadline: float,
+) -> tuple[str, str, dict[str, Any]]:
+    """Copy immutable worker inputs once to WSL tmpfs and verify their hashes."""
+
+    for path in (case_json, base_json):
+        reject_onedrive(path)
+        if not path.is_file():
+            raise ValueError(f"worker input does not exist: {path}")
+    token = f"{os.getpid():x}_{time.time_ns():x}"
+    destinations = {
+        "case": f"/dev/shm/gravityx_go2_{token}_case.json",
+        "base": f"/dev/shm/gravityx_go2_{token}_base.json",
+    }
+    expected_hashes = {
+        "case": sha256(case_json),
+        "base": sha256(base_json),
+    }
+    started = time.perf_counter()
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.0:
+            raise CompetitionTimeout(
+                "WSL worker-input staging reached the end-to-end work deadline"
+            )
+        return remaining
+
+    copied: list[str] = []
+    try:
+        for name, source in (("case", case_json), ("base", base_json)):
+            completed = subprocess.run(
+                [
+                    "wsl",
+                    "-d",
+                    distro,
+                    "--",
+                    "cp",
+                    "--",
+                    to_wsl(source),
+                    destinations[name],
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=remaining_timeout(),
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "WSL worker-input staging failed: "
+                    f"name={name}, returncode={completed.returncode}, "
+                    f"output={completed.stdout.strip()}"
+                )
+            copied.append(destinations[name])
+        verified = subprocess.run(
+            [
+                "wsl",
+                "-d",
+                distro,
+                "--",
+                "sha256sum",
+                destinations["case"],
+                destinations["base"],
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=remaining_timeout(),
+        )
+        if verified.returncode != 0:
+            raise RuntimeError(
+                "WSL staged-input hash command failed: "
+                f"returncode={verified.returncode}, "
+                f"output={verified.stdout.strip()}"
+            )
+        observed_hashes: dict[str, str] = {}
+        destination_to_name = {
+            value: name for name, value in destinations.items()
+        }
+        for line in verified.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] in destination_to_name:
+                observed_hashes[destination_to_name[fields[1]]] = fields[0].lower()
+        if observed_hashes != expected_hashes:
+            raise RuntimeError(
+                "WSL staged-input hash mismatch: "
+                f"expected={expected_hashes}, observed={observed_hashes}"
+            )
+    except Exception:
+        if copied:
+            try:
+                subprocess.run(
+                    ["wsl", "-d", distro, "--", "rm", "-f", "--", *copied],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+        raise
+
+    def cleanup() -> None:
+        try:
+            subprocess.run(
+                [
+                    "wsl",
+                    "-d",
+                    distro,
+                    "--",
+                    "rm",
+                    "-f",
+                    "--",
+                    destinations["case"],
+                    destinations["base"],
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+
+    atexit.register(cleanup)
+    metadata = {
+        "mode": "single_copy_to_wsl_tmpfs_with_sha256_verification",
+        "wall_seconds": time.perf_counter() - started,
+        "destinations": destinations,
+        "sha256": expected_hashes,
+        "cleanup": "registered_with_atexit",
+    }
+    return destinations["case"], destinations["base"], metadata
+
+
 def run_cpp(
     executable: Path,
     distro: str,
@@ -2578,6 +2719,7 @@ def main() -> int:
     parser.add_argument("--fast-screen-heavy-profile", type=Path)
     parser.add_argument("--fast-screen-heavy-workers", type=int, default=0)
     parser.add_argument("--wsl-fast-screen-scratch", action="store_true")
+    parser.add_argument("--wsl-stage-worker-inputs", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
     parser.add_argument("--robust-contingency-base", action="store_true")
@@ -2887,6 +3029,7 @@ def main() -> int:
         "fast_screen_heavy_profile": fast_screen_heavy_profile_metadata,
         "fast_screen_heavy_worker_count": args.fast_screen_heavy_workers,
         "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
+        "wsl_stage_worker_inputs": args.wsl_stage_worker_inputs,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
         "robust_contingency_base": args.robust_contingency_base,
@@ -3155,6 +3298,23 @@ def main() -> int:
     )
     checkpoint()
 
+    worker_case_argument = to_wsl(args.case_json)
+    worker_base_argument = to_wsl(base_json)
+    worker_input_staging: dict[str, Any] | None = None
+    if args.wsl_stage_worker_inputs:
+        (
+            worker_case_argument,
+            worker_base_argument,
+            worker_input_staging,
+        ) = stage_wsl_worker_inputs(
+            args.distro,
+            args.case_json,
+            base_json,
+            work_deadline,
+        )
+        run_status["worker_input_staging"] = worker_input_staging
+        checkpoint()
+
     streaming_evaluation: StreamingSerialEvaluation | None = None
     if args.streaming_serial_evaluation_shards > 1:
         for path in (args.python, args.evaluator):
@@ -3385,8 +3545,8 @@ def main() -> int:
                 args.distro,
                 [
                     "contingency-worker",
-                    to_wsl(args.case_json),
-                    to_wsl(base_json),
+                    worker_case_argument,
+                    worker_base_argument,
                     "0",
                     "fast-pf",
                     "fast-only",
@@ -3678,8 +3838,8 @@ def main() -> int:
         )
         worker_arguments = [
             "contingency-worker",
-            to_wsl(args.case_json),
-            to_wsl(base_json),
+            worker_case_argument,
+            worker_base_argument,
             "0",
         ]
         if args.resident_contingency_model:

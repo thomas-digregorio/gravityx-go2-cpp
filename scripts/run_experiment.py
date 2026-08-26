@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run one cold Gravity C++ GO2 experiment and the official evaluator.
 
-All optimization subprocesses use the pinned Gravity C++ executable.  Python
-only orchestrates isolated contingency processes, writes the official text
-format, records provenance, and invokes the official evaluator.
+Optimization subprocesses use pinned Gravity C++ executables from one source
+revision. Python only orchestrates isolated contingency processes, writes the
+official text format, records provenance, and invokes the official evaluator.
 """
 
 from __future__ import annotations
@@ -1493,6 +1493,7 @@ def main() -> int:
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--executable", type=Path, default=DEFAULT_EXE)
+    parser.add_argument("--fast-screen-executable", type=Path)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--fast-workers", type=int, default=8)
     parser.add_argument("--post-screen-workers", type=int)
@@ -1587,9 +1588,23 @@ def main() -> int:
             "--fallback-schedule-profile requires "
             "--two-stage-contingency-screen"
         )
+    if (args.fast_screen_executable is not None and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--fast-screen-executable requires "
+            "--two-stage-contingency-screen"
+        )
 
     for path in (args.case_json, args.case_dir, args.output_dir, args.executable):
         reject_onedrive(path)
+    fast_screen_executable = args.fast_screen_executable or args.executable
+    reject_onedrive(fast_screen_executable)
+    for label, executable in (
+        ("base/exact", args.executable),
+        ("fast-screen", fast_screen_executable),
+    ):
+        if not executable.is_file():
+            raise ValueError(f"{label} executable does not exist: {executable}")
     if args.fallback_schedule_profile is not None:
         reject_onedrive(args.fallback_schedule_profile)
     if args.workers < 1:
@@ -1703,6 +1718,13 @@ def main() -> int:
         "stage": "initializing",
         "started_at_utc": started_utc,
         "git_revision": git_revision(),
+        "base_exact_executable": str(args.executable.resolve()),
+        "base_exact_executable_sha256": sha256(args.executable),
+        "fast_screen_executable": str(fast_screen_executable.resolve()),
+        "fast_screen_executable_sha256": sha256(fast_screen_executable),
+        "mixed_build_fast_screen": (
+            args.executable.resolve() != fast_screen_executable.resolve()
+        ),
         "competition_timing": {
             "division": 1,
             "code1_time_limit_seconds": args.code1_time_limit,
@@ -2162,7 +2184,7 @@ def main() -> int:
                 args.contingency_timeout, contingency_deadline
             )
             command = cpp_command(
-                args.executable,
+                fast_screen_executable,
                 args.distro,
                 [
                     "contingency-worker",

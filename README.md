@@ -114,3 +114,19 @@ validation passes.  The complete JSON result remains available for audit and
 fallback, while the Python orchestrator consumes a compact state-free summary.
 This changes serialization placement, not the solved model or acceptance
 tolerance.
+
+For large contingency screens on a fixed CPU host, a second binary can be
+built with host-specific instructions and interprocedural optimization:
+
+```bash
+cmake --fresh -S . -B .build-native -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGRAVITYX_NATIVE_OPTIMIZATION=ON
+cmake --build .build-native -j "$(nproc)"
+```
+
+Pass it with `--fast-screen-executable .build-native/gravityx_go2`. The base
+solve and any exact corrective fallback continue to use `--executable`; every
+fast-screen candidate still must pass the same in-process nonlinear residual
+checks. Both executable paths and SHA-256 hashes are recorded in
+`run_status.json`.

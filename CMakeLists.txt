@@ -5,6 +5,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(
+    GRAVITYX_NATIVE_OPTIMIZATION
+    "Enable host-specific CPU instructions and interprocedural optimization"
+    OFF
+)
+
 set(GRAVITY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.deps/Gravity" CACHE PATH "Pinned Gravity source tree")
 set(IPOPT_ROOT "$ENV{IPOPT_ROOT_DIR}" CACHE PATH "Ipopt installation prefix")
 
@@ -59,6 +65,20 @@ target_link_libraries(gravityx_go2 PRIVATE
 set_target_properties(gravityx_go2 PROPERTIES
     BUILD_RPATH "${IPOPT_ROOT}/lib"
 )
+if(GRAVITYX_NATIVE_OPTIMIZATION)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR
+            "GRAVITYX_NATIVE_OPTIMIZATION requires GCC or Clang")
+    endif()
+    target_compile_options(gravityx_go2 PRIVATE -march=native -mtune=native)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT gravityx_ipo_supported OUTPUT gravityx_ipo_error)
+    if(NOT gravityx_ipo_supported)
+        message(FATAL_ERROR
+            "Native interprocedural optimization is unavailable: ${gravityx_ipo_error}")
+    endif()
+    set_property(TARGET gravityx_go2 PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)

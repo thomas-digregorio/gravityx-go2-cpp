@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <queue>
@@ -928,6 +929,32 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "validated fast power-flow contingency regression failed: "
             + fast_result.failure_reason);
+    }
+    {
+        const gravityx::GoSolutionWriter writer(data);
+        const auto unique = std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto path = std::filesystem::temp_directory_path() /
+            ("gravityx_completed_writer_" + unique + ".txt");
+        writer.write_completed(
+            path.string(), fast_result.solve.state, {1},
+            &branch_contingency);
+        std::ifstream input(path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error(
+                "completed solution writer did not create its output");
+        }
+        const std::string actual{
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+        const auto expected = writer.text(
+            fast_result.solve.state, {1}, &branch_contingency);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+        if (actual != expected || remove_error) {
+            throw std::runtime_error(
+                "completed solution writer regression failed");
+        }
     }
     auto deliberately_bad_rolling_candidate = solve.state;
     deliberately_bad_rolling_candidate.va[1] += 0.5;
@@ -3620,8 +3647,6 @@ int run_contingency_worker(
         fast_power_flow = std::make_unique<gravityx::FastContingencyPowerFlow>(
             data, base.state, base.commitment, fast_options);
     }
-    std::optional<gravityx::AcState> rolling_corrective_seed;
-    std::string rolling_corrective_seed_label;
     std::vector<CorrectiveSeed> corrective_seed_bank;
     std::cout << "GRAVITYX_WORKER_READY" << std::endl;
     std::string line;
@@ -3670,14 +3695,19 @@ int run_contingency_worker(
                 fast_screen_json.at("solve").at("state"));
         }
         std::optional<ContingencyComputation> completed_computation;
+        const CorrectiveSeed* rolling_corrective_seed =
+            corrective_seed_bank.empty()
+            ? nullptr : &corrective_seed_bank.front();
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
             reusable_model ? &resident_model : nullptr,
             acceptable_termination, fast_power_flow.get(), fast_only,
             linearized_fallback, linearized_only,
             precomputed_fast_state ? &*precomputed_fast_state : nullptr,
-            rolling_corrective_seed ? &*rolling_corrective_seed : nullptr,
-            rolling_corrective_seed ? &rolling_corrective_seed_label : nullptr,
+            rolling_corrective_seed
+                ? &rolling_corrective_seed->state : nullptr,
+            rolling_corrective_seed
+                ? &rolling_corrective_seed->label : nullptr,
             (linearized_fallback || fast_only)
                 ? &corrective_seed_bank : nullptr,
             &completed_computation, !remove_output_after_result);
@@ -3701,7 +3731,7 @@ int run_contingency_worker(
             }
             const auto solution_write_start =
                 std::chrono::steady_clock::now();
-            solution_writer.write(
+            solution_writer.write_completed(
                 *solution_path, completed_computation->state,
                 base.commitment,
                 &*contingency);
@@ -3732,9 +3762,6 @@ int run_contingency_worker(
             data.buses.size() >= 16000 && completed_computation) {
             const auto& result_json = completed_computation->result;
             if (result_json.value("success", false)) {
-                auto verified_corrective_state = completed_computation->state;
-                rolling_corrective_seed = verified_corrective_state;
-                rolling_corrective_seed_label = label;
                 corrective_seed_bank.erase(
                     std::remove_if(
                         corrective_seed_bank.begin(),
@@ -3745,7 +3772,8 @@ int run_contingency_worker(
                     corrective_seed_bank.end());
                 corrective_seed_bank.insert(
                     corrective_seed_bank.begin(),
-                    CorrectiveSeed{label, std::move(verified_corrective_state)});
+                    CorrectiveSeed{
+                        label, std::move(completed_computation->state)});
                 constexpr std::size_t kMaximumCorrectiveSeedBankSize = 16;
                 if (corrective_seed_bank.size() >
                     kMaximumCorrectiveSeedBankSize) {
@@ -3839,8 +3867,8 @@ int run_contingency_worker(
             {"rolling_corrective_seed_updated",
              rolling_corrective_seed_updated},
             {"rolling_corrective_seed_label",
-             rolling_corrective_seed
-                 ? nlohmann::json(rolling_corrective_seed_label)
+             !corrective_seed_bank.empty()
+                 ? nlohmann::json(corrective_seed_bank.front().label)
                  : nlohmann::json(nullptr)},
             {"corrective_seed_bank_size", corrective_seed_bank.size()},
             {"solution_written", solution_written},

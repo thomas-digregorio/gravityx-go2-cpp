@@ -299,6 +299,40 @@ void GoSolutionWriter::write(
     std::filesystem::rename(temporary, output);
 }
 
+void GoSolutionWriter::write_completed(
+    const std::string& path,
+    const AcState& state,
+    const std::vector<int>& commitment,
+    const Contingency* contingency) const {
+    reject_onedrive(path);
+    const std::filesystem::path output(path);
+    if (output.has_parent_path()) {
+        const auto parent = output.parent_path().string();
+        if (parent != prepared_output_parent_) {
+            std::filesystem::create_directories(output.parent_path());
+            prepared_output_parent_ = parent;
+        }
+    }
+    std::ofstream stream(output, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        throw std::runtime_error(
+            "cannot open completed submission output: " + path);
+    }
+    const auto solution_text = text(state, commitment, contingency);
+    stream.write(
+        solution_text.data(),
+        static_cast<std::streamsize>(solution_text.size()));
+    if (!stream) {
+        throw std::runtime_error(
+            "failed while writing completed submission output: " + path);
+    }
+    stream.close();
+    if (!stream) {
+        throw std::runtime_error(
+            "failed while closing completed submission output: " + path);
+    }
+}
+
 std::string go_solution_text(
     const CaseData& data,
     const AcState& state,

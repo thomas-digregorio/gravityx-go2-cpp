@@ -26,6 +26,16 @@ public:
         const std::vector<int>& commitment,
         const Contingency* contingency = nullptr) const;
 
+    // Persistent workers own a unique solution path and acknowledge it only
+    // after the stream closes. Avoid a second filesystem metadata operation
+    // for a temporary-file rename while retaining write() for callers that
+    // require atomic replacement semantics.
+    void write_completed(
+        const std::string& path,
+        const AcState& state,
+        const std::vector<int>& commitment,
+        const Contingency* contingency = nullptr) const;
+
 private:
     using RowSpan = std::pair<std::size_t, std::size_t>;
 
@@ -38,6 +48,7 @@ private:
     std::string transformer_section_;
     std::unordered_map<int, RowSpan> line_outage_rows_;
     std::unordered_map<int, RowSpan> transformer_outage_rows_;
+    mutable std::string prepared_output_parent_;
 };
 
 std::string go_solution_text(

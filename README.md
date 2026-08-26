@@ -130,3 +130,10 @@ solve and any exact corrective fallback continue to use `--executable`; every
 fast-screen candidate still must pass the same in-process nonlinear residual
 checks. Both executable paths and SHA-256 hashes are recorded in
 `run_status.json`.
+
+Runs near the hard end-to-end deadline may add `--compact-final-summary`.
+This keeps the complete base state, worker records, solutions, and official
+evaluation details in their existing audit artifacts and writes references to
+them in `run_summary.json`, rather than embedding the large records a second
+time. The controller still checks the completed writes against the same hard
+deadline.

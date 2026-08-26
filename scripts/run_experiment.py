@@ -37,6 +37,7 @@ DEFAULT_EVALUATOR = Path(
 )
 WSL_LIBRARY_PATH = "/home/thomasdigregorio/.local/share/gravityx-go2-cpp/env/lib"
 FINALIZATION_RESERVE_SECONDS = 5.0
+COMPACT_FINALIZATION_RESERVE_SECONDS = 1.0
 PROGRESS_CHECKPOINT_INTERVAL_SECONDS = 5.0
 PROGRESS_LOG_INITIAL_COUNT = 10
 PROGRESS_LOG_INTERVAL = 100
@@ -79,6 +80,14 @@ def code2_time_limit(contingency_count: int, seconds_per_contingency: float) -> 
     if seconds_per_contingency <= 0:
         raise ValueError("seconds per contingency must be positive")
     return contingency_count * seconds_per_contingency
+
+
+def finalization_reserve_seconds(compact_summary: bool) -> float:
+    return (
+        COMPACT_FINALIZATION_RESERVE_SECONDS
+        if compact_summary
+        else FINALIZATION_RESERVE_SECONDS
+    )
 
 
 def effective_process_timeout(
@@ -1519,6 +1528,7 @@ def main() -> int:
     parser.add_argument("--vendor-evaluator-reference", type=Path)
     parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
+    parser.add_argument("--compact-final-summary", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
@@ -1681,7 +1691,10 @@ def main() -> int:
         raise ValueError("end-to-end time limit must be positive")
     if args.evaluation_reserve <= 0:
         raise ValueError("evaluation reserve must be positive")
-    if args.evaluation_reserve + FINALIZATION_RESERVE_SECONDS >= args.total_time_limit:
+    finalization_reserve = finalization_reserve_seconds(
+        args.compact_final_summary
+    )
+    if args.evaluation_reserve + finalization_reserve >= args.total_time_limit:
         raise ValueError("evaluation and finalization reserves exhaust the end-to-end limit")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError(f"cold-run output directory is not empty: {args.output_dir}")
@@ -1691,7 +1704,7 @@ def main() -> int:
     wall_start = time.perf_counter()
     total_deadline = wall_start + args.total_time_limit
     work_deadline = total_deadline - args.evaluation_reserve
-    evaluation_deadline = total_deadline - FINALIZATION_RESERVE_SECONDS
+    evaluation_deadline = total_deadline - finalization_reserve
 
     case = read_json(args.case_json)
     contingencies = contingency_records(case)
@@ -1736,7 +1749,7 @@ def main() -> int:
         "end_to_end_timing": {
             "time_limit_seconds": args.total_time_limit,
             "evaluation_reserve_seconds": args.evaluation_reserve,
-            "finalization_reserve_seconds": FINALIZATION_RESERVE_SECONDS,
+            "finalization_reserve_seconds": finalization_reserve,
             "measurement_boundary": (
                 "normalized-case loading through referenced official evaluator "
                 "equations and result serialization"
@@ -2994,6 +3007,20 @@ def main() -> int:
 
     total_wall = time.perf_counter() - wall_start
     max_residual = max((item["max_residual"] for item in records), default=0.0)
+    compact_base = (
+        {
+            "artifact": "internal/base.json",
+            "sha256": sha256(base_json),
+            "success": bool(base.get("success", False)),
+            "base_method": base.get("base_method"),
+            "wall_seconds": base.get("wall_seconds"),
+            "base_validation": base.get("base_validation"),
+            "commitment_count": sum(int(value) for value in commitment),
+            "complete_state_and_commitment_in_artifact": True,
+        }
+        if args.compact_final_summary
+        else base
+    )
     summary = {
         "method": (
             "C++ source commitment with HiGHS sequential-linearized AC base, "
@@ -3010,6 +3037,16 @@ def main() -> int:
         "started_at_utc": started_utc,
         "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_revision": git_revision(),
+        "base_exact_executable": run_status["base_exact_executable"],
+        "base_exact_executable_sha256": run_status[
+            "base_exact_executable_sha256"
+        ],
+        "fast_screen_executable": run_status["fast_screen_executable"],
+        "fast_screen_executable_sha256": run_status[
+            "fast_screen_executable_sha256"
+        ],
+        "mixed_build_fast_screen": run_status["mixed_build_fast_screen"],
+        "compact_final_summary": args.compact_final_summary,
         "input_hashes": {
             "normalized_case_sha256": sha256(args.case_json),
             "raw_sha256": sha256(args.case_dir / "case.raw"),
@@ -3047,7 +3084,16 @@ def main() -> int:
         ),
         "longest_first_schedule": args.longest_first_schedule,
         "contingency_schedule_mode": run_status["contingency_schedule_mode"],
-        "contingency_schedule": run_status["contingency_schedule"],
+        "contingency_schedule": (
+            None
+            if args.compact_final_summary
+            else run_status["contingency_schedule"]
+        ),
+        "contingency_schedule_artifact": (
+            "run_status.json#contingency_schedule"
+            if args.compact_final_summary
+            else None
+        ),
         "contingency_execution_mode": (
             (
                 "parallel fast-only sparse-Newton screen followed by "
@@ -3153,12 +3199,33 @@ def main() -> int:
             not bool(item["feasible"]) for item in screen_records
         ),
         "max_independent_contingency_residual": max_residual,
-        "base": base,
+        "base": compact_base,
         "contingency_workers": worker_records,
-        "fast_screen_records": sorted(
-            screen_records, key=lambda item: item["label"]
+        "fast_screen_records": (
+            None
+            if args.compact_final_summary
+            else sorted(screen_records, key=lambda item: item["label"])
         ),
-        "contingencies": records,
+        "contingencies": (
+            None if args.compact_final_summary else records
+        ),
+        "detailed_artifacts": (
+            {
+                "base_result": "internal/base.json",
+                "run_status_and_schedule": "run_status.json",
+                "fast_screen_worker_logs": "internal/fast_screen_worker_logs",
+                "corrective_worker_logs": "internal/worker_logs",
+                "official_evaluation_certificate": (
+                    "internal/official_evaluation_certificate.json"
+                ),
+                "official_evaluation_shards": (
+                    "internal/streaming_serial_evaluation_shards"
+                ),
+                "official_solution_pattern": "solution_*.txt",
+            }
+            if args.compact_final_summary
+            else None
+        ),
         "official_evaluation": evaluation_summary,
     }
     write_json(args.output_dir / "run_summary.json", summary)

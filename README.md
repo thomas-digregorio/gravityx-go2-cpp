@@ -41,6 +41,7 @@ The multi-scenario scale results are recorded in:
 - `docs/C2FEN08300_FINAL_SCENARIOS_20260824.md`
 - `docs/C2FEN08300_EAB4F29_REGRESSION_20260824.md`
 - `docs/FINAL_EVENT_REPEATABILITY_FC5E43C_20260824.md`
+- `docs/FINAL_EVENT_FROZEN_REGRESSION_C7FA432_20260826.md`
 
 ## What is implemented
 

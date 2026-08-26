@@ -61,20 +61,126 @@ void append_separator(std::string& output) {
     output.append(", ");
 }
 
+void append_static_section(
+    std::string& output,
+    const std::string& section,
+    const std::unordered_map<int, std::pair<std::size_t, std::size_t>>&
+        outage_rows,
+    int outage_index) {
+    const auto omission = outage_rows.find(outage_index);
+    if (omission == outage_rows.end()) {
+        output.append(section);
+        return;
+    }
+    const auto [offset, length] = omission->second;
+    output.append(section.data(), offset);
+    const auto suffix_offset = offset + length;
+    output.append(
+        section.data() + suffix_offset,
+        section.size() - suffix_offset);
+}
+
 }  // namespace
 
-std::string go_solution_text(
-    const CaseData& data,
+GoSolutionWriter::GoSolutionWriter(const CaseData& data)
+    : data_(data),
+      bus_prefixes_(data.buses.size()),
+      load_prefixes_(data.loads.size()),
+      generator_prefixes_(data.generators.size()),
+      shunt_prefixes_(data.shunts.size()) {
+    for (std::size_t position = 0; position < data_.buses.size(); ++position) {
+        const auto& bus = data_.buses[position];
+        if (!bus.present) {
+            continue;
+        }
+        append_integer(bus_prefixes_[position], bus.index);
+        append_separator(bus_prefixes_[position]);
+    }
+    for (std::size_t position = 0; position < data_.loads.size(); ++position) {
+        const auto& load = data_.loads[position];
+        if (!load.present) {
+            continue;
+        }
+        append_integer(load_prefixes_[position], load.source_bus);
+        append_separator(load_prefixes_[position]);
+        load_prefixes_[position].append(load.source_id);
+        append_separator(load_prefixes_[position]);
+    }
+    for (std::size_t position = 0;
+         position < data_.generators.size(); ++position) {
+        const auto& generator = data_.generators[position];
+        if (!generator.present) {
+            continue;
+        }
+        append_integer(
+            generator_prefixes_[position], generator.source_bus);
+        append_separator(generator_prefixes_[position]);
+        generator_prefixes_[position].append(generator.source_id);
+        append_separator(generator_prefixes_[position]);
+    }
+    for (std::size_t position = 0; position < data_.shunts.size(); ++position) {
+        const auto& shunt = data_.shunts[position];
+        if (!shunt.present || !shunt.dispatchable) {
+            continue;
+        }
+        append_integer(shunt_prefixes_[position], shunt.source_bus);
+    }
+
+    line_section_.append(
+        "--line section\n"
+        "iorig, idest, id, x\n");
+    transformer_section_.append(
+        "--transformer section\n"
+        "iorig, idest, id, x, xst\n");
+    for (const auto& branch : data_.branches) {
+        if (!branch.present) {
+            continue;
+        }
+        auto& section = branch.transformer
+            ? transformer_section_ : line_section_;
+        const auto offset = section.size();
+        append_integer(section, branch.source_from);
+        append_separator(section);
+        append_integer(section, branch.source_to);
+        append_separator(section);
+        section.append(branch.source_id);
+        append_separator(section);
+        append_integer(section, branch.status != 0 ? 1 : 0);
+        if (branch.transformer) {
+            int step = 0;
+            if (branch.control_mode == 1 || branch.control_mode == -1) {
+                step = branch.tm_step;
+            } else if (branch.control_mode == 3 ||
+                       branch.control_mode == -3) {
+                step = branch.ta_step;
+            }
+            append_separator(section);
+            append_integer(section, step);
+        }
+        section.push_back('\n');
+        auto& outage_rows = branch.transformer
+            ? transformer_outage_rows_ : line_outage_rows_;
+        const auto inserted = outage_rows.emplace(
+            branch.index, RowSpan{offset, section.size() - offset});
+        if (!inserted.second) {
+            throw std::runtime_error(
+                "duplicate branch index in solution writer: " +
+                std::to_string(branch.index));
+        }
+    }
+}
+
+std::string GoSolutionWriter::text(
     const AcState& state,
     const std::vector<int>& commitment,
-    const Contingency* contingency) {
-    require_size(state.vm.size(), data.buses.size(), "vm");
-    require_size(state.va.size(), data.buses.size(), "va");
-    require_size(state.demand_factor.size(), data.loads.size(),
+    const Contingency* contingency) const {
+    require_size(state.vm.size(), data_.buses.size(), "vm");
+    require_size(state.va.size(), data_.buses.size(), "va");
+    require_size(state.demand_factor.size(), data_.loads.size(),
                  "demand_factor");
-    require_size(state.pg.size(), data.generators.size(), "pg");
-    require_size(state.qg.size(), data.generators.size(), "qg");
-    require_size(commitment.size(), data.generators.size(), "commitment");
+    require_size(state.pg.size(), data_.generators.size(), "pg");
+    require_size(state.qg.size(), data_.generators.size(), "qg");
+    require_size(commitment.size(), data_.generators.size(), "commitment");
 
     const bool generator_outage = contingency != nullptr &&
         contingency->type == ContingencyType::Generator;
@@ -85,16 +191,17 @@ std::string go_solution_text(
 
     std::string output;
     const std::size_t estimated_rows =
-        data.buses.size() + data.loads.size() + data.generators.size() +
-        data.branches.size() + data.shunts.size();
-    output.reserve(512 + 48 * estimated_rows);
+        data_.buses.size() + data_.loads.size() + data_.generators.size() +
+        data_.shunts.size();
+    output.reserve(
+        line_section_.size() + transformer_section_.size() +
+        512 + 48 * estimated_rows);
     output.append("--bus section\n"
                   "i, v, theta\n");
-    for (std::size_t position = 0; position < data.buses.size(); ++position) {
-        const auto& bus = data.buses[position];
+    for (std::size_t position = 0; position < data_.buses.size(); ++position) {
+        const auto& bus = data_.buses[position];
         if (bus.present) {
-            append_integer(output, bus.index);
-            append_separator(output);
+            output.append(bus_prefixes_[position]);
             append_double(output, state.vm[position]);
             append_separator(output);
             append_double(output, state.va[position]);
@@ -104,13 +211,10 @@ std::string go_solution_text(
 
     output.append("--load section\n"
                   "i, id, t\n");
-    for (std::size_t position = 0; position < data.loads.size(); ++position) {
-        const auto& load = data.loads[position];
+    for (std::size_t position = 0; position < data_.loads.size(); ++position) {
+        const auto& load = data_.loads[position];
         if (load.present) {
-            append_integer(output, load.source_bus);
-            append_separator(output);
-            output.append(load.source_id);
-            append_separator(output);
+            output.append(load_prefixes_[position]);
             append_double(output, state.demand_factor[position]);
             output.push_back('\n');
         }
@@ -119,16 +223,13 @@ std::string go_solution_text(
     output.append("--generator section\n"
                   "i, id, p, q, x\n");
     for (std::size_t position = 0;
-         position < data.generators.size(); ++position) {
-        const auto& generator = data.generators[position];
+         position < data_.generators.size(); ++position) {
+        const auto& generator = data_.generators[position];
         if (!generator.present ||
             (generator_outage && generator.index == outage_index)) {
             continue;
         }
-        append_integer(output, generator.source_bus);
-        append_separator(output);
-        output.append(generator.source_id);
-        append_separator(output);
+        output.append(generator_prefixes_[position]);
         append_double(output, state.pg[position]);
         append_separator(output);
         append_double(output, state.qg[position]);
@@ -137,54 +238,18 @@ std::string go_solution_text(
         output.push_back('\n');
     }
 
-    output.append("--line section\n"
-                  "iorig, idest, id, x\n");
-    for (const auto& branch : data.branches) {
-        if (!branch.present || branch.transformer ||
-            (branch_outage && branch.index == outage_index)) {
-            continue;
-        }
-        append_integer(output, branch.source_from);
-        append_separator(output);
-        append_integer(output, branch.source_to);
-        append_separator(output);
-        output.append(branch.source_id);
-        append_separator(output);
-        append_integer(output, branch.status != 0 ? 1 : 0);
-        output.push_back('\n');
-    }
-
-    output.append("--transformer section\n"
-                  "iorig, idest, id, x, xst\n");
-    for (const auto& branch : data.branches) {
-        if (!branch.present || !branch.transformer ||
-            (branch_outage && branch.index == outage_index)) {
-            continue;
-        }
-        int step = 0;
-        if (branch.control_mode == 1 || branch.control_mode == -1) {
-            step = branch.tm_step;
-        } else if (branch.control_mode == 3 ||
-                   branch.control_mode == -3) {
-            step = branch.ta_step;
-        }
-        append_integer(output, branch.source_from);
-        append_separator(output);
-        append_integer(output, branch.source_to);
-        append_separator(output);
-        output.append(branch.source_id);
-        append_separator(output);
-        append_integer(output, branch.status != 0 ? 1 : 0);
-        append_separator(output);
-        append_integer(output, step);
-        output.push_back('\n');
-    }
+    append_static_section(
+        output, line_section_, line_outage_rows_,
+        branch_outage ? outage_index : -1);
+    append_static_section(
+        output, transformer_section_, transformer_outage_rows_,
+        branch_outage ? outage_index : -1);
 
     output.append(
         "--switched shunt section\n"
         "i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8\n");
-    for (std::size_t position = 0; position < data.shunts.size(); ++position) {
-        const auto& shunt = data.shunts[position];
+    for (std::size_t position = 0; position < data_.shunts.size(); ++position) {
+        const auto& shunt = data_.shunts[position];
         if (!shunt.present || !shunt.dispatchable) {
             continue;
         }
@@ -192,7 +257,7 @@ std::string go_solution_text(
         if (position < state.shunt_steps.size()) {
             steps = &state.shunt_steps[position];
         }
-        append_integer(output, shunt.source_bus);
+        output.append(shunt_prefixes_[position]);
         for (const int step : *steps) {
             append_separator(output);
             append_integer(output, step);
@@ -202,12 +267,11 @@ std::string go_solution_text(
     return output;
 }
 
-void write_go_solution(
+void GoSolutionWriter::write(
     const std::string& path,
-    const CaseData& data,
     const AcState& state,
     const std::vector<int>& commitment,
-    const Contingency* contingency) {
+    const Contingency* contingency) const {
     reject_onedrive(path);
     const std::filesystem::path output(path);
     if (output.has_parent_path()) {
@@ -220,15 +284,33 @@ void write_go_solution(
             throw std::runtime_error(
                 "cannot open submission output: " + temporary);
         }
-        const auto text = go_solution_text(
-            data, state, commitment, contingency);
-        stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+        const auto solution_text = text(state, commitment, contingency);
+        stream.write(
+            solution_text.data(),
+            static_cast<std::streamsize>(solution_text.size()));
         if (!stream) {
             throw std::runtime_error(
                 "failed while writing submission output: " + temporary);
         }
     }
     std::filesystem::rename(temporary, output);
+}
+
+std::string go_solution_text(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& commitment,
+    const Contingency* contingency) {
+    return GoSolutionWriter(data).text(state, commitment, contingency);
+}
+
+void write_go_solution(
+    const std::string& path,
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& commitment,
+    const Contingency* contingency) {
+    GoSolutionWriter(data).write(path, state, commitment, contingency);
 }
 
 }  // namespace gravityx

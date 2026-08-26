@@ -2580,6 +2580,7 @@ int run_contingency_worker(
     reject_onedrive(base_result_path);
     const auto data = gravityx::CaseData::load(case_path);
     const auto base = load_base_point(base_result_path);
+    const gravityx::GoSolutionWriter solution_writer(data);
     if (fast_only && !fast_power_flow_screen) {
         throw std::runtime_error(
             "fast-only contingency worker requires fast-pf mode");
@@ -2682,8 +2683,8 @@ int run_contingency_worker(
             }
             const auto solution_write_start =
                 std::chrono::steady_clock::now();
-            gravityx::write_go_solution(
-                *solution_path, data, completed_computation->state,
+            solution_writer.write(
+                *solution_path, completed_computation->state,
                 base.commitment,
                 &*contingency);
             solution_write_seconds = std::chrono::duration<double>(

@@ -29,6 +29,7 @@ from run_experiment import (  # noqa: E402
     evaluator_subprocess_environment,
     fast_screen_affinity_groups,
     finalization_reserve_seconds,
+    load_fast_screen_heavy_profile,
     longest_first_contingencies,
     progress_log_due,
     progress_checkpoint_due,
@@ -435,18 +436,21 @@ class CompetitionTimingTests(unittest.TestCase):
         work = AffinityScreenWorkQueue([first, second], worker_count=2)
 
         source, group = work.get(abort, worker_id=0)
-        self.assertEqual(source, "scheduled")
+        self.assertEqual(source, "bulk")
         self.assertEqual([item["label"] for item in group], ["A", "B", "C"])
         self.assertEqual(
             work.requeue_remaining_as_singletons(
-                group, 1, origin_worker_id=0
+                group,
+                1,
+                origin_worker_id=0,
+                source=source,
             ),
             2,
         )
         work.task_done(source)
 
         source, group = work.get(abort, worker_id=0)
-        self.assertEqual((source, group[0]["label"]), ("scheduled", "D"))
+        self.assertEqual((source, group[0]["label"]), ("bulk", "D"))
         work.task_done(source)
 
         observed = []
@@ -454,13 +458,112 @@ class CompetitionTimingTests(unittest.TestCase):
             source, group = work.get(abort, worker_id=1)
             observed.append((source, [item["label"] for item in group]))
             work.task_done(source)
-        self.assertTrue(all(source == "urgent" for source, _ in observed))
+        self.assertTrue(all(source == "urgent_bulk" for source, _ in observed))
         self.assertEqual(
             {labels[0] for _, labels in observed},
             {"B", "C"},
         )
         self.assertEqual(work.remaining_group_count, 0)
         self.assertIsNone(work.get(abort, worker_id=0))
+
+    def test_affinity_screen_queue_caps_profiled_heavy_lane(self):
+        abort = threading.Event()
+        groups = [
+            [{"label": "H1"}],
+            [{"label": "B1"}],
+            [{"label": "H2"}],
+            [{"label": "B2"}],
+        ]
+        work = AffinityScreenWorkQueue(
+            groups,
+            worker_count=2,
+            heavy_labels={"H1", "H2"},
+            heavy_worker_count=1,
+        )
+        self.assertEqual(work.initial_heavy_group_count, 2)
+        self.assertEqual(work.worker_lane(0), "heavy")
+        self.assertEqual(work.worker_lane(1), "bulk")
+
+        heavy_source, heavy_group = work.get(abort, worker_id=0)
+        bulk_source, bulk_group = work.get(abort, worker_id=1)
+        self.assertEqual(
+            (heavy_source, heavy_group[0]["label"]), ("heavy", "H1")
+        )
+        self.assertEqual(
+            (bulk_source, bulk_group[0]["label"]), ("bulk", "B1")
+        )
+        work.task_done(heavy_source)
+        work.task_done(bulk_source)
+
+        heavy_source, heavy_group = work.get(abort, worker_id=0)
+        bulk_source, bulk_group = work.get(abort, worker_id=1)
+        self.assertEqual(
+            (heavy_source, heavy_group[0]["label"]), ("heavy", "H2")
+        )
+        self.assertEqual(
+            (bulk_source, bulk_group[0]["label"]), ("bulk", "B2")
+        )
+        work.task_done(heavy_source)
+        work.task_done(bulk_source)
+        self.assertEqual(work.remaining_group_count, 0)
+
+    def test_single_heavy_worker_can_reclaim_its_split_sibling(self):
+        abort = threading.Event()
+        group = [{"label": "H1"}, {"label": "H2"}]
+        work = AffinityScreenWorkQueue(
+            [group],
+            worker_count=2,
+            heavy_labels={"H1"},
+            heavy_worker_count=1,
+        )
+        source, assigned = work.get(abort, worker_id=0)
+        self.assertEqual(source, "heavy")
+        self.assertEqual(
+            work.requeue_remaining_as_singletons(
+                assigned,
+                1,
+                origin_worker_id=0,
+                source=source,
+            ),
+            1,
+        )
+        work.task_done(source)
+        source, assigned = work.get(abort, worker_id=0)
+        self.assertEqual((source, assigned[0]["label"]), ("urgent_heavy", "H2"))
+        work.task_done(source)
+        self.assertEqual(work.remaining_group_count, 0)
+
+    def test_fast_screen_heavy_profile_is_timing_only_and_hash_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heavy.json"
+            write_json(
+                path,
+                {
+                    "schema_version": 1,
+                    "case_sha256": "case-hash",
+                    "heavy_threshold_seconds": 5.0,
+                    "contingencies": [
+                        {
+                            "label": "A",
+                            "measured_solver_wall_seconds": 7.5,
+                        },
+                        {
+                            "label": "B",
+                            "measured_solver_wall_seconds": 5.0,
+                        },
+                    ],
+                },
+            )
+            labels, metadata = load_fast_screen_heavy_profile(
+                path, "case-hash", {"A", "B", "C"}
+            )
+            self.assertEqual(labels, {"A", "B"})
+            self.assertEqual(metadata["profiled_contingency_count"], 2)
+            self.assertFalse(metadata["uses_prior_solution_state"])
+            with self.assertRaisesRegex(ValueError, "case hash"):
+                load_fast_screen_heavy_profile(
+                    path, "different-hash", {"A", "B", "C"}
+                )
 
     def test_contiguous_evaluation_shards_preserve_schedule(self):
         labels = [f"CTG_{index}" for index in range(7)]

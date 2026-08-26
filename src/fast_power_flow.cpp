@@ -698,39 +698,61 @@ void compute_branch_flows(
             continue;
         }
         const auto& branch = data.branches[i];
-        const double denominator = branch.r * branch.r + branch.x * branch.x;
-        const double g = denominator > 1e-20 ? branch.r / denominator : 0.0;
-        const double b = denominator > 1e-20 ? -branch.x / denominator : 0.0;
-        const double tm = branch.tap;
-        const double tm2 = tm * tm;
-        const double tr = tm * std::cos(branch.shift);
-        const double ti = tm * std::sin(branch.shift);
+        double from_g_self = branch.flow_from_g_self;
+        double from_b_self = branch.flow_from_b_self;
+        double to_g_self = branch.flow_to_g_self;
+        double to_b_self = branch.flow_to_b_self;
+        double from_cross_cos = branch.flow_from_cross_cos;
+        double from_cross_sin = branch.flow_from_cross_sin;
+        double to_cross_cos = branch.flow_to_cross_cos;
+        double to_cross_sin = branch.flow_to_cross_sin;
+        if (!branch.flow_coefficients_valid) {
+            const double denominator =
+                branch.r * branch.r + branch.x * branch.x;
+            const double g = denominator > 1e-20
+                ? branch.r / denominator : 0.0;
+            const double b = denominator > 1e-20
+                ? -branch.x / denominator : 0.0;
+            const double tap_squared = branch.tap * branch.tap;
+            const double tap_real = branch.tap * std::cos(branch.shift);
+            const double tap_imag = branch.tap * std::sin(branch.shift);
+            from_g_self = branch.transformer
+                ? g / tap_squared + branch.g_fr
+                : (g + branch.g_fr) / tap_squared;
+            from_b_self = branch.transformer
+                ? b / tap_squared + branch.b_fr
+                : (b + branch.b_fr) / tap_squared;
+            to_g_self = g + branch.g_to;
+            to_b_self = b + branch.b_to;
+            from_cross_cos =
+                (-g * tap_real + b * tap_imag) / tap_squared;
+            from_cross_sin =
+                (-b * tap_real - g * tap_imag) / tap_squared;
+            to_cross_cos =
+                (-g * tap_real - b * tap_imag) / tap_squared;
+            to_cross_sin =
+                (-b * tap_real + g * tap_imag) / tap_squared;
+        }
         const int f = branch.from;
         const int t = branch.to;
-        const double cross_cos_ft = state.vm[f] * state.vm[t]
-            * std::cos(state.va[f] - state.va[t]);
-        const double cross_sin_ft = state.vm[f] * state.vm[t]
-            * std::sin(state.va[f] - state.va[t]);
-        const double from_g_self = branch.transformer
-            ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
-        const double from_b_self = branch.transformer
-            ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
+        const double voltage_product = state.vm[f] * state.vm[t];
+        const double angle_delta = state.va[f] - state.va[t];
+        const double cross_cos_ft = voltage_product * std::cos(angle_delta);
+        const double cross_sin_ft = voltage_product * std::sin(angle_delta);
         state.pf[i] = from_g_self * state.vm[f] * state.vm[f]
-            + ((-g * tr + b * ti) / tm2) * cross_cos_ft
-            + ((-b * tr - g * ti) / tm2) * cross_sin_ft;
+            + from_cross_cos * cross_cos_ft
+            + from_cross_sin * cross_sin_ft;
         state.qf[i] = -from_b_self * state.vm[f] * state.vm[f]
-            - ((-b * tr - g * ti) / tm2) * cross_cos_ft
-            + ((-g * tr + b * ti) / tm2) * cross_sin_ft;
-        const double cross_cos_tf = state.vm[t] * state.vm[f]
-            * std::cos(state.va[t] - state.va[f]);
-        const double cross_sin_tf = state.vm[t] * state.vm[f]
-            * std::sin(state.va[t] - state.va[f]);
-        state.pt[i] = (g + branch.g_to) * state.vm[t] * state.vm[t]
-            + ((-g * tr - b * ti) / tm2) * cross_cos_tf
-            + ((-b * tr + g * ti) / tm2) * cross_sin_tf;
-        state.qt[i] = -(b + branch.b_to) * state.vm[t] * state.vm[t]
-            - ((-b * tr + g * ti) / tm2) * cross_cos_tf
-            + ((-g * tr - b * ti) / tm2) * cross_sin_tf;
+            - from_cross_sin * cross_cos_ft
+            + from_cross_cos * cross_sin_ft;
+        // cos(-x) == cos(x) and sin(-x) == -sin(x); reuse the same
+        // trigonometric pair for the opposite terminal.
+        state.pt[i] = to_g_self * state.vm[t] * state.vm[t]
+            + to_cross_cos * cross_cos_ft
+            - to_cross_sin * cross_sin_ft;
+        state.qt[i] = -to_b_self * state.vm[t] * state.vm[t]
+            - to_cross_sin * cross_cos_ft
+            - to_cross_cos * cross_sin_ft;
 
         const double from_magnitude = std::hypot(state.pf[i], state.qf[i]);
         const double to_magnitude = std::hypot(state.pt[i], state.qt[i]);

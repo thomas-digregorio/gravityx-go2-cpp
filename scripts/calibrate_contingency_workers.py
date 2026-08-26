@@ -20,10 +20,12 @@ from run_experiment import (
     contingency_records,
     cpp_command,
     fast_screen_affinity_groups,
+    load_fast_screen_heavy_profile,
     longest_first_contingencies,
     read_json,
     reject_onedrive,
     safe_label,
+    sha256,
     to_wsl,
     write_json,
 )
@@ -44,6 +46,8 @@ def run_trial(
     linearized_fallback: bool = False,
     precomputed_fast_screen_dir: Path | None = None,
     wsl_fast_screen_scratch: bool = False,
+    heavy_labels: set[str] | None = None,
+    heavy_worker_count: int = 0,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     if task_groups is None:
@@ -52,7 +56,12 @@ def run_trial(
         item["label"] for item in records
     ]:
         raise ValueError("task groups must contain every record exactly once in order")
-    task_queue = AffinityScreenWorkQueue(task_groups, workers)
+    task_queue = AffinityScreenWorkQueue(
+        task_groups,
+        workers,
+        heavy_labels=heavy_labels,
+        heavy_worker_count=heavy_worker_count,
+    )
     abort = threading.Event()
     deadline = time.perf_counter() + timeout_seconds
     completed: list[dict[str, Any]] = []
@@ -245,7 +254,10 @@ def run_trial(
                     split_count = 0
                     if result.get("requires_exact_fallback", False):
                         split_count = task_queue.requeue_remaining_as_singletons(
-                            group, group_position + 1, worker_id
+                            group,
+                            group_position + 1,
+                            worker_id,
+                            work_source,
                         )
                         if split_count:
                             affinity_split_group_count += 1
@@ -268,6 +280,7 @@ def run_trial(
                 "worker_id": worker_id,
                 "labels": labels,
                 "wall_seconds": time.perf_counter() - started,
+                "screen_lane": task_queue.worker_lane(worker_id),
                 "affinity_split_group_count": affinity_split_group_count,
                 "affinity_split_contingency_count": (
                     affinity_split_contingency_count
@@ -329,6 +342,8 @@ def run_trial(
             int(item.get("affinity_split_contingency_count", 0))
             for item in worker_records
         ),
+        "profiled_heavy_group_count": task_queue.initial_heavy_group_count,
+        "heavy_worker_count": heavy_worker_count,
         "solver_seconds_sum": sum(
             item["solver_wall_seconds"] for item in completed
         ),
@@ -357,6 +372,8 @@ def main() -> int:
     parser.add_argument("--fast-only", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
+    parser.add_argument("--fast-screen-heavy-profile", type=Path)
+    parser.add_argument("--fast-screen-heavy-workers", type=int, default=0)
     parser.add_argument("--additional-easy-task-count", type=int, default=0)
     parser.add_argument("--selection-offset", type=int, default=0)
     parser.add_argument("--labels", nargs="+")
@@ -390,12 +407,43 @@ def main() -> int:
             "--fast-screen-easy-first requires "
             "--fast-screen-affinity-schedule"
         )
+    if ((args.fast_screen_heavy_profile is None) !=
+            (args.fast_screen_heavy_workers == 0)):
+        parser.error(
+            "--fast-screen-heavy-profile and a positive "
+            "--fast-screen-heavy-workers must be provided together"
+        )
+    if (args.fast_screen_heavy_profile is not None and
+            not args.fast_screen_affinity_schedule):
+        parser.error(
+            "--fast-screen-heavy-profile requires "
+            "--fast-screen-affinity-schedule"
+        )
+    if args.fast_screen_heavy_workers < 0:
+        parser.error("--fast-screen-heavy-workers must be nonnegative")
+    if any(args.fast_screen_heavy_workers > workers for workers in args.workers):
+        parser.error(
+            "--fast-screen-heavy-workers cannot exceed any calibrated "
+            "worker count"
+        )
     if args.selection_offset < 0:
         parser.error("--selection-offset must be nonnegative")
     if args.additional_easy_task_count < 0:
         parser.error("--additional-easy-task-count must be nonnegative")
 
     case = read_json(args.case_json)
+    heavy_labels: set[str] = set()
+    heavy_profile_metadata: dict[str, Any] | None = None
+    if args.fast_screen_heavy_profile is not None:
+        reject_onedrive(args.fast_screen_heavy_profile)
+        heavy_labels, heavy_profile_metadata = load_fast_screen_heavy_profile(
+            args.fast_screen_heavy_profile,
+            sha256(args.case_json),
+            {
+                str(item["label"])
+                for item in contingency_records(case)
+            },
+        )
     base = read_json(args.base_json)
     ordered_records = longest_first_contingencies(
         case,
@@ -445,6 +493,8 @@ def main() -> int:
         "fast_only": args.fast_only,
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "fast_screen_easy_first": args.fast_screen_easy_first,
+        "fast_screen_heavy_profile": heavy_profile_metadata,
+        "fast_screen_heavy_workers": args.fast_screen_heavy_workers,
         "additional_easy_task_count": args.additional_easy_task_count,
         "linearized_fallback": args.linearized_fallback,
         "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
@@ -480,6 +530,8 @@ def main() -> int:
             args.linearized_fallback,
             args.precomputed_fast_screen_dir,
             args.wsl_fast_screen_scratch,
+            heavy_labels,
+            args.fast_screen_heavy_workers,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

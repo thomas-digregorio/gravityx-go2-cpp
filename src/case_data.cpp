@@ -221,6 +221,31 @@ CaseData CaseData::load(const std::string& path) {
         branch.b_to = item.at("b_to").get<double>();
         branch.tap = item.at("tap").get<double>();
         branch.shift = item.at("shift").get<double>();
+        const double denominator = branch.r * branch.r + branch.x * branch.x;
+        const double g = denominator > 1e-20
+            ? branch.r / denominator : 0.0;
+        const double b = denominator > 1e-20
+            ? -branch.x / denominator : 0.0;
+        const double tap_squared = branch.tap * branch.tap;
+        const double tap_real = branch.tap * std::cos(branch.shift);
+        const double tap_imag = branch.tap * std::sin(branch.shift);
+        branch.flow_from_g_self = branch.transformer
+            ? g / tap_squared + branch.g_fr
+            : (g + branch.g_fr) / tap_squared;
+        branch.flow_from_b_self = branch.transformer
+            ? b / tap_squared + branch.b_fr
+            : (b + branch.b_fr) / tap_squared;
+        branch.flow_to_g_self = g + branch.g_to;
+        branch.flow_to_b_self = b + branch.b_to;
+        branch.flow_from_cross_cos =
+            (-g * tap_real + b * tap_imag) / tap_squared;
+        branch.flow_from_cross_sin =
+            (-b * tap_real - g * tap_imag) / tap_squared;
+        branch.flow_to_cross_cos =
+            (-g * tap_real - b * tap_imag) / tap_squared;
+        branch.flow_to_cross_sin =
+            (-b * tap_real + g * tap_imag) / tap_squared;
+        branch.flow_coefficients_valid = true;
         branch.angmin = item.at("angmin").get<double>();
         branch.angmax = item.at("angmax").get<double>();
         branch.rate_a = item.at("rate_a").get<double>();

@@ -150,18 +150,25 @@ static ValidationReport validate_state_impl(
         }
     }
     require_finite_state(state, "candidate.");
-    if (contingency) {
+    if (contingency && !skip_rebuilt_economic_and_ohms_checks) {
+        // Rebuilt trial validation is called repeatedly inside one fast
+        // contingency solve. Its immutable base state was fully validated
+        // before screening and is checked again by the final independent
+        // validator, so rescanning every base vector in every local-search
+        // trial adds no new acceptance protection.
         require_finite_state(contingency->base_state, "base.");
     }
 
-    std::vector<int> fixed_status = fixed_status_argument;
-    if (fixed_status.empty()) {
-        fixed_status.reserve(ng);
+    std::vector<int> default_fixed_status;
+    const std::vector<int>* fixed_status = &fixed_status_argument;
+    if (fixed_status_argument.empty()) {
+        default_fixed_status.reserve(ng);
         for (const auto& gen : data.generators) {
-            fixed_status.push_back(gen.status_prev);
+            default_fixed_status.push_back(gen.status_prev);
         }
+        fixed_status = &default_fixed_status;
     }
-    if (fixed_status.size() != ng) {
+    if (fixed_status->size() != ng) {
         throw std::runtime_error("fixed commitment vector has the wrong length");
     }
 
@@ -227,7 +234,7 @@ static ValidationReport validate_state_impl(
         const bool outaged = contingency &&
             contingency->outaged_generator == static_cast<int>(i);
         const bool active = !outaged &&
-            (mode == ModelMode::UnitCommitmentRelaxation || fixed_status[i] == 1);
+            (mode == ModelMode::UnitCommitmentRelaxation || (*fixed_status)[i] == 1);
         double pg_lower = 0.0;
         double pg_upper = 0.0;
         double qg_lower = 0.0;
@@ -481,44 +488,63 @@ static ValidationReport validate_state_impl(
         const int f = branch.from;
         const int t = branch.to;
         if (!skip_rebuilt_economic_and_ohms_checks) {
-            const double denominator =
-                branch.r * branch.r + branch.x * branch.x;
-            const double g = denominator > 1e-20
-                ? branch.r / denominator : 0.0;
-            const double b = denominator > 1e-20
-                ? -branch.x / denominator : 0.0;
-            const double tm = branch.tap;
-            const double tm2 = tm * tm;
-            const double tr = tm * std::cos(branch.shift);
-            const double ti = tm * std::sin(branch.shift);
-            const double cross_cos_ft = state.vm[f] * state.vm[t] *
-                std::cos(state.va[f] - state.va[t]);
-            const double cross_sin_ft = state.vm[f] * state.vm[t] *
-                std::sin(state.va[f] - state.va[t]);
-            const double from_g_self = branch.transformer
-                ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
-            const double from_b_self = branch.transformer
-                ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
+            double from_g_self = branch.flow_from_g_self;
+            double from_b_self = branch.flow_from_b_self;
+            double to_g_self = branch.flow_to_g_self;
+            double to_b_self = branch.flow_to_b_self;
+            double from_cross_cos = branch.flow_from_cross_cos;
+            double from_cross_sin = branch.flow_from_cross_sin;
+            double to_cross_cos = branch.flow_to_cross_cos;
+            double to_cross_sin = branch.flow_to_cross_sin;
+            if (!branch.flow_coefficients_valid) {
+                const double denominator =
+                    branch.r * branch.r + branch.x * branch.x;
+                const double g = denominator > 1e-20
+                    ? branch.r / denominator : 0.0;
+                const double b = denominator > 1e-20
+                    ? -branch.x / denominator : 0.0;
+                const double tap_squared = branch.tap * branch.tap;
+                const double tap_real = branch.tap * std::cos(branch.shift);
+                const double tap_imag = branch.tap * std::sin(branch.shift);
+                from_g_self = branch.transformer
+                    ? g / tap_squared + branch.g_fr
+                    : (g + branch.g_fr) / tap_squared;
+                from_b_self = branch.transformer
+                    ? b / tap_squared + branch.b_fr
+                    : (b + branch.b_fr) / tap_squared;
+                to_g_self = g + branch.g_to;
+                to_b_self = b + branch.b_to;
+                from_cross_cos =
+                    (-g * tap_real + b * tap_imag) / tap_squared;
+                from_cross_sin =
+                    (-b * tap_real - g * tap_imag) / tap_squared;
+                to_cross_cos =
+                    (-g * tap_real - b * tap_imag) / tap_squared;
+                to_cross_sin =
+                    (-b * tap_real + g * tap_imag) / tap_squared;
+            }
+            const double voltage_product = state.vm[f] * state.vm[t];
+            const double angle_delta = state.va[f] - state.va[t];
+            const double cross_cos_ft =
+                voltage_product * std::cos(angle_delta);
+            const double cross_sin_ft =
+                voltage_product * std::sin(angle_delta);
             const double expected_pf =
                 from_g_self * state.vm[f] * state.vm[f] +
-                ((-g * tr + b * ti) / tm2) * cross_cos_ft +
-                ((-b * tr - g * ti) / tm2) * cross_sin_ft;
+                from_cross_cos * cross_cos_ft +
+                from_cross_sin * cross_sin_ft;
             const double expected_qf =
                 -from_b_self * state.vm[f] * state.vm[f] -
-                ((-b * tr - g * ti) / tm2) * cross_cos_ft +
-                ((-g * tr + b * ti) / tm2) * cross_sin_ft;
-            const double cross_cos_tf = state.vm[t] * state.vm[f] *
-                std::cos(state.va[t] - state.va[f]);
-            const double cross_sin_tf = state.vm[t] * state.vm[f] *
-                std::sin(state.va[t] - state.va[f]);
+                from_cross_sin * cross_cos_ft +
+                from_cross_cos * cross_sin_ft;
             const double expected_pt =
-                (g + branch.g_to) * state.vm[t] * state.vm[t] +
-                ((-g * tr - b * ti) / tm2) * cross_cos_tf +
-                ((-b * tr + g * ti) / tm2) * cross_sin_tf;
+                to_g_self * state.vm[t] * state.vm[t] +
+                to_cross_cos * cross_cos_ft -
+                to_cross_sin * cross_sin_ft;
             const double expected_qt =
-                -(b + branch.b_to) * state.vm[t] * state.vm[t] -
-                ((-b * tr + g * ti) / tm2) * cross_cos_tf +
-                ((-g * tr - b * ti) / tm2) * cross_sin_tf;
+                -to_b_self * state.vm[t] * state.vm[t] -
+                to_cross_sin * cross_cos_ft -
+                to_cross_cos * cross_sin_ft;
             const double ohms = std::max({
                 std::abs(state.pf[i] - expected_pf),
                 std::abs(state.qf[i] - expected_qf),

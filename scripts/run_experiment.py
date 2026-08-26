@@ -1533,7 +1533,7 @@ def longest_first_contingencies(
 
 
 class AffinityScreenWorkQueue:
-    """Serve affinity groups while allowing failed groups to fan out safely.
+    """Serve affinity groups through optional heavy and bulk worker lanes.
 
     A verified corrective state is useful to later outages in the same
     affinity group, so successful groups remain serial on one resident
@@ -1542,29 +1542,80 @@ class AffinityScreenWorkQueue:
     work and should be made immediately available to idle workers instead of
     extending one worker's critical path.
 
-    ``remaining`` counts queued plus active groups. Idle workers therefore
-    wait while another worker can still create urgent singleton work, and
-    exit only after every original or split group has called ``task_done``.
+    A timing-only profile can classify groups containing known expensive
+    screens. Only the first ``heavy_worker_count`` workers consume that queue;
+    every other worker starts on the bulk queue. Heavy workers help with bulk
+    work after their lane drains, while bulk workers never increase expensive
+    concurrency. This prevents memory-bandwidth-limited sparse solves from
+    slowing each other down without discarding any mathematical state.
+
+    ``remaining`` counts queued plus active groups across both lanes. Idle
+    workers therefore wait while another worker can still create urgent
+    singleton work, and exit only after every original or split group has
+    called ``task_done``.
     """
 
     def __init__(
         self,
         groups: list[list[dict[str, Any]]],
         worker_count: int,
+        heavy_labels: set[str] | None = None,
+        heavy_worker_count: int = 0,
     ):
         if any(not group for group in groups):
             raise ValueError("affinity screen groups must be nonempty")
         if worker_count < 1:
             raise ValueError("affinity screen worker count must be positive")
-        self._scheduled: queue.Queue[list[dict[str, Any]]] = queue.Queue()
-        self._urgent: queue.Queue[
+        if heavy_worker_count < 0 or heavy_worker_count > worker_count:
+            raise ValueError(
+                "affinity heavy worker count must be between zero and "
+                "the total worker count"
+            )
+        heavy_labels = heavy_labels or set()
+        if heavy_labels and heavy_worker_count == 0:
+            raise ValueError("profiled heavy groups require at least one heavy worker")
+        if not heavy_labels and heavy_worker_count != 0:
+            raise ValueError("heavy workers require at least one profiled label")
+        self._scheduled_heavy: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+        self._scheduled_bulk: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+        self._urgent_heavy: queue.Queue[
             tuple[int, list[dict[str, Any]]]
         ] = queue.Queue()
+        self._urgent_bulk: queue.Queue[
+            tuple[int, list[dict[str, Any]]]
+        ] = queue.Queue()
+        heavy_group_count = 0
         for group in groups:
-            self._scheduled.put(group)
+            if any(str(item["label"]) in heavy_labels for item in group):
+                self._scheduled_heavy.put(group)
+                heavy_group_count += 1
+            else:
+                self._scheduled_bulk.put(group)
         self._condition = threading.Condition()
         self._remaining = len(groups)
         self._worker_count = worker_count
+        self._heavy_worker_count = heavy_worker_count
+        self._initial_heavy_group_count = heavy_group_count
+
+    def _get_urgent(
+        self,
+        urgent_queue: queue.Queue[tuple[int, list[dict[str, Any]]]],
+        source: str,
+        worker_id: int,
+        eligible_worker_count: int,
+    ) -> tuple[tuple[str, list[dict[str, Any]]] | None, bool]:
+        try:
+            origin_worker_id, group = urgent_queue.get_nowait()
+        except queue.Empty:
+            return None, False
+        if origin_worker_id != worker_id or eligible_worker_count == 1:
+            return (source, group), False
+        # Do not let the worker that exposed parallel work reclaim it
+        # immediately. Preserve queue accounting while giving a waiting peer
+        # in the same lane the opportunity to take the sibling.
+        urgent_queue.put((origin_worker_id, group))
+        urgent_queue.task_done()
+        return None, True
 
     def get(
         self,
@@ -1574,25 +1625,42 @@ class AffinityScreenWorkQueue:
     ) -> tuple[str, list[dict[str, Any]]] | None:
         while not abort.is_set():
             deferred_own_split = False
-            try:
-                origin_worker_id, group = self._urgent.get_nowait()
-                if (
-                    origin_worker_id != worker_id
-                    or self._worker_count == 1
-                ):
-                    return "urgent", group
-                # Do not let the worker that exposed parallel work reclaim it
-                # immediately. Preserve the queue accounting while giving an
-                # already-waiting peer the opportunity to take the sibling.
-                self._urgent.put((origin_worker_id, group))
-                self._urgent.task_done()
-                deferred_own_split = True
-            except queue.Empty:
-                pass
-            try:
-                return "scheduled", self._scheduled.get_nowait()
-            except queue.Empty:
-                pass
+            heavy_worker = worker_id < self._heavy_worker_count
+            eligible_urgent = (
+                [
+                    (self._urgent_heavy, "urgent_heavy"),
+                    (self._urgent_bulk, "urgent_bulk"),
+                ]
+                if heavy_worker
+                else [(self._urgent_bulk, "urgent_bulk")]
+            )
+            for urgent_queue, source in eligible_urgent:
+                work, deferred = self._get_urgent(
+                    urgent_queue,
+                    source,
+                    worker_id,
+                    (
+                        self._heavy_worker_count
+                        if source == "urgent_heavy"
+                        else self._worker_count
+                    ),
+                )
+                deferred_own_split = deferred_own_split or deferred
+                if work is not None:
+                    return work
+            eligible_scheduled = (
+                [
+                    (self._scheduled_heavy, "heavy"),
+                    (self._scheduled_bulk, "bulk"),
+                ]
+                if heavy_worker
+                else [(self._scheduled_bulk, "bulk")]
+            )
+            for scheduled_queue, source in eligible_scheduled:
+                try:
+                    return source, scheduled_queue.get_nowait()
+                except queue.Empty:
+                    pass
             with self._condition:
                 if self._remaining == 0:
                     return None
@@ -1610,19 +1678,30 @@ class AffinityScreenWorkQueue:
         group: list[dict[str, Any]],
         first_unattempted_position: int,
         origin_worker_id: int,
+        source: str,
     ) -> int:
         remaining = group[first_unattempted_position:]
         if not remaining:
             return 0
+        heavy = source in {"heavy", "urgent_heavy"}
+        urgent_queue = self._urgent_heavy if heavy else self._urgent_bulk
         with self._condition:
             for item in remaining:
-                self._urgent.put((origin_worker_id, [item]))
+                urgent_queue.put((origin_worker_id, [item]))
             self._remaining += len(remaining)
             self._condition.notify_all()
         return len(remaining)
 
     def task_done(self, source: str) -> None:
-        source_queue = self._urgent if source == "urgent" else self._scheduled
+        source_queues = {
+            "heavy": self._scheduled_heavy,
+            "bulk": self._scheduled_bulk,
+            "urgent_heavy": self._urgent_heavy,
+            "urgent_bulk": self._urgent_bulk,
+        }
+        if source not in source_queues:
+            raise ValueError(f"unknown affinity screen queue source: {source}")
+        source_queue = source_queues[source]
         source_queue.task_done()
         with self._condition:
             if self._remaining <= 0:
@@ -1634,6 +1713,13 @@ class AffinityScreenWorkQueue:
     def remaining_group_count(self) -> int:
         with self._condition:
             return self._remaining
+
+    @property
+    def initial_heavy_group_count(self) -> int:
+        return self._initial_heavy_group_count
+
+    def worker_lane(self, worker_id: int) -> str:
+        return "heavy" if worker_id < self._heavy_worker_count else "bulk"
 
 
 def fast_screen_affinity_groups(
@@ -1722,6 +1808,61 @@ def fast_screen_affinity_groups(
         for item in group:
             item["fast_screen_affinity_group_rank"] = rank
     return groups
+
+
+def load_fast_screen_heavy_profile(
+    path: Path,
+    case_sha256: str,
+    contingency_labels: set[str],
+) -> tuple[set[str], dict[str, Any]]:
+    """Load a timing-only list used solely to cap expensive concurrency."""
+    reject_onedrive(path)
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("fast-screen heavy profile must use schema_version 1")
+    if raw.get("case_sha256") != case_sha256:
+        raise ValueError("fast-screen heavy profile case hash does not match")
+    threshold = float(raw.get("heavy_threshold_seconds", math.nan))
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("fast-screen heavy profile threshold must be positive")
+    entries = raw.get("contingencies")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("fast-screen heavy profile contingencies must be nonempty")
+
+    labels: set[str] = set()
+    measured_seconds: list[float] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("fast-screen heavy profile entry must be an object")
+        label = str(entry.get("label", ""))
+        measured = float(
+            entry.get("measured_solver_wall_seconds", math.nan)
+        )
+        if label not in contingency_labels:
+            raise ValueError(f"unknown profiled fast-screen label: {label}")
+        if label in labels:
+            raise ValueError(f"duplicate profiled fast-screen label: {label}")
+        if not math.isfinite(measured) or measured < threshold:
+            raise ValueError(
+                f"invalid profiled fast-screen time for {label}: {measured}"
+            )
+        labels.add(label)
+        measured_seconds.append(measured)
+
+    metadata = {
+        "path": str(path.resolve()),
+        "sha256": sha256(path),
+        "schema_version": 1,
+        "heavy_threshold_seconds": threshold,
+        "profiled_contingency_count": len(labels),
+        "measured_solver_seconds_sum": sum(measured_seconds),
+        "uses_prior_solution_state": False,
+        "dispatch_semantics": (
+            "timing-only heavy-lane classification; no primal, dual, "
+            "commitment, network, or solver state"
+        ),
+    }
+    return labels, metadata
 
 
 def load_fallback_schedule_profile(
@@ -1856,6 +1997,8 @@ def main() -> int:
     parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
+    parser.add_argument("--fast-screen-heavy-profile", type=Path)
+    parser.add_argument("--fast-screen-heavy-workers", type=int, default=0)
     parser.add_argument("--wsl-fast-screen-scratch", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
@@ -1889,6 +2032,24 @@ def main() -> int:
         parser.error(
             "--fast-screen-easy-first requires "
             "--fast-screen-affinity-schedule"
+        )
+    if ((args.fast_screen_heavy_profile is None) !=
+            (args.fast_screen_heavy_workers == 0)):
+        parser.error(
+            "--fast-screen-heavy-profile and a positive "
+            "--fast-screen-heavy-workers must be provided together"
+        )
+    if (args.fast_screen_heavy_profile is not None and
+            not args.fast_screen_affinity_schedule):
+        parser.error(
+            "--fast-screen-heavy-profile requires "
+            "--fast-screen-affinity-schedule"
+        )
+    if args.fast_screen_heavy_workers < 0:
+        parser.error("--fast-screen-heavy-workers must be nonnegative")
+    if args.fast_screen_heavy_workers > args.fast_workers:
+        parser.error(
+            "--fast-screen-heavy-workers cannot exceed --fast-workers"
         )
     if args.wsl_fast_screen_scratch and not (
         args.two_stage_contingency_screen and args.cpp_solution_writer
@@ -1938,6 +2099,8 @@ def main() -> int:
             raise ValueError(f"{label} executable does not exist: {executable}")
     if args.fallback_schedule_profile is not None:
         reject_onedrive(args.fallback_schedule_profile)
+    if args.fast_screen_heavy_profile is not None:
+        reject_onedrive(args.fast_screen_heavy_profile)
     if args.workers < 1:
         raise ValueError("workers must be positive")
     if args.fast_workers < 1:
@@ -2030,6 +2193,16 @@ def main() -> int:
     case = read_json(args.case_json)
     contingencies = contingency_records(case)
     case_json_sha256 = sha256(args.case_json)
+    fast_screen_heavy_labels: set[str] = set()
+    fast_screen_heavy_profile_metadata: dict[str, Any] | None = None
+    if args.fast_screen_heavy_profile is not None:
+        fast_screen_heavy_labels, fast_screen_heavy_profile_metadata = (
+            load_fast_screen_heavy_profile(
+                args.fast_screen_heavy_profile,
+                case_json_sha256,
+                {str(item["label"]) for item in contingencies},
+            )
+        )
     fallback_schedule: dict[str, dict[str, float | int]] = {}
     fallback_schedule_metadata: dict[str, Any] | None = None
     if args.fallback_schedule_profile is not None:
@@ -2082,6 +2255,8 @@ def main() -> int:
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "cpp_solution_writer": args.cpp_solution_writer,
         "fast_screen_easy_first": args.fast_screen_easy_first,
+        "fast_screen_heavy_profile": fast_screen_heavy_profile_metadata,
+        "fast_screen_heavy_worker_count": args.fast_screen_heavy_workers,
         "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
@@ -2283,6 +2458,11 @@ def main() -> int:
                 else "globally difficult-first groups, then "
             )
             + "fallback-triggered parallel group splitting, then "
+            + (
+                f"{args.fast_screen_heavy_workers}-worker profiled heavy lane, then "
+                if fast_screen_heavy_labels
+                else ""
+            )
             + schedule_mode
         )
     run_status.update(
@@ -2506,7 +2686,13 @@ def main() -> int:
             screen_groups = [[item] for item in contingencies]
         fast_worker_count = min(args.fast_workers, len(contingencies))
         screen_work = AffinityScreenWorkQueue(
-            screen_groups, fast_worker_count
+            screen_groups,
+            fast_worker_count,
+            heavy_labels=fast_screen_heavy_labels,
+            heavy_worker_count=args.fast_screen_heavy_workers,
+        )
+        run_status["fast_screen_profiled_heavy_group_count"] = (
+            screen_work.initial_heavy_group_count
         )
         fallback_items: list[dict[str, Any]] = []
 
@@ -2656,7 +2842,10 @@ def main() -> int:
                                     )
                             split_count = (
                                 screen_work.requeue_remaining_as_singletons(
-                                    group, group_position + 1, worker_id
+                                    group,
+                                    group_position + 1,
+                                    worker_id,
+                                    work_source,
                                 )
                             )
                             if split_count:
@@ -2704,6 +2893,7 @@ def main() -> int:
                     "task_count": len(assigned_labels),
                     "process_wall_seconds": time.perf_counter() - started,
                     "labels": assigned_labels,
+                    "screen_lane": screen_work.worker_lane(worker_id),
                     "affinity_split_group_count": affinity_split_group_count,
                     "affinity_split_contingency_count": (
                         affinity_split_contingency_count

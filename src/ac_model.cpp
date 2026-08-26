@@ -239,24 +239,24 @@ BalanceSlackSeed nodal_balance_slack_seed(
         double p = 0.0;
         double q = 0.0;
         for (int branch : bus.branches_from) {
-            p += state.pf.at(branch);
-            q += state.qf.at(branch);
+            p += state.pf[branch];
+            q += state.qf[branch];
         }
         for (int branch : bus.branches_to) {
-            p += state.pt.at(branch);
-            q += state.qt.at(branch);
+            p += state.pt[branch];
+            q += state.qt[branch];
         }
         for (int generator : bus.generators) {
-            p -= state.pg.at(generator);
-            q -= state.qg.at(generator);
+            p -= state.pg[generator];
+            q -= state.qg[generator];
         }
         for (int load : bus.loads) {
-            p += data.loads.at(load).pd_nominal * state.demand_factor.at(load);
-            q += data.loads.at(load).qd_nominal * state.demand_factor.at(load);
+            p += data.loads[load].pd_nominal * state.demand_factor[load];
+            q += data.loads[load].qd_nominal * state.demand_factor[load];
         }
         for (int shunt : bus.shunts) {
             const double vm2 = state.vm[i] * state.vm[i];
-            p += data.shunts.at(shunt).gs * vm2;
+            p += data.shunts[shunt].gs * vm2;
             q -= effective_shunt_susceptance(data, state, shunt) * vm2;
         }
         if (!std::isfinite(p) || !std::isfinite(q)) {

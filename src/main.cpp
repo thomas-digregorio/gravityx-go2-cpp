@@ -265,6 +265,14 @@ int run_component_tests() {
         throw std::runtime_error(
             "component test failed: official solution text schema");
     }
+    writer_state.vm[0] = 1.123456789012345;
+    const auto precision_text = gravityx::go_solution_text(
+        writer_case, writer_state, {1}, &writer_outage);
+    if (precision_text.find("101, 1.12345678901, 0\n") ==
+        std::string::npos) {
+        throw std::runtime_error(
+            "component test failed: bounded solution precision");
+    }
     std::cout << "component tests passed\n";
     return 0;
 }

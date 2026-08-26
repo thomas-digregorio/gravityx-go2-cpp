@@ -85,6 +85,25 @@ def code2_time_limit(contingency_count: int, seconds_per_contingency: float) -> 
     return contingency_count * seconds_per_contingency
 
 
+def idle_screen_evaluation_process_target(
+    initial_processes: int,
+    post_screen_processes: int,
+    screen_workers: int,
+    remaining_screen_groups: int,
+) -> int:
+    """Replace drained screen-group capacity with evaluator processes."""
+    if initial_processes < 0:
+        raise ValueError("initial evaluator process count cannot be negative")
+    if post_screen_processes < max(1, initial_processes):
+        raise ValueError("post-screen evaluator process count is invalid")
+    if screen_workers < 1:
+        raise ValueError("screen worker count must be positive")
+    if remaining_screen_groups < 0:
+        raise ValueError("remaining screen group count cannot be negative")
+    released = max(0, screen_workers - remaining_screen_groups)
+    return min(post_screen_processes, initial_processes + released)
+
+
 def finalization_reserve_seconds(compact_summary: bool) -> float:
     return (
         COMPACT_FINALIZATION_RESERVE_SECONDS
@@ -1077,6 +1096,7 @@ class StreamingSerialEvaluation:
         self.aborted = False
         self.first_process_started: float | None = None
         self.last_process_finished: float | None = None
+        self.screen_idle_promotion_events: list[dict[str, int]] = []
 
     def _abort_locked(self) -> None:
         self.aborted = True
@@ -1208,10 +1228,39 @@ class StreamingSerialEvaluation:
                 self.ready_records.append(record)
             self._launch_ready_locked()
 
+    def promote_maximum_processes(
+        self,
+        maximum_processes: int,
+        remaining_screen_groups: int,
+    ) -> None:
+        """Monotonically release drained screen capacity to evaluation."""
+        if maximum_processes < 0:
+            raise ValueError("streaming evaluator process count is negative")
+        with self.lock:
+            if self.aborted:
+                raise CompetitionTimeout(
+                    "streaming official evaluation was aborted"
+                )
+            target = min(
+                self.post_screen_maximum_processes,
+                max(self.maximum_processes, maximum_processes),
+            )
+            if target == self.maximum_processes:
+                return
+            self.maximum_processes = target
+            self.screen_idle_promotion_events.append(
+                {
+                    "maximum_processes": target,
+                    "remaining_screen_groups": remaining_screen_groups,
+                }
+            )
+            self._launch_ready_locked()
+
     def finish(self) -> tuple[dict[str, Any], dict[str, Any]]:
         tail_started = time.perf_counter()
         try:
             with self.lock:
+                pre_tail_maximum_processes = self.maximum_processes
                 self.maximum_processes = self.post_screen_maximum_processes
                 completed_before_tail_wait = len(self.finalization_futures)
                 missing = set(self.labels) - self.completed_labels
@@ -1288,6 +1337,12 @@ class StreamingSerialEvaluation:
                     ),
                     "post_screen_maximum_parallel_processes": (
                         self.post_screen_maximum_processes
+                    ),
+                    "pre_tail_maximum_parallel_processes": (
+                        pre_tail_maximum_processes
+                    ),
+                    "screen_idle_promotion_events": list(
+                        self.screen_idle_promotion_events
                     ),
                 }
             )
@@ -2080,6 +2135,9 @@ def main() -> int:
     )
     parser.add_argument("--streaming-evaluation-processes", type=int, default=2)
     parser.add_argument(
+        "--streaming-evaluation-idle-screen-ramp", action="store_true"
+    )
+    parser.add_argument(
         "--evaluator-linear-algebra-threads", type=int, default=1
     )
     parser.add_argument("--post-screen-streaming-evaluation-processes", type=int)
@@ -2254,6 +2312,14 @@ def main() -> int:
                 "--streaming-serial-evaluation-shards cannot be combined "
                 "with --skip-evaluation"
             )
+    if args.streaming_evaluation_idle_screen_ramp and not (
+        args.two_stage_contingency_screen
+        and args.streaming_serial_evaluation_shards > 1
+    ):
+        parser.error(
+            "--streaming-evaluation-idle-screen-ramp requires "
+            "--two-stage-contingency-screen and streaming evaluation shards"
+        )
     if args.evaluation_processes > 1 and args.mpiexec is None:
         parser.error("--evaluation-processes greater than one requires --mpiexec")
     if args.mpiexec is not None:
@@ -2379,6 +2445,9 @@ def main() -> int:
         ),
         "streaming_evaluation_processes": (
             args.streaming_evaluation_processes
+        ),
+        "streaming_evaluation_idle_screen_ramp": (
+            args.streaming_evaluation_idle_screen_ramp
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads
@@ -3014,6 +3083,23 @@ def main() -> int:
                         if split_count:
                             break
                     screen_work.task_done(work_source)
+                    if args.streaming_evaluation_idle_screen_ramp:
+                        assert streaming_evaluation is not None
+                        remaining_screen_groups = (
+                            screen_work.remaining_group_count
+                        )
+                        target_processes = (
+                            idle_screen_evaluation_process_target(
+                                args.streaming_evaluation_processes,
+                                args.post_screen_streaming_evaluation_processes,
+                                fast_worker_count,
+                                remaining_screen_groups,
+                            )
+                        )
+                        streaming_evaluation.promote_maximum_processes(
+                            target_processes,
+                            remaining_screen_groups,
+                        )
                 if process.poll() is None:
                     assert process.stdin is not None
                     process.stdin.write('{"stop":true}\n')
@@ -3827,6 +3913,9 @@ def main() -> int:
         ),
         "streaming_evaluation_processes": (
             args.streaming_evaluation_processes
+        ),
+        "streaming_evaluation_idle_screen_ramp": (
+            args.streaming_evaluation_idle_screen_ramp
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads

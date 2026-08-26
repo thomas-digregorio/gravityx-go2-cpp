@@ -29,6 +29,7 @@ from run_experiment import (  # noqa: E402
     evaluator_subprocess_environment,
     fast_screen_affinity_groups,
     finalization_reserve_seconds,
+    idle_screen_evaluation_process_target,
     load_fast_screen_heavy_profile,
     longest_first_contingencies,
     progress_log_due,
@@ -715,6 +716,20 @@ class CompetitionTimingTests(unittest.TestCase):
             )
             self.assertEqual(merged, {"A": 8.0, "B": 7.5, "C": 5.0})
 
+    def test_idle_screen_capacity_promotes_evaluation_without_oversubscription(self):
+        self.assertEqual(
+            idle_screen_evaluation_process_target(1, 44, 24, 24), 1
+        )
+        self.assertEqual(
+            idle_screen_evaluation_process_target(1, 44, 24, 20), 5
+        )
+        self.assertEqual(
+            idle_screen_evaluation_process_target(1, 44, 24, 0), 25
+        )
+        self.assertEqual(
+            idle_screen_evaluation_process_target(4, 8, 24, 0), 8
+        )
+
     def test_contiguous_evaluation_shards_preserve_schedule(self):
         labels = [f"CTG_{index}" for index in range(7)]
         groups = contiguous_shard_groups(labels, 3)
@@ -1082,6 +1097,10 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
                 manager.mark_completed(label)
             self.assertEqual(manager.running_records, {})
             self.assertEqual(len(manager.ready_records), 2)
+            manager.promote_maximum_processes(1, remaining_screen_groups=1)
+            self.assertEqual(manager.maximum_processes, 1)
+            self.assertEqual(len(manager.running_records), 1)
+            self.assertEqual(len(manager.ready_records), 1)
             summary, metadata = manager.finish()
 
             self.assertEqual(summary["num_ctg"], 4)
@@ -1097,6 +1116,13 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             self.assertEqual(metadata["initial_maximum_parallel_processes"], 0)
             self.assertEqual(
                 metadata["post_screen_maximum_parallel_processes"], 2
+            )
+            self.assertEqual(
+                metadata["pre_tail_maximum_parallel_processes"], 1
+            )
+            self.assertEqual(
+                metadata["screen_idle_promotion_events"],
+                [{"maximum_processes": 1, "remaining_screen_groups": 1}],
             )
             self.assertTrue(metadata["incremental_shard_validation"])
             self.assertEqual(metadata["shard_validation_workers"], 2)

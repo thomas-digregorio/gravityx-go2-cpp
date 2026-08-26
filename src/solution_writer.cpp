@@ -4,7 +4,6 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <stdexcept>
 #include <system_error>
 
@@ -46,11 +45,15 @@ void append_integer(std::string& output, Integer value) {
 }
 
 void append_double(std::string& output, double value) {
+    // Twelve significant decimal digits keep serialization error many orders
+    // below the 1e-5 official feasibility tolerance while materially reducing
+    // both the 19k-case write volume and downstream numeric parsing work.
+    constexpr int kSubmissionPrecision = 12;
     char buffer[64];
     const auto conversion = std::to_chars(
         buffer, buffer + sizeof(buffer), value,
         std::chars_format::general,
-        std::numeric_limits<double>::max_digits10);
+        kSubmissionPrecision);
     if (conversion.ec != std::errc{}) {
         throw std::runtime_error("failed to format submission floating-point value");
     }

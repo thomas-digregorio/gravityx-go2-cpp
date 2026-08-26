@@ -78,6 +78,22 @@ def evaluator_subprocess_environment(
     return environment
 
 
+def evaluator_priority_popen_options(
+    below_normal_priority: bool,
+) -> dict[str, int]:
+    """Return an explicit Windows priority class for overlapping evaluators."""
+
+    if not below_normal_priority:
+        return {}
+    if os.name != "nt":
+        raise ValueError(
+            "below-normal evaluator priority is supported only on Windows"
+        )
+    return {
+        "creationflags": int(subprocess.BELOW_NORMAL_PRIORITY_CLASS),
+    }
+
+
 def persistent_evaluator_protocol_markers_present(evaluator: Path) -> bool:
     """Return whether an evaluator advertises the persistent shard protocol."""
 
@@ -1130,6 +1146,7 @@ class PersistentEvaluatorProcess:
         evaluator: Path,
         environment: dict[str, str],
         log_path: Path,
+        below_normal_priority: bool = False,
     ) -> None:
         self.worker_id = worker_id
         self.log_path = log_path
@@ -1143,6 +1160,7 @@ class PersistentEvaluatorProcess:
             stderr=subprocess.STDOUT,
             bufsize=1,
             env=environment,
+            **evaluator_priority_popen_options(below_normal_priority),
         )
         self.task_count = 0
         try:
@@ -1281,6 +1299,7 @@ class StreamingSerialEvaluation:
         completion_order_groups: bool = False,
         completion_order_tail_sizes: list[int] | None = None,
         persistent_evaluator_processes: bool = False,
+        evaluator_below_normal_priority: bool = False,
     ) -> None:
         if maximum_processes < 0:
             raise ValueError(
@@ -1327,6 +1346,7 @@ class StreamingSerialEvaluation:
         )
         self.vendor_evaluator_reference = vendor_evaluator_reference
         self.persistent_evaluator_processes = persistent_evaluator_processes
+        self.evaluator_below_normal_priority = evaluator_below_normal_priority
         groups = completion_order_shard_groups(
             self.labels,
             shard_count,
@@ -1451,6 +1471,7 @@ class StreamingSerialEvaluation:
                 self.internal_dir
                 / "persistent_streaming_evaluator_workers"
                 / f"persistent_worker_{worker_id:03d}.log",
+                self.evaluator_below_normal_priority,
             )
             self.persistent_workers.append(worker)
             self.available_persistent_workers.append(worker)
@@ -1575,6 +1596,9 @@ class StreamingSerialEvaluation:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=self.environment,
+                **evaluator_priority_popen_options(
+                    self.evaluator_below_normal_priority
+                ),
             )
             started = time.perf_counter()
             if self.first_process_started is None:
@@ -1774,6 +1798,9 @@ class StreamingSerialEvaluation:
                     ),
                     "persistent_evaluator_processes": (
                         self.persistent_evaluator_processes
+                    ),
+                    "evaluator_below_normal_priority": (
+                        self.evaluator_below_normal_priority
                     ),
                     "persistent_evaluator_process_count": len(
                         self.persistent_workers
@@ -2746,6 +2773,9 @@ def main() -> int:
         "--streaming-persistent-evaluator-processes", action="store_true"
     )
     parser.add_argument(
+        "--streaming-evaluator-below-normal-priority", action="store_true"
+    )
+    parser.add_argument(
         "--evaluator-linear-algebra-threads", type=int, default=1
     )
     parser.add_argument("--post-screen-streaming-evaluation-processes", type=int)
@@ -2784,6 +2814,11 @@ def main() -> int:
             "--streaming-persistent-evaluator-processes requires an evaluator "
             "implementing the persistent shard protocol; pass "
             "--evaluator scripts/fast_official_evaluator.py"
+        )
+    if args.streaming_evaluator_below_normal_priority and os.name != "nt":
+        parser.error(
+            "--streaming-evaluator-below-normal-priority is supported only "
+            "on Windows"
         )
     if args.ipopt_acceptable_termination and not args.resident_contingency_model:
         parser.error(
@@ -3119,6 +3154,9 @@ def main() -> int:
         "streaming_persistent_evaluator_processes": (
             args.streaming_persistent_evaluator_processes
         ),
+        "streaming_evaluator_below_normal_priority": (
+            args.streaming_evaluator_below_normal_priority
+        ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads
         ),
@@ -3409,6 +3447,7 @@ def main() -> int:
             args.streaming_evaluation_completion_order_shards,
             streaming_evaluation_tail_shard_sizes,
             args.streaming_persistent_evaluator_processes,
+            args.streaming_evaluator_below_normal_priority,
         )
         run_status["streaming_evaluation_prepared"] = True
         checkpoint()
@@ -4654,6 +4693,9 @@ def main() -> int:
         ),
         "streaming_persistent_evaluator_processes": (
             args.streaming_persistent_evaluator_processes
+        ),
+        "streaming_evaluator_below_normal_priority": (
+            args.streaming_evaluator_below_normal_priority
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads

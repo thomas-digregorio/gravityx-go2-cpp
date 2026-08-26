@@ -28,6 +28,7 @@ from run_experiment import (  # noqa: E402
     completion_order_shard_groups,
     contiguous_shard_groups,
     effective_process_timeout,
+    evaluator_priority_popen_options,
     evaluator_subprocess_environment,
     fast_screen_affinity_groups,
     finalization_reserve_seconds,
@@ -837,6 +838,21 @@ class CompetitionTimingTests(unittest.TestCase):
                 "referenced_vendor_evaluator.py"
             )
         )
+
+    def test_evaluator_priority_is_opt_in_and_uses_windows_priority_class(self):
+        self.assertEqual(evaluator_priority_popen_options(False), {})
+        if sys.platform == "win32":
+            self.assertEqual(
+                evaluator_priority_popen_options(True),
+                {
+                    "creationflags": int(
+                        subprocess.BELOW_NORMAL_PRIORITY_CLASS
+                    )
+                },
+            )
+        else:
+            with self.assertRaisesRegex(ValueError, "only on Windows"):
+                evaluator_priority_popen_options(True)
 
     def test_persistent_evaluator_requires_all_protocol_markers(self):
         with tempfile.TemporaryDirectory() as directory:

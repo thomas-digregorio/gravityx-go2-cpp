@@ -33,6 +33,7 @@ from run_experiment import (  # noqa: E402
     progress_checkpoint_due,
     streamed_queue_get,
     validate_and_normalize_evaluation_details,
+    validate_in_memory_evaluation_certificate,
     read_contingency_blocks,
     write_contingency_subset,
     write_json,
@@ -577,14 +578,26 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
         class FakeEvaluation:
             def __init__(self):
                 self.summary_all_cases = {}
-                self.summary = {"obj": {"val": 1.0}}
+                self.summary = {
+                    "obj": {"val": 1.0},
+                    "infeas": {"val": False},
+                }
                 self.ctg_label = ["CTG_A"]
                 self.writes = []
+
+            def write_final_summary_and_detail(self, path):
+                del path
 
             def write_detail(
                 self, path, case, detail_csv=False, detail_json=False
             ):
                 self.writes.append((path, case, detail_csv, detail_json))
+                if detail_json:
+                    output = Path(path)
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / f"eval_detail_{case.strip()}.json").write_text(
+                        json.dumps(self.summary), encoding="utf-8"
+                    )
 
             def json_to_summary_all_cases(self, path):
                 raise AssertionError(f"unexpected disk reread from {path}")
@@ -594,26 +607,109 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
             clean_string=lambda value: value.strip(),
         )
         install_in_memory_summary_aggregation(module)
-        evaluation = module.Evaluation()
-        evaluation.write_detail("out", "BASECASE", detail_json=True)
-        evaluation.summary["obj"]["val"] = 2.0
-        evaluation.write_detail("out", "CTG_A", detail_json=True)
-        evaluation.summary["obj"]["val"] = 3.0
-        evaluation.json_to_summary_all_cases("out")
+        with tempfile.TemporaryDirectory() as directory:
+            evaluation = module.Evaluation()
+            evaluation.write_detail(directory, "BASECASE", detail_json=True)
+            evaluation.summary["obj"]["val"] = 2.0
+            evaluation.write_detail(directory, "CTG_A", detail_json=True)
+            evaluation.summary["obj"]["val"] = 3.0
+            evaluation.json_to_summary_all_cases(directory)
+            evaluation.write_final_summary_and_detail(directory)
 
-        self.assertEqual(
-            evaluation.writes,
-            [
-                ("out", "BASECASE", False, True),
-                ("out", "CTG_A", False, True),
-            ],
-        )
-        self.assertEqual(
-            evaluation.summary_all_cases["BASECASE"]["obj"]["val"], 1.0
-        )
-        self.assertEqual(
-            evaluation.summary_all_cases["CTG_A"]["obj"]["val"], 2.0
-        )
+            self.assertEqual(
+                evaluation.writes,
+                [
+                    (directory, "BASECASE", False, True),
+                    (directory, "CTG_A", False, True),
+                ],
+            )
+            self.assertEqual(
+                evaluation.summary_all_cases["BASECASE"]["obj"]["val"],
+                1.0,
+            )
+            self.assertEqual(
+                evaluation.summary_all_cases["CTG_A"]["obj"]["val"], 2.0
+            )
+            capture = json.loads(
+                (
+                    Path(directory)
+                    / "gravityx_in_memory_detail_certificate.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                capture["objectives"], {"BASECASE": 1.0, "CTG_A": 2.0}
+            )
+
+    def test_in_memory_evaluator_certificate_validates_exact_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            values = {"BASECASE": 10.0, "CTG_A": 4.0}
+            detail_files = {}
+            for label, objective in values.items():
+                detail = output / f"eval_detail_{label}.json"
+                detail.write_text(
+                    json.dumps(
+                        {
+                            "obj": {"val": objective},
+                            "infeas": {"val": False},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                detail_files[label] = {
+                    "name": detail.name,
+                    "size": detail.stat().st_size,
+                }
+            write_json(
+                output / "gravityx_in_memory_detail_certificate.json",
+                {
+                    "schema_version": 1,
+                    "capture_point": (
+                        "immediately_after_unchanged_vendor_write_detail_returned"
+                    ),
+                    "vendor_detail_json_files_preserved": True,
+                    "expected_detail_count": 2,
+                    "observed_detail_count": 2,
+                    "objectives": values,
+                    "infeasibilities": {
+                        "BASECASE": False,
+                        "CTG_A": False,
+                    },
+                    "detail_files": detail_files,
+                },
+            )
+            summary = {
+                "solutions_exist": True,
+                "num_ctg": 1,
+                "obj": 14.0,
+                "infeas": 0.0,
+                "obj_all_cases": values,
+                "infeas_all_cases": {
+                    "BASECASE": False,
+                    "CTG_A": False,
+                },
+            }
+            normalized, certificate = (
+                validate_in_memory_evaluation_certificate(
+                    output,
+                    output / "internal",
+                    {"CTG_A"},
+                    summary,
+                )
+            )
+            self.assertEqual(normalized["obj"], 14.0)
+            self.assertTrue(certificate["complete_label_set"])
+            self.assertFalse(certificate["detail_json_files_reparsed"])
+            (output / "eval_detail_CTG_A.json").write_text(
+                "changed", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "artifact changed"):
+                validate_in_memory_evaluation_certificate(
+                    output,
+                    output / "internal2",
+                    {"CTG_A"},
+                    summary,
+                )
 
     def test_fast_evaluator_quiet_mode_only_replaces_print(self):
         original = object()

@@ -50,6 +50,9 @@ EVALUATOR_THREAD_ENVIRONMENT_VARIABLES = (
     "NUMEXPR_NUM_THREADS",
 )
 VENDOR_EVALUATOR_ENVIRONMENT_VARIABLE = "GRAVITYX_VENDOR_EVALUATOR"
+IN_MEMORY_DETAIL_CERTIFICATE_NAME = (
+    "gravityx_in_memory_detail_certificate.json"
+)
 
 
 class CompetitionTimeout(RuntimeError):
@@ -355,6 +358,162 @@ def validate_and_normalize_evaluation_details(
     return normalized, certificate
 
 
+def validate_in_memory_evaluation_certificate(
+    output_dir: Path,
+    internal_dir: Path,
+    expected_contingency_labels: set[str],
+    summary: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the fast evaluator's exact post-detail-write capture."""
+
+    capture_path = output_dir / IN_MEMORY_DETAIL_CERTIFICATE_NAME
+    capture = read_json(capture_path)
+    expected_labels = {"BASECASE", *expected_contingency_labels}
+    if (
+        int(capture.get("schema_version", -1)) != 1
+        or capture.get("capture_point")
+        != "immediately_after_unchanged_vendor_write_detail_returned"
+        or not bool(capture.get("vendor_detail_json_files_preserved", False))
+    ):
+        raise RuntimeError("invalid in-memory evaluator capture provenance")
+
+    raw_objectives = capture.get("objectives")
+    raw_infeasibilities = capture.get("infeasibilities")
+    raw_detail_files = capture.get("detail_files")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            raw_objectives,
+            raw_infeasibilities,
+            raw_detail_files,
+        )
+    ):
+        raise RuntimeError("in-memory evaluator capture is incomplete")
+    if (
+        set(raw_objectives) != expected_labels
+        or set(raw_infeasibilities) != expected_labels
+        or set(raw_detail_files) != expected_labels
+        or int(capture.get("expected_detail_count", -1)) != len(expected_labels)
+        or int(capture.get("observed_detail_count", -1)) != len(expected_labels)
+    ):
+        raise RuntimeError(
+            "in-memory evaluator capture label-set mismatch"
+        )
+
+    objectives = {
+        label: float(raw_objectives[label]) for label in expected_labels
+    }
+    infeasibilities = {
+        label: bool(raw_infeasibilities[label]) for label in expected_labels
+    }
+    if any(not math.isfinite(value) for value in objectives.values()):
+        raise RuntimeError("in-memory evaluator capture has a non-finite objective")
+
+    expected_names = {
+        f"eval_detail_{label}.json": label for label in expected_labels
+    }
+    observed_entries: dict[str, os.DirEntry[str]] = {}
+    with os.scandir(output_dir) as entries:
+        for entry in entries:
+            if entry.is_file() and entry.name.startswith("eval_detail_") and (
+                entry.name.endswith(".json")
+            ):
+                observed_entries[entry.name] = entry
+    if set(observed_entries) != set(expected_names):
+        raise RuntimeError(
+            "captured evaluator detail-file set does not match expected labels"
+        )
+    for file_name, label in expected_names.items():
+        record = raw_detail_files[label]
+        if (
+            not isinstance(record, dict)
+            or record.get("name") != file_name
+            or int(record.get("size", -1))
+            != observed_entries[file_name].stat().st_size
+        ):
+            raise RuntimeError(
+                f"captured evaluator detail artifact changed for {label}"
+            )
+
+    summary_objectives = summary.get("obj_all_cases")
+    summary_infeasibilities = summary.get("infeas_all_cases")
+    if not isinstance(summary_objectives, dict) or not isinstance(
+        summary_infeasibilities, dict
+    ):
+        raise RuntimeError("vendor summary has no captured per-case values")
+    if set(summary_objectives) != expected_labels or set(
+        summary_infeasibilities
+    ) != expected_labels:
+        raise RuntimeError("vendor summary per-case label set is incomplete")
+    for label in expected_labels:
+        if not math.isclose(
+            float(summary_objectives[label]),
+            objectives[label],
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ) or bool(summary_infeasibilities[label]) != infeasibilities[label]:
+            raise RuntimeError(
+                f"vendor summary disagrees with its captured detail for {label}"
+            )
+
+    contingency_count = len(expected_contingency_labels)
+    if int(summary.get("num_ctg", -1)) != contingency_count:
+        raise RuntimeError("captured evaluator contingency count mismatch")
+    expected_objective = objectives["BASECASE"]
+    if contingency_count:
+        expected_objective += math.fsum(
+            objectives[label]
+            for label in sorted(expected_contingency_labels)
+        ) / contingency_count
+    reported_objective = float(summary.get("obj", math.nan))
+    if not math.isclose(
+        reported_objective,
+        expected_objective,
+        rel_tol=1e-12,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError(
+            "vendor summary objective disagrees with captured details"
+        )
+    infeasible_labels = sorted(
+        label for label, value in infeasibilities.items() if value
+    )
+    reported_infeasibility = float(summary.get("infeas", math.nan))
+    if reported_infeasibility != float(len(infeasible_labels)):
+        raise RuntimeError(
+            "vendor summary infeasibility disagrees with captured details"
+        )
+
+    normalized = dict(summary)
+    normalized["obj_all_cases"] = {
+        label: objectives[label] for label in sorted(expected_labels)
+    }
+    normalized["infeas_all_cases"] = {
+        label: infeasibilities[label] for label in sorted(expected_labels)
+    }
+    certificate = {
+        "schema_version": 2,
+        "parallel_processes": 1,
+        "parallel_mode": "serial",
+        "expected_contingency_count": contingency_count,
+        "expected_detail_count": len(expected_labels),
+        "observed_detail_count": len(observed_entries),
+        "complete_label_set": True,
+        "objective_from_details": expected_objective,
+        "serial_cumulative_objective_from_details": expected_objective,
+        "reported_objective": reported_objective,
+        "infeasible_labels": infeasible_labels,
+        "reported_infeasibility": reported_infeasibility,
+        "repaired_vendor_mpi_bookkeeping_fields": [],
+        "detail_value_source": "post_vendor_write_detail_in_memory_capture",
+        "detail_files_verified_by_name_and_size": True,
+        "detail_json_files_reparsed": False,
+        "capture_certificate_sha256": sha256(capture_path),
+    }
+    write_json(internal_dir / "official_evaluation_certificate.json", certificate)
+    return normalized, certificate
+
+
 def read_contingency_blocks(path: Path) -> dict[str, list[str]]:
     """Read source CON blocks without treating the final END as a contingency."""
     blocks: dict[str, list[str]] = {}
@@ -526,14 +685,25 @@ def finalize_serial_evaluation_shard(
             f"official evaluator shard {record['shard_index']} wrote no summary"
         )
     summary = read_json(summary_path)
-    normalized, certificate = validate_and_normalize_evaluation_details(
-        record["solution_dir"],
-        record["solution_dir"] / "internal_validation",
-        set(record["labels"]),
-        summary,
-        1,
-        "serial",
+    capture_path = (
+        record["solution_dir"] / IN_MEMORY_DETAIL_CERTIFICATE_NAME
     )
+    if capture_path.is_file():
+        normalized, certificate = validate_in_memory_evaluation_certificate(
+            record["solution_dir"],
+            record["solution_dir"] / "internal_validation",
+            set(record["labels"]),
+            summary,
+        )
+    else:
+        normalized, certificate = validate_and_normalize_evaluation_details(
+            record["solution_dir"],
+            record["solution_dir"] / "internal_validation",
+            set(record["labels"]),
+            summary,
+            1,
+            "serial",
+        )
     return {
         **record,
         "summary": normalized,

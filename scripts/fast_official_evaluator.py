@@ -21,6 +21,7 @@ from __future__ import annotations
 import csv
 import copy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -32,6 +33,9 @@ import numpy as np
 
 
 VENDOR_EVALUATOR_ENVIRONMENT_VARIABLE = "GRAVITYX_VENDOR_EVALUATOR"
+IN_MEMORY_DETAIL_CERTIFICATE_NAME = (
+    "gravityx_in_memory_detail_certificate.json"
+)
 
 
 def _rows(
@@ -608,6 +612,9 @@ def install_in_memory_summary_aggregation(module: ModuleType) -> None:
     """
 
     original_write_detail = module.Evaluation.write_detail
+    original_write_final_summary_and_detail = (
+        module.Evaluation.write_final_summary_and_detail
+    )
 
     def write_detail_and_capture(
         self: Any,
@@ -624,9 +631,24 @@ def install_in_memory_summary_aggregation(module: ModuleType) -> None:
             detail_json=detail_json,
         )
         if detail_json:
-            self.summary_all_cases[module.clean_string(case)] = copy.deepcopy(
-                self.summary
+            label = module.clean_string(case)
+            self.summary_all_cases[label] = copy.deepcopy(self.summary)
+            detail_path = Path(path) / f"eval_detail_{label}.json"
+            if not detail_path.is_file():
+                raise RuntimeError(
+                    "vendor detail writer returned without its JSON artifact: "
+                    f"{detail_path}"
+                )
+            detail_files = getattr(
+                self, "_gravityx_written_detail_files", None
             )
+            if detail_files is None:
+                detail_files = {}
+                self._gravityx_written_detail_files = detail_files
+            detail_files[label] = {
+                "name": detail_path.name,
+                "size": detail_path.stat().st_size,
+            }
         return result
 
     def summaries_already_loaded(self: Any, path: str | os.PathLike[str]) -> None:
@@ -641,8 +663,53 @@ def install_in_memory_summary_aggregation(module: ModuleType) -> None:
                 f"missing={missing}, extra={extra}"
             )
 
+    def write_final_summary_and_capture_certificate(
+        self: Any,
+        path: str | os.PathLike[str],
+    ) -> Any:
+        result = original_write_final_summary_and_detail(self, path)
+        expected = {"BASECASE", *self.ctg_label}
+        observed = set(self.summary_all_cases)
+        detail_files = getattr(self, "_gravityx_written_detail_files", {})
+        if observed != expected or set(detail_files) != expected:
+            raise RuntimeError(
+                "cannot certify an incomplete in-memory evaluator detail set"
+            )
+        objectives = {
+            label: float(self.summary_all_cases[label]["obj"]["val"])
+            for label in sorted(expected)
+        }
+        infeasibilities = {
+            label: bool(self.summary_all_cases[label]["infeas"]["val"])
+            for label in sorted(expected)
+        }
+        certificate = {
+            "schema_version": 1,
+            "capture_point": (
+                "immediately_after_unchanged_vendor_write_detail_returned"
+            ),
+            "vendor_detail_json_files_preserved": True,
+            "expected_detail_count": len(expected),
+            "observed_detail_count": len(observed),
+            "objectives": objectives,
+            "infeasibilities": infeasibilities,
+            "detail_files": {
+                label: detail_files[label] for label in sorted(expected)
+            },
+        }
+        certificate_path = Path(path) / IN_MEMORY_DETAIL_CERTIFICATE_NAME
+        with certificate_path.open(
+            "w", encoding="utf-8", newline="\n"
+        ) as stream:
+            json.dump(certificate, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+        return result
+
     module.Evaluation.write_detail = write_detail_and_capture
     module.Evaluation.json_to_summary_all_cases = summaries_already_loaded
+    module.Evaluation.write_final_summary_and_detail = (
+        write_final_summary_and_capture_certificate
+    )
 
 
 def suppress_verbose_timing_output(module: ModuleType) -> None:

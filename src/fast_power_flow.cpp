@@ -2791,6 +2791,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             std::unique_ptr<FixedJacobianPredictorCache>
                 contingency_predictor_cache;
             int active_feasibility_repair_attempts = 0;
+            int ac_feasibility_repair_attempts = 0;
             int proactive_local_search_attempts = 0;
             int consecutive_full_local_reactive_active_angle = 0;
             std::string prior_selected_correction_mode;
@@ -2806,7 +2807,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             // Productive paths still return immediately and true stalls still
             // break when no improving candidate exists, so this ceiling only
             // extends the late monotone active-flow alternation.
-            constexpr int kMaximumFixedJacobianIterations = 192;
+            constexpr int kMaximumFixedJacobianIterations = 224;
             for (int predictor_iteration = 0;
                  predictor_iteration <= kMaximumFixedJacobianIterations;
                  ++predictor_iteration) {
@@ -5351,6 +5352,66 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         output.fixed_jacobian_predictor_trace.back()[
                             "active_feasibility_repair"] =
                             std::move(active_repair_json);
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "selected_damping"] = selected_damping;
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "selected_correction_mode"] =
+                            selected_correction_mode;
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "selected_next_validation"] =
+                            selected_validation.to_json();
+                    }
+                }
+                // The inexpensive active-only Phase I above is sufficient for
+                // most generator outages, but it cannot move voltage or
+                // reactive generation.  A small number of large-case outages
+                // therefore reach a genuine final stall at a reactive-balance
+                // or apparent-flow bound even though a nearby corrective AC
+                // point exists.  Before escalating to the much more expensive
+                // nonlinear fallback, solve one current-violation-only
+                // linearized AC Phase I.  This retains every source ramp,
+                // generator, load, voltage, angle, and security bound.  The
+                // returned point is never trusted directly: nonlinear branch
+                // flows are rebuilt and the independent contingency validator
+                // must show strict improvement before the predictor can use it.
+                const bool final_generator_ac_feasibility_repair =
+                    outaged_generator >= 0 &&
+                    ac_feasibility_repair_attempts == 0 &&
+                    selected_damping == 0.0 &&
+                    predictor_validation.max_residual >
+                        options_.validation_tolerance;
+                if (final_generator_ac_feasibility_repair) {
+                    ++ac_feasibility_repair_attempts;
+                    auto ac_repair =
+                        solve_linearized_active_feasibility_repair(
+                            data_, correction_reference, commitment_,
+                            *direct_context, 0.49, 0.05, 5.0, 0.01,
+                            true, true);
+                    nlohmann::json ac_repair_json;
+                    if (options_.capture_diagnostics) {
+                        ac_repair_json = ac_repair.to_json(false);
+                    }
+                    if (ac_repair.success) {
+                        auto ac_trial = std::move(ac_repair.state);
+                        const auto ac_validation =
+                            project_trial_reactive_and_validate(ac_trial);
+                        if (options_.capture_diagnostics) {
+                            ac_repair_json["nonlinear_validation"] =
+                                ac_validation.to_json();
+                        }
+                        if (ac_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(ac_trial);
+                            selected_validation = ac_validation;
+                            selected_damping = 1.0;
+                            selected_correction_mode =
+                                "linearized_ac_feasibility_repair";
+                        }
+                    }
+                    if (options_.capture_diagnostics) {
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "ac_feasibility_repair"] =
+                            std::move(ac_repair_json);
                         output.fixed_jacobian_predictor_trace.back()[
                             "selected_damping"] = selected_damping;
                         output.fixed_jacobian_predictor_trace.back()[

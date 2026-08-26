@@ -561,11 +561,13 @@ int run_parallel_circuit_regression() {
             data, active_repair_reference, {1}, branch_context,
             0.49, 0.5, 5.0, 0.1, true, true);
     if (!screened_active_repair.success ||
+        !screened_active_repair.include_reactive ||
         !screened_active_repair.current_security_rows_only ||
         screened_active_repair.simplex_strategy != 4 ||
         !screened_active_repair.finite_solution_values ||
         screened_active_repair.maximum_column_violation > 1e-7 ||
         screened_active_repair.maximum_linearized_violation > 1e-7 ||
+        screened_active_repair.maximum_voltage_change > 0.1 + 1e-9 ||
         screened_active_repair.branch_security_row_count >
             active_repair.branch_security_row_count) {
         throw std::runtime_error(

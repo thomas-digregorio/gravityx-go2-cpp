@@ -1214,6 +1214,11 @@ int run_parallel_circuit_regression() {
     if (!full_contingency_seed.success ||
         !balance_only_contingency_seed.success ||
         !subset_security_contingency_seed.success ||
+        !full_contingency_seed.model_preflight_passed ||
+        !full_contingency_seed.model_construction_success ||
+        full_contingency_seed.add_vars_status != 0 ||
+        full_contingency_seed.change_cols_cost_status != 0 ||
+        full_contingency_seed.add_rows_status != 0 ||
         !balance_only_contingency_seed.projected_balance_slack ||
         !balance_only_contingency_seed.branch_security_rows_omitted ||
         !balance_only_contingency_seed.feasibility_only ||
@@ -1228,6 +1233,18 @@ int run_parallel_circuit_regression() {
             full_contingency_seed.row_count) {
         throw std::runtime_error(
             "balance-only contingency Phase-I regression failed");
+    }
+    auto nonfinite_linear_reference = solve.state;
+    nonfinite_linear_reference.vm[0] =
+        std::numeric_limits<double>::quiet_NaN();
+    const auto nonfinite_linear_seed = gravityx::solve_linearized_ac_seed(
+        data, nonfinite_linear_reference, {1}, 0.49, branch_context);
+    if (nonfinite_linear_seed.success ||
+        nonfinite_linear_seed.model_preflight_passed ||
+        nonfinite_linear_seed.model_load_failure_call != "preflight" ||
+        nonfinite_linear_seed.model_preflight_failure.empty()) {
+        throw std::runtime_error(
+            "linearized model preflight did not reject non-finite input");
     }
     const auto contingency_rating_validation = gravityx::validate_state(
         contingency_rating_data, gravityx::ModelMode::ContingencySoft,

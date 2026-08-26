@@ -47,6 +47,13 @@ struct SparseRow {
     std::vector<std::pair<HighsInt, double>> entries;
 };
 
+struct LinearizedModelAudit {
+    bool passed{true};
+    std::string failure;
+    int tiny_matrix_entries_removed{};
+    double maximum_tiny_matrix_entry_removed{};
+};
+
 FlowValues branch_flows(
     const Branch& branch,
     double vm_from,
@@ -143,7 +150,10 @@ LinearizedBranch linearize_branch(
 }
 
 void append(SparseRow& row, HighsInt column, double value) {
-    if (std::abs(value) > 1e-14) {
+    // Preserve non-finite values until the explicit model preflight so they
+    // are reported rather than silently discarded by a floating-point
+    // comparison with NaN.
+    if (!std::isfinite(value) || std::abs(value) > 1e-14) {
         row.entries.emplace_back(column, value);
     }
 }
@@ -166,6 +176,89 @@ void normalize(SparseRow& row) {
             [](const auto& entry) { return std::abs(entry.second) <= 1e-14; }),
         combined.end());
     row.entries = std::move(combined);
+}
+
+LinearizedModelAudit audit_and_prune_model(
+    const std::vector<double>& lower,
+    const std::vector<double>& upper,
+    const std::vector<double>& cost,
+    std::vector<SparseRow>& rows,
+    double small_matrix_value) {
+    LinearizedModelAudit audit;
+    if (lower.size() != upper.size() || lower.size() != cost.size()) {
+        audit.passed = false;
+        audit.failure = "column vector sizes disagree";
+        return audit;
+    }
+    if (!std::isfinite(small_matrix_value) || small_matrix_value <= 0.0) {
+        audit.passed = false;
+        audit.failure = "small matrix value is not positive and finite";
+        return audit;
+    }
+    for (std::size_t column = 0; column < lower.size(); ++column) {
+        if (std::isnan(lower[column]) ||
+            std::isnan(upper[column]) ||
+            !std::isfinite(cost[column])) {
+            audit.passed = false;
+            audit.failure = "non-finite column data at column " +
+                std::to_string(column);
+            return audit;
+        }
+        if (lower[column] > upper[column]) {
+            audit.passed = false;
+            audit.failure = "empty column interval at column " +
+                std::to_string(column);
+            return audit;
+        }
+    }
+    for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
+        auto& row = rows[row_index];
+        normalize(row);
+        if (std::isnan(row.lower) || std::isnan(row.upper)) {
+            audit.passed = false;
+            audit.failure = "non-finite row bound at row " +
+                std::to_string(row_index);
+            return audit;
+        }
+        if (row.lower > row.upper) {
+            audit.passed = false;
+            audit.failure = "empty row interval at row " +
+                std::to_string(row_index);
+            return audit;
+        }
+        for (const auto& [column, value] : row.entries) {
+            if (column < 0 ||
+                column >= static_cast<HighsInt>(lower.size())) {
+                audit.passed = false;
+                audit.failure = "column index out of range at row " +
+                    std::to_string(row_index);
+                return audit;
+            }
+            if (!std::isfinite(value)) {
+                audit.passed = false;
+                audit.failure = "non-finite matrix coefficient at row " +
+                    std::to_string(row_index) + ", column " +
+                    std::to_string(column);
+                return audit;
+            }
+        }
+        row.entries.erase(
+            std::remove_if(
+                row.entries.begin(), row.entries.end(),
+                [&](const auto& entry) {
+                    const double magnitude = std::abs(entry.second);
+                    if (magnitude <= small_matrix_value) {
+                        ++audit.tiny_matrix_entries_removed;
+                        audit.maximum_tiny_matrix_entry_removed = std::max(
+                            audit.maximum_tiny_matrix_entry_removed,
+                            magnitude);
+                        return true;
+                    }
+                    return false;
+                }),
+            row.entries.end());
+    }
+    return audit;
 }
 
 }  // namespace
@@ -204,6 +297,18 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"row_count", row_count},
         {"column_count", column_count},
         {"nonzero_count", nonzero_count},
+        {"model_preflight_passed", model_preflight_passed},
+        {"model_preflight_failure", model_preflight_failure},
+        {"tiny_matrix_entries_removed", tiny_matrix_entries_removed},
+        {"maximum_tiny_matrix_entry_removed",
+         maximum_tiny_matrix_entry_removed},
+        {"small_matrix_value", small_matrix_value},
+        {"add_vars_status", add_vars_status},
+        {"change_cols_cost_status", change_cols_cost_status},
+        {"add_rows_status", add_rows_status},
+        {"model_load_warning", model_load_warning},
+        {"model_construction_success", model_construction_success},
+        {"model_load_failure_call", model_load_failure_call},
         {"run_status", run_status},
         {"model_status", model_status},
         {"primal_solution_status", primal_solution_status},
@@ -742,35 +847,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         }
     }
 
-    std::vector<double> row_lower;
-    std::vector<double> row_upper;
-    std::vector<HighsInt> starts;
-    std::vector<HighsInt> indices;
-    std::vector<double> values;
-    row_lower.reserve(rows.size());
-    row_upper.reserve(rows.size());
-    starts.reserve(rows.size() + 1);
-    starts.push_back(0);
-    for (auto& row : rows) {
-        normalize(row);
-        row_lower.push_back(row.lower);
-        row_upper.push_back(row.upper);
-        for (const auto& [column, value] : row.entries) {
-            indices.push_back(column);
-            values.push_back(value);
-        }
-        starts.push_back(static_cast<HighsInt>(indices.size()));
-    }
-
-    Highs highs;
     const char* highs_log = std::getenv("GRAVITYX_HIGHS_LOG");
-    highs.setOptionValue(
-        "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
-    highs.setOptionValue("threads", 1);
-    highs.setOptionValue("presolve", "on");
-    if (elastic_balance_phase_one) {
-        highs.setOptionValue("small_matrix_value", 1e-12);
-    }
     // The 8k-bus trust-region seed has a much smaller, better-scaled presolved
     // system than the original full contingency LP.  IPM solves this form in
     // less than half the measured dual-simplex time and returns a candidate
@@ -779,24 +856,12 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const std::string solver = solver_override != nullptr
         ? std::string(solver_override)
         : (feasibility_only && nb >= 16000 ? "simplex" : "ipm");
-    highs.setOptionValue("solver", solver);
     int simplex_strategy = elastic_balance_phase_one ? 1 : 4;
     const char* simplex_strategy_override =
         std::getenv("GRAVITYX_LINEAR_SEED_SIMPLEX_STRATEGY");
     if (simplex_strategy_override != nullptr) {
         simplex_strategy = std::stoi(simplex_strategy_override);
     }
-    if (solver == "simplex" && feasibility_only) {
-        // The large elastic Phase I defaults to numerically stable serial dual
-        // simplex. Diagnostics showed that a long primal pivot sequence can
-        // violate nonnegative elastic bounds on the 19k coefficient range.
-        // Smaller zero-objective feasibility models retain primal simplex.
-        highs.setOptionValue("simplex_strategy", simplex_strategy);
-    }
-    highs.setOptionValue("run_crossover", "off");
-    highs.setOptionValue("time_limit", time_limit_seconds);
-    highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
-    highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     // The feasibility-only LP has an identically zero objective, so every
     // primal-feasible point is already an exact optimum for Phase I.  A looser
     // IPM dual-gap stopping test avoids spending tens of seconds proving an
@@ -808,17 +873,140 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const double ipm_optimality_tolerance = feasibility_only
         ? kPhaseOneIpmOptimalityTolerance
         : kOrdinaryIpmOptimalityTolerance;
+    // Match sparse preprocessing to the exact value HiGHS will use.  HiGHS
+    // returns kWarning after dropping smaller entries.  The previous wrapper
+    // treated that warning as a construction failure even though the model
+    // was valid and had been loaded.  Pruning the same entries ourselves is
+    // mathematically identical to the solver's effective matrix and makes the
+    // transformation explicit and auditable.
+    constexpr double kOrdinarySmallMatrixValue = 1e-9;
+    constexpr double kElasticSmallMatrixValue = 1e-12;
+    const double small_matrix_value = elastic_balance_phase_one
+        ? kElasticSmallMatrixValue : kOrdinarySmallMatrixValue;
+    const auto model_audit = audit_and_prune_model(
+        lower, upper, cost, rows, small_matrix_value);
+
+    std::vector<double> row_lower;
+    std::vector<double> row_upper;
+    std::vector<HighsInt> starts;
+    std::vector<HighsInt> indices;
+    std::vector<double> values;
+    row_lower.reserve(rows.size());
+    row_upper.reserve(rows.size());
+    starts.reserve(rows.size() + 1);
+    starts.push_back(0);
+    if (model_audit.passed) {
+        for (const auto& row : rows) {
+            row_lower.push_back(row.lower);
+            row_upper.push_back(row.upper);
+            for (const auto& [column, value] : row.entries) {
+                indices.push_back(column);
+                values.push_back(value);
+            }
+            starts.push_back(static_cast<HighsInt>(indices.size()));
+        }
+    }
+
+    LinearizedAcSeedResult output;
+    output.projected_balance_slack = projected_balance_slack;
+    output.branch_security_rows_omitted = omit_branch_security_rows;
+    output.branch_security_subset_count = branch_security_subset_count;
+    output.feasibility_only = feasibility_only;
+    output.elastic_balance_phase_one = elastic_balance_phase_one;
+    output.simplex_strategy = simplex_strategy;
+    output.maximum_column_scale = *std::max_element(
+        column_scale.begin(), column_scale.end());
+    output.voltage_trust_radius = lightweight_large_seed
+        ? voltage_trust_radius : 0.0;
+    output.angle_trust_radius = lightweight_large_seed
+        ? angle_trust_radius : 0.0;
+    output.projected_reference_voltage_count =
+        projected_reference_voltage_count;
+    output.maximum_reference_voltage_projection =
+        maximum_reference_voltage_projection;
+    output.time_limit_seconds = time_limit_seconds;
+    output.ipm_optimality_tolerance = ipm_optimality_tolerance;
+    output.row_count = static_cast<int>(rows.size());
+    output.column_count = column_count;
+    output.nonzero_count = static_cast<int>(indices.size());
+    output.model_preflight_passed = model_audit.passed;
+    output.model_preflight_failure = model_audit.failure;
+    output.tiny_matrix_entries_removed =
+        model_audit.tiny_matrix_entries_removed;
+    output.maximum_tiny_matrix_entry_removed =
+        model_audit.maximum_tiny_matrix_entry_removed;
+    output.small_matrix_value = small_matrix_value;
+    output.run_status = -99;
+    output.model_status = -99;
+    output.primal_solution_status = -99;
+    const auto finish_model_failure = [&](const std::string& call,
+                                          const std::string& status) {
+        output.success = false;
+        output.model_construction_success = false;
+        output.model_load_failure_call = call;
+        output.status = status;
+        output.state = reference;
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        if (highs_log != nullptr && std::string(highs_log) != "0") {
+            std::cerr << "GRAVITYX_LINEAR_SEED_RESULT "
+                      << output.to_json(false).dump() << '\n';
+        }
+        return output;
+    };
+    if (!model_audit.passed) {
+        return finish_model_failure(
+            "preflight", "Model preflight failed: " + model_audit.failure);
+    }
+
+    Highs highs;
+    highs.setOptionValue(
+        "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
+    highs.setOptionValue("threads", 1);
+    highs.setOptionValue("presolve", "on");
+    highs.setOptionValue("small_matrix_value", small_matrix_value);
+    highs.setOptionValue("solver", solver);
+    if (solver == "simplex" && feasibility_only) {
+        highs.setOptionValue("simplex_strategy", simplex_strategy);
+    }
+    highs.setOptionValue("run_crossover", "off");
+    highs.setOptionValue("time_limit", time_limit_seconds);
+    highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
+    highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     highs.setOptionValue(
         "ipm_optimality_tolerance", ipm_optimality_tolerance);
-    if (highs.addVars(column_count, lower.data(), upper.data()) != HighsStatus::kOk ||
-        highs.changeColsCost(0, column_count - 1, cost.data()) != HighsStatus::kOk ||
-        highs.addRows(
-            static_cast<HighsInt>(rows.size()),
-            row_lower.data(), row_upper.data(),
-            static_cast<HighsInt>(indices.size()), starts.data(),
-            indices.data(), values.data()) != HighsStatus::kOk) {
-        throw std::runtime_error("failed to construct the linearized AC HiGHS model");
+
+    const HighsStatus add_vars_status =
+        highs.addVars(column_count, lower.data(), upper.data());
+    output.add_vars_status = static_cast<int>(add_vars_status);
+    output.model_load_warning = add_vars_status == HighsStatus::kWarning;
+    if (add_vars_status == HighsStatus::kError) {
+        return finish_model_failure(
+            "addVars", "HiGHS addVars returned kError");
     }
+    const HighsStatus change_cols_cost_status =
+        highs.changeColsCost(0, column_count - 1, cost.data());
+    output.change_cols_cost_status =
+        static_cast<int>(change_cols_cost_status);
+    output.model_load_warning = output.model_load_warning ||
+        change_cols_cost_status == HighsStatus::kWarning;
+    if (change_cols_cost_status == HighsStatus::kError) {
+        return finish_model_failure(
+            "changeColsCost", "HiGHS changeColsCost returned kError");
+    }
+    const HighsStatus add_rows_status = highs.addRows(
+        static_cast<HighsInt>(rows.size()),
+        row_lower.data(), row_upper.data(),
+        static_cast<HighsInt>(indices.size()), starts.data(),
+        indices.data(), values.data());
+    output.add_rows_status = static_cast<int>(add_rows_status);
+    output.model_load_warning = output.model_load_warning ||
+        add_rows_status == HighsStatus::kWarning;
+    if (add_rows_status == HighsStatus::kError) {
+        return finish_model_failure(
+            "addRows", "HiGHS addRows returned kError");
+    }
+    output.model_construction_success = true;
     bool primal_start_attempted = false;
     HighsStatus primal_start_status = HighsStatus::kOk;
     bool primal_basis_attempted = false;
@@ -898,7 +1086,6 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const auto& solution = highs.getSolution();
     const auto& info = highs.getInfo();
 
-    LinearizedAcSeedResult output;
     output.projected_balance_slack = projected_balance_slack;
     output.branch_security_rows_omitted = omit_branch_security_rows;
     output.branch_security_subset_count = branch_security_subset_count;

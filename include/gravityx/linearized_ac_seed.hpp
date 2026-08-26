@@ -41,6 +41,17 @@ struct LinearizedAcSeedResult {
     int row_count{};
     int column_count{};
     int nonzero_count{};
+    bool model_preflight_passed{};
+    std::string model_preflight_failure;
+    int tiny_matrix_entries_removed{};
+    double maximum_tiny_matrix_entry_removed{};
+    double small_matrix_value{};
+    int add_vars_status{-99};
+    int change_cols_cost_status{-99};
+    int add_rows_status{-99};
+    bool model_load_warning{};
+    bool model_construction_success{};
+    std::string model_load_failure_call;
     int run_status{};
     int model_status{};
     int primal_solution_status{};

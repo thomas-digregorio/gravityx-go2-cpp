@@ -896,7 +896,13 @@ class StreamingSerialEvaluation:
         self.completed_labels: set[str] = set()
         self.ready_records: list[dict[str, Any]] = []
         self.running_records: dict[int, dict[str, Any]] = {}
-        self.completed_records: list[dict[str, Any]] = []
+        self.finalization_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(self.records))
+        )
+        self.finalization_futures: dict[
+            int, concurrent.futures.Future[dict[str, Any]]
+        ] = {}
+        self.finalization_executor_shutdown = False
         self.lock = threading.RLock()
         self.aborted = False
         self.first_process_started: float | None = None
@@ -917,10 +923,22 @@ class StreamingSerialEvaluation:
             if log is not None and not log.closed:
                 log.close()
         self.running_records.clear()
+        for future in self.finalization_futures.values():
+            future.cancel()
+
+    def _shutdown_finalization_executor(self, wait: bool) -> None:
+        if self.finalization_executor_shutdown:
+            return
+        self.finalization_executor_shutdown = True
+        self.finalization_executor.shutdown(
+            wait=wait,
+            cancel_futures=not wait,
+        )
 
     def abort(self) -> None:
         with self.lock:
             self._abort_locked()
+        self._shutdown_finalization_executor(False)
 
     def _collect_finished_locked(self) -> None:
         for shard_index, record in list(self.running_records.items()):
@@ -946,7 +964,19 @@ class StreamingSerialEvaluation:
                     "streaming official evaluator shard failed: "
                     f"index={shard_index}, returncode={returncode}"
                 )
-            self.completed_records.append(record)
+            self.finalization_futures[shard_index] = (
+                self.finalization_executor.submit(
+                    finalize_serial_evaluation_shard,
+                    record,
+                )
+            )
+        for shard_index, future in self.finalization_futures.items():
+            if future.done() and future.exception() is not None:
+                self._abort_locked()
+                raise RuntimeError(
+                    "streaming official evaluator shard validation failed: "
+                    f"index={shard_index}"
+                ) from future.exception()
 
     def _launch_ready_locked(self) -> None:
         self._collect_finished_locked()
@@ -1010,77 +1040,94 @@ class StreamingSerialEvaluation:
 
     def finish(self) -> tuple[dict[str, Any], dict[str, Any]]:
         tail_started = time.perf_counter()
-        with self.lock:
-            self.maximum_processes = self.post_screen_maximum_processes
-            completed_before_tail_wait = len(self.completed_records)
-            missing = set(self.labels) - self.completed_labels
-            if missing:
-                self._abort_locked()
-                raise RuntimeError(
-                    "streaming official evaluation is missing completed solutions: "
-                    + ", ".join(sorted(missing))
-                )
-        while True:
+        try:
             with self.lock:
-                if self.aborted:
-                    raise CompetitionTimeout(
-                        "streaming official evaluation was aborted"
-                    )
-                self._launch_ready_locked()
-                if len(self.completed_records) == len(self.records):
-                    break
-                if time.perf_counter() >= self.deadline:
+                self.maximum_processes = self.post_screen_maximum_processes
+                completed_before_tail_wait = len(self.finalization_futures)
+                missing = set(self.labels) - self.completed_labels
+                if missing:
                     self._abort_locked()
-                    raise CompetitionTimeout(
-                        "streaming official evaluation reached its deadline"
+                    raise RuntimeError(
+                        "streaming official evaluation is missing completed solutions: "
+                        + ", ".join(sorted(missing))
                     )
-            time.sleep(0.05)
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, len(self.completed_records))
-        ) as executor:
-            finalized_records = list(
-                executor.map(
-                    finalize_serial_evaluation_shard,
-                    self.completed_records,
+            while True:
+                with self.lock:
+                    if self.aborted:
+                        raise CompetitionTimeout(
+                            "streaming official evaluation was aborted"
+                        )
+                    self._launch_ready_locked()
+                    if len(self.finalization_futures) == len(self.records):
+                        break
+                    if time.perf_counter() >= self.deadline:
+                        self._abort_locked()
+                        raise CompetitionTimeout(
+                            "streaming official evaluation reached its deadline"
+                        )
+                time.sleep(0.05)
+            remaining = self.deadline - time.perf_counter()
+            if remaining <= 0.0:
+                with self.lock:
+                    self._abort_locked()
+                raise CompetitionTimeout(
+                    "streaming official evaluation validation reached its deadline"
                 )
+            done, pending = concurrent.futures.wait(
+                self.finalization_futures.values(),
+                timeout=remaining,
             )
-        summary, metadata = merge_serial_evaluation_shards(
-            finalized_records,
-            self.output_dir,
-            self.internal_dir,
-            sorted(self.labels),
-            self.requested_shards,
-            "overlapped_serial_shards",
-            "streaming_serial_evaluation_shards.json",
-            self.maximum_processes,
-            False,
-        )
-        now = time.perf_counter()
-        metadata.update(
-            {
-                "tail_wait_seconds": now - tail_started,
-                "overlap_span_seconds": (
-                    now - self.first_process_started
-                    if self.first_process_started is not None
-                    else 0.0
-                ),
-                "completed_before_tail_wait": completed_before_tail_wait,
-                "evaluator_linear_algebra_threads": (
-                    self.evaluator_linear_algebra_threads
-                ),
-                "initial_maximum_parallel_processes": (
-                    self.initial_maximum_processes
-                ),
-                "post_screen_maximum_parallel_processes": (
-                    self.post_screen_maximum_processes
-                ),
-            }
-        )
-        write_json(
-            self.internal_dir / "streaming_serial_evaluation_shards.json",
-            metadata,
-        )
-        return summary, metadata
+            if pending:
+                with self.lock:
+                    self._abort_locked()
+                raise CompetitionTimeout(
+                    "streaming official evaluation validation reached its deadline"
+                )
+            finalized_records = [
+                self.finalization_futures[index].result()
+                for index in sorted(self.finalization_futures)
+            ]
+            summary, metadata = merge_serial_evaluation_shards(
+                finalized_records,
+                self.output_dir,
+                self.internal_dir,
+                sorted(self.labels),
+                self.requested_shards,
+                "overlapped_serial_shards",
+                "streaming_serial_evaluation_shards.json",
+                self.maximum_processes,
+                False,
+            )
+            now = time.perf_counter()
+            metadata.update(
+                {
+                    "tail_wait_seconds": now - tail_started,
+                    "overlap_span_seconds": (
+                        now - self.first_process_started
+                        if self.first_process_started is not None
+                        else 0.0
+                    ),
+                    "completed_before_tail_wait": completed_before_tail_wait,
+                    "incremental_shard_validation": True,
+                    "shard_validation_workers": min(8, len(self.records)),
+                    "evaluator_linear_algebra_threads": (
+                        self.evaluator_linear_algebra_threads
+                    ),
+                    "initial_maximum_parallel_processes": (
+                        self.initial_maximum_processes
+                    ),
+                    "post_screen_maximum_parallel_processes": (
+                        self.post_screen_maximum_processes
+                    ),
+                }
+            )
+            write_json(
+                self.internal_dir / "streaming_serial_evaluation_shards.json",
+                metadata,
+            )
+            return summary, metadata
+        finally:
+            self._shutdown_finalization_executor(not self.aborted)
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:

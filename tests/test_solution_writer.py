@@ -714,6 +714,8 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             self.assertEqual(
                 metadata["post_screen_maximum_parallel_processes"], 2
             )
+            self.assertTrue(metadata["incremental_shard_validation"])
+            self.assertEqual(metadata["shard_validation_workers"], 2)
             self.assertEqual(list(output_dir.glob("eval_detail_*.json")), [])
             sharded_detail_labels = {
                 path.stem.removeprefix("eval_detail_")

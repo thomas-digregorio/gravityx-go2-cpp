@@ -632,16 +632,27 @@ def prepare_serial_evaluation_shards(
     groups: list[list[str]],
     root_name: str,
     materialize_all_solutions: bool,
+    *,
+    start_index: int = 0,
+    allow_existing_root: bool = False,
 ) -> list[dict[str, Any]]:
     """Prepare immutable inputs for exact vendor-evaluator subprocesses."""
     if not groups or any(not group for group in groups):
         raise ValueError("serial evaluation groups must be nonempty")
+    if start_index < 0:
+        raise ValueError("serial evaluation start index cannot be negative")
     shard_root = internal_dir / root_name
     if shard_root.exists():
-        raise RuntimeError(
-            f"serial evaluation shard directory already exists: {shard_root}"
-        )
-    shard_root.mkdir(parents=True)
+        if not allow_existing_root:
+            raise RuntimeError(
+                f"serial evaluation shard directory already exists: {shard_root}"
+            )
+    else:
+        if allow_existing_root:
+            raise RuntimeError(
+                f"serial evaluation shard directory is missing: {shard_root}"
+            )
+        shard_root.mkdir(parents=True)
 
     case_files = [case_dir / name for name in ("case.raw", "case.json")]
     for path in [*case_files, case_dir / "case.con"]:
@@ -653,7 +664,8 @@ def prepare_serial_evaluation_shards(
 
     seen_labels: set[str] = set()
     shard_records: list[dict[str, Any]] = []
-    for shard_index, group in enumerate(groups):
+    for group_offset, group in enumerate(groups):
+        shard_index = start_index + group_offset
         duplicates = seen_labels.intersection(group)
         if duplicates:
             raise ValueError(
@@ -1038,6 +1050,7 @@ class StreamingSerialEvaluation:
         evaluator_linear_algebra_threads: int = 1,
         post_screen_maximum_processes: int | None = None,
         vendor_evaluator_reference: Path | None = None,
+        completion_order_groups: bool = False,
     ) -> None:
         if maximum_processes < 0:
             raise ValueError(
@@ -1060,8 +1073,12 @@ class StreamingSerialEvaluation:
         self.evaluator = evaluator
         self.output_dir = output_dir
         self.internal_dir = internal_dir
+        self.case_dir = case_dir
         self.labels = list(ordered_labels)
+        self.label_set = set(self.labels)
         self.requested_shards = shard_count
+        self.active_shards = min(shard_count, len(self.labels))
+        self.completion_order_groups = completion_order_groups
         self.initial_maximum_processes = maximum_processes
         self.post_screen_maximum_processes = post_screen_maximum_processes
         self.maximum_processes = maximum_processes
@@ -1073,14 +1090,23 @@ class StreamingSerialEvaluation:
         )
         self.vendor_evaluator_reference = vendor_evaluator_reference
         groups = contiguous_shard_groups(self.labels, shard_count)
-        self.records = prepare_serial_evaluation_shards(
-            case_dir,
-            output_dir,
-            internal_dir,
-            groups,
-            "streaming_serial_evaluation_shards",
-            False,
-        )
+        if completion_order_groups:
+            self.dynamic_group_sizes = [len(group) for group in groups]
+            self.dynamic_group_labels: list[str] = []
+            self.dynamic_next_shard_index = 0
+            self.records: list[dict[str, Any]] = []
+        else:
+            self.dynamic_group_sizes = []
+            self.dynamic_group_labels = []
+            self.dynamic_next_shard_index = 0
+            self.records = prepare_serial_evaluation_shards(
+                case_dir,
+                output_dir,
+                internal_dir,
+                groups,
+                "streaming_serial_evaluation_shards",
+                False,
+            )
         self.record_by_label: dict[str, dict[str, Any]] = {}
         for record in self.records:
             record["pending_labels"] = set(record["labels"])
@@ -1090,7 +1116,7 @@ class StreamingSerialEvaluation:
         self.ready_records: list[dict[str, Any]] = []
         self.running_records: dict[int, dict[str, Any]] = {}
         self.finalization_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, len(self.records))
+            max_workers=min(8, self.active_shards)
         )
         self.finalization_futures: dict[
             int, concurrent.futures.Future[dict[str, Any]]
@@ -1208,7 +1234,7 @@ class StreamingSerialEvaluation:
             self.running_records[int(record["shard_index"])] = record
 
     def mark_completed(self, label: str) -> None:
-        if label not in self.record_by_label:
+        if label not in self.label_set:
             raise RuntimeError(f"unknown streaming evaluation label: {label}")
         with self.lock:
             if self.aborted:
@@ -1223,13 +1249,43 @@ class StreamingSerialEvaluation:
                     "streaming official evaluation solution is incomplete: "
                     f"{source}"
                 )
-            record = self.record_by_label[label]
-            destination = record["solution_dir"] / source.name
-            link_or_copy(source, destination)
             self.completed_labels.add(label)
-            record["pending_labels"].remove(label)
-            if not record["pending_labels"]:
-                self.ready_records.append(record)
+            if self.completion_order_groups:
+                self.dynamic_group_labels.append(label)
+                shard_index = self.dynamic_next_shard_index
+                if shard_index >= len(self.dynamic_group_sizes):
+                    raise RuntimeError(
+                        "streaming completion-order shard count overflow"
+                    )
+                target_size = self.dynamic_group_sizes[shard_index]
+                if len(self.dynamic_group_labels) == target_size:
+                    prepared = prepare_serial_evaluation_shards(
+                        self.case_dir,
+                        self.output_dir,
+                        self.internal_dir,
+                        [list(self.dynamic_group_labels)],
+                        "streaming_serial_evaluation_shards",
+                        True,
+                        start_index=shard_index,
+                        allow_existing_root=shard_index > 0,
+                    )
+                    record = prepared[0]
+                    record["pending_labels"] = set()
+                    self.records.append(record)
+                    self.ready_records.append(record)
+                    self.dynamic_group_labels.clear()
+                    self.dynamic_next_shard_index += 1
+                elif len(self.dynamic_group_labels) > target_size:
+                    raise RuntimeError(
+                        "streaming completion-order shard size overflow"
+                    )
+            else:
+                record = self.record_by_label[label]
+                destination = record["solution_dir"] / source.name
+                link_or_copy(source, destination)
+                record["pending_labels"].remove(label)
+                if not record["pending_labels"]:
+                    self.ready_records.append(record)
             self._launch_ready_locked()
 
     def promote_maximum_processes(
@@ -1273,6 +1329,15 @@ class StreamingSerialEvaluation:
                     raise RuntimeError(
                         "streaming official evaluation is missing completed solutions: "
                         + ", ".join(sorted(missing))
+                    )
+                if self.completion_order_groups and (
+                    self.dynamic_group_labels
+                    or self.dynamic_next_shard_index != self.active_shards
+                    or len(self.records) != self.active_shards
+                ):
+                    self._abort_locked()
+                    raise RuntimeError(
+                        "streaming completion-order shards are incomplete"
                     )
             while True:
                 with self.lock:
@@ -1347,6 +1412,11 @@ class StreamingSerialEvaluation:
                     ),
                     "screen_idle_promotion_events": list(
                         self.screen_idle_promotion_events
+                    ),
+                    "shard_grouping": (
+                        "solution_completion_order"
+                        if self.completion_order_groups
+                        else "configured_schedule_order"
                     ),
                 }
             )
@@ -2142,6 +2212,9 @@ def main() -> int:
         "--streaming-evaluation-idle-screen-ramp", action="store_true"
     )
     parser.add_argument(
+        "--streaming-evaluation-completion-order-shards", action="store_true"
+    )
+    parser.add_argument(
         "--evaluator-linear-algebra-threads", type=int, default=1
     )
     parser.add_argument("--post-screen-streaming-evaluation-processes", type=int)
@@ -2324,6 +2397,13 @@ def main() -> int:
             "--streaming-evaluation-idle-screen-ramp requires "
             "--two-stage-contingency-screen and streaming evaluation shards"
         )
+    if args.streaming_evaluation_completion_order_shards and (
+        args.streaming_serial_evaluation_shards <= 1
+    ):
+        parser.error(
+            "--streaming-evaluation-completion-order-shards requires "
+            "streaming evaluation shards"
+        )
     if args.evaluation_processes > 1 and args.mpiexec is None:
         parser.error("--evaluation-processes greater than one requires --mpiexec")
     if args.mpiexec is not None:
@@ -2452,6 +2532,9 @@ def main() -> int:
         ),
         "streaming_evaluation_idle_screen_ramp": (
             args.streaming_evaluation_idle_screen_ramp
+        ),
+        "streaming_evaluation_completion_order_shards": (
+            args.streaming_evaluation_completion_order_shards
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads
@@ -2723,6 +2806,7 @@ def main() -> int:
             args.evaluator_linear_algebra_threads,
             args.post_screen_streaming_evaluation_processes,
             args.vendor_evaluator_reference,
+            args.streaming_evaluation_completion_order_shards,
         )
         run_status["streaming_evaluation_prepared"] = True
         checkpoint()
@@ -3920,6 +4004,9 @@ def main() -> int:
         ),
         "streaming_evaluation_idle_screen_ramp": (
             args.streaming_evaluation_idle_screen_ramp
+        ),
+        "streaming_evaluation_completion_order_shards": (
+            args.streaming_evaluation_completion_order_shards
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads

@@ -1135,6 +1135,65 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             }
             self.assertEqual(sharded_detail_labels, {"BASECASE", *labels})
 
+    def test_streaming_shards_can_follow_actual_solution_completion_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "case"
+            output_dir = root / "output"
+            internal_dir = output_dir / "internal"
+            case_dir.mkdir()
+            output_dir.mkdir()
+            (case_dir / "case.raw").write_text("raw\n", encoding="utf-8")
+            (case_dir / "case.json").write_text("{}\n", encoding="utf-8")
+            labels = ["CTG_A", "CTG_B", "CTG_C", "CTG_D"]
+            (case_dir / "case.con").write_text(
+                "".join(
+                    f"CONTINGENCY {label}\nEND\n" for label in labels
+                )
+                + "END\n",
+                encoding="utf-8",
+            )
+            (output_dir / "solution_BASECASE.txt").write_text(
+                "base\n", encoding="utf-8"
+            )
+            completion_order = ["CTG_C", "CTG_A", "CTG_D", "CTG_B"]
+            for label in completion_order:
+                (output_dir / f"solution_{label}.txt").write_text(
+                    f"{label}\n", encoding="utf-8"
+                )
+
+            manager = StreamingSerialEvaluation(
+                Path(sys.executable),
+                root / "unused_evaluator.py",
+                case_dir,
+                output_dir,
+                internal_dir,
+                labels,
+                2,
+                0,
+                time.perf_counter() + 30.0,
+                1,
+                2,
+                completion_order_groups=True,
+            )
+            try:
+                for label in completion_order:
+                    manager.mark_completed(label)
+
+                self.assertEqual(
+                    [record["labels"] for record in manager.records],
+                    [["CTG_C", "CTG_A"], ["CTG_D", "CTG_B"]],
+                )
+                self.assertEqual(len(manager.ready_records), 2)
+                self.assertEqual(manager.dynamic_group_labels, [])
+                self.assertEqual(manager.dynamic_next_shard_index, 2)
+                first_subset = read_contingency_blocks(
+                    manager.records[0]["case_dir"] / "case.con"
+                )
+                self.assertEqual(set(first_subset), {"CTG_C", "CTG_A"})
+            finally:
+                manager.abort()
+
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)
         self.assertEqual(code2_time_limit(0, 2.0), 0.0)

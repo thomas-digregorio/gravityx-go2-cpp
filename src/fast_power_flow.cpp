@@ -5060,22 +5060,47 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         1e-4 &&
                     selected_validation.max_residual >=
                         0.99 * predictor_validation.max_residual;
-                if (outaged_generator >= 0 &&
-                    (initial_active_feasibility_repair ||
-                     late_security_stagnation_repair)) {
+                const bool branch_security_stagnation_repair =
+                    outaged_branch >= 0 &&
+                    active_feasibility_repair_attempts == 0 &&
+                    predictor_iteration >= 12 &&
+                    predictor_validation.worst_category ==
+                        "variable_bound" &&
+                    worst_active_flow_excess > 1e-4 &&
+                    selected_validation.max_residual >=
+                        0.99 * predictor_validation.max_residual;
+                if (initial_active_feasibility_repair ||
+                    branch_security_stagnation_repair ||
+                    late_security_stagnation_repair) {
                     ++active_feasibility_repair_attempts;
+                    // Branch outages can also stall at an active-flow box
+                    // bound while every nodal balance is already inside its
+                    // source-authorized band.  The same source-bounded LP is
+                    // valid for either outage type.  Give its first branch
+                    // invocation the broader trust region; every returned
+                    // candidate is still rebuilt through the nonlinear AC
+                    // equations and independently validated before use.
+                    const bool broad_active_repair =
+                        initial_active_feasibility_repair ||
+                        branch_security_stagnation_repair;
                     const double active_balance_limit =
-                        initial_active_feasibility_repair ? 0.25 : 0.20;
+                        outaged_branch >= 0
+                            ? 0.49
+                            : (broad_active_repair ? 0.25 : 0.20);
                     const double active_angle_trust =
-                        initial_active_feasibility_repair ? 0.05 : 0.02;
+                        broad_active_repair ? 0.05 : 0.02;
                     const double active_voltage_trust =
-                        initial_active_feasibility_repair ? 0.005 : 0.002;
+                        broad_active_repair ? 0.005 : 0.002;
+                    const double active_repair_time_limit =
+                        5.0;
                     auto active_repair =
                         solve_linearized_active_feasibility_repair(
                             data_, correction_reference, commitment_,
                             *direct_context, active_balance_limit,
-                            active_angle_trust, 5.0,
-                            active_voltage_trust, false);
+                            active_angle_trust, active_repair_time_limit,
+                            active_voltage_trust,
+                            outaged_branch >= 0,
+                            outaged_branch >= 0);
                     nlohmann::json active_repair_json;
                     if (options_.capture_diagnostics) {
                         active_repair_json = active_repair.to_json(false);

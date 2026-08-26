@@ -455,7 +455,9 @@ int run_parallel_circuit_regression() {
     if (direct_rolling_screen.feasible ||
         direct_rolling_screen.fixed_jacobian_predictor_attempted ||
         direct_rolling_screen.direct_candidate_validation.max_residual <=
-            1e-5) {
+            1e-5 ||
+        direct_rolling_screen.direct_candidate_validation
+            .worst_identity.empty()) {
         throw std::runtime_error(
             "rolling corrective candidate was not screened directly");
     }
@@ -517,11 +519,29 @@ int run_parallel_circuit_regression() {
             0.49, 0.5, 5.0, 0.1);
     if (!active_repair.success || active_repair.row_count < 2 ||
         active_repair.branch_security_row_count <= 0 ||
+        !active_repair.finite_solution_values ||
+        active_repair.maximum_column_violation > 1e-7 ||
         active_repair.maximum_linearized_violation > 1e-7 ||
         active_repair.maximum_angle_change > 0.5 + 1e-9) {
         throw std::runtime_error(
             "active feasibility repair regression failed: " +
             active_repair.status);
+    }
+    const auto screened_active_repair =
+        gravityx::solve_linearized_active_feasibility_repair(
+            data, active_repair_reference, {1}, branch_context,
+            0.49, 0.5, 5.0, 0.1, true, true);
+    if (!screened_active_repair.success ||
+        !screened_active_repair.current_security_rows_only ||
+        screened_active_repair.simplex_strategy != 4 ||
+        !screened_active_repair.finite_solution_values ||
+        screened_active_repair.maximum_column_violation > 1e-7 ||
+        screened_active_repair.maximum_linearized_violation > 1e-7 ||
+        screened_active_repair.branch_security_row_count >
+            active_repair.branch_security_row_count) {
+        throw std::runtime_error(
+            "screened active feasibility repair regression failed: " +
+            screened_active_repair.status);
     }
     auto active_repair_state = active_repair.state;
     gravityx::rebuild_contingency_state_derived_fields(

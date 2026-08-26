@@ -236,10 +236,12 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"angle_trust_radius", angle_trust_radius},
         {"voltage_trust_radius", voltage_trust_radius},
         {"include_reactive", include_reactive},
+        {"current_security_rows_only", current_security_rows_only},
         {"row_count", row_count},
         {"column_count", column_count},
         {"nonzero_count", nonzero_count},
         {"branch_security_row_count", branch_security_row_count},
+        {"simplex_strategy", simplex_strategy},
         {"run_status", run_status},
         {"model_status", model_status},
         {"primal_solution_status", primal_solution_status},
@@ -247,6 +249,8 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"iterations", iterations},
         {"max_primal_infeasibility", max_primal_infeasibility},
         {"maximum_linearized_violation", maximum_linearized_violation},
+        {"maximum_column_violation", maximum_column_violation},
+        {"finite_solution_values", finite_solution_values},
         {"maximum_angle_change", maximum_angle_change},
         {"maximum_voltage_change", maximum_voltage_change},
         {"maximum_generation_change", maximum_generation_change},
@@ -272,13 +276,15 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     double angle_trust_radius,
     double time_limit_seconds,
     double voltage_trust_radius,
-    bool include_reactive) {
+    bool include_reactive,
+    bool current_security_rows_only) {
     const auto wall_start = std::chrono::steady_clock::now();
     ActiveFeasibilityRepairResult output;
     output.balance_slack_limit = balance_slack_limit;
     output.angle_trust_radius = angle_trust_radius;
     output.voltage_trust_radius = voltage_trust_radius;
     output.include_reactive = include_reactive;
+    output.current_security_rows_only = current_security_rows_only;
     output.time_limit_seconds = time_limit_seconds;
     output.state = reference;
     const int nb = static_cast<int>(data.buses.size());
@@ -720,6 +726,10 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         double voltage_to_derivative,
         const Branch& branch,
         double target) {
+        if (current_security_rows_only &&
+            current >= -target && current <= target) {
+            return;
+        }
         const double angle_range = angle_trust_radius *
             ((angle_index[branch.from] >= 0 ? 1.0 : 0.0) +
              (angle_index[branch.to] >= 0 ? 1.0 : 0.0));
@@ -757,6 +767,10 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             ((angle_index[branch.from] >= 0 ? 1.0 : 0.0) +
              (angle_index[branch.to] >= 0 ? 1.0 : 0.0));
         const double current_squared = p * p + q * q;
+        if (current_security_rows_only &&
+            current_squared <= limit_squared) {
+            return;
+        }
         const double movement =
             std::abs(angle_tangent) * angle_range +
             voltage_trust_radius *
@@ -850,6 +864,11 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         }
         const double current_delta =
             output.state.va[branch.from] - output.state.va[branch.to];
+        if (current_security_rows_only &&
+            current_delta >= branch.angmin &&
+            current_delta <= branch.angmax) {
+            continue;
+        }
         const double delta_range = angle_trust_radius *
             ((angle_index[branch.from] >= 0 ? 1.0 : 0.0) +
              (angle_index[branch.to] >= 0 ? 1.0 : 0.0));
@@ -906,6 +925,14 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.solver = solver_override != nullptr
         ? std::string(solver_override) : "simplex";
     highs.setOptionValue("solver", output.solver);
+    if (current_security_rows_only && output.solver == "simplex") {
+        // This repair is a feasibility oracle.  Dual simplex can spend the
+        // complete short deadline proving movement optimality without ever
+        // exposing a primal-feasible basis; primal simplex prioritizes the
+        // candidate that the nonlinear validator actually needs.
+        output.simplex_strategy = 4;
+        highs.setOptionValue("simplex_strategy", output.simplex_strategy);
+    }
     if (highs.addVars(column_count, lower.data(), upper.data()) !=
             HighsStatus::kOk ||
         highs.changeColsCost(
@@ -939,10 +966,25 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     const bool shape_valid = solution.value_valid &&
         solution.col_value.size() == static_cast<std::size_t>(column_count);
     if (shape_valid) {
-        for (const auto& row : rows) {
-            output.maximum_linearized_violation = std::max(
-                output.maximum_linearized_violation,
-                row_violation(row, solution.col_value));
+        output.finite_solution_values = true;
+        for (HighsInt column = 0; column < column_count; ++column) {
+            const double value = solution.col_value[column];
+            if (!std::isfinite(value)) {
+                output.finite_solution_values = false;
+                break;
+            }
+            output.maximum_column_violation = std::max(
+                output.maximum_column_violation,
+                std::max(
+                    std::max(0.0, lower[column] - value),
+                    std::max(0.0, value - upper[column])));
+        }
+        if (output.finite_solution_values) {
+            for (const auto& row : rows) {
+                output.maximum_linearized_violation = std::max(
+                    output.maximum_linearized_violation,
+                    row_violation(row, solution.col_value));
+            }
         }
     }
     const bool optimal = run_status != HighsStatus::kError &&
@@ -953,9 +995,13 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         info.num_primal_infeasibilities == 0 &&
         std::isfinite(info.max_primal_infeasibility) &&
         info.max_primal_infeasibility <= 1e-8;
-    output.accepted_feasible_nonoptimal = feasible_nonoptimal && !optimal;
-    output.success = (optimal || feasible_nonoptimal) &&
+    const bool independently_feasible = shape_valid &&
+        output.finite_solution_values &&
+        output.maximum_column_violation <= 1e-7 &&
         output.maximum_linearized_violation <= 1e-7;
+    output.accepted_feasible_nonoptimal =
+        (feasible_nonoptimal || independently_feasible) && !optimal;
+    output.success = optimal || feasible_nonoptimal || independently_feasible;
     if (output.success) {
         for (int bus = 0; bus < nb; ++bus) {
             const int index = angle_index[bus];

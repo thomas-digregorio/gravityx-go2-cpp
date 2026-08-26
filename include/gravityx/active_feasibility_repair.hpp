@@ -19,10 +19,12 @@ struct ActiveFeasibilityRepairResult {
     double angle_trust_radius{};
     double voltage_trust_radius{};
     bool include_reactive{};
+    bool current_security_rows_only{};
     int row_count{};
     int column_count{};
     int nonzero_count{};
     int branch_security_row_count{};
+    int simplex_strategy{-1};
     int run_status{};
     int model_status{};
     int primal_solution_status{};
@@ -30,6 +32,8 @@ struct ActiveFeasibilityRepairResult {
     int iterations{};
     double max_primal_infeasibility{};
     double maximum_linearized_violation{};
+    double maximum_column_violation{};
+    bool finite_solution_values{};
     double maximum_angle_change{};
     double maximum_voltage_change{};
     double maximum_generation_change{};
@@ -57,6 +61,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     double angle_trust_radius = 0.15,
     double time_limit_seconds = 5.0,
     double voltage_trust_radius = 0.02,
-    bool include_reactive = true);
+    bool include_reactive = true,
+    bool current_security_rows_only = false);
 
 }  // namespace gravityx

@@ -1,6 +1,7 @@
 #include "gravityx/validation.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -13,16 +14,21 @@ double positive_part(double value) {
     return std::max(0.0, value);
 }
 
-void record(
+template <typename IdentityFactory>
+void update_category(
     ValidationReport& report,
+    double& category,
     double value,
-    const std::string& category,
-    const std::string& identity) {
+    const char* name,
+    bool capture_identity,
+    IdentityFactory&& identity_factory) {
     value = std::abs(value);
+    category = std::max(category, value);
     if (value > report.max_residual) {
         report.max_residual = value;
-        report.worst_category = category;
-        report.worst_identity = identity;
+        report.worst_category = name;
+        report.worst_identity = capture_identity
+            ? identity_factory() : std::string();
     }
 }
 
@@ -160,20 +166,18 @@ static ValidationReport validate_state_impl(
     }
 
     ValidationReport report;
-    const auto update_category = [&report](double& category, double value,
-                                           const std::string& name, const std::string& identity) {
-        value = std::abs(value);
-        category = std::max(category, value);
-        record(report, value, name, identity);
-    };
+    const bool capture_identity =
+        !skip_rebuilt_economic_and_ohms_checks;
 
     for (std::size_t i = 0; i < nb; ++i) {
-        update_category(report.max_variable_bound_violation,
+        update_category(report, report.max_variable_bound_violation,
             bound_violation(state.vm[i], data.buses[i].vmin, data.buses[i].vmax),
-            "variable_bound", "bus:" + data.buses[i].source_key + ":vm");
+            "variable_bound", capture_identity,
+            [&] { return "bus:" + data.buses[i].source_key + ":vm"; });
         if (data.buses[i].type == 3) {
-            update_category(report.max_reference_angle_residual, state.va[i],
-                "reference_angle", "bus:" + data.buses[i].source_key);
+            update_category(report, report.max_reference_angle_residual,
+                state.va[i], "reference_angle", capture_identity,
+                [&] { return "bus:" + data.buses[i].source_key; });
         }
     }
 
@@ -193,14 +197,16 @@ static ValidationReport validate_state_impl(
              block < shunt.block_maximum_steps.size(); ++block) {
             const int step = state.shunt_steps[i][block];
             update_category(
-                report.max_variable_bound_violation,
+                report, report.max_variable_bound_violation,
                 bound_violation(
                     static_cast<double>(step), 0.0,
                     static_cast<double>(
                         shunt.block_maximum_steps[block])),
-                "variable_bound",
-                "shunt:" + shunt.source_key + ":block:" +
-                    std::to_string(block));
+                "variable_bound", capture_identity,
+                [&] {
+                    return "shunt:" + shunt.source_key + ":block:" +
+                        std::to_string(block);
+                });
             expected_bs += static_cast<double>(step) *
                 shunt.block_susceptance[block];
         }
@@ -208,10 +214,11 @@ static ValidationReport validate_state_impl(
             expected_bs = shunt.bs;
         }
         update_category(
-            report.max_variable_bound_violation,
+            report, report.max_variable_bound_violation,
             effective_shunt_susceptance(data, state, static_cast<int>(i)) -
                 expected_bs,
-            "variable_bound", "shunt:" + shunt.source_key + ":bs");
+            "variable_bound", capture_identity,
+            [&] { return "shunt:" + shunt.source_key + ":bs"; });
     }
 
     int gen_lambda_offset = 0;
@@ -244,12 +251,14 @@ static ValidationReport validate_state_impl(
             qg_lower = gen.qmin;
             qg_upper = gen.qmax;
         }
-        update_category(report.max_variable_bound_violation,
+        update_category(report, report.max_variable_bound_violation,
             bound_violation(state.pg[i], pg_lower, pg_upper), "variable_bound",
-            "gen:" + gen.source_key + ":pg");
-        update_category(report.max_variable_bound_violation,
+            capture_identity,
+            [&] { return "gen:" + gen.source_key + ":pg"; });
+        update_category(report, report.max_variable_bound_violation,
             bound_violation(state.qg[i], qg_lower, qg_upper), "variable_bound",
-            "gen:" + gen.source_key + ":qg");
+            capture_identity,
+            [&] { return "gen:" + gen.source_key + ":qg"; });
 
         if (active && !skip_rebuilt_economic_and_ohms_checks) {
             const auto points = active_pwl_points(gen.cost, gen.ncost, pg_lower, pg_upper);
@@ -262,14 +271,17 @@ static ValidationReport validate_state_impl(
                 const double lambda = state.gen_lambda[gen_lambda_offset++];
                 sum += lambda;
                 power += point.mw * lambda;
-                update_category(report.max_variable_bound_violation,
+                update_category(report, report.max_variable_bound_violation,
                     bound_violation(lambda, 0.0, 1.0), "variable_bound",
-                    "gen:" + gen.source_key + ":lambda");
+                    capture_identity,
+                    [&] { return "gen:" + gen.source_key + ":lambda"; });
             }
-            update_category(report.max_pwl_sum_residual, sum - 1.0, "pwl_sum",
-                "gen:" + gen.source_key);
-            update_category(report.max_pwl_power_residual, power - state.pg[i], "pwl_power",
-                "gen:" + gen.source_key);
+            update_category(report, report.max_pwl_sum_residual, sum - 1.0,
+                "pwl_sum", capture_identity,
+                [&] { return "gen:" + gen.source_key; });
+            update_category(report, report.max_pwl_power_residual,
+                power - state.pg[i], "pwl_power", capture_identity,
+                [&] { return "gen:" + gen.source_key; });
         }
 
         if (mode == ModelMode::UnitCommitmentRelaxation) {
@@ -279,25 +291,37 @@ static ValidationReport validate_state_impl(
             const double z = state.commitment[i];
             const double su = state.startup[i];
             const double sd = state.shutdown[i];
-            update_category(report.max_generator_residual,
-                positive_part(state.pg[i] - gen.pmax * z), "generator", "gen:" + gen.source_key + ":pmax");
-            update_category(report.max_generator_residual,
-                positive_part(gen.pmin * z - state.pg[i]), "generator", "gen:" + gen.source_key + ":pmin");
-            update_category(report.max_generator_residual,
-                positive_part(state.qg[i] - gen.qmax * z), "generator", "gen:" + gen.source_key + ":qmax");
-            update_category(report.max_generator_residual,
-                positive_part(gen.qmin * z - state.qg[i]), "generator", "gen:" + gen.source_key + ":qmin");
+            update_category(report, report.max_generator_residual,
+                positive_part(state.pg[i] - gen.pmax * z), "generator",
+                capture_identity,
+                [&] { return "gen:" + gen.source_key + ":pmax"; });
+            update_category(report, report.max_generator_residual,
+                positive_part(gen.pmin * z - state.pg[i]), "generator",
+                capture_identity,
+                [&] { return "gen:" + gen.source_key + ":pmin"; });
+            update_category(report, report.max_generator_residual,
+                positive_part(state.qg[i] - gen.qmax * z), "generator",
+                capture_identity,
+                [&] { return "gen:" + gen.source_key + ":qmax"; });
+            update_category(report, report.max_generator_residual,
+                positive_part(gen.qmin * z - state.qg[i]), "generator",
+                capture_identity,
+                [&] { return "gen:" + gen.source_key + ":qmin"; });
             const double previous = gen.status_prev == 0 ? gen.pmin : gen.pg_prev;
-            update_category(report.max_generator_residual,
+            update_category(report, report.max_generator_residual,
                 positive_part(state.pg[i] - previous * z - data.delta_r * gen.prumax),
-                "generator", "gen:" + gen.source_key + ":ramp_up");
-            update_category(report.max_generator_residual,
+                "generator", capture_identity,
+                [&] { return "gen:" + gen.source_key + ":ramp_up"; });
+            update_category(report, report.max_generator_residual,
                 positive_part(previous * z - data.delta_r * gen.prdmax - state.pg[i]),
-                "generator", "gen:" + gen.source_key + ":ramp_down");
-            update_category(report.max_generator_residual,
-                z - gen.status_prev - su + sd, "generator", "gen:" + gen.source_key + ":transition");
-            update_category(report.max_generator_residual,
-                positive_part(su + sd - 1.0), "generator", "gen:" + gen.source_key + ":exclusive");
+                "generator", capture_identity,
+                [&] { return "gen:" + gen.source_key + ":ramp_down"; });
+            update_category(report, report.max_generator_residual,
+                z - gen.status_prev - su + sd, "generator", capture_identity,
+                [&] { return "gen:" + gen.source_key + ":transition"; });
+            update_category(report, report.max_generator_residual,
+                positive_part(su + sd - 1.0), "generator", capture_identity,
+                [&] { return "gen:" + gen.source_key + ":exclusive"; });
         }
     }
 
@@ -319,9 +343,10 @@ static ValidationReport validate_state_impl(
         } else {
             bounds = {load.tmin, load.tmax};
         }
-        update_category(report.max_variable_bound_violation,
+        update_category(report, report.max_variable_bound_violation,
             bound_violation(state.demand_factor[i], bounds.first, bounds.second),
-            "variable_bound", "load:" + load.source_key + ":factor");
+            "variable_bound", capture_identity,
+            [&] { return "load:" + load.source_key + ":factor"; });
         if (!skip_rebuilt_economic_and_ohms_checks) {
             const auto points = active_pwl_points(
                 load.cost, load.ncost, load.pd_min, load.pd_max);
@@ -336,32 +361,43 @@ static ValidationReport validate_state_impl(
                 const double lambda = state.load_lambda[load_lambda_offset++];
                 sum += lambda;
                 power += point.mw * lambda;
-                update_category(report.max_variable_bound_violation,
+                update_category(report, report.max_variable_bound_violation,
                     bound_violation(lambda, 0.0, 1.0), "variable_bound",
-                    "load:" + load.source_key + ":lambda");
+                    capture_identity,
+                    [&] { return "load:" + load.source_key + ":lambda"; });
             }
-            update_category(report.max_pwl_sum_residual, sum - 1.0,
-                "pwl_sum", "load:" + load.source_key);
-            update_category(report.max_pwl_power_residual,
+            update_category(report, report.max_pwl_sum_residual, sum - 1.0,
+                "pwl_sum", capture_identity,
+                [&] { return "load:" + load.source_key; });
+            update_category(report, report.max_pwl_power_residual,
                 power - load.pd_nominal * state.demand_factor[i],
-                "pwl_power", "load:" + load.source_key);
+                "pwl_power", capture_identity,
+                [&] { return "load:" + load.source_key; });
         }
         if (mode == ModelMode::UnitCommitmentRelaxation) {
-            update_category(report.max_load_ramp_violation,
+            update_category(report, report.max_load_ramp_violation,
                 positive_part(load.pd_nominal * state.demand_factor[i] - load.pd_prev - load.prumax * data.delta_r),
-                "load_ramp", "load:" + load.source_key + ":up");
-            update_category(report.max_load_ramp_violation,
+                "load_ramp", capture_identity,
+                [&] { return "load:" + load.source_key + ":up"; });
+            update_category(report, report.max_load_ramp_violation,
                 positive_part(load.pd_prev - load.prdmax * data.delta_r - load.pd_nominal * state.demand_factor[i]),
-                "load_ramp", "load:" + load.source_key + ":down");
+                "load_ramp", capture_identity,
+                [&] { return "load:" + load.source_key + ":down"; });
         } else if (mode == ModelMode::ContingencySoft) {
             const double previous = load.pd_nominal * contingency->base_state.demand_factor[i];
             const double current = load.pd_nominal * state.demand_factor[i];
-            update_category(report.max_load_ramp_violation,
+            update_category(report, report.max_load_ramp_violation,
                 positive_part(current - previous - load.prumaxctg * data.delta_r_ctg),
-                "load_ramp", "load:" + load.source_key + ":contingency_up");
-            update_category(report.max_load_ramp_violation,
+                "load_ramp", capture_identity,
+                [&] {
+                    return "load:" + load.source_key + ":contingency_up";
+                });
+            update_category(report, report.max_load_ramp_violation,
                 positive_part(previous - load.prdmaxctg * data.delta_r_ctg - current),
-                "load_ramp", "load:" + load.source_key + ":contingency_down");
+                "load_ramp", capture_identity,
+                [&] {
+                    return "load:" + load.source_key + ":contingency_down";
+                });
         }
     }
 
@@ -397,17 +433,21 @@ static ValidationReport validate_state_impl(
             ? positive_part(std::abs(q) - state.q_delta[i])
             : std::abs(q);
         if (mode != ModelMode::UnitCommitmentRelaxation) {
-            update_category(report.max_variable_bound_violation,
+            update_category(report, report.max_variable_bound_violation,
                 bound_violation(state.p_delta[i], 0.0, 0.5),
-                "variable_bound", "bus:" + bus.source_key + ":p_delta");
-            update_category(report.max_variable_bound_violation,
+                "variable_bound", capture_identity,
+                [&] { return "bus:" + bus.source_key + ":p_delta"; });
+            update_category(report, report.max_variable_bound_violation,
                 bound_violation(state.q_delta[i], 0.0, 0.5),
-                "variable_bound", "bus:" + bus.source_key + ":q_delta");
+                "variable_bound", capture_identity,
+                [&] { return "bus:" + bus.source_key + ":q_delta"; });
         }
-        update_category(report.max_active_balance_residual, p_residual,
-            "active_balance", "bus:" + bus.source_key);
-        update_category(report.max_reactive_balance_residual, q_residual,
-            "reactive_balance", "bus:" + bus.source_key);
+        update_category(report, report.max_active_balance_residual,
+            p_residual, "active_balance", capture_identity,
+            [&] { return "bus:" + bus.source_key; });
+        update_category(report, report.max_reactive_balance_residual,
+            q_residual, "reactive_balance", capture_identity,
+            [&] { return "bus:" + bus.source_key; });
     }
 
     for (std::size_t i = 0; i < nl; ++i) {
@@ -419,18 +459,22 @@ static ValidationReport validate_state_impl(
             ? branch.rate_c : branch.rate_a;
         const double flow_lower = unavailable ? 0.0 : -rating;
         const double flow_upper = unavailable ? 0.0 : rating;
-        for (const auto& item : std::vector<std::pair<std::string, double>>{
+        for (const auto& item : std::array<std::pair<const char*, double>, 4>{{
                  {"pf", state.pf[i]}, {"qf", state.qf[i]},
-                 {"pt", state.pt[i]}, {"qt", state.qt[i]}}) {
-            update_category(report.max_variable_bound_violation,
+                 {"pt", state.pt[i]}, {"qt", state.qt[i]}}}) {
+            update_category(report, report.max_variable_bound_violation,
                 bound_violation(item.second, flow_lower, flow_upper),
-                "variable_bound", "branch:" + branch.source_key + ":" + item.first);
+                "variable_bound", capture_identity,
+                [&] {
+                    return "branch:" + branch.source_key + ":" + item.first;
+                });
         }
-        update_category(report.max_variable_bound_violation,
+        update_category(report, report.max_variable_bound_violation,
             bound_violation(
                 state.sm_slack[i], 0.0,
                 unavailable ? 0.0 : data.sm_vio_limit),
-            "variable_bound", "branch:" + branch.source_key + ":sm_slack");
+            "variable_bound", capture_identity,
+            [&] { return "branch:" + branch.source_key + ":sm_slack"; });
         if (unavailable) {
             continue;
         }
@@ -481,8 +525,9 @@ static ValidationReport validate_state_impl(
                 std::abs(state.pt[i] - expected_pt),
                 std::abs(state.qt[i] - expected_qt)});
             update_category(
-                report.max_ohms_residual, ohms, "ohms",
-                "branch:" + branch.source_key);
+                report, report.max_ohms_residual, ohms, "ohms",
+                capture_identity,
+                [&] { return "branch:" + branch.source_key; });
         }
 
         const double start_delta = mode == ModelMode::ContingencySoft
@@ -490,9 +535,10 @@ static ValidationReport validate_state_impl(
             : data.buses[f].va_start - data.buses[t].va_start;
         if (start_delta >= branch.angmin && start_delta <= branch.angmax) {
             const double angle = state.va[f] - state.va[t];
-            update_category(report.max_angle_violation,
+            update_category(report, report.max_angle_violation,
                 std::max(positive_part(angle - branch.angmax), positive_part(branch.angmin - angle)),
-                "angle", "branch:" + branch.source_key);
+                "angle", capture_identity,
+                [&] { return "branch:" + branch.source_key; });
         }
         const double from_squared = state.pf[i] * state.pf[i] + state.qf[i] * state.qf[i];
         const double to_squared = state.pt[i] * state.pt[i] + state.qt[i] * state.qt[i];
@@ -502,9 +548,10 @@ static ValidationReport validate_state_impl(
         const double to_limit = branch.transformer
             ? rating * rating * std::pow(1.0 + state.sm_slack[i], 2)
             : rating * rating * std::pow(state.vm[t] + state.sm_slack[i], 2);
-        update_category(report.max_flow_limit_violation,
+        update_category(report, report.max_flow_limit_violation,
             std::max(positive_part(from_squared - from_limit), positive_part(to_squared - to_limit)),
-            "flow_limit", "branch:" + branch.source_key);
+            "flow_limit", capture_identity,
+            [&] { return "branch:" + branch.source_key; });
     }
 
     return report;

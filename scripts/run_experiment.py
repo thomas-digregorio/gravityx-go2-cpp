@@ -1545,10 +1545,12 @@ class AffinityScreenWorkQueue:
     A timing-only profile can classify groups containing known expensive
     screens. Only the first ``heavy_worker_count`` workers consume that queue;
     every other worker starts on the bulk queue. Heavy workers help with bulk
-    work after their lane drains. Once every queued or active bulk group has
-    completed, otherwise-idle bulk workers may spill into the remaining heavy
-    queue. This preserves the expensive-screen concurrency cap while bulk work
-    exists without stranding processors on a heavy-only final critical path.
+    work after their lane drains. Once the queued bulk groups have drained,
+    otherwise-idle bulk workers may spill into the remaining heavy queue even
+    while another bulk group is still active. Any newly exposed urgent bulk
+    work regains priority on the next dispatch. This preserves the
+    expensive-screen concurrency cap while queued bulk work exists without
+    imposing an all-bulk-workers barrier before the heavy final critical path.
 
     ``remaining`` counts queued plus active groups across both lanes. Idle
     workers therefore wait while another worker can still create urgent
@@ -1634,10 +1636,14 @@ class AffinityScreenWorkQueue:
             deferred_own_split = False
             heavy_worker = worker_id < self._heavy_worker_count
             with self._condition:
+                bulk_queues_drained = (
+                    self._scheduled_bulk.empty()
+                    and self._urgent_bulk.empty()
+                )
                 heavy_spill = (
                     not heavy_worker
                     and self._heavy_spill_enabled
-                    and self._remaining_bulk == 0
+                    and bulk_queues_drained
                 )
             eligible_urgent = (
                 [

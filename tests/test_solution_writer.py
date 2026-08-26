@@ -507,7 +507,7 @@ class CompetitionTimingTests(unittest.TestCase):
         work.task_done(bulk_source)
         self.assertEqual(work.remaining_group_count, 0)
 
-    def test_bulk_worker_spills_to_heavy_only_after_bulk_lane_drains(self):
+    def test_idle_bulk_worker_spills_when_queued_bulk_lane_drains(self):
         abort = threading.Event()
         work = AffinityScreenWorkQueue(
             [
@@ -515,7 +515,7 @@ class CompetitionTimingTests(unittest.TestCase):
                 [{"label": "H2"}],
                 [{"label": "B1"}],
             ],
-            worker_count=2,
+            worker_count=3,
             heavy_labels={"H1", "H2"},
             heavy_worker_count=1,
         )
@@ -525,13 +525,14 @@ class CompetitionTimingTests(unittest.TestCase):
         self.assertEqual((heavy_source, heavy_group[0]["label"]), ("heavy", "H1"))
         self.assertEqual((bulk_source, bulk_group[0]["label"]), ("bulk", "B1"))
 
-        # H1 remains active. Completing the last queued-or-active bulk group
-        # releases the formerly bulk-only worker onto the heavy critical path.
-        work.task_done(bulk_source)
-        spill_source, spill_group = work.get(abort, worker_id=1)
+        # B1 and H1 both remain active. With no queued bulk work left, the
+        # second bulk worker must help the heavy critical path immediately
+        # instead of waiting for every active bulk group to finish.
+        spill_source, spill_group = work.get(abort, worker_id=2)
         self.assertEqual((spill_source, spill_group[0]["label"]), ("heavy", "H2"))
 
         work.task_done(spill_source)
+        work.task_done(bulk_source)
         work.task_done(heavy_source)
         self.assertEqual(work.remaining_group_count, 0)
 

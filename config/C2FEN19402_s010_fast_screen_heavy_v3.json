@@ -1,0 +1,968 @@
+{
+  "case_sha256": "1f0b056260851e105be0c79809e87de9cba4c9981a5feb8c23598deedb89ac7b",
+  "contingencies": [
+    {
+      "label": "CTG_000000",
+      "measured_solver_wall_seconds": 31.425351088
+    },
+    {
+      "label": "CTG_000001",
+      "measured_solver_wall_seconds": 31.458514038
+    },
+    {
+      "label": "CTG_000002",
+      "measured_solver_wall_seconds": 28.450521535
+    },
+    {
+      "label": "CTG_000003",
+      "measured_solver_wall_seconds": 5.852752843
+    },
+    {
+      "label": "CTG_000004",
+      "measured_solver_wall_seconds": 5.897685482
+    },
+    {
+      "label": "CTG_000005",
+      "measured_solver_wall_seconds": 12.98432299
+    },
+    {
+      "label": "CTG_000016",
+      "measured_solver_wall_seconds": 22.687250727
+    },
+    {
+      "label": "CTG_000055",
+      "measured_solver_wall_seconds": 8.838975898
+    },
+    {
+      "label": "CTG_000064",
+      "measured_solver_wall_seconds": 21.198847315
+    },
+    {
+      "label": "CTG_000071",
+      "measured_solver_wall_seconds": 6.585113621
+    },
+    {
+      "label": "CTG_000107",
+      "measured_solver_wall_seconds": 5.323789002
+    },
+    {
+      "label": "CTG_000129",
+      "measured_solver_wall_seconds": 20.503207393
+    },
+    {
+      "label": "CTG_000135",
+      "measured_solver_wall_seconds": 6.214595306
+    },
+    {
+      "label": "CTG_000136",
+      "measured_solver_wall_seconds": 6.361093511
+    },
+    {
+      "label": "CTG_000151",
+      "measured_solver_wall_seconds": 9.463867331
+    },
+    {
+      "label": "CTG_000176",
+      "measured_solver_wall_seconds": 10.544218889
+    },
+    {
+      "label": "CTG_000177",
+      "measured_solver_wall_seconds": 32.555068524
+    },
+    {
+      "label": "CTG_000190",
+      "measured_solver_wall_seconds": 11.351128182
+    },
+    {
+      "label": "CTG_000193",
+      "measured_solver_wall_seconds": 13.256448212
+    },
+    {
+      "label": "CTG_000194",
+      "measured_solver_wall_seconds": 12.934054023
+    },
+    {
+      "label": "CTG_000214",
+      "measured_solver_wall_seconds": 7.025372133
+    },
+    {
+      "label": "CTG_000218",
+      "measured_solver_wall_seconds": 33.273230438
+    },
+    {
+      "label": "CTG_000261",
+      "measured_solver_wall_seconds": 44.052418137
+    },
+    {
+      "label": "CTG_000273",
+      "measured_solver_wall_seconds": 12.643636834
+    },
+    {
+      "label": "CTG_000278",
+      "measured_solver_wall_seconds": 14.053645906
+    },
+    {
+      "label": "CTG_000279",
+      "measured_solver_wall_seconds": 12.196879636
+    },
+    {
+      "label": "CTG_000283",
+      "measured_solver_wall_seconds": 7.621763826
+    },
+    {
+      "label": "CTG_000293",
+      "measured_solver_wall_seconds": 12.973451272
+    },
+    {
+      "label": "CTG_000294",
+      "measured_solver_wall_seconds": 14.587854996
+    },
+    {
+      "label": "CTG_000297",
+      "measured_solver_wall_seconds": 43.393202445
+    },
+    {
+      "label": "CTG_000303",
+      "measured_solver_wall_seconds": 28.588177189
+    },
+    {
+      "label": "CTG_000306",
+      "measured_solver_wall_seconds": 6.608307436
+    },
+    {
+      "label": "CTG_000336",
+      "measured_solver_wall_seconds": 35.545291251
+    },
+    {
+      "label": "CTG_000337",
+      "measured_solver_wall_seconds": 8.665754151
+    },
+    {
+      "label": "CTG_000338",
+      "measured_solver_wall_seconds": 9.965795628
+    },
+    {
+      "label": "CTG_000339",
+      "measured_solver_wall_seconds": 9.830245217
+    },
+    {
+      "label": "CTG_000376",
+      "measured_solver_wall_seconds": 7.507868151
+    },
+    {
+      "label": "CTG_000377",
+      "measured_solver_wall_seconds": 7.649604019
+    },
+    {
+      "label": "CTG_000378",
+      "measured_solver_wall_seconds": 7.851656865
+    },
+    {
+      "label": "CTG_000379",
+      "measured_solver_wall_seconds": 7.909669414
+    },
+    {
+      "label": "CTG_000380",
+      "measured_solver_wall_seconds": 8.493034192
+    },
+    {
+      "label": "CTG_000381",
+      "measured_solver_wall_seconds": 7.59636453
+    },
+    {
+      "label": "CTG_000421",
+      "measured_solver_wall_seconds": 37.679683814
+    },
+    {
+      "label": "CTG_000422",
+      "measured_solver_wall_seconds": 55.972492354
+    },
+    {
+      "label": "CTG_000440",
+      "measured_solver_wall_seconds": 23.831601572
+    },
+    {
+      "label": "CTG_000441",
+      "measured_solver_wall_seconds": 20.457906367
+    },
+    {
+      "label": "CTG_000484",
+      "measured_solver_wall_seconds": 7.094478502
+    },
+    {
+      "label": "CTG_000485",
+      "measured_solver_wall_seconds": 7.339778424
+    },
+    {
+      "label": "CTG_000487",
+      "measured_solver_wall_seconds": 6.679364177
+    },
+    {
+      "label": "CTG_000488",
+      "measured_solver_wall_seconds": 14.849132485
+    },
+    {
+      "label": "CTG_000489",
+      "measured_solver_wall_seconds": 6.502377499
+    },
+    {
+      "label": "CTG_000493",
+      "measured_solver_wall_seconds": 5.475484815
+    },
+    {
+      "label": "CTG_000494",
+      "measured_solver_wall_seconds": 6.25247347
+    },
+    {
+      "label": "CTG_000495",
+      "measured_solver_wall_seconds": 39.420447089
+    },
+    {
+      "label": "CTG_000497",
+      "measured_solver_wall_seconds": 16.894477036
+    },
+    {
+      "label": "CTG_000498",
+      "measured_solver_wall_seconds": 7.000574096
+    },
+    {
+      "label": "CTG_000513",
+      "measured_solver_wall_seconds": 7.369442359
+    },
+    {
+      "label": "CTG_000520",
+      "measured_solver_wall_seconds": 11.136087768
+    },
+    {
+      "label": "CTG_000547",
+      "measured_solver_wall_seconds": 6.09610293
+    },
+    {
+      "label": "CTG_000560",
+      "measured_solver_wall_seconds": 7.815918783
+    },
+    {
+      "label": "CTG_000564",
+      "measured_solver_wall_seconds": 10.267800269
+    },
+    {
+      "label": "CTG_000568",
+      "measured_solver_wall_seconds": 9.790989126
+    },
+    {
+      "label": "CTG_000570",
+      "measured_solver_wall_seconds": 5.074695447
+    },
+    {
+      "label": "CTG_000574",
+      "measured_solver_wall_seconds": 8.545469665
+    },
+    {
+      "label": "CTG_000580",
+      "measured_solver_wall_seconds": 7.141313093
+    },
+    {
+      "label": "CTG_000588",
+      "measured_solver_wall_seconds": 5.269106026
+    },
+    {
+      "label": "CTG_000591",
+      "measured_solver_wall_seconds": 7.014427999
+    },
+    {
+      "label": "CTG_000622",
+      "measured_solver_wall_seconds": 12.357053399
+    },
+    {
+      "label": "CTG_000625",
+      "measured_solver_wall_seconds": 9.718614503
+    },
+    {
+      "label": "CTG_000628",
+      "measured_solver_wall_seconds": 10.134738995
+    },
+    {
+      "label": "CTG_000630",
+      "measured_solver_wall_seconds": 6.783002155
+    },
+    {
+      "label": "CTG_000633",
+      "measured_solver_wall_seconds": 5.949242783
+    },
+    {
+      "label": "CTG_000646",
+      "measured_solver_wall_seconds": 27.653842932
+    },
+    {
+      "label": "CTG_000663",
+      "measured_solver_wall_seconds": 6.359612711
+    },
+    {
+      "label": "CTG_000670",
+      "measured_solver_wall_seconds": 15.777711639
+    },
+    {
+      "label": "CTG_000672",
+      "measured_solver_wall_seconds": 10.306079235
+    },
+    {
+      "label": "CTG_000676",
+      "measured_solver_wall_seconds": 7.960174839
+    },
+    {
+      "label": "CTG_000691",
+      "measured_solver_wall_seconds": 5.136163013
+    },
+    {
+      "label": "CTG_000700",
+      "measured_solver_wall_seconds": 5.759942773
+    },
+    {
+      "label": "CTG_000711",
+      "measured_solver_wall_seconds": 5.422450553
+    },
+    {
+      "label": "CTG_000720",
+      "measured_solver_wall_seconds": 7.928441134
+    },
+    {
+      "label": "CTG_000721",
+      "measured_solver_wall_seconds": 9.82097636
+    },
+    {
+      "label": "CTG_000724",
+      "measured_solver_wall_seconds": 12.415162775
+    },
+    {
+      "label": "CTG_000779",
+      "measured_solver_wall_seconds": 11.022063969
+    },
+    {
+      "label": "CTG_000780",
+      "measured_solver_wall_seconds": 7.919420177
+    },
+    {
+      "label": "CTG_000781",
+      "measured_solver_wall_seconds": 9.158287593
+    },
+    {
+      "label": "CTG_000791",
+      "measured_solver_wall_seconds": 6.557514516
+    },
+    {
+      "label": "CTG_000795",
+      "measured_solver_wall_seconds": 5.282263371
+    },
+    {
+      "label": "CTG_000810",
+      "measured_solver_wall_seconds": 7.241323225
+    },
+    {
+      "label": "CTG_000881",
+      "measured_solver_wall_seconds": 9.891395565
+    },
+    {
+      "label": "CTG_000885",
+      "measured_solver_wall_seconds": 7.180077994
+    },
+    {
+      "label": "CTG_000903",
+      "measured_solver_wall_seconds": 8.241784568
+    },
+    {
+      "label": "CTG_000906",
+      "measured_solver_wall_seconds": 12.915519944
+    },
+    {
+      "label": "CTG_000907",
+      "measured_solver_wall_seconds": 7.068618229
+    },
+    {
+      "label": "CTG_000911",
+      "measured_solver_wall_seconds": 17.812929427
+    },
+    {
+      "label": "CTG_000912",
+      "measured_solver_wall_seconds": 14.611537659
+    },
+    {
+      "label": "CTG_000934",
+      "measured_solver_wall_seconds": 7.093163176
+    },
+    {
+      "label": "CTG_000945",
+      "measured_solver_wall_seconds": 6.838782744
+    },
+    {
+      "label": "CTG_001082",
+      "measured_solver_wall_seconds": 6.769179432
+    },
+    {
+      "label": "CTG_001159",
+      "measured_solver_wall_seconds": 5.014197419
+    },
+    {
+      "label": "CTG_001217",
+      "measured_solver_wall_seconds": 5.404123716
+    },
+    {
+      "label": "CTG_001337",
+      "measured_solver_wall_seconds": 5.648976018
+    },
+    {
+      "label": "CTG_001378",
+      "measured_solver_wall_seconds": 8.227025353
+    },
+    {
+      "label": "CTG_001409",
+      "measured_solver_wall_seconds": 7.033589197
+    },
+    {
+      "label": "CTG_001422",
+      "measured_solver_wall_seconds": 8.198054986
+    },
+    {
+      "label": "CTG_001448",
+      "measured_solver_wall_seconds": 11.200617291
+    },
+    {
+      "label": "CTG_001499",
+      "measured_solver_wall_seconds": 5.738115181
+    },
+    {
+      "label": "CTG_001535",
+      "measured_solver_wall_seconds": 5.263711098
+    },
+    {
+      "label": "CTG_001560",
+      "measured_solver_wall_seconds": 12.735997879
+    },
+    {
+      "label": "CTG_001567",
+      "measured_solver_wall_seconds": 9.113912618
+    },
+    {
+      "label": "CTG_001569",
+      "measured_solver_wall_seconds": 22.800625753
+    },
+    {
+      "label": "CTG_001579",
+      "measured_solver_wall_seconds": 12.317488498
+    },
+    {
+      "label": "CTG_001597",
+      "measured_solver_wall_seconds": 23.306306861
+    },
+    {
+      "label": "CTG_001632",
+      "measured_solver_wall_seconds": 23.714483718
+    },
+    {
+      "label": "CTG_001633",
+      "measured_solver_wall_seconds": 9.962520015
+    },
+    {
+      "label": "CTG_001645",
+      "measured_solver_wall_seconds": 5.332811793
+    },
+    {
+      "label": "CTG_001693",
+      "measured_solver_wall_seconds": 13.563776114
+    },
+    {
+      "label": "CTG_001726",
+      "measured_solver_wall_seconds": 10.62202538
+    },
+    {
+      "label": "CTG_001738",
+      "measured_solver_wall_seconds": 6.497711196
+    },
+    {
+      "label": "CTG_001743",
+      "measured_solver_wall_seconds": 5.350859885
+    },
+    {
+      "label": "CTG_001753",
+      "measured_solver_wall_seconds": 14.607778386
+    },
+    {
+      "label": "CTG_001756",
+      "measured_solver_wall_seconds": 9.3369878
+    },
+    {
+      "label": "CTG_001782",
+      "measured_solver_wall_seconds": 11.595101511
+    },
+    {
+      "label": "CTG_001792",
+      "measured_solver_wall_seconds": 19.503223352
+    },
+    {
+      "label": "CTG_002101",
+      "measured_solver_wall_seconds": 11.267748486
+    },
+    {
+      "label": "CTG_002160",
+      "measured_solver_wall_seconds": 27.451328737
+    },
+    {
+      "label": "CTG_002167",
+      "measured_solver_wall_seconds": 5.95646033
+    },
+    {
+      "label": "CTG_002211",
+      "measured_solver_wall_seconds": 6.966929771
+    },
+    {
+      "label": "CTG_002215",
+      "measured_solver_wall_seconds": 5.590063503
+    },
+    {
+      "label": "CTG_002264",
+      "measured_solver_wall_seconds": 8.918384882
+    },
+    {
+      "label": "CTG_002279",
+      "measured_solver_wall_seconds": 5.590098174
+    },
+    {
+      "label": "CTG_002365",
+      "measured_solver_wall_seconds": 15.379677186
+    },
+    {
+      "label": "CTG_002370",
+      "measured_solver_wall_seconds": 8.56619991
+    },
+    {
+      "label": "CTG_002392",
+      "measured_solver_wall_seconds": 9.496615017
+    },
+    {
+      "label": "CTG_002393",
+      "measured_solver_wall_seconds": 6.395017329
+    },
+    {
+      "label": "CTG_002403",
+      "measured_solver_wall_seconds": 5.715588306
+    },
+    {
+      "label": "CTG_002424",
+      "measured_solver_wall_seconds": 13.165031074
+    },
+    {
+      "label": "CTG_002432",
+      "measured_solver_wall_seconds": 7.448627674
+    },
+    {
+      "label": "CTG_002459",
+      "measured_solver_wall_seconds": 18.106664224
+    },
+    {
+      "label": "CTG_002529",
+      "measured_solver_wall_seconds": 5.247920577
+    },
+    {
+      "label": "CTG_002574",
+      "measured_solver_wall_seconds": 9.186810511
+    },
+    {
+      "label": "CTG_002579",
+      "measured_solver_wall_seconds": 8.925866145
+    },
+    {
+      "label": "CTG_002731",
+      "measured_solver_wall_seconds": 10.041799254
+    },
+    {
+      "label": "CTG_002736",
+      "measured_solver_wall_seconds": 9.944870712
+    },
+    {
+      "label": "CTG_002805",
+      "measured_solver_wall_seconds": 6.667085995
+    },
+    {
+      "label": "CTG_002806",
+      "measured_solver_wall_seconds": 6.640755839
+    },
+    {
+      "label": "CTG_002811",
+      "measured_solver_wall_seconds": 6.994081994
+    },
+    {
+      "label": "CTG_002815",
+      "measured_solver_wall_seconds": 10.776606369
+    },
+    {
+      "label": "CTG_002822",
+      "measured_solver_wall_seconds": 5.824577557
+    },
+    {
+      "label": "CTG_002852",
+      "measured_solver_wall_seconds": 6.940379254
+    },
+    {
+      "label": "CTG_002868",
+      "measured_solver_wall_seconds": 12.611849729
+    },
+    {
+      "label": "CTG_003063",
+      "measured_solver_wall_seconds": 7.193843883
+    },
+    {
+      "label": "CTG_003065",
+      "measured_solver_wall_seconds": 9.391713169
+    },
+    {
+      "label": "CTG_003066",
+      "measured_solver_wall_seconds": 16.117850113
+    },
+    {
+      "label": "CTG_003067",
+      "measured_solver_wall_seconds": 7.906799122
+    },
+    {
+      "label": "CTG_003068",
+      "measured_solver_wall_seconds": 6.945607052
+    },
+    {
+      "label": "CTG_003069",
+      "measured_solver_wall_seconds": 7.245444985
+    },
+    {
+      "label": "CTG_003075",
+      "measured_solver_wall_seconds": 10.743856463
+    },
+    {
+      "label": "CTG_003077",
+      "measured_solver_wall_seconds": 8.497833262
+    },
+    {
+      "label": "CTG_003103",
+      "measured_solver_wall_seconds": 7.389474734
+    },
+    {
+      "label": "CTG_003105",
+      "measured_solver_wall_seconds": 9.04460786
+    },
+    {
+      "label": "CTG_003111",
+      "measured_solver_wall_seconds": 6.576787079
+    },
+    {
+      "label": "CTG_003208",
+      "measured_solver_wall_seconds": 5.70088101
+    },
+    {
+      "label": "CTG_003214",
+      "measured_solver_wall_seconds": 7.211851599
+    },
+    {
+      "label": "CTG_003227",
+      "measured_solver_wall_seconds": 5.315298902
+    },
+    {
+      "label": "CTG_003239",
+      "measured_solver_wall_seconds": 11.013844753
+    },
+    {
+      "label": "CTG_003267",
+      "measured_solver_wall_seconds": 7.990661698
+    },
+    {
+      "label": "CTG_003334",
+      "measured_solver_wall_seconds": 7.493522002
+    },
+    {
+      "label": "CTG_003335",
+      "measured_solver_wall_seconds": 5.637913568
+    },
+    {
+      "label": "CTG_003361",
+      "measured_solver_wall_seconds": 7.131992523
+    },
+    {
+      "label": "CTG_003363",
+      "measured_solver_wall_seconds": 9.859539434
+    },
+    {
+      "label": "CTG_003531",
+      "measured_solver_wall_seconds": 11.352321782
+    },
+    {
+      "label": "CTG_003551",
+      "measured_solver_wall_seconds": 8.421969348
+    },
+    {
+      "label": "CTG_003583",
+      "measured_solver_wall_seconds": 9.673025241
+    },
+    {
+      "label": "CTG_003606",
+      "measured_solver_wall_seconds": 10.614667813
+    },
+    {
+      "label": "CTG_003664",
+      "measured_solver_wall_seconds": 10.130290791
+    },
+    {
+      "label": "CTG_003744",
+      "measured_solver_wall_seconds": 24.706985462
+    },
+    {
+      "label": "CTG_003767",
+      "measured_solver_wall_seconds": 10.348821438
+    },
+    {
+      "label": "CTG_003768",
+      "measured_solver_wall_seconds": 10.220828764
+    },
+    {
+      "label": "CTG_003797",
+      "measured_solver_wall_seconds": 5.047625032
+    },
+    {
+      "label": "CTG_003957",
+      "measured_solver_wall_seconds": 5.840865627
+    },
+    {
+      "label": "CTG_004008",
+      "measured_solver_wall_seconds": 10.480392122
+    },
+    {
+      "label": "CTG_004034",
+      "measured_solver_wall_seconds": 18.944746733
+    },
+    {
+      "label": "CTG_004036",
+      "measured_solver_wall_seconds": 6.213046054
+    },
+    {
+      "label": "CTG_004255",
+      "measured_solver_wall_seconds": 6.825039667
+    },
+    {
+      "label": "CTG_004313",
+      "measured_solver_wall_seconds": 8.007689183
+    },
+    {
+      "label": "CTG_004330",
+      "measured_solver_wall_seconds": 11.120471611
+    },
+    {
+      "label": "CTG_004331",
+      "measured_solver_wall_seconds": 12.057980324
+    },
+    {
+      "label": "CTG_004334",
+      "measured_solver_wall_seconds": 5.940406982
+    },
+    {
+      "label": "CTG_004342",
+      "measured_solver_wall_seconds": 11.049314916
+    },
+    {
+      "label": "CTG_004414",
+      "measured_solver_wall_seconds": 7.429260193
+    },
+    {
+      "label": "CTG_004497",
+      "measured_solver_wall_seconds": 6.32841371
+    },
+    {
+      "label": "CTG_004529",
+      "measured_solver_wall_seconds": 13.509797543
+    },
+    {
+      "label": "CTG_004561",
+      "measured_solver_wall_seconds": 10.146492468
+    },
+    {
+      "label": "CTG_004622",
+      "measured_solver_wall_seconds": 7.418893877
+    },
+    {
+      "label": "CTG_004667",
+      "measured_solver_wall_seconds": 8.300675462
+    },
+    {
+      "label": "CTG_004668",
+      "measured_solver_wall_seconds": 5.768340078
+    },
+    {
+      "label": "CTG_004731",
+      "measured_solver_wall_seconds": 10.009567981
+    },
+    {
+      "label": "CTG_004982",
+      "measured_solver_wall_seconds": 15.978513648
+    },
+    {
+      "label": "CTG_004987",
+      "measured_solver_wall_seconds": 8.822762596
+    },
+    {
+      "label": "CTG_005042",
+      "measured_solver_wall_seconds": 7.109574503
+    },
+    {
+      "label": "CTG_005065",
+      "measured_solver_wall_seconds": 7.386707541
+    },
+    {
+      "label": "CTG_005197",
+      "measured_solver_wall_seconds": 8.530570398
+    },
+    {
+      "label": "CTG_005219",
+      "measured_solver_wall_seconds": 7.062174435
+    },
+    {
+      "label": "CTG_005220",
+      "measured_solver_wall_seconds": 7.134204632
+    },
+    {
+      "label": "CTG_005417",
+      "measured_solver_wall_seconds": 78.703058354
+    },
+    {
+      "label": "CTG_005470",
+      "measured_solver_wall_seconds": 9.7322367
+    },
+    {
+      "label": "CTG_005483",
+      "measured_solver_wall_seconds": 8.573245119
+    },
+    {
+      "label": "CTG_005588",
+      "measured_solver_wall_seconds": 13.199847783
+    },
+    {
+      "label": "CTG_005612",
+      "measured_solver_wall_seconds": 6.750961425
+    },
+    {
+      "label": "CTG_005923",
+      "measured_solver_wall_seconds": 20.445881836
+    },
+    {
+      "label": "CTG_005945",
+      "measured_solver_wall_seconds": 17.511502709
+    },
+    {
+      "label": "CTG_005957",
+      "measured_solver_wall_seconds": 5.056380615
+    },
+    {
+      "label": "CTG_006056",
+      "measured_solver_wall_seconds": 13.232139991
+    },
+    {
+      "label": "CTG_006072",
+      "measured_solver_wall_seconds": 6.982867931
+    },
+    {
+      "label": "CTG_006076",
+      "measured_solver_wall_seconds": 8.388293509
+    },
+    {
+      "label": "CTG_006084",
+      "measured_solver_wall_seconds": 9.212122001
+    },
+    {
+      "label": "CTG_006086",
+      "measured_solver_wall_seconds": 8.364855523
+    },
+    {
+      "label": "CTG_006087",
+      "measured_solver_wall_seconds": 8.390217565
+    },
+    {
+      "label": "CTG_006092",
+      "measured_solver_wall_seconds": 6.547495371
+    },
+    {
+      "label": "CTG_006094",
+      "measured_solver_wall_seconds": 7.353715378
+    },
+    {
+      "label": "CTG_006198",
+      "measured_solver_wall_seconds": 5.10457109
+    },
+    {
+      "label": "CTG_006199",
+      "measured_solver_wall_seconds": 6.531421268
+    },
+    {
+      "label": "CTG_006201",
+      "measured_solver_wall_seconds": 11.503413791
+    },
+    {
+      "label": "CTG_006203",
+      "measured_solver_wall_seconds": 8.485903147
+    },
+    {
+      "label": "CTG_006239",
+      "measured_solver_wall_seconds": 7.441227162
+    },
+    {
+      "label": "CTG_006240",
+      "measured_solver_wall_seconds": 9.096479408
+    },
+    {
+      "label": "CTG_006241",
+      "measured_solver_wall_seconds": 7.137748838
+    },
+    {
+      "label": "CTG_006242",
+      "measured_solver_wall_seconds": 7.50229196
+    },
+    {
+      "label": "CTG_006319",
+      "measured_solver_wall_seconds": 7.000012131
+    },
+    {
+      "label": "CTG_006360",
+      "measured_solver_wall_seconds": 9.720895932
+    },
+    {
+      "label": "CTG_006470",
+      "measured_solver_wall_seconds": 10.618144798
+    },
+    {
+      "label": "CTG_006480",
+      "measured_solver_wall_seconds": 10.054062034
+    },
+    {
+      "label": "CTG_006607",
+      "measured_solver_wall_seconds": 5.876054908
+    },
+    {
+      "label": "CTG_006617",
+      "measured_solver_wall_seconds": 12.772776466
+    }
+  ],
+  "heavy_threshold_seconds": 5.0,
+  "purpose": "Scheduling-only heavy-screen concurrency profile. Contains no primal, dual, commitment, network, or solver state. Repeated cold timings are merged by maximum measured solver time.",
+  "schema_version": 1,
+  "source_measurement": {
+    "complete_contingency_coverage": true,
+    "merge_rule": "maximum measured solver wall time by label",
+    "runs": [
+      {
+        "completed_task_result_count": 6692,
+        "git_revision": "bf73580d7d7dcc603c1b4bff217754221d1eb1d6",
+        "scenario_run_name": "C2FEN19402_s010_cold_r11_reused_network_slacks",
+        "source_run_success": false,
+        "worker_log_count": 24
+      },
+      {
+        "completed_task_result_count": 6684,
+        "git_revision": "feddb1dfd1775088b5f736528e2cc7b7b892249d",
+        "scenario_run_name": "C2FEN19402_s010_cold_r12_profile_v2",
+        "source_run_success": false,
+        "worker_log_count": 24
+      }
+    ]
+  }
+}

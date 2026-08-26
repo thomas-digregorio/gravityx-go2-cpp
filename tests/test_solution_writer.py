@@ -47,6 +47,10 @@ from fast_official_evaluator import (  # noqa: E402
     suppress_verbose_timing_output,
     skip_dataframe_copy,
 )
+from build_fast_screen_heavy_profile import (  # noqa: E402
+    merge_max_measurements,
+    parse_worker_log_measurements,
+)
 
 
 class SolutionWriterTests(unittest.TestCase):
@@ -681,6 +685,35 @@ class CompetitionTimingTests(unittest.TestCase):
                 load_fast_screen_heavy_profile(
                     path, "different-hash", {"A", "B", "C"}
                 )
+
+    def test_fast_screen_profile_measurements_parse_and_merge_by_maximum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory)
+            payloads = [
+                {
+                    "label": "A",
+                    "result_summary": {"solve": {"wall_seconds": 4.0}},
+                },
+                {
+                    "label": "B",
+                    "result_summary": {"solve": {"wall_seconds": 7.5}},
+                },
+            ]
+            (logs / "worker_000.log").write_text(
+                "noise\n"
+                + "\n".join(
+                    "GRAVITYX_TASK_RESULT " + json.dumps(payload)
+                    for payload in payloads
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            first = parse_worker_log_measurements(logs)
+            self.assertEqual(first, {"A": 4.0, "B": 7.5})
+            merged = merge_max_measurements(
+                [first, {"A": 8.0, "B": 6.0, "C": 5.0}]
+            )
+            self.assertEqual(merged, {"A": 8.0, "B": 7.5, "C": 5.0})
 
     def test_contiguous_evaluation_shards_preserve_schedule(self):
         labels = [f"CTG_{index}" for index in range(7)]

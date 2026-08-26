@@ -222,8 +222,12 @@ def read_json(path: Path) -> Any:
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(
-        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    # Keep the atomic-write name independent of the destination basename.  A
+    # repeated basename can push an otherwise valid Windows path over the
+    # legacy MAX_PATH boundary (the shard certificate exposed this at exactly
+    # 260 characters).
+    temporary = path.parent / (
+        f".{os.getpid():x}.{threading.get_ident():x}.tmp"
     )
     with temporary.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, indent=2, sort_keys=True)

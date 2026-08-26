@@ -1170,6 +1170,20 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             self.assertEqual(attempts, 3)
             self.assertEqual(json.loads(destination.read_text()), {"success": True})
 
+    def test_json_checkpoint_uses_short_temporary_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            filename = "official_evaluation_certificate.json"
+            padding = 250 - len(str(root)) - len(filename) - 2
+            self.assertGreater(padding, 0)
+            destination = root / ("x" * padding) / filename
+            self.assertEqual(len(str(destination)), 250)
+
+            write_json(destination, {"success": True})
+
+            self.assertEqual(json.loads(destination.read_text()), {"success": True})
+            self.assertEqual(list(destination.parent.glob("*.tmp")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

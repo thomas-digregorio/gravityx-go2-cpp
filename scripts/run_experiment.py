@@ -2442,8 +2442,8 @@ def main() -> int:
     started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     wall_start = time.perf_counter()
     total_deadline = wall_start + args.total_time_limit
-    work_deadline = total_deadline - args.evaluation_reserve
     evaluation_deadline = total_deadline - finalization_reserve
+    work_deadline = evaluation_deadline - args.evaluation_reserve
 
     case = read_json(args.case_json)
     contingencies = contingency_records(case)

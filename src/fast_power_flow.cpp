@@ -2769,6 +2769,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             std::unique_ptr<FixedJacobianPredictorCache>
                 contingency_predictor_cache;
             int active_feasibility_repair_attempts = 0;
+            int proactive_local_search_attempts = 0;
             int consecutive_full_local_reactive_active_angle = 0;
             std::string prior_selected_correction_mode;
             double prior_selected_damping = 0.0;
@@ -4278,7 +4279,33 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             "one_hop_voltage_coordinate_continuation";
                     }
                 }
-                if (selected_damping == 0.0) {
+                // Once an apparent-power slack bound is only improving by
+                // microscopic amounts, accepting that nominal step can
+                // suppress the localized voltage search for dozens of
+                // iterations. Permit one proactive local search at the first
+                // verified stall. The existing candidate remains available,
+                // and every localized trial is still rebuilt and validated
+                // against the complete nonlinear contingency model.
+                const bool proactive_apparent_slack_local_search =
+                    selected_damping != 0.0 &&
+                    proactive_local_search_attempts == 0 &&
+                    active_feasibility_repair_attempts > 0 &&
+                    predictor_iteration >= 8 &&
+                    apparent_slack_dominant &&
+                    predictor_validation.max_residual >
+                        options_.validation_tolerance &&
+                    selected_validation.max_residual >=
+                        0.99 * predictor_validation.max_residual;
+                if (selected_damping == 0.0 ||
+                    proactive_apparent_slack_local_search) {
+                    if (proactive_apparent_slack_local_search) {
+                        ++proactive_local_search_attempts;
+                        if (options_.capture_diagnostics) {
+                            output.fixed_jacobian_predictor_trace.back()[
+                                "proactive_apparent_slack_local_search"] =
+                                true;
+                        }
+                    }
                     int worst_q_bus = -1;
                     double worst_q_excess = 0.0;
                     for (int bus = 0; bus < nb; ++bus) {
@@ -5069,8 +5096,27 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     worst_active_flow_excess > 1e-4 &&
                     selected_validation.max_residual >=
                         0.99 * predictor_validation.max_residual;
+                // Generator outages can enter the same active-flow-bound
+                // stall while still finding microscopic redispatch steps.
+                // Requiring selected_damping == 0 meant those tiny steps
+                // suppressed Phase I indefinitely; difficult 19k cases then
+                // consumed more than one hundred predictor iterations before
+                // the repair was first attempted.  Trigger the identical
+                // source-bounded LP when verified progress has fallen below
+                // one percent and an active terminal bound is still blocking
+                // the generator-outage correction.
+                const bool generator_security_stagnation_repair =
+                    outaged_generator >= 0 &&
+                    active_feasibility_repair_attempts == 0 &&
+                    predictor_iteration >= 12 &&
+                    predictor_validation.worst_category ==
+                        "variable_bound" &&
+                    worst_active_flow_excess > 1e-4 &&
+                    selected_validation.max_residual >=
+                        0.99 * predictor_validation.max_residual;
                 if (initial_active_feasibility_repair ||
                     branch_security_stagnation_repair ||
+                    generator_security_stagnation_repair ||
                     late_security_stagnation_repair) {
                     ++active_feasibility_repair_attempts;
                     // Branch outages can also stall at an active-flow box
@@ -5082,7 +5128,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     // equations and independently validated before use.
                     const bool broad_active_repair =
                         initial_active_feasibility_repair ||
-                        branch_security_stagnation_repair;
+                        branch_security_stagnation_repair ||
+                        generator_security_stagnation_repair;
                     const double active_balance_limit =
                         outaged_branch >= 0
                             ? 0.49

@@ -1532,6 +1532,110 @@ def longest_first_contingencies(
     return scheduled
 
 
+class AffinityScreenWorkQueue:
+    """Serve affinity groups while allowing failed groups to fan out safely.
+
+    A verified corrective state is useful to later outages in the same
+    affinity group, so successful groups remain serial on one resident
+    worker. Once a fast screen requires exact fallback, however, it produced
+    no verified state to reuse. The unattempted siblings are then independent
+    work and should be made immediately available to idle workers instead of
+    extending one worker's critical path.
+
+    ``remaining`` counts queued plus active groups. Idle workers therefore
+    wait while another worker can still create urgent singleton work, and
+    exit only after every original or split group has called ``task_done``.
+    """
+
+    def __init__(
+        self,
+        groups: list[list[dict[str, Any]]],
+        worker_count: int,
+    ):
+        if any(not group for group in groups):
+            raise ValueError("affinity screen groups must be nonempty")
+        if worker_count < 1:
+            raise ValueError("affinity screen worker count must be positive")
+        self._scheduled: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+        self._urgent: queue.Queue[
+            tuple[int, list[dict[str, Any]]]
+        ] = queue.Queue()
+        for group in groups:
+            self._scheduled.put(group)
+        self._condition = threading.Condition()
+        self._remaining = len(groups)
+        self._worker_count = worker_count
+
+    def get(
+        self,
+        abort: threading.Event,
+        worker_id: int,
+        poll_seconds: float = 0.05,
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        while not abort.is_set():
+            deferred_own_split = False
+            try:
+                origin_worker_id, group = self._urgent.get_nowait()
+                if (
+                    origin_worker_id != worker_id
+                    or self._worker_count == 1
+                ):
+                    return "urgent", group
+                # Do not let the worker that exposed parallel work reclaim it
+                # immediately. Preserve the queue accounting while giving an
+                # already-waiting peer the opportunity to take the sibling.
+                self._urgent.put((origin_worker_id, group))
+                self._urgent.task_done()
+                deferred_own_split = True
+            except queue.Empty:
+                pass
+            try:
+                return "scheduled", self._scheduled.get_nowait()
+            except queue.Empty:
+                pass
+            with self._condition:
+                if self._remaining == 0:
+                    return None
+                self._condition.wait(
+                    timeout=(
+                        min(poll_seconds, 0.005)
+                        if deferred_own_split
+                        else poll_seconds
+                    )
+                )
+        return None
+
+    def requeue_remaining_as_singletons(
+        self,
+        group: list[dict[str, Any]],
+        first_unattempted_position: int,
+        origin_worker_id: int,
+    ) -> int:
+        remaining = group[first_unattempted_position:]
+        if not remaining:
+            return 0
+        with self._condition:
+            for item in remaining:
+                self._urgent.put((origin_worker_id, [item]))
+            self._remaining += len(remaining)
+            self._condition.notify_all()
+        return len(remaining)
+
+    def task_done(self, source: str) -> None:
+        source_queue = self._urgent if source == "urgent" else self._scheduled
+        source_queue.task_done()
+        with self._condition:
+            if self._remaining <= 0:
+                raise RuntimeError("affinity screen queue task accounting underflow")
+            self._remaining -= 1
+            self._condition.notify_all()
+
+    @property
+    def remaining_group_count(self) -> int:
+        with self._condition:
+            return self._remaining
+
+
 def fast_screen_affinity_groups(
     case: dict[str, Any],
     base_state: dict[str, Any],
@@ -2178,6 +2282,7 @@ def main() -> int:
                 if args.fast_screen_easy_first
                 else "globally difficult-first groups, then "
             )
+            + "fallback-triggered parallel group splitting, then "
             + schedule_mode
         )
     run_status.update(
@@ -2394,16 +2499,16 @@ def main() -> int:
     ] = {}
     if args.two_stage_contingency_screen:
         fast_screen_start = time.perf_counter()
-        screen_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
         if args.fast_screen_affinity_schedule:
             assert fast_screen_groups is not None
             screen_groups = fast_screen_groups
         else:
             screen_groups = [[item] for item in contingencies]
-        for group in screen_groups:
-            screen_queue.put(group)
-        fallback_items: list[dict[str, Any]] = []
         fast_worker_count = min(args.fast_workers, len(contingencies))
+        screen_work = AffinityScreenWorkQueue(
+            screen_groups, fast_worker_count
+        )
+        fallback_items: list[dict[str, Any]] = []
 
         def screen_worker(worker_id: int) -> dict[str, Any]:
             log_path = (
@@ -2429,6 +2534,8 @@ def main() -> int:
             started = time.perf_counter()
             output_lines: list[str] = []
             assigned_labels: list[str] = []
+            affinity_split_group_count = 0
+            affinity_split_contingency_count = 0
             process = subprocess.Popen(
                 command,
                 text=True,
@@ -2461,11 +2568,11 @@ def main() -> int:
             try:
                 read_until("GRAVITYX_WORKER_READY")
                 while not abort_contingencies.is_set():
-                    try:
-                        group = screen_queue.get_nowait()
-                    except queue.Empty:
+                    work = screen_work.get(abort_contingencies, worker_id)
+                    if work is None:
                         break
-                    for item in group:
+                    work_source, group = work
+                    for group_position, item in enumerate(group):
                         if abort_contingencies.is_set():
                             break
                         label = str(item["label"])
@@ -2519,6 +2626,7 @@ def main() -> int:
                                 )
                         else:
                             result = read_json(result_path)
+                        split_count = 0
                         if result.get("success", False):
                             save_secure_result(item, result, worker_id, "fast_screen")
                         elif result.get("screen_completed", False):
@@ -2546,6 +2654,14 @@ def main() -> int:
                                             item,
                                         )
                                     )
+                            split_count = (
+                                screen_work.requeue_remaining_as_singletons(
+                                    group, group_position + 1, worker_id
+                                )
+                            )
+                            if split_count:
+                                affinity_split_group_count += 1
+                                affinity_split_contingency_count += split_count
                         else:
                             raise RuntimeError(
                                 f"fast screen {label} returned an incomplete result"
@@ -2566,7 +2682,9 @@ def main() -> int:
                             run_status["screened_contingency_count"] = len(screen_records)
                             run_status["fast_screen_fallback_count"] = len(fallback_items)
                             progress_checkpoint()
-                    screen_queue.task_done()
+                        if split_count:
+                            break
+                    screen_work.task_done(work_source)
                 if process.poll() is None:
                     assert process.stdin is not None
                     process.stdin.write('{"stop":true}\n')
@@ -2586,6 +2704,10 @@ def main() -> int:
                     "task_count": len(assigned_labels),
                     "process_wall_seconds": time.perf_counter() - started,
                     "labels": assigned_labels,
+                    "affinity_split_group_count": affinity_split_group_count,
+                    "affinity_split_contingency_count": (
+                        affinity_split_contingency_count
+                    ),
                 }
             except Exception:
                 abort_contingencies.set()
@@ -2859,6 +2981,19 @@ def main() -> int:
                 bool(item["feasible"]) for item in screen_records
             )
             run_status["fast_screen_fallback_count"] = len(exact_contingencies)
+            fast_screen_workers = [
+                item
+                for item in worker_records
+                if item.get("phase") == "fast_screen"
+            ]
+            run_status["fast_screen_affinity_split_group_count"] = sum(
+                int(item.get("affinity_split_group_count", 0))
+                for item in fast_screen_workers
+            )
+            run_status["fast_screen_affinity_split_contingency_count"] = sum(
+                int(item.get("affinity_split_contingency_count", 0))
+                for item in fast_screen_workers
+            )
             run_status["streaming_fallback_overlap"] = (
                 not args.defer_fallback_until_screen_complete
             )

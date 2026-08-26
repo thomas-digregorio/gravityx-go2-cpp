@@ -8,13 +8,13 @@ import concurrent.futures
 import json
 import os
 from pathlib import Path
-import queue
 import subprocess
 import threading
 import time
 from typing import Any
 
 from run_experiment import (
+    AffinityScreenWorkQueue,
     DEFAULT_EXE,
     CompetitionTimeout,
     contingency_records,
@@ -46,15 +46,13 @@ def run_trial(
     wsl_fast_screen_scratch: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
-    task_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue()
     if task_groups is None:
         task_groups = [[item] for item in records]
     if [item["label"] for group in task_groups for item in group] != [
         item["label"] for item in records
     ]:
         raise ValueError("task groups must contain every record exactly once in order")
-    for group in task_groups:
-        task_queue.put(group)
+    task_queue = AffinityScreenWorkQueue(task_groups, workers)
     abort = threading.Event()
     deadline = time.perf_counter() + timeout_seconds
     completed: list[dict[str, Any]] = []
@@ -88,6 +86,8 @@ def run_trial(
         )
         output_lines: list[str] = []
         labels: list[str] = []
+        affinity_split_group_count = 0
+        affinity_split_contingency_count = 0
         process = subprocess.Popen(
             command,
             text=True,
@@ -119,11 +119,11 @@ def run_trial(
         try:
             read_until("GRAVITYX_WORKER_READY")
             while not abort.is_set():
-                try:
-                    group = task_queue.get_nowait()
-                except queue.Empty:
+                work = task_queue.get(abort, worker_id)
+                if work is None:
                     break
-                for item in group:
+                work_source, group = work
+                for group_position, item in enumerate(group):
                     label = str(item["label"])
                     labels.append(label)
                     result_path = (
@@ -242,7 +242,16 @@ def run_trial(
                                 ),
                             }
                         )
-                task_queue.task_done()
+                    split_count = 0
+                    if result.get("requires_exact_fallback", False):
+                        split_count = task_queue.requeue_remaining_as_singletons(
+                            group, group_position + 1, worker_id
+                        )
+                        if split_count:
+                            affinity_split_group_count += 1
+                            affinity_split_contingency_count += split_count
+                            break
+                task_queue.task_done(work_source)
             if process.poll() is None:
                 assert process.stdin is not None
                 process.stdin.write('{"stop":true}\n')
@@ -259,6 +268,10 @@ def run_trial(
                 "worker_id": worker_id,
                 "labels": labels,
                 "wall_seconds": time.perf_counter() - started,
+                "affinity_split_group_count": affinity_split_group_count,
+                "affinity_split_contingency_count": (
+                    affinity_split_contingency_count
+                ),
             }
         except Exception:
             abort.set()
@@ -307,6 +320,14 @@ def run_trial(
         "rolling_seed_selected_count": sum(
             item["rolling_corrective_seed_label"] is not None
             for item in completed
+        ),
+        "affinity_split_group_count": sum(
+            int(item.get("affinity_split_group_count", 0))
+            for item in worker_records
+        ),
+        "affinity_split_contingency_count": sum(
+            int(item.get("affinity_split_contingency_count", 0))
+            for item in worker_records
         ),
         "solver_seconds_sum": sum(
             item["solver_wall_seconds"] for item in completed

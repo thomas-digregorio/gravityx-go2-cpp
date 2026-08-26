@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
 from run_experiment import (  # noqa: E402
+    AffinityScreenWorkQueue,
     CompetitionTimeout,
     StreamingSerialEvaluation,
     apply_fallback_schedule_profile,
@@ -426,6 +427,40 @@ class CompetitionTimingTests(unittest.TestCase):
             easy_first_groups[0][0]["fast_screen_affinity_score"],
             easy_first_groups[-1][0]["fast_screen_affinity_score"],
         )
+
+    def test_affinity_screen_queue_prioritizes_failed_group_siblings(self):
+        abort = threading.Event()
+        first = [{"label": "A"}, {"label": "B"}, {"label": "C"}]
+        second = [{"label": "D"}]
+        work = AffinityScreenWorkQueue([first, second], worker_count=2)
+
+        source, group = work.get(abort, worker_id=0)
+        self.assertEqual(source, "scheduled")
+        self.assertEqual([item["label"] for item in group], ["A", "B", "C"])
+        self.assertEqual(
+            work.requeue_remaining_as_singletons(
+                group, 1, origin_worker_id=0
+            ),
+            2,
+        )
+        work.task_done(source)
+
+        source, group = work.get(abort, worker_id=0)
+        self.assertEqual((source, group[0]["label"]), ("scheduled", "D"))
+        work.task_done(source)
+
+        observed = []
+        for _ in range(2):
+            source, group = work.get(abort, worker_id=1)
+            observed.append((source, [item["label"] for item in group]))
+            work.task_done(source)
+        self.assertTrue(all(source == "urgent" for source, _ in observed))
+        self.assertEqual(
+            {labels[0] for _, labels in observed},
+            {"B", "C"},
+        )
+        self.assertEqual(work.remaining_group_count, 0)
+        self.assertIsNone(work.get(abort, worker_id=0))
 
     def test_contiguous_evaluation_shards_preserve_schedule(self):
         labels = [f"CTG_{index}" for index in range(7)]

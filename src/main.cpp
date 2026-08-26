@@ -861,6 +861,25 @@ int run_parallel_circuit_regression() {
                 "lightweight linearized AC seed left its trust region");
         }
     }
+    auto outside_voltage_reference = source_base.solve.state;
+    outside_voltage_reference.vm[0] = data.buses[0].vmax + 0.2;
+    const auto projected_voltage_seed = gravityx::solve_linearized_ac_seed(
+        data, outside_voltage_reference, {1}, 0.49, std::nullopt, false, true,
+        60.0, false, false, {}, false,
+        kTestVoltageTrustRadius, kTestAngleTrustRadius);
+    if (projected_voltage_seed.projected_reference_voltage_count != 1 ||
+        std::abs(projected_voltage_seed.maximum_reference_voltage_projection -
+                 0.2) > 1e-10 ||
+        projected_voltage_seed.row_count <= 0 ||
+        projected_voltage_seed.column_count <= 0 ||
+        projected_voltage_seed.status.empty() ||
+        (projected_voltage_seed.success &&
+         (projected_voltage_seed.state.vm[0] < data.buses[0].vmin - 1e-9 ||
+          projected_voltage_seed.state.vm[0] > data.buses[0].vmax + 1e-9))) {
+        throw std::runtime_error(
+            "out-of-bound reference-voltage projection regression failed: " +
+            projected_voltage_seed.status);
+    }
     const auto balance_only_base_seed = gravityx::solve_linearized_ac_seed(
         data, source_base.solve.state, {1}, 0.25, std::nullopt,
         true, true, 60.0, true, true);

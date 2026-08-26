@@ -189,6 +189,10 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"maximum_column_scale", maximum_column_scale},
         {"voltage_trust_radius", voltage_trust_radius},
         {"angle_trust_radius", angle_trust_radius},
+        {"projected_reference_voltage_count",
+         projected_reference_voltage_count},
+        {"maximum_reference_voltage_projection",
+         maximum_reference_voltage_projection},
         {"maximum_balance_slack", maximum_balance_slack},
         {"total_balance_slack", total_balance_slack},
         {"solution_value_valid", solution_value_valid},
@@ -316,6 +320,25 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         ? voltage_trust_radius_override : default_voltage_trust_radius;
     const double angle_trust_radius = angle_trust_radius_override > 0.0
         ? angle_trust_radius_override : default_angle_trust_radius;
+    // Sparse Newton is allowed to return an intermediate point outside a
+    // source voltage bound.  Centering a local LP trust box on that point can
+    // create an empty interval before HiGHS sees the model.  Project only the
+    // LP linearization voltage into [VMIN, VMAX]; every returned state is still
+    // checked against the unchanged complete nonlinear validator.
+    std::vector<double> linearization_vm = reference.vm;
+    int projected_reference_voltage_count = 0;
+    double maximum_reference_voltage_projection = 0.0;
+    for (int i = 0; i < nb; ++i) {
+        const double projected = std::clamp(
+            reference.vm[i], data.buses[i].vmin, data.buses[i].vmax);
+        const double movement = std::abs(projected - reference.vm[i]);
+        if (movement > 1e-12) {
+            ++projected_reference_voltage_count;
+            maximum_reference_voltage_projection = std::max(
+                maximum_reference_voltage_projection, movement);
+        }
+        linearization_vm[i] = projected;
+    }
     const bool projected_balance_slack =
         project_balance_slack &&
         (lightweight_large_seed || feasibility_only) &&
@@ -344,12 +367,12 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         lower[vm_offset + i] = lightweight_large_seed
             ? std::max(
                 data.buses[i].vmin,
-                reference.vm[i] - voltage_trust_radius)
+                linearization_vm[i] - voltage_trust_radius)
             : data.buses[i].vmin;
         upper[vm_offset + i] = lightweight_large_seed
             ? std::min(
                 data.buses[i].vmax,
-                reference.vm[i] + voltage_trust_radius)
+                linearization_vm[i] + voltage_trust_radius)
             : data.buses[i].vmax;
         lower[va_offset + i] = lightweight_large_seed
             ? std::max(
@@ -462,7 +485,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         const auto& branch = data.branches[i];
         linearized[i] = linearize_branch(
             branch,
-            reference.vm[branch.from], reference.vm[branch.to],
+            linearization_vm[branch.from], linearization_vm[branch.to],
             reference.va[branch.from], reference.va[branch.to]);
     }
 
@@ -525,10 +548,12 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             gs += data.shunts[shunt].gs;
             bs += data.shunts[shunt].bs;
         }
-        active_constant -= gs * reference.vm[bus] * reference.vm[bus];
-        reactive_constant += bs * reference.vm[bus] * reference.vm[bus];
-        append(active, vm_offset + bus, 2.0 * gs * reference.vm[bus]);
-        append(reactive, vm_offset + bus, -2.0 * bs * reference.vm[bus]);
+        active_constant -=
+            gs * linearization_vm[bus] * linearization_vm[bus];
+        reactive_constant +=
+            bs * linearization_vm[bus] * linearization_vm[bus];
+        append(active, vm_offset + bus, 2.0 * gs * linearization_vm[bus]);
+        append(reactive, vm_offset + bus, -2.0 * bs * linearization_vm[bus]);
         if (projected_balance_slack) {
             // Project the two bounded positive/negative balance-slack columns
             // onto the balance row.  This has the identical feasible set in
@@ -894,6 +919,10 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         ? voltage_trust_radius : 0.0;
     output.angle_trust_radius = lightweight_large_seed
         ? angle_trust_radius : 0.0;
+    output.projected_reference_voltage_count =
+        projected_reference_voltage_count;
+    output.maximum_reference_voltage_projection =
+        maximum_reference_voltage_projection;
     output.time_limit_seconds = time_limit_seconds;
     output.ipm_optimality_tolerance = ipm_optimality_tolerance;
     output.row_count = static_cast<int>(rows.size());

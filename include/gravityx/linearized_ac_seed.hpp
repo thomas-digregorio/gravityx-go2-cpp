@@ -29,6 +29,8 @@ struct LinearizedAcSeedResult {
     double maximum_column_scale{1.0};
     double voltage_trust_radius{};
     double angle_trust_radius{};
+    int projected_reference_voltage_count{};
+    double maximum_reference_voltage_projection{};
     double maximum_balance_slack{};
     double total_balance_slack{};
     bool solution_value_valid{};

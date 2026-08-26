@@ -1545,9 +1545,10 @@ class AffinityScreenWorkQueue:
     A timing-only profile can classify groups containing known expensive
     screens. Only the first ``heavy_worker_count`` workers consume that queue;
     every other worker starts on the bulk queue. Heavy workers help with bulk
-    work after their lane drains, while bulk workers never increase expensive
-    concurrency. This prevents memory-bandwidth-limited sparse solves from
-    slowing each other down without discarding any mathematical state.
+    work after their lane drains. Once every queued or active bulk group has
+    completed, otherwise-idle bulk workers may spill into the remaining heavy
+    queue. This preserves the expensive-screen concurrency cap while bulk work
+    exists without stranding processors on a heavy-only final critical path.
 
     ``remaining`` counts queued plus active groups across both lanes. Idle
     workers therefore wait while another worker can still create urgent
@@ -1593,6 +1594,12 @@ class AffinityScreenWorkQueue:
                 self._scheduled_bulk.put(group)
         self._condition = threading.Condition()
         self._remaining = len(groups)
+        self._remaining_heavy = heavy_group_count
+        self._remaining_bulk = len(groups) - heavy_group_count
+        # An all-heavy calibration intentionally measures the configured
+        # heavy cap. Spill is a transition after a real bulk lane drains, not
+        # a way to bypass that cap when no bulk work existed initially.
+        self._heavy_spill_enabled = self._remaining_bulk > 0
         self._worker_count = worker_count
         self._heavy_worker_count = heavy_worker_count
         self._initial_heavy_group_count = heavy_group_count
@@ -1626,13 +1633,23 @@ class AffinityScreenWorkQueue:
         while not abort.is_set():
             deferred_own_split = False
             heavy_worker = worker_id < self._heavy_worker_count
+            with self._condition:
+                heavy_spill = (
+                    not heavy_worker
+                    and self._heavy_spill_enabled
+                    and self._remaining_bulk == 0
+                )
             eligible_urgent = (
                 [
                     (self._urgent_heavy, "urgent_heavy"),
                     (self._urgent_bulk, "urgent_bulk"),
                 ]
                 if heavy_worker
-                else [(self._urgent_bulk, "urgent_bulk")]
+                else (
+                    [(self._urgent_heavy, "urgent_heavy")]
+                    if heavy_spill
+                    else [(self._urgent_bulk, "urgent_bulk")]
+                )
             )
             for urgent_queue, source in eligible_urgent:
                 work, deferred = self._get_urgent(
@@ -1640,7 +1657,11 @@ class AffinityScreenWorkQueue:
                     source,
                     worker_id,
                     (
-                        self._heavy_worker_count
+                        (
+                            self._worker_count
+                            if heavy_spill
+                            else self._heavy_worker_count
+                        )
                         if source == "urgent_heavy"
                         else self._worker_count
                     ),
@@ -1654,7 +1675,11 @@ class AffinityScreenWorkQueue:
                     (self._scheduled_bulk, "bulk"),
                 ]
                 if heavy_worker
-                else [(self._scheduled_bulk, "bulk")]
+                else (
+                    [(self._scheduled_heavy, "heavy")]
+                    if heavy_spill
+                    else [(self._scheduled_bulk, "bulk")]
+                )
             )
             for scheduled_queue, source in eligible_scheduled:
                 try:
@@ -1689,6 +1714,10 @@ class AffinityScreenWorkQueue:
             for item in remaining:
                 urgent_queue.put((origin_worker_id, [item]))
             self._remaining += len(remaining)
+            if heavy:
+                self._remaining_heavy += len(remaining)
+            else:
+                self._remaining_bulk += len(remaining)
             self._condition.notify_all()
         return len(remaining)
 
@@ -1707,6 +1736,18 @@ class AffinityScreenWorkQueue:
             if self._remaining <= 0:
                 raise RuntimeError("affinity screen queue task accounting underflow")
             self._remaining -= 1
+            if source in {"heavy", "urgent_heavy"}:
+                if self._remaining_heavy <= 0:
+                    raise RuntimeError(
+                        "affinity heavy-lane task accounting underflow"
+                    )
+                self._remaining_heavy -= 1
+            else:
+                if self._remaining_bulk <= 0:
+                    raise RuntimeError(
+                        "affinity bulk-lane task accounting underflow"
+                    )
+                self._remaining_bulk -= 1
             self._condition.notify_all()
 
     @property

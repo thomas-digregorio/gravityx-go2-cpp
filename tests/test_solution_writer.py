@@ -507,6 +507,34 @@ class CompetitionTimingTests(unittest.TestCase):
         work.task_done(bulk_source)
         self.assertEqual(work.remaining_group_count, 0)
 
+    def test_bulk_worker_spills_to_heavy_only_after_bulk_lane_drains(self):
+        abort = threading.Event()
+        work = AffinityScreenWorkQueue(
+            [
+                [{"label": "H1"}],
+                [{"label": "H2"}],
+                [{"label": "B1"}],
+            ],
+            worker_count=2,
+            heavy_labels={"H1", "H2"},
+            heavy_worker_count=1,
+        )
+
+        heavy_source, heavy_group = work.get(abort, worker_id=0)
+        bulk_source, bulk_group = work.get(abort, worker_id=1)
+        self.assertEqual((heavy_source, heavy_group[0]["label"]), ("heavy", "H1"))
+        self.assertEqual((bulk_source, bulk_group[0]["label"]), ("bulk", "B1"))
+
+        # H1 remains active. Completing the last queued-or-active bulk group
+        # releases the formerly bulk-only worker onto the heavy critical path.
+        work.task_done(bulk_source)
+        spill_source, spill_group = work.get(abort, worker_id=1)
+        self.assertEqual((spill_source, spill_group[0]["label"]), ("heavy", "H2"))
+
+        work.task_done(spill_source)
+        work.task_done(heavy_source)
+        self.assertEqual(work.remaining_group_count, 0)
+
     def test_single_heavy_worker_can_reclaim_its_split_sibling(self):
         abort = threading.Event()
         group = [{"label": "H1"}, {"label": "H2"}]

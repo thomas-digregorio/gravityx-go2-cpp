@@ -485,6 +485,23 @@ int run_component_tests() {
         restored.commitment != source.commitment || restored.gen_lambda != source.gen_lambda) {
         throw std::runtime_error("component test failed: AC state JSON round trip");
     }
+    gravityx::ContingencyContext owned_context;
+    owned_context.base_state = source;
+    if (&owned_context.effective_base_state() != &owned_context.base_state ||
+        owned_context.effective_base_state().pg != source.pg) {
+        throw std::runtime_error(
+            "component test failed: owned contingency base state");
+    }
+    gravityx::ContingencyContext borrowed_context;
+    borrowed_context.base_state.pg = {-1.0};
+    borrowed_context.borrow_base_state(source);
+    const auto copied_borrowed_context = borrowed_context;
+    if (&borrowed_context.effective_base_state() != &source ||
+        &copied_borrowed_context.effective_base_state() != &source ||
+        borrowed_context.effective_base_state().pg != source.pg) {
+        throw std::runtime_error(
+            "component test failed: borrowed contingency base state");
+    }
     source.qg = {0.1};
     source.demand_factor = {0.95};
     source.pf = {0.4};
@@ -2334,7 +2351,7 @@ bool solve_loaded_contingency(
         -> gravityx::ContingencyContext& {
         if (!deferred_context) {
             deferred_context.emplace();
-            deferred_context->base_state = base.state;
+            deferred_context->borrow_base_state(base.state);
             if (match->type == gravityx::ContingencyType::Generator) {
                 deferred_context->outaged_generator = match->component;
             } else {

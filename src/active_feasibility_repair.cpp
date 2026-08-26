@@ -292,8 +292,10 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     const int nd = static_cast<int>(data.loads.size());
     const int nl = static_cast<int>(data.branches.size());
     if (commitment.size() != data.generators.size() ||
-        contingency.base_state.pg.size() != data.generators.size() ||
-        contingency.base_state.demand_factor.size() != data.loads.size() ||
+        contingency.effective_base_state().pg.size() !=
+            data.generators.size() ||
+        contingency.effective_base_state().demand_factor.size() !=
+            data.loads.size() ||
         reference.vm.size() != data.buses.size() ||
         reference.va.size() != data.buses.size() ||
         reference.pg.size() != data.generators.size() ||
@@ -338,11 +340,11 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         const auto& generator = data.generators[i];
         p_lower[i] = std::max(
             generator.pmin,
-            contingency.base_state.pg[i] -
+            contingency.effective_base_state().pg[i] -
                 data.delta_r_ctg * generator.prdmaxctg);
         p_upper[i] = std::min(
             generator.pmax,
-            contingency.base_state.pg[i] +
+            contingency.effective_base_state().pg[i] +
                 data.delta_r_ctg * generator.prumaxctg);
         q_lower[i] = generator.qmin;
         q_upper[i] = generator.qmax;
@@ -365,7 +367,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     for (int i = 0; i < nd; ++i) {
         const auto& load = data.loads[i];
         const double previous = load.pd_nominal *
-            contingency.base_state.demand_factor[i];
+            contingency.effective_base_state().demand_factor[i];
         if (std::abs(load.pd_nominal) <= 1e-12) {
             load_factor_lower[i] = load.tmin;
             load_factor_upper[i] = load.tmax;
@@ -877,8 +879,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             branch.rate_c * branch.rate_c * to_scale * to_scale);
 
         const double source_delta =
-            contingency.base_state.va[branch.from] -
-            contingency.base_state.va[branch.to];
+            contingency.effective_base_state().va[branch.from] -
+            contingency.effective_base_state().va[branch.to];
         if (source_delta < branch.angmin || source_delta > branch.angmax) {
             continue;
         }

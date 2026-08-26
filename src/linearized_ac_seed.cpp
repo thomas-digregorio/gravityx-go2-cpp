@@ -376,7 +376,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         }
     }
     if (contingency) {
-        const auto& base = contingency->base_state;
+        const auto& base = contingency->effective_base_state();
         if (base.pg.size() != data.generators.size() ||
             base.demand_factor.size() != data.loads.size() ||
             base.va.size() != data.buses.size()) {
@@ -523,11 +523,11 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             if (contingency) {
                 lower[pg_offset + i] = std::max(
                     gen.pmin,
-                    contingency->base_state.pg[i]
+                    contingency->effective_base_state().pg[i]
                         - data.delta_r_ctg * gen.prdmaxctg);
                 upper[pg_offset + i] = std::min(
                     gen.pmax,
-                    contingency->base_state.pg[i]
+                    contingency->effective_base_state().pg[i]
                         + data.delta_r_ctg * gen.prumaxctg);
             } else {
                 const double previous =
@@ -557,7 +557,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         if (std::abs(load.pd_nominal) > 1e-12) {
             const double previous = contingency
                 ? load.pd_nominal
-                    * contingency->base_state.demand_factor[i]
+                    * contingency->effective_base_state().demand_factor[i]
                 : load.pd_prev;
             const double down = contingency
                 ? load.prdmaxctg * data.delta_r_ctg
@@ -740,8 +740,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             rows.push_back(std::move(row));
         }
         const double source_delta = contingency
-            ? contingency->base_state.va[branch.from]
-                - contingency->base_state.va[branch.to]
+            ? contingency->effective_base_state().va[branch.from]
+                - contingency->effective_base_state().va[branch.to]
             : data.buses[branch.from].va_start
                 - data.buses[branch.to].va_start;
         const double angle_minimum =

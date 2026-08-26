@@ -304,7 +304,7 @@ AcModel::AcModel(
             "acceptable termination requires a reusable contingency model");
     }
     if (contingency_) {
-        const auto& state = contingency_->base_state;
+        const auto& state = contingency_->effective_base_state();
         if (state.vm.size() != data_.buses.size() || state.va.size() != data_.buses.size() ||
             state.pg.size() != data_.generators.size() || state.qg.size() != data_.generators.size() ||
             state.demand_factor.size() != data_.loads.size() ||
@@ -406,8 +406,14 @@ void AcModel::build_variables() {
         } else if (active) {
             const auto bounds = mode_ == ModelMode::ContingencySoft
                 ? std::pair<double, double>{
-                    std::max(gen.pmin, contingency_->base_state.pg[i] - data_.delta_r_ctg * gen.prdmaxctg),
-                    std::min(gen.pmax, contingency_->base_state.pg[i] + data_.delta_r_ctg * gen.prumaxctg)}
+                    std::max(
+                        gen.pmin,
+                        contingency_->effective_base_state().pg[i] -
+                            data_.delta_r_ctg * gen.prdmaxctg),
+                    std::min(
+                        gen.pmax,
+                        contingency_->effective_base_state().pg[i] +
+                            data_.delta_r_ctg * gen.prumaxctg)}
                 : base_pg_bounds(gen, 1, data_.delta_r);
             if (bounds.first > bounds.second + 1e-12) {
                 throw std::runtime_error("empty generator ramp interval in " + gen.source_key);
@@ -449,7 +455,8 @@ void AcModel::build_variables() {
             demand_lower[i] = bounds.first;
             demand_upper[i] = bounds.second;
         } else if (mode_ == ModelMode::ContingencySoft) {
-            const double previous = load.pd_nominal * contingency_->base_state.demand_factor[i];
+            const double previous = load.pd_nominal *
+                contingency_->effective_base_state().demand_factor[i];
             if (std::abs(load.pd_nominal) <= 1e-12) {
                 demand_lower[i] = load.tmin;
                 demand_upper[i] = load.tmax;
@@ -597,11 +604,11 @@ void AcModel::build_constraints_and_objective() {
             if (reusable_contingencies_ && fixed_status_[i] == 1) {
                 const double pg_lower = std::max(
                     gen.pmin,
-                    contingency_->base_state.pg[i] -
+                    contingency_->effective_base_state().pg[i] -
                         data_.delta_r_ctg * gen.prdmaxctg);
                 const double pg_upper = std::min(
                     gen.pmax,
-                    contingency_->base_state.pg[i] +
+                    contingency_->effective_base_state().pg[i] +
                         data_.delta_r_ctg * gen.prumaxctg);
                 add_le(model_, "resident_gen_pmax_" + std::to_string(i),
                        (*pg_)(i) - pg_upper * (*generator_available_)(i));
@@ -756,7 +763,8 @@ void AcModel::build_constraints_and_objective() {
         add_eq(model_, "ohms_qt_" + std::to_string(i), q_to);
 
         const double start_delta = mode_ == ModelMode::ContingencySoft
-            ? contingency_->base_state.va[f] - contingency_->base_state.va[t]
+            ? contingency_->effective_base_state().va[f] -
+                contingency_->effective_base_state().va[t]
             : data_.buses[f].va_start - data_.buses[t].va_start;
         if (start_delta >= branch.angmin && start_delta <= branch.angmax &&
             (reusable_contingencies_ || branch.status != 0)) {
@@ -806,15 +814,15 @@ void AcModel::build_constraints_and_objective() {
 void AcModel::initialize_source_point() {
     std::optional<AcState> contingency_start;
     if (mode_ == ModelMode::ContingencySoft) {
-        contingency_start = contingency_->base_state;
+        contingency_start = contingency_->effective_base_state();
     }
 
     for (std::size_t i = 0; i < data_.buses.size(); ++i) {
         const double vm = mode_ == ModelMode::ContingencySoft
-            ? contingency_->base_state.vm[i]
+            ? contingency_->effective_base_state().vm[i]
             : data_.buses[i].vm_start;
         const double va = mode_ == ModelMode::ContingencySoft
-            ? contingency_->base_state.va[i]
+            ? contingency_->effective_base_state().va[i]
             : data_.buses[i].va_start;
         const double bounded_vm = clamp_to(vm, data_.buses[i].vmin, data_.buses[i].vmax);
         vm_->initialize(i, bounded_vm);
@@ -828,10 +836,10 @@ void AcModel::initialize_source_point() {
     for (std::size_t i = 0; i < data_.generators.size(); ++i) {
         const auto& gen = data_.generators[i];
         double pg = mode_ == ModelMode::ContingencySoft
-            ? contingency_->base_state.pg[i]
+            ? contingency_->effective_base_state().pg[i]
             : gen.pg_start;
         double qg = mode_ == ModelMode::ContingencySoft
-            ? contingency_->base_state.qg[i]
+            ? contingency_->effective_base_state().qg[i]
             : gen.qg_start;
         if (mode_ == ModelMode::BaseSoft) {
             const auto bounds = base_pg_bounds(gen, fixed_status_[i], data_.delta_r);
@@ -855,9 +863,13 @@ void AcModel::initialize_source_point() {
                 qg = 0.0;
             } else {
                 const double lower = std::max(
-                    gen.pmin, contingency_->base_state.pg[i] - data_.delta_r_ctg * gen.prdmaxctg);
+                    gen.pmin,
+                    contingency_->effective_base_state().pg[i] -
+                        data_.delta_r_ctg * gen.prdmaxctg);
                 const double upper = std::min(
-                    gen.pmax, contingency_->base_state.pg[i] + data_.delta_r_ctg * gen.prumaxctg);
+                    gen.pmax,
+                    contingency_->effective_base_state().pg[i] +
+                        data_.delta_r_ctg * gen.prumaxctg);
                 pg = clamp_to(pg, lower, upper);
                 qg = clamp_to(qg, gen.qmin, gen.qmax);
             }
@@ -887,7 +899,7 @@ void AcModel::initialize_source_point() {
 
     for (std::size_t i = 0; i < data_.loads.size(); ++i) {
         double z = mode_ == ModelMode::ContingencySoft
-            ? contingency_->base_state.demand_factor[i]
+            ? contingency_->effective_base_state().demand_factor[i]
             : data_.loads[i].z_start;
         if (mode_ == ModelMode::BaseSoft) {
             const auto bounds = base_load_bounds(data_.loads[i], data_.delta_r);
@@ -896,7 +908,8 @@ void AcModel::initialize_source_point() {
             z = clamp_to(z, data_.loads[i].tmin, data_.loads[i].tmax);
         } else {
             const auto& load = data_.loads[i];
-            const double previous = load.pd_nominal * contingency_->base_state.demand_factor[i];
+            const double previous = load.pd_nominal *
+                contingency_->effective_base_state().demand_factor[i];
             const double lower = std::abs(load.pd_nominal) <= 1e-12
                 ? load.tmin
                 : std::max(load.tmin, (previous - load.prdmaxctg * data_.delta_r_ctg) / load.pd_nominal);
@@ -920,13 +933,13 @@ void AcModel::initialize_source_point() {
             contingency_->outaged_branch == static_cast<int>(i);
         const bool unavailable = data_.branches[i].status == 0 || outaged;
         const double pf = mode_ == ModelMode::ContingencySoft && !unavailable
-            ? contingency_->base_state.pf[i] : 0.0;
+            ? contingency_->effective_base_state().pf[i] : 0.0;
         const double qf = mode_ == ModelMode::ContingencySoft && !unavailable
-            ? contingency_->base_state.qf[i] : 0.0;
+            ? contingency_->effective_base_state().qf[i] : 0.0;
         const double pt = mode_ == ModelMode::ContingencySoft && !unavailable
-            ? contingency_->base_state.pt[i] : 0.0;
+            ? contingency_->effective_base_state().pt[i] : 0.0;
         const double qt = mode_ == ModelMode::ContingencySoft && !unavailable
-            ? contingency_->base_state.qt[i] : 0.0;
+            ? contingency_->effective_base_state().qt[i] : 0.0;
         pf_->initialize(i, pf);
         qf_->initialize(i, qf);
         pt_->initialize(i, pt);
@@ -958,7 +971,7 @@ void AcModel::set_contingency(const ContingencyContext& contingency) {
     if (!reusable_contingencies_) {
         throw std::runtime_error("cannot update a non-reusable contingency model");
     }
-    const auto& state = contingency.base_state;
+    const auto& state = contingency.effective_base_state();
     if (state.vm.size() != data_.buses.size() || state.va.size() != data_.buses.size() ||
         state.pg.size() != data_.generators.size() || state.qg.size() != data_.generators.size() ||
         state.demand_factor.size() != data_.loads.size() ||
@@ -1137,9 +1150,13 @@ void AcModel::initialize_from(const AcState& state) {
                 qg = 0.0;
             } else {
                 const double lower = std::max(
-                    gen.pmin, contingency_->base_state.pg[i] - data_.delta_r_ctg * gen.prdmaxctg);
+                    gen.pmin,
+                    contingency_->effective_base_state().pg[i] -
+                        data_.delta_r_ctg * gen.prdmaxctg);
                 const double upper = std::min(
-                    gen.pmax, contingency_->base_state.pg[i] + data_.delta_r_ctg * gen.prumaxctg);
+                    gen.pmax,
+                    contingency_->effective_base_state().pg[i] +
+                        data_.delta_r_ctg * gen.prumaxctg);
                 pg = clamp_to(pg, lower, upper);
                 qg = clamp_to(qg, gen.qmin, gen.qmax);
             }

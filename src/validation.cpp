@@ -306,7 +306,7 @@ static ValidationReport validate_state_impl(
         throw std::runtime_error("soft-balance state dimensions do not match case dimensions");
     }
     if (contingency) {
-        const auto& base = contingency->base_state;
+        const auto& base = contingency->effective_base_state();
         if (base.vm.size() != nb || base.va.size() != nb || base.pg.size() != ng ||
             base.qg.size() != ng || base.demand_factor.size() != nd ||
             base.pf.size() != nl || base.qf.size() != nl ||
@@ -321,7 +321,7 @@ static ValidationReport validate_state_impl(
         // before screening and is checked again by the final independent
         // validator, so rescanning every base vector in every local-search
         // trial adds no new acceptance protection.
-        require_finite_state(contingency->base_state, "base.");
+        require_finite_state(contingency->effective_base_state(), "base.");
     }
 
     std::vector<int> default_fixed_status;
@@ -428,7 +428,8 @@ static ValidationReport validate_state_impl(
         }
 
         const double start_delta = mode == ModelMode::ContingencySoft
-            ? contingency->base_state.va[f] - contingency->base_state.va[t]
+            ? contingency->effective_base_state().va[f] -
+                contingency->effective_base_state().va[t]
             : data.buses[f].va_start - data.buses[t].va_start;
         if (start_delta >= branch.angmin && start_delta <= branch.angmax) {
             const double angle = state.va[f] - state.va[t];
@@ -544,10 +545,12 @@ static ValidationReport validate_state_impl(
             if (mode == ModelMode::ContingencySoft) {
                 pg_lower = std::max(
                     gen.pmin,
-                    contingency->base_state.pg[i] - data.delta_r_ctg * gen.prdmaxctg);
+                    contingency->effective_base_state().pg[i] -
+                        data.delta_r_ctg * gen.prdmaxctg);
                 pg_upper = std::min(
                     gen.pmax,
-                    contingency->base_state.pg[i] + data.delta_r_ctg * gen.prumaxctg);
+                    contingency->effective_base_state().pg[i] +
+                        data.delta_r_ctg * gen.prumaxctg);
             } else {
                 std::tie(pg_lower, pg_upper) = base_pg_bounds(gen, 1, data.delta_r);
             }
@@ -620,7 +623,8 @@ static ValidationReport validate_state_impl(
         if (mode == ModelMode::BaseSoft) {
             bounds = base_load_bounds(load, data.delta_r);
         } else if (mode == ModelMode::ContingencySoft) {
-            const double previous = load.pd_nominal * contingency->base_state.demand_factor[i];
+            const double previous = load.pd_nominal *
+                contingency->effective_base_state().demand_factor[i];
             bounds = std::abs(load.pd_nominal) <= 1e-12
                 ? std::pair<double, double>{load.tmin, load.tmax}
                 : std::pair<double, double>{
@@ -650,7 +654,8 @@ static ValidationReport validate_state_impl(
                 "load_ramp", capture_identity,
                 [&] { return "load:" + load.source_key + ":down"; });
         } else if (mode == ModelMode::ContingencySoft) {
-            const double previous = load.pd_nominal * contingency->base_state.demand_factor[i];
+            const double previous = load.pd_nominal *
+                contingency->effective_base_state().demand_factor[i];
             const double current = load.pd_nominal * state.demand_factor[i];
             update_category(report, report.max_load_ramp_violation,
                 positive_part(current - previous - load.prumaxctg * data.delta_r_ctg),
@@ -750,7 +755,7 @@ ValidationReport validate_rebuilt_contingency_economic_and_ohms(
     if (state.vm.size() != nb || state.va.size() != nb || state.pg.size() != ng ||
         state.demand_factor.size() != nd || state.pf.size() != nl ||
         state.qf.size() != nl || state.pt.size() != nl || state.qt.size() != nl ||
-        contingency.base_state.pg.size() != ng) {
+        contingency.effective_base_state().pg.size() != ng) {
         throw std::runtime_error(
             "rebuilt economic/Ohm validation dimensions do not match case");
     }
@@ -780,11 +785,11 @@ ValidationReport validate_rebuilt_contingency_economic_and_ohms(
         }
         const double pg_lower = std::max(
             gen.pmin,
-            contingency.base_state.pg[i] -
+            contingency.effective_base_state().pg[i] -
                 data.delta_r_ctg * gen.prdmaxctg);
         const double pg_upper = std::min(
             gen.pmax,
-            contingency.base_state.pg[i] +
+            contingency.effective_base_state().pg[i] +
                 data.delta_r_ctg * gen.prumaxctg);
         validate_generator_pwl(
             report, gen, state, i, pg_lower, pg_upper,

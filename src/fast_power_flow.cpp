@@ -2720,7 +2720,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     std::optional<ContingencyContext> direct_context;
     if (!base_mode) {
         direct_context = ContingencyContext{};
-        direct_context->base_state = base_state_;
+        direct_context->borrow_base_state(base_state_);
         direct_context->outaged_generator = outaged_generator;
         direct_context->outaged_branch = outaged_branch;
     }
@@ -6708,7 +6708,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     std::optional<ContingencyContext> context;
     if (!base_mode) {
         context = ContingencyContext{};
-        context->base_state = base_state_;
+        context->borrow_base_state(base_state_);
         context->outaged_generator = outaged_generator;
         context->outaged_branch = outaged_branch;
     }

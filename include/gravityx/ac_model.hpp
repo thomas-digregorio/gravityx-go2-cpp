@@ -53,6 +53,16 @@ struct ContingencyContext {
     int outaged_generator{-1};
     int outaged_branch{-1};
     AcState base_state;
+    const AcState* base_state_reference{};
+
+    const AcState& effective_base_state() const noexcept {
+        return base_state_reference != nullptr
+            ? *base_state_reference : base_state;
+    }
+
+    void borrow_base_state(const AcState& state) noexcept {
+        base_state_reference = &state;
+    }
 };
 
 struct BalanceSlackSeed {

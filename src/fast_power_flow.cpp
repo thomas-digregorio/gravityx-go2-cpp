@@ -853,9 +853,86 @@ std::vector<std::vector<int>> connected_components(
     return result;
 }
 
+std::vector<unsigned char> bridge_branches(const CaseData& data) {
+    struct IncidentEdge {
+        int neighbor{-1};
+        int branch{-1};
+    };
+    struct DfsFrame {
+        int bus{-1};
+        std::size_t next_edge{};
+    };
+
+    const int nb = static_cast<int>(data.buses.size());
+    std::vector<std::vector<IncidentEdge>> adjacency(
+        static_cast<std::size_t>(nb));
+    for (int branch_index = 0;
+         branch_index < static_cast<int>(data.branches.size());
+         ++branch_index) {
+        const auto& branch = data.branches[branch_index];
+        if (branch.status == 0) {
+            continue;
+        }
+        adjacency[branch.from].push_back({branch.to, branch_index});
+        adjacency[branch.to].push_back({branch.from, branch_index});
+    }
+
+    std::vector<int> discovery(static_cast<std::size_t>(nb), -1);
+    std::vector<int> low(static_cast<std::size_t>(nb), -1);
+    std::vector<int> parent_bus(static_cast<std::size_t>(nb), -1);
+    std::vector<int> parent_branch(static_cast<std::size_t>(nb), -1);
+    std::vector<unsigned char> bridge(data.branches.size(), 0);
+    std::vector<DfsFrame> stack;
+    stack.reserve(static_cast<std::size_t>(nb));
+    int next_discovery = 0;
+
+    for (int root = 0; root < nb; ++root) {
+        if (discovery[root] >= 0) {
+            continue;
+        }
+        discovery[root] = next_discovery;
+        low[root] = next_discovery;
+        ++next_discovery;
+        stack.push_back({root, 0});
+        while (!stack.empty()) {
+            auto& frame = stack.back();
+            const int bus = frame.bus;
+            if (frame.next_edge < adjacency[bus].size()) {
+                const auto edge = adjacency[bus][frame.next_edge++];
+                if (edge.branch == parent_branch[bus]) {
+                    continue;
+                }
+                if (discovery[edge.neighbor] < 0) {
+                    parent_bus[edge.neighbor] = bus;
+                    parent_branch[edge.neighbor] = edge.branch;
+                    discovery[edge.neighbor] = next_discovery;
+                    low[edge.neighbor] = next_discovery;
+                    ++next_discovery;
+                    stack.push_back({edge.neighbor, 0});
+                    continue;
+                }
+                low[bus] = std::min(low[bus], discovery[edge.neighbor]);
+                continue;
+            }
+
+            stack.pop_back();
+            const int parent = parent_bus[bus];
+            if (parent < 0) {
+                continue;
+            }
+            const int branch = parent_branch[bus];
+            if (low[bus] > discovery[parent]) {
+                bridge[branch] = 1;
+            }
+            low[parent] = std::min(low[parent], low[bus]);
+        }
+    }
+    return bridge;
+}
+
 void normalize_source_reference_angles(
     const CaseData& data,
-    int outaged_branch,
+    const std::vector<std::vector<int>>& components,
     std::vector<double>& va) {
     if (va.size() != data.buses.size()) {
         throw std::runtime_error(
@@ -867,7 +944,7 @@ void normalize_source_reference_angles(
     // zero radians.  A component-wide angle translation leaves all branch
     // angle differences, AC flows, and operating controls unchanged, so
     // restore that source gauge before independently validating a candidate.
-    for (const auto& component : connected_components(data, outaged_branch)) {
+    for (const auto& component : components) {
         int source_reference = -1;
         for (int bus : component) {
             if (data.buses[bus].type == 3) {
@@ -879,6 +956,9 @@ void normalize_source_reference_angles(
             continue;
         }
         const double offset = va[source_reference];
+        if (offset == 0.0) {
+            continue;
+        }
         for (int bus : component) {
             va[bus] -= offset;
         }
@@ -886,6 +966,51 @@ void normalize_source_reference_angles(
 }
 
 }  // namespace
+
+void run_fast_power_flow_topology_cache_regression() {
+    CaseData data;
+    data.buses.resize(3);
+    data.buses[0].type = 3;
+    data.buses[1].type = 1;
+    data.buses[2].type = 3;
+    data.branches.resize(3);
+    for (int branch = 0; branch < 2; ++branch) {
+        data.branches[branch].from = 0;
+        data.branches[branch].to = 1;
+        data.branches[branch].status = 1;
+    }
+    data.branches[2].from = 1;
+    data.branches[2].to = 2;
+    data.branches[2].status = 1;
+
+    const auto bridges = bridge_branches(data);
+    if (bridges.size() != 3 || bridges[0] != 0 || bridges[1] != 0 ||
+        bridges[2] == 0) {
+        throw std::runtime_error(
+            "fast power-flow topology cache misclassified a parallel edge "
+            "or bridge");
+    }
+    const auto parallel_outage_components = connected_components(data, 0);
+    if (parallel_outage_components.size() != 1 ||
+        parallel_outage_components.front().size() != 3) {
+        throw std::runtime_error(
+            "fast power-flow topology cache split a parallel outage");
+    }
+    const auto bridge_outage_components = connected_components(data, 2);
+    if (bridge_outage_components.size() != 2) {
+        throw std::runtime_error(
+            "fast power-flow topology cache did not split a bridge outage");
+    }
+    std::vector<double> angles{0.25, 0.40, -0.30};
+    normalize_source_reference_angles(
+        data, bridge_outage_components, angles);
+    if (std::abs(angles[0]) > 1e-12 ||
+        std::abs(angles[1] - 0.15) > 1e-12 ||
+        std::abs(angles[2]) > 1e-12) {
+        throw std::runtime_error(
+            "fast power-flow topology cache normalized the wrong island");
+    }
+}
 
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     struct LowRankUpdate {
@@ -2386,7 +2511,8 @@ ValidatedSourceBaseResult build_validated_source_base(
             data.buses[i].vm_start, data.buses[i].vmin, data.buses[i].vmax);
         state.va[i] = data.buses[i].va_start;
     }
-    normalize_source_reference_angles(data, -1, state.va);
+    const auto source_components = connected_components(data, -1);
+    normalize_source_reference_angles(data, source_components, state.va);
 
     state.pg.assign(data.generators.size(), 0.0);
     state.qg.assign(data.generators.size(), 0.0);
@@ -2487,7 +2613,9 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
     : data_(data),
       base_state_(base_state),
       commitment_(std::move(commitment)),
-      options_(options) {
+      options_(options),
+      base_components_(connected_components(data, -1)),
+      bridge_branch_(bridge_branches(data)) {
     if (commitment_.size() != data_.generators.size()) {
         throw std::runtime_error("fast power flow commitment has wrong length");
     }
@@ -2596,10 +2724,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         direct_context->outaged_generator = outaged_generator;
         direct_context->outaged_branch = outaged_branch;
     }
+    std::vector<std::vector<int>> bridge_outage_components;
+    const std::vector<std::vector<int>>* components_pointer =
+        &base_components_;
+    if (outaged_branch >= 0 &&
+        bridge_branch_[static_cast<std::size_t>(outaged_branch)] != 0) {
+        bridge_outage_components =
+            connected_components(data_, outaged_branch);
+        components_pointer = &bridge_outage_components;
+    }
+    const auto& components = *components_pointer;
     AcState direct_state = initial_state;
     direct_state.pg = pg;
     direct_state.qg = qg;
-    normalize_source_reference_angles(data_, outaged_branch, direct_state.va);
+    normalize_source_reference_angles(data_, components, direct_state.va);
     compute_branch_flows(data_, outaged_branch, !base_mode, direct_state);
     const auto direct_balance = nodal_balance_slack_seed(
         data_, direct_state, 0.5, 1e-7);
@@ -2686,7 +2824,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         return output;
     }
 
-    const auto components = connected_components(data_, outaged_branch);
     std::vector<bool> slack(nb, false);
     std::vector<bool> pq(nb, true);
     std::vector<int> component_of(nb, -1);
@@ -2916,7 +3053,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 const auto projection_validation_start =
                     std::chrono::steady_clock::now();
                 normalize_source_reference_angles(
-                    data_, outaged_branch, predictor_state.va);
+                    data_, components, predictor_state.va);
                 // The predictor changes only the physical controls below.
                 // Recompute branch flows once here, then seed nodal slacks
                 // after the local P/Q projections have finished.  Calling
@@ -3510,7 +3647,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 const auto project_trial_reactive_and_validate =
                     [&](AcState& trial) {
                     normalize_source_reference_angles(
-                        data_, outaged_branch, trial.va);
+                        data_, components, trial.va);
                     // Correction trials need fresh nonlinear branch flows,
                     // but their nodal slacks are only meaningful after the
                     // local active/reactive redispatch below.  Avoid the
@@ -5590,7 +5727,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         output.solve.iterations = output.fixed_jacobian_predictor_iterations;
         output.solve.state = best_intermediate_state;
         normalize_source_reference_angles(
-            data_, outaged_branch, output.solve.state.va);
+            data_, components, output.solve.state.va);
         output.solve.objective = rebuild_contingency_state_derived_fields(
             data_, base_state_, commitment_, *contingency,
             output.solve.state);
@@ -6198,7 +6335,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
     }
 
-    normalize_source_reference_angles(data_, outaged_branch, va);
+    normalize_source_reference_angles(data_, components, va);
     for (int bus = 0; bus < nb; ++bus) {
         vm[bus] = std::clamp(
             vm[bus], data_.buses[bus].vmin, data_.buses[bus].vmax);
@@ -6669,7 +6806,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             }
 
             normalize_source_reference_angles(
-                data_, outaged_branch, state.va);
+                data_, components, state.va);
             refresh_network_fields();
             const ValidationReport polished_validation =
                 validate_candidate(state);

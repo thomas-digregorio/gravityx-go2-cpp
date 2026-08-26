@@ -81,6 +81,8 @@ ValidatedSourceBaseResult build_validated_source_base(
     std::vector<int> commitment,
     double validation_tolerance = 1e-5);
 
+void run_fast_power_flow_topology_cache_regression();
+
 double rebuild_base_state_derived_fields(
     const CaseData& data,
     const std::vector<int>& commitment,
@@ -121,6 +123,8 @@ private:
     const AcState& base_state_;
     std::vector<int> commitment_;
     FastPowerFlowOptions options_;
+    std::vector<std::vector<int>> base_components_;
+    std::vector<unsigned char> bridge_branch_;
     struct FixedJacobianPredictorCache;
     mutable std::unique_ptr<FixedJacobianPredictorCache> predictor_cache_;
 

@@ -461,6 +461,7 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 }
 
 int run_component_tests() {
+    gravityx::run_fast_power_flow_topology_cache_regression();
     const auto points = gravityx::active_pwl_points(
         {0.0, 0.0, 10.0, 100.0, 20.0, 300.0}, 3, 5.0, 15.0);
     if (points.size() != 3) {

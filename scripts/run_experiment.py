@@ -3461,6 +3461,7 @@ def main() -> int:
                             task["solution_path"] = to_wsl(
                                 args.output_dir / f"solution_{label}.txt"
                             )
+                        task_started = time.perf_counter()
                         process.stdin.write(
                             json.dumps(task, separators=(",", ":")) + "\n"
                         )
@@ -3468,6 +3469,7 @@ def main() -> int:
                         acknowledgement = json.loads(
                             read_until("GRAVITYX_TASK_RESULT ")
                         )
+                        task_wall_seconds = time.perf_counter() - task_started
                         if (acknowledgement.get("label") != label or
                                 not acknowledgement.get("success", False)):
                             raise RuntimeError(
@@ -3488,6 +3490,36 @@ def main() -> int:
                                 )
                         else:
                             result = read_json(result_path)
+                        solve_wall_seconds = float(
+                            result["solve"]["wall_seconds"]
+                        )
+                        solution_write_seconds = float(
+                            acknowledgement.get("solution_write_seconds", 0.0)
+                        )
+                        orchestration_unattributed_seconds = max(
+                            0.0,
+                            task_wall_seconds
+                            - solve_wall_seconds
+                            - solution_write_seconds,
+                        )
+                        output_lines.append(
+                            "GRAVITYX_ORCHESTRATION "
+                            + json.dumps(
+                                {
+                                    "label": label,
+                                    "task_wall_seconds": task_wall_seconds,
+                                    "solver_wall_seconds": solve_wall_seconds,
+                                    "solution_write_seconds": (
+                                        solution_write_seconds
+                                    ),
+                                    "unattributed_seconds": (
+                                        orchestration_unattributed_seconds
+                                    ),
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
                         split_count = 0
                         if result.get("success", False):
                             save_secure_result(item, result, worker_id, "fast_screen")
@@ -3547,6 +3579,13 @@ def main() -> int:
                                     "worker_id": worker_id,
                                     "feasible": bool(result.get("success", False)),
                                     "wall_seconds": result["solve"]["wall_seconds"],
+                                    "task_wall_seconds": task_wall_seconds,
+                                    "solution_write_seconds": (
+                                        solution_write_seconds
+                                    ),
+                                    "orchestration_unattributed_seconds": (
+                                        orchestration_unattributed_seconds
+                                    ),
                                     "max_residual": result["validation"]["max_residual"],
                                     "failure_reason": (
                                         result.get("fast_screen") or {}

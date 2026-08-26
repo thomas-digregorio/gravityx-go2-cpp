@@ -1555,6 +1555,9 @@ class AffinityScreenWorkQueue:
     affinity group exposes its unattempted siblings as singleton tasks. The
     completed member still provides the group's initial related-outage seed,
     while the hidden serial tail becomes available to every idle worker.
+    When measured heavy-label times are supplied, heavy groups use
+    longest-predicted-work-first order. Unprofiled siblings receive the
+    smallest measured heavy time so group size remains represented.
 
     ``remaining`` counts queued plus active groups across both lanes. Idle
     workers therefore wait while another worker can still create urgent
@@ -1568,6 +1571,7 @@ class AffinityScreenWorkQueue:
         worker_count: int,
         heavy_labels: set[str] | None = None,
         heavy_worker_count: int = 0,
+        heavy_label_seconds: dict[str, float] | None = None,
     ):
         if any(not group for group in groups):
             raise ValueError("affinity screen groups must be nonempty")
@@ -1579,6 +1583,11 @@ class AffinityScreenWorkQueue:
                 "the total worker count"
             )
         heavy_labels = heavy_labels or set()
+        heavy_label_seconds = heavy_label_seconds or {}
+        if not set(heavy_label_seconds).issubset(heavy_labels):
+            raise ValueError(
+                "profiled heavy times must refer only to profiled heavy labels"
+            )
         if heavy_labels and heavy_worker_count == 0:
             raise ValueError("profiled heavy groups require at least one heavy worker")
         if not heavy_labels and heavy_worker_count != 0:
@@ -1591,13 +1600,35 @@ class AffinityScreenWorkQueue:
         self._urgent_bulk: queue.Queue[
             tuple[int, list[dict[str, Any]]]
         ] = queue.Queue()
-        heavy_group_count = 0
-        for group in groups:
+        heavy_groups: list[tuple[float, int, list[dict[str, Any]]]] = []
+        bulk_groups: list[list[dict[str, Any]]] = []
+        default_heavy_seconds = (
+            min(heavy_label_seconds.values()) if heavy_label_seconds else 0.0
+        )
+        for original_position, group in enumerate(groups):
             if any(str(item["label"]) in heavy_labels for item in group):
-                self._scheduled_heavy.put(group)
-                heavy_group_count += 1
+                estimated_seconds = sum(
+                    heavy_label_seconds.get(
+                        str(item["label"]), default_heavy_seconds
+                    )
+                    for item in group
+                )
+                for item in group:
+                    item["fast_screen_profiled_group_wall_seconds"] = (
+                        estimated_seconds
+                    )
+                heavy_groups.append((estimated_seconds, original_position, group))
             else:
-                self._scheduled_bulk.put(group)
+                bulk_groups.append(group)
+        if heavy_label_seconds:
+            heavy_groups.sort(key=lambda item: (-item[0], item[1]))
+        for dispatch_rank, (_, _, group) in enumerate(heavy_groups, start=1):
+            for item in group:
+                item["fast_screen_profiled_heavy_dispatch_rank"] = dispatch_rank
+            self._scheduled_heavy.put(group)
+        for group in bulk_groups:
+            self._scheduled_bulk.put(group)
+        heavy_group_count = len(heavy_groups)
         self._condition = threading.Condition()
         self._remaining = len(groups)
         self._remaining_heavy = heavy_group_count
@@ -1876,8 +1907,8 @@ def load_fast_screen_heavy_profile(
     path: Path,
     case_sha256: str,
     contingency_labels: set[str],
-) -> tuple[set[str], dict[str, Any]]:
-    """Load a timing-only list used solely to cap expensive concurrency."""
+) -> tuple[set[str], dict[str, float], dict[str, Any]]:
+    """Load timing-only heavy classification and group-ordering data."""
     reject_onedrive(path)
     raw = read_json(path)
     if not isinstance(raw, dict) or raw.get("schema_version") != 1:
@@ -1892,6 +1923,7 @@ def load_fast_screen_heavy_profile(
         raise ValueError("fast-screen heavy profile contingencies must be nonempty")
 
     labels: set[str] = set()
+    measured_by_label: dict[str, float] = {}
     measured_seconds: list[float] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1909,6 +1941,7 @@ def load_fast_screen_heavy_profile(
                 f"invalid profiled fast-screen time for {label}: {measured}"
             )
         labels.add(label)
+        measured_by_label[label] = measured
         measured_seconds.append(measured)
 
     metadata = {
@@ -1920,11 +1953,12 @@ def load_fast_screen_heavy_profile(
         "measured_solver_seconds_sum": sum(measured_seconds),
         "uses_prior_solution_state": False,
         "dispatch_semantics": (
-            "timing-only heavy-lane classification; no primal, dual, "
-            "commitment, network, or solver state"
+            "timing-only heavy-lane classification and descending predicted "
+            "group-work ordering; no primal, dual, commitment, network, or "
+            "solver state"
         ),
     }
-    return labels, metadata
+    return labels, measured_by_label, metadata
 
 
 def load_fallback_schedule_profile(
@@ -2256,14 +2290,17 @@ def main() -> int:
     contingencies = contingency_records(case)
     case_json_sha256 = sha256(args.case_json)
     fast_screen_heavy_labels: set[str] = set()
+    fast_screen_heavy_seconds: dict[str, float] = {}
     fast_screen_heavy_profile_metadata: dict[str, Any] | None = None
     if args.fast_screen_heavy_profile is not None:
-        fast_screen_heavy_labels, fast_screen_heavy_profile_metadata = (
-            load_fast_screen_heavy_profile(
-                args.fast_screen_heavy_profile,
-                case_json_sha256,
-                {str(item["label"]) for item in contingencies},
-            )
+        (
+            fast_screen_heavy_labels,
+            fast_screen_heavy_seconds,
+            fast_screen_heavy_profile_metadata,
+        ) = load_fast_screen_heavy_profile(
+            args.fast_screen_heavy_profile,
+            case_json_sha256,
+            {str(item["label"]) for item in contingencies},
         )
     fallback_schedule: dict[str, dict[str, float | int]] = {}
     fallback_schedule_metadata: dict[str, Any] | None = None
@@ -2524,7 +2561,8 @@ def main() -> int:
                 "splitting, then "
             )
             + (
-                f"{args.fast_screen_heavy_workers}-worker profiled heavy lane, then "
+                "descending timing-profiled heavy group work, then "
+                f"{args.fast_screen_heavy_workers}-worker heavy lane, then "
                 if fast_screen_heavy_labels
                 else ""
             )
@@ -2561,6 +2599,12 @@ def main() -> int:
                     ),
                     "fast_screen_affinity_size": item.get(
                         "fast_screen_affinity_size"
+                    ),
+                    "fast_screen_profiled_group_wall_seconds": item.get(
+                        "fast_screen_profiled_group_wall_seconds"
+                    ),
+                    "fast_screen_profiled_heavy_dispatch_rank": item.get(
+                        "fast_screen_profiled_heavy_dispatch_rank"
                     ),
                 }
                 for item in contingencies
@@ -2755,7 +2799,29 @@ def main() -> int:
             fast_worker_count,
             heavy_labels=fast_screen_heavy_labels,
             heavy_worker_count=args.fast_screen_heavy_workers,
+            heavy_label_seconds=fast_screen_heavy_seconds,
         )
+        profiled_group_seconds = {
+            str(item["label"]): item.get(
+                "fast_screen_profiled_group_wall_seconds"
+            )
+            for group in screen_groups
+            for item in group
+        }
+        profiled_dispatch_ranks = {
+            str(item["label"]): item.get(
+                "fast_screen_profiled_heavy_dispatch_rank"
+            )
+            for group in screen_groups
+            for item in group
+        }
+        for schedule_entry in run_status["contingency_schedule"]:
+            schedule_entry["fast_screen_profiled_group_wall_seconds"] = (
+                profiled_group_seconds.get(str(schedule_entry["label"]))
+            )
+            schedule_entry["fast_screen_profiled_heavy_dispatch_rank"] = (
+                profiled_dispatch_ranks.get(str(schedule_entry["label"]))
+            )
         run_status["fast_screen_profiled_heavy_group_count"] = (
             screen_work.initial_heavy_group_count
         )

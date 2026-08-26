@@ -48,6 +48,7 @@ def run_trial(
     wsl_fast_screen_scratch: bool = False,
     heavy_labels: set[str] | None = None,
     heavy_worker_count: int = 0,
+    heavy_label_seconds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     if task_groups is None:
@@ -61,6 +62,7 @@ def run_trial(
         workers,
         heavy_labels=heavy_labels,
         heavy_worker_count=heavy_worker_count,
+        heavy_label_seconds=heavy_label_seconds,
     )
     abort = threading.Event()
     deadline = time.perf_counter() + timeout_seconds
@@ -433,10 +435,15 @@ def main() -> int:
 
     case = read_json(args.case_json)
     heavy_labels: set[str] = set()
+    heavy_label_seconds: dict[str, float] = {}
     heavy_profile_metadata: dict[str, Any] | None = None
     if args.fast_screen_heavy_profile is not None:
         reject_onedrive(args.fast_screen_heavy_profile)
-        heavy_labels, heavy_profile_metadata = load_fast_screen_heavy_profile(
+        (
+            heavy_labels,
+            heavy_label_seconds,
+            heavy_profile_metadata,
+        ) = load_fast_screen_heavy_profile(
             args.fast_screen_heavy_profile,
             sha256(args.case_json),
             {
@@ -532,6 +539,7 @@ def main() -> int:
             args.wsl_fast_screen_scratch,
             heavy_labels,
             args.fast_screen_heavy_workers,
+            heavy_label_seconds,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

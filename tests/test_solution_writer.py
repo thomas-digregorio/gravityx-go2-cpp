@@ -584,6 +584,45 @@ class CompetitionTimingTests(unittest.TestCase):
         )
         self.assertEqual(work.remaining_group_count, 0)
 
+    def test_heavy_groups_use_longest_predicted_work_first(self):
+        abort = threading.Event()
+        work = AffinityScreenWorkQueue(
+            [
+                [{"label": "H_SHORT"}],
+                [{"label": "H_LONG"}, {"label": "H_LONG_SIBLING"}],
+                [{"label": "B1"}],
+            ],
+            worker_count=2,
+            heavy_labels={"H_SHORT", "H_LONG"},
+            heavy_worker_count=1,
+            heavy_label_seconds={"H_SHORT": 6.0, "H_LONG": 7.0},
+        )
+
+        source, group = work.get(abort, worker_id=0)
+        self.assertEqual(source, "heavy")
+        self.assertEqual(
+            [item["label"] for item in group],
+            ["H_LONG", "H_LONG_SIBLING"],
+        )
+        self.assertEqual(
+            group[0]["fast_screen_profiled_group_wall_seconds"], 13.0
+        )
+        self.assertEqual(
+            group[0]["fast_screen_profiled_heavy_dispatch_rank"], 1
+        )
+        work.task_done(source)
+
+        source, group = work.get(abort, worker_id=0)
+        self.assertEqual((source, group[0]["label"]), ("heavy", "H_SHORT"))
+        self.assertEqual(
+            group[0]["fast_screen_profiled_heavy_dispatch_rank"], 2
+        )
+        work.task_done(source)
+        source, group = work.get(abort, worker_id=1)
+        self.assertEqual((source, group[0]["label"]), ("bulk", "B1"))
+        work.task_done(source)
+        self.assertEqual(work.remaining_group_count, 0)
+
     def test_single_heavy_worker_can_reclaim_its_split_sibling(self):
         abort = threading.Event()
         group = [{"label": "H1"}, {"label": "H2"}]
@@ -631,10 +670,11 @@ class CompetitionTimingTests(unittest.TestCase):
                     ],
                 },
             )
-            labels, metadata = load_fast_screen_heavy_profile(
+            labels, measured, metadata = load_fast_screen_heavy_profile(
                 path, "case-hash", {"A", "B", "C"}
             )
             self.assertEqual(labels, {"A", "B"})
+            self.assertEqual(measured, {"A": 7.5, "B": 5.0})
             self.assertEqual(metadata["profiled_contingency_count"], 2)
             self.assertFalse(metadata["uses_prior_solution_state"])
             with self.assertRaisesRegex(ValueError, "case hash"):

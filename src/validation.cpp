@@ -115,7 +115,8 @@ static ValidationReport validate_state_impl(
     const AcState& state,
     const std::vector<int>& fixed_status_argument,
     const std::optional<ContingencyContext>& contingency,
-    bool skip_rebuilt_economic_and_ohms_checks) {
+    bool skip_rebuilt_economic_and_ohms_checks,
+    bool capture_identity) {
     const std::size_t nb = data.buses.size();
     const std::size_t ng = data.generators.size();
     const std::size_t nd = data.loads.size();
@@ -173,8 +174,6 @@ static ValidationReport validate_state_impl(
     }
 
     ValidationReport report;
-    const bool capture_identity =
-        !skip_rebuilt_economic_and_ohms_checks;
 
     for (std::size_t i = 0; i < nb; ++i) {
         update_category(report, report.max_variable_bound_violation,
@@ -590,7 +589,7 @@ ValidationReport validate_state(
     const std::vector<int>& fixed_status,
     const std::optional<ContingencyContext>& contingency) {
     return validate_state_impl(
-        data, mode, state, fixed_status, contingency, false);
+        data, mode, state, fixed_status, contingency, false, true);
 }
 
 ValidationReport validate_rebuilt_contingency_trial(
@@ -600,7 +599,17 @@ ValidationReport validate_rebuilt_contingency_trial(
     const ContingencyContext& contingency) {
     return validate_state_impl(
         data, ModelMode::ContingencySoft, state, fixed_status,
-        contingency, true);
+        contingency, true, false);
+}
+
+ValidationReport validate_rebuilt_contingency_predictor(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency) {
+    return validate_state_impl(
+        data, ModelMode::ContingencySoft, state, fixed_status,
+        contingency, true, true);
 }
 
 }  // namespace gravityx

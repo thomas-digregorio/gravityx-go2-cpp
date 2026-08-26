@@ -2795,6 +2795,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             int consecutive_full_local_reactive_active_angle = 0;
             std::string prior_selected_correction_mode;
             double prior_selected_damping = 0.0;
+            std::vector<std::pair<int, double>> coordinate_history;
             double initial_predictor_validation_residual =
                 std::numeric_limits<double>::infinity();
             // Difficult generator outages can enter a late, monotonically
@@ -2811,9 +2812,14 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                  ++predictor_iteration) {
                 const auto projection_validation_start =
                     std::chrono::steady_clock::now();
-                rebuild_contingency_state_fields(
-                    data_, base_state_, commitment_, *contingency,
-                    predictor_state, 0.5, false);
+                // The predictor changes only the physical controls below.
+                // Recompute branch flows once here, then seed nodal slacks
+                // after the local P/Q projections have finished.  Calling
+                // rebuild_contingency_state_fields at both points performed
+                // an otherwise unused full nodal-balance pass before those
+                // projections on every predictor iteration.
+                compute_branch_flows(
+                    data_, outaged_branch, true, predictor_state);
 
                 std::vector<double> p_network(
                     static_cast<std::size_t>(nb), 0.0);
@@ -3028,13 +3034,33 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     }
                 }
 
-                const double predictor_objective =
-                    rebuild_contingency_state_derived_fields(
-                        data_, base_state_, commitment_, *contingency,
-                        predictor_state);
-                predictor_validation = validate_state(
-                    data_, ModelMode::ContingencySoft,
-                    predictor_state, commitment_, direct_context);
+                // Rank nonfinal predictor states using the same physical
+                // source constraints as the full validator.  Economic PWL
+                // fields and branch Ohm residuals are deterministic rebuilds
+                // of Pg/load and the branch flows already computed above, so
+                // recreating and rescanning them for every infeasible trial
+                // adds no acceptance protection.  A candidate that crosses
+                // the physical tolerance is rebuilt economically and passed
+                // through the complete validator before it can be accepted.
+                const auto predictor_balance = nodal_balance_slack_seed(
+                    data_, predictor_state, 0.5, 1e-7);
+                predictor_state.p_delta = predictor_balance.active;
+                predictor_state.q_delta = predictor_balance.reactive;
+                predictor_validation =
+                    validate_rebuilt_contingency_predictor(
+                        data_, predictor_state, commitment_,
+                        *direct_context);
+                double predictor_objective = 0.0;
+                if (predictor_validation.max_residual <=
+                    options_.validation_tolerance) {
+                    predictor_objective =
+                        rebuild_contingency_state_derived_fields(
+                            data_, base_state_, commitment_, *contingency,
+                            predictor_state);
+                    predictor_validation = validate_state(
+                        data_, ModelMode::ContingencySoft,
+                        predictor_state, commitment_, direct_context);
+                }
                 output.fixed_jacobian_predictor_iterations =
                     predictor_iteration;
                 output.fixed_jacobian_predictor_validation =
@@ -3223,6 +3249,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 ValidationReport selected_validation = predictor_validation;
                 double selected_damping = 0.0;
                 std::string selected_correction_mode = "none";
+                int selected_coordinate_bus = -1;
                 constexpr std::array<double, 5> kDampingCandidates{
                     1.0, 0.5, 0.25, 0.125, 0.0625};
                 const auto strongly_improving_full_damping = [&]
@@ -3378,9 +3405,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 }
                 const auto project_trial_reactive_and_validate =
                     [&](AcState& trial) {
-                    rebuild_contingency_state_fields(
-                        data_, base_state_, commitment_, *contingency,
-                        trial, 0.5, false);
+                    // Correction trials need fresh nonlinear branch flows,
+                    // but their nodal slacks are only meaningful after the
+                    // local active/reactive redispatch below.  Avoid the
+                    // redundant pre-projection nodal-balance pass.
+                    compute_branch_flows(
+                        data_, outaged_branch, true, trial);
                     std::vector<double> trial_p_network(
                         static_cast<std::size_t>(nb), 0.0);
                     std::vector<double> trial_q_network(
@@ -3636,6 +3666,60 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             "reactive_feasibility_band";
                         return true;
                     };
+                    const auto try_reactive_voltage_then_active = [&]() {
+                        for (const double damping : kDampingCandidates) {
+                            auto trial = correction_reference;
+                            if (!cache.apply_reactive_correction(
+                                    data_, q_spec, q_network,
+                                    trial.vm, damping)) {
+                                continue;
+                            }
+                            rebuild_contingency_state_fields(
+                                data_, base_state_, commitment_, *contingency,
+                                trial, 0.5, false);
+                            std::vector<double> trial_p_network(
+                                static_cast<std::size_t>(nb), 0.0);
+                            for (int branch_index = 0;
+                                 branch_index <
+                                     static_cast<int>(data_.branches.size());
+                                 ++branch_index) {
+                                if (branch_index == outaged_branch ||
+                                    data_.branches[branch_index].status == 0) {
+                                    continue;
+                                }
+                                const auto& branch =
+                                    data_.branches[branch_index];
+                                trial_p_network[branch.from] +=
+                                    trial.pf[branch_index];
+                                trial_p_network[branch.to] +=
+                                    trial.pt[branch_index];
+                            }
+                            for (const auto& shunt : data_.shunts) {
+                                trial_p_network[shunt.bus] +=
+                                    shunt.gs * trial.vm[shunt.bus] *
+                                    trial.vm[shunt.bus];
+                            }
+                            if (!cache.apply_active_correction(
+                                    data_, p_spec, trial_p_network,
+                                    trial.va, 1.0)) {
+                                continue;
+                            }
+                            const auto trial_validation =
+                                project_trial_reactive_and_validate(trial);
+                            if (trial_validation.max_residual + 1e-10 <
+                                selected_validation.max_residual) {
+                                selected_correction = std::move(trial);
+                                selected_validation = trial_validation;
+                                selected_damping = damping;
+                                selected_correction_mode =
+                                    "reactive_voltage_then_active_angle";
+                                if (strongly_improving_full_damping(
+                                        damping, trial_validation)) {
+                                    break;
+                                }
+                            }
+                        }
+                    };
 
                     // Once this combined correction has selected a full step
                     // twice consecutively, that full step usually remains
@@ -3687,6 +3771,32 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 "continuation_correction_selected"] = true;
                         }
                         return;
+                    }
+                    // When the exact validator identifies a reactive-flow
+                    // bound as the dominant residual, the generic search
+                    // commonly rejects several complete correction families
+                    // before selecting this coupled voltage/angle step. Try
+                    // that same fully rebuilt and validated family first.
+                    // A material-decrease gate protects the nonlinear basin;
+                    // a weak or failed priority attempt is discarded and the
+                    // original deterministic search remains unchanged.
+                    if (reactive_flow_bound_dominant) {
+                        try_reactive_voltage_then_active();
+                        if (selected_correction_mode ==
+                                "reactive_voltage_then_active_angle" &&
+                            selected_validation.max_residual <=
+                                0.99 * predictor_validation.max_residual) {
+                            if (options_.capture_diagnostics) {
+                                output.fixed_jacobian_predictor_trace.back()[
+                                    "reactive_flow_priority_correction_"
+                                    "selected"] = true;
+                            }
+                            return;
+                        }
+                        selected_correction = correction_reference;
+                        selected_validation = predictor_validation;
+                        selected_damping = 0.0;
+                        selected_correction_mode = "none";
                     }
                     if (active_flow_bound_dominant) {
                         const auto& branch =
@@ -4053,60 +4163,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             }
                         }
                     }
-                    for (const double damping : kDampingCandidates) {
-                        if (active_block_dominant) {
-                            break;
-                        }
-                        auto trial = correction_reference;
-                        if (!cache.apply_reactive_correction(
-                                data_, q_spec, q_network,
-                                trial.vm, damping)) {
-                            continue;
-                        }
-                        rebuild_contingency_state_fields(
-                            data_, base_state_, commitment_, *contingency,
-                            trial, 0.5, false);
-                        std::vector<double> trial_p_network(
-                            static_cast<std::size_t>(nb), 0.0);
-                        for (int branch_index = 0;
-                             branch_index <
-                                 static_cast<int>(data_.branches.size());
-                             ++branch_index) {
-                            if (branch_index == outaged_branch ||
-                                data_.branches[branch_index].status == 0) {
-                                continue;
-                            }
-                            const auto& branch =
-                                data_.branches[branch_index];
-                            trial_p_network[branch.from] +=
-                                trial.pf[branch_index];
-                            trial_p_network[branch.to] +=
-                                trial.pt[branch_index];
-                        }
-                        for (const auto& shunt : data_.shunts) {
-                            trial_p_network[shunt.bus] +=
-                                shunt.gs * trial.vm[shunt.bus] *
-                                trial.vm[shunt.bus];
-                        }
-                        if (!cache.apply_active_correction(
-                                data_, p_spec, trial_p_network,
-                                trial.va, 1.0)) {
-                            continue;
-                        }
-                        const auto trial_validation =
-                            project_trial_reactive_and_validate(trial);
-                        if (trial_validation.max_residual + 1e-10 <
-                            selected_validation.max_residual) {
-                            selected_correction = std::move(trial);
-                            selected_validation = trial_validation;
-                            selected_damping = damping;
-                            selected_correction_mode =
-                                "reactive_voltage_then_active_angle";
-                            if (strongly_improving_full_damping(
-                                    damping, trial_validation)) {
-                                break;
-                            }
-                        }
+                    if (!active_block_dominant) {
+                        try_reactive_voltage_then_active();
                     }
                     for (const double damping : kDampingCandidates) {
                         if (active_block_dominant) {
@@ -4134,6 +4192,73 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         }
                     }
                 };
+                const bool prior_one_hop_coordinate =
+                    prior_selected_correction_mode ==
+                        "one_hop_voltage_coordinate" ||
+                    prior_selected_correction_mode ==
+                        "one_hop_voltage_coordinate_continuation";
+                if (!coordinate_history.empty() &&
+                    predictor_validation.worst_category ==
+                        "reactive_balance") {
+                    auto history_trace = nlohmann::json::array();
+                    for (const auto& [candidate_bus, voltage_change] :
+                         coordinate_history) {
+                        if (candidate_bus < 0 || candidate_bus >= nb ||
+                            std::abs(voltage_change) < 1e-12) {
+                            continue;
+                        }
+                        const double proposed_voltage =
+                            correction_reference.vm[candidate_bus] +
+                            voltage_change;
+                        if (proposed_voltage <
+                                data_.buses[candidate_bus].vmin - 1e-12 ||
+                            proposed_voltage >
+                                data_.buses[candidate_bus].vmax + 1e-12) {
+                            continue;
+                        }
+                        auto trial = correction_reference;
+                        trial.vm[candidate_bus] = proposed_voltage;
+                        const auto trial_validation =
+                            project_trial_reactive_and_validate(trial);
+                        if (options_.capture_diagnostics) {
+                            history_trace.push_back({
+                                {"candidate_bus",
+                                 data_.buses[candidate_bus].bus_i},
+                                {"voltage_change", voltage_change},
+                                {"validation",
+                                 trial_validation.to_json()},
+                            });
+                        }
+                        if (trial_validation.max_residual + 1e-10 <
+                            selected_validation.max_residual) {
+                            selected_correction = std::move(trial);
+                            selected_validation = trial_validation;
+                            selected_damping = voltage_change;
+                            selected_correction_mode =
+                                "one_hop_voltage_coordinate_continuation";
+                            selected_coordinate_bus = candidate_bus;
+                        }
+                    }
+                    if (options_.capture_diagnostics) {
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "coordinate_history_trials"] =
+                            std::move(history_trace);
+                    }
+                    // The complete neighborhood search accepts any exact
+                    // residual decrease. Reuse a recent coordinate only when
+                    // that same complete validation shows a measurable
+                    // decrease; otherwise discard it and retain the original
+                    // search below.
+                    if (selected_validation.max_residual >
+                        0.9999 * predictor_validation.max_residual) {
+                        selected_correction = correction_reference;
+                        selected_validation = predictor_validation;
+                        selected_damping = 0.0;
+                        selected_correction_mode = "none";
+                        selected_coordinate_bus = -1;
+                    }
+                }
+
                 // The resident base-case Jacobian is intentionally cheap and
                 // handles most outages.  A low-impedance branch outage can,
                 // however, remove a dominant Jacobian term while the stale
@@ -4146,7 +4271,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     predictor_validation.max_residual > 0.1 &&
                     predictor_validation.max_residual >
                         0.25 * initial_predictor_validation_residual;
-                if (!contingency_predictor_cache && slow_branch_outage) {
+                if (selected_damping == 0.0 &&
+                    !contingency_predictor_cache && slow_branch_outage) {
                     contingency_predictor_cache =
                         std::make_unique<FixedJacobianPredictorCache>(
                             data_, correction_reference, commitment_,
@@ -4161,32 +4287,30 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             "slow_branch_outage_progress";
                     }
                 }
-                if (contingency_predictor_cache) {
-                    try_damped_corrections(*contingency_predictor_cache);
-                } else {
-                    try_damped_corrections(*predictor_cache_);
-                    if (selected_damping == 0.0) {
-                        contingency_predictor_cache =
-                            std::make_unique<FixedJacobianPredictorCache>(
-                                data_, correction_reference, commitment_,
-                                outaged_branch);
-                        output.fixed_jacobian_predictor_preparation_seconds +=
-                            contingency_predictor_cache->preparation_seconds;
-                        if (options_.capture_diagnostics) {
-                            output.fixed_jacobian_predictor_trace.back()[
-                                "contingency_specific_refactorization"] = true;
-                        }
-                        if (contingency_predictor_cache->valid) {
-                            try_damped_corrections(
-                                *contingency_predictor_cache);
+                if (selected_damping == 0.0) {
+                    if (contingency_predictor_cache) {
+                        try_damped_corrections(*contingency_predictor_cache);
+                    } else {
+                        try_damped_corrections(*predictor_cache_);
+                        if (selected_damping == 0.0) {
+                            contingency_predictor_cache =
+                                std::make_unique<FixedJacobianPredictorCache>(
+                                    data_, correction_reference, commitment_,
+                                    outaged_branch);
+                            output.fixed_jacobian_predictor_preparation_seconds +=
+                                contingency_predictor_cache->preparation_seconds;
+                            if (options_.capture_diagnostics) {
+                                output.fixed_jacobian_predictor_trace.back()[
+                                    "contingency_specific_refactorization"] =
+                                    true;
+                            }
+                            if (contingency_predictor_cache->valid) {
+                                try_damped_corrections(
+                                    *contingency_predictor_cache);
+                            }
                         }
                     }
                 }
-                const bool prior_one_hop_coordinate =
-                    prior_selected_correction_mode ==
-                        "one_hop_voltage_coordinate" ||
-                    prior_selected_correction_mode ==
-                        "one_hop_voltage_coordinate_continuation";
                 if (selected_damping == 0.0 && prior_one_hop_coordinate &&
                     std::abs(prior_selected_damping) >= 1e-12) {
                     int continuation_worst_q_bus = -1;
@@ -4235,6 +4359,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     ValidationReport continuation_best_validation =
                         predictor_validation;
                     double continuation_best_damping = 0.0;
+                    int continuation_best_bus = -1;
                     const std::array<double, 2>
                         continuation_voltage_changes{
                             prior_selected_damping,
@@ -4282,6 +4407,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 continuation_best_validation =
                                     trial_validation;
                                 continuation_best_damping = voltage_change;
+                                continuation_best_bus = candidate_bus;
                             }
                         }
                     }
@@ -4299,6 +4425,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         selected_damping = continuation_best_damping;
                         selected_correction_mode =
                             "one_hop_voltage_coordinate_continuation";
+                        selected_coordinate_bus = continuation_best_bus;
                     }
                 }
                 // Once an apparent-power slack bound is only improving by
@@ -4749,6 +4876,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     constexpr std::array<double, 4>
                         kLocalVoltageChanges{
                             -0.005, -0.001, 0.001, 0.005};
+                    bool strong_local_voltage_coordinate_selected = false;
                     for (int candidate_bus : shunt_candidate_buses) {
                         for (double voltage_change :
                              kLocalVoltageChanges) {
@@ -4780,13 +4908,36 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 selected_damping = voltage_change;
                                 selected_correction_mode =
                                     "one_hop_voltage_coordinate";
+                                selected_coordinate_bus = candidate_bus;
+                                // Treat this coordinate loop as a guarded
+                                // line search.  A fully rebuilt candidate
+                                // that removes at least ten percent of the
+                                // exact dominant residual is already a
+                                // useful nonlinear step; evaluating every
+                                // remaining neighbor and voltage magnitude
+                                // only changes which improving point is
+                                // chosen.  We retain the exhaustive search
+                                // whenever no candidate clears this
+                                // conservative gate.
+                                if (trial_validation.max_residual <=
+                                    0.90 * predictor_validation.max_residual) {
+                                    strong_local_voltage_coordinate_selected =
+                                        true;
+                                    break;
+                                }
                             }
+                        }
+                        if (strong_local_voltage_coordinate_selected) {
+                            break;
                         }
                     }
                     if (options_.capture_diagnostics) {
                         output.fixed_jacobian_predictor_trace.back()[
                             "local_voltage_trials"] =
                             std::move(local_voltage_trace);
+                        output.fixed_jacobian_predictor_trace.back()[
+                            "strong_local_voltage_coordinate_selected"] =
+                            strong_local_voltage_coordinate_selected;
                     }
                     for (int candidate_bus : shunt_candidate_buses) {
                     for (int shunt_index :
@@ -5091,6 +5242,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         "selected_correction_mode"] =
                         selected_correction_mode;
                     output.fixed_jacobian_predictor_trace.back()[
+                        "selected_coordinate_bus"] =
+                        selected_coordinate_bus >= 0
+                        ? data_.buses[selected_coordinate_bus].bus_i : -1;
+                    output.fixed_jacobian_predictor_trace.back()[
                         "selected_next_validation"] =
                         selected_validation.to_json();
                 }
@@ -5225,6 +5380,32 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 }
                 prior_selected_correction_mode = selected_correction_mode;
                 prior_selected_damping = selected_damping;
+                if ((selected_correction_mode ==
+                         "one_hop_voltage_coordinate" ||
+                     selected_correction_mode ==
+                         "one_hop_voltage_coordinate_continuation") &&
+                    selected_coordinate_bus >= 0) {
+                    coordinate_history.erase(
+                        std::remove_if(
+                            coordinate_history.begin(),
+                            coordinate_history.end(),
+                            [&](const auto& item) {
+                                return item.first == selected_coordinate_bus &&
+                                    std::abs(
+                                        item.second - selected_damping) <=
+                                        1e-12;
+                            }),
+                        coordinate_history.end());
+                    coordinate_history.insert(
+                        coordinate_history.begin(),
+                        {selected_coordinate_bus, selected_damping});
+                    constexpr std::size_t kCoordinateHistoryLimit = 4;
+                    if (coordinate_history.size() >
+                        kCoordinateHistoryLimit) {
+                        coordinate_history.resize(
+                            kCoordinateHistoryLimit);
+                    }
+                }
                 predictor_state = std::move(selected_correction);
             }
         }

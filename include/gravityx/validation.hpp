@@ -46,4 +46,14 @@ ValidationReport validate_rebuilt_contingency_trial(
     const std::vector<int>& fixed_status,
     const ContingencyContext& contingency);
 
+// Predictor iteration selection also needs the exact identity of the
+// dominant physical residual (for example, whether a variable-bound maximum
+// is a branch apparent-power slack).  Preserve that routing information while
+// retaining the same rebuilt-field shortcuts as trial validation.
+ValidationReport validate_rebuilt_contingency_predictor(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency);
+
 }  // namespace gravityx

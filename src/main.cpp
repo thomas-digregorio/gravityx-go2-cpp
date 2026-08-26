@@ -515,6 +515,28 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "lightweight trial validation repeated rebuilt invariants");
     }
+    auto predictor_identity_state = fast_result.solve.state;
+    predictor_identity_state.vm[0] = data.buses[0].vmax + 0.2;
+    gravityx::rebuild_contingency_state_derived_fields(
+        data, solve.state, {1}, branch_contingency,
+        predictor_identity_state);
+    const auto identity_free_trial_validation =
+        gravityx::validate_rebuilt_contingency_trial(
+            data, predictor_identity_state, {1}, branch_context);
+    const auto predictor_identity_validation =
+        gravityx::validate_rebuilt_contingency_predictor(
+            data, predictor_identity_state, {1}, branch_context);
+    require_near(
+        predictor_identity_validation.max_residual,
+        identity_free_trial_validation.max_residual, 1e-12,
+        "predictor validation residual identity capture");
+    if (!identity_free_trial_validation.worst_identity.empty() ||
+        predictor_identity_validation.worst_identity.empty() ||
+        predictor_identity_validation.worst_category.empty()) {
+        throw std::runtime_error(
+            "lightweight predictor validation did not preserve residual "
+            "routing identity");
+    }
     auto active_repair_reference = fast_result.solve.state;
     active_repair_reference.va[1] += 0.35;
     gravityx::rebuild_contingency_state_derived_fields(

@@ -536,6 +536,54 @@ class CompetitionTimingTests(unittest.TestCase):
         work.task_done(heavy_source)
         self.assertEqual(work.remaining_group_count, 0)
 
+    def test_active_heavy_group_exposes_siblings_after_bulk_queue_drains(self):
+        abort = threading.Event()
+        work = AffinityScreenWorkQueue(
+            [
+                [{"label": "H1"}, {"label": "H2"}, {"label": "H3"}],
+                [{"label": "B1"}],
+                [{"label": "B2"}],
+            ],
+            worker_count=3,
+            heavy_labels={"H1"},
+            heavy_worker_count=1,
+        )
+
+        heavy_source, heavy_group = work.get(abort, worker_id=0)
+        bulk_source_1, bulk_group_1 = work.get(abort, worker_id=1)
+        self.assertFalse(work.should_split_heavy_group(heavy_source))
+        bulk_source_2, bulk_group_2 = work.get(abort, worker_id=2)
+        self.assertTrue(work.should_split_heavy_group(heavy_source))
+
+        self.assertEqual(
+            work.requeue_remaining_as_singletons(
+                heavy_group,
+                1,
+                origin_worker_id=0,
+                source=heavy_source,
+            ),
+            2,
+        )
+        work.task_done(heavy_source)
+
+        exposed = []
+        for worker_id in (1, 2):
+            source, group = work.get(abort, worker_id=worker_id)
+            exposed.append((source, group[0]["label"]))
+            work.task_done(source)
+        self.assertEqual(
+            set(exposed),
+            {("urgent_heavy", "H2"), ("urgent_heavy", "H3")},
+        )
+
+        work.task_done(bulk_source_1)
+        work.task_done(bulk_source_2)
+        self.assertEqual(
+            [bulk_group_1[0]["label"], bulk_group_2[0]["label"]],
+            ["B1", "B2"],
+        )
+        self.assertEqual(work.remaining_group_count, 0)
+
     def test_single_heavy_worker_can_reclaim_its_split_sibling(self):
         abort = threading.Event()
         group = [{"label": "H1"}, {"label": "H2"}]

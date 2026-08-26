@@ -1551,6 +1551,10 @@ class AffinityScreenWorkQueue:
     work regains priority on the next dispatch. This preserves the
     expensive-screen concurrency cap while queued bulk work exists without
     imposing an all-bulk-workers barrier before the heavy final critical path.
+    At that same transition, a worker finishing one member of an active heavy
+    affinity group exposes its unattempted siblings as singleton tasks. The
+    completed member still provides the group's initial related-outage seed,
+    while the hidden serial tail becomes available to every idle worker.
 
     ``remaining`` counts queued plus active groups across both lanes. Idle
     workers therefore wait while another worker can still create urgent
@@ -1767,6 +1771,17 @@ class AffinityScreenWorkQueue:
 
     def worker_lane(self, worker_id: int) -> str:
         return "heavy" if worker_id < self._heavy_worker_count else "bulk"
+
+    def should_split_heavy_group(self, source: str) -> bool:
+        """Expose hidden heavy siblings once no queued bulk work remains."""
+        if source not in {"heavy", "urgent_heavy"}:
+            return False
+        with self._condition:
+            return (
+                self._heavy_spill_enabled
+                and self._scheduled_bulk.empty()
+                and self._urgent_bulk.empty()
+            )
 
 
 def fast_screen_affinity_groups(
@@ -2504,7 +2519,10 @@ def main() -> int:
                 if args.fast_screen_easy_first
                 else "globally difficult-first groups, then "
             )
-            + "fallback-triggered parallel group splitting, then "
+            + (
+                "fallback- or drained-bulk-triggered parallel group "
+                "splitting, then "
+            )
             + (
                 f"{args.fast_screen_heavy_workers}-worker profiled heavy lane, then "
                 if fast_screen_heavy_labels
@@ -2862,6 +2880,15 @@ def main() -> int:
                         split_count = 0
                         if result.get("success", False):
                             save_secure_result(item, result, worker_id, "fast_screen")
+                            if screen_work.should_split_heavy_group(work_source):
+                                split_count = (
+                                    screen_work.requeue_remaining_as_singletons(
+                                        group,
+                                        group_position + 1,
+                                        worker_id,
+                                        work_source,
+                                    )
+                                )
                         elif result.get("screen_completed", False):
                             if (args.wsl_fast_screen_scratch and
                                     not acknowledgement.get(

@@ -3517,6 +3517,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     predictor_validation.worst_category ==
                         "active_balance" &&
                     predictor_validation.max_active_balance_residual > 1e-4;
+                int rejection_priority_balance_bus = -1;
+                double rejection_priority_balance_residual = -1.0;
+                if (predictor_validation.worst_category ==
+                        "active_balance" ||
+                    predictor_validation.worst_category ==
+                        "reactive_balance") {
+                    const bool active_priority =
+                        predictor_validation.worst_category ==
+                            "active_balance";
+                    for (int bus = 0; bus < nb; ++bus) {
+                        const double balance = active_priority
+                            ? p_balance_by_bus[bus]
+                            : q_balance_by_bus[bus];
+                        const double slack_value = active_priority
+                            ? predictor_state.p_delta[bus]
+                            : predictor_state.q_delta[bus];
+                        const double residual = std::max(
+                            0.0, std::abs(balance) - slack_value);
+                        if (residual >
+                            rejection_priority_balance_residual) {
+                            rejection_priority_balance_residual = residual;
+                            rejection_priority_balance_bus = bus;
+                        }
+                    }
+                }
                 int worst_active_flow_branch = -1;
                 bool worst_active_flow_from_side = true;
                 double worst_active_flow_excess = 0.0;
@@ -3525,6 +3550,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 bool worst_reactive_flow_from_side = true;
                 double worst_reactive_flow_excess = 0.0;
                 double worst_reactive_flow_target = 0.0;
+                int rejection_priority_branch = -1;
+                double rejection_priority_branch_residual = -1.0;
                 const std::string sm_slack_suffix = ":sm_slack";
                 const bool apparent_slack_dominant =
                     predictor_validation.worst_category ==
@@ -3601,6 +3628,83 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         predictor_state.pt[branch_index],
                         predictor_state.qt[branch_index],
                         predictor_state.vm[branch.to], false);
+                    double priority_residual = -1.0;
+                    if (predictor_validation.worst_category ==
+                            "variable_bound") {
+                        const auto bound_excess = [](
+                            double value, double lower, double upper) {
+                            return std::max(
+                                std::max(0.0, lower - value),
+                                std::max(0.0, value - upper));
+                        };
+                        priority_residual = std::max({
+                            bound_excess(
+                                predictor_state.pf[branch_index],
+                                -rating, rating),
+                            bound_excess(
+                                predictor_state.qf[branch_index],
+                                -rating, rating),
+                            bound_excess(
+                                predictor_state.pt[branch_index],
+                                -rating, rating),
+                            bound_excess(
+                                predictor_state.qt[branch_index],
+                                -rating, rating),
+                            bound_excess(
+                                predictor_state.sm_slack[branch_index],
+                                0.0, data_.sm_vio_limit)});
+                    } else if (predictor_validation.worst_category ==
+                                   "flow_limit") {
+                        const double from_squared =
+                            predictor_state.pf[branch_index] *
+                                predictor_state.pf[branch_index] +
+                            predictor_state.qf[branch_index] *
+                                predictor_state.qf[branch_index];
+                        const double to_squared =
+                            predictor_state.pt[branch_index] *
+                                predictor_state.pt[branch_index] +
+                            predictor_state.qt[branch_index] *
+                                predictor_state.qt[branch_index];
+                        const double from_limit = rating * rating *
+                            std::pow(
+                                branch.transformer
+                                    ? 1.0 +
+                                        predictor_state.sm_slack[branch_index]
+                                    : predictor_state.vm[branch.from] +
+                                        predictor_state.sm_slack[branch_index],
+                                2);
+                        const double to_limit = rating * rating *
+                            std::pow(
+                                branch.transformer
+                                    ? 1.0 +
+                                        predictor_state.sm_slack[branch_index]
+                                    : predictor_state.vm[branch.to] +
+                                        predictor_state.sm_slack[branch_index],
+                                2);
+                        priority_residual = std::max(
+                            std::max(0.0, from_squared - from_limit),
+                            std::max(0.0, to_squared - to_limit));
+                    } else if (predictor_validation.worst_category ==
+                                   "angle") {
+                        const double start_delta =
+                            base_state_.va[branch.from] -
+                            base_state_.va[branch.to];
+                        if (start_delta >= branch.angmin &&
+                            start_delta <= branch.angmax) {
+                            const double angle =
+                                predictor_state.va[branch.from] -
+                                predictor_state.va[branch.to];
+                            priority_residual = std::max(
+                                std::max(0.0, angle - branch.angmax),
+                                std::max(0.0, branch.angmin - angle));
+                        }
+                    }
+                    if (priority_residual >
+                        rejection_priority_branch_residual) {
+                        rejection_priority_branch_residual =
+                            priority_residual;
+                        rejection_priority_branch = branch_index;
+                    }
                 }
                 const bool active_flow_blocks_balance_repair =
                     predictor_validation.worst_category ==
@@ -3808,7 +3912,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     return
                         validate_rebuilt_contingency_trial_until_rejected(
                             data_, trial, commitment_, *direct_context,
-                            selected_validation.max_residual);
+                            selected_validation.max_residual,
+                            rejection_priority_balance_bus,
+                            rejection_priority_branch);
                 };
                 const auto try_damped_corrections = [&]
                     (FixedJacobianPredictorCache& cache) {

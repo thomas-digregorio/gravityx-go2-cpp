@@ -278,7 +278,9 @@ static ValidationReport validate_state_impl(
     bool skip_rebuilt_economic_and_ohms_checks,
     bool capture_identity,
     double incumbent_max_residual =
-        std::numeric_limits<double>::infinity()) {
+        std::numeric_limits<double>::infinity(),
+    int preferred_balance_bus = -1,
+    int preferred_branch = -1) {
     const std::size_t nb = data.buses.size();
     const std::size_t ng = data.generators.size();
     const std::size_t nd = data.loads.size();
@@ -542,7 +544,7 @@ static ValidationReport validate_state_impl(
         }
     }
 
-    for (std::size_t i = 0; i < nb; ++i) {
+    const auto validate_balance_bus = [&](std::size_t i) {
         const auto& bus = data.buses[i];
         double p = 0.0;
         double q = 0.0;
@@ -589,12 +591,25 @@ static ValidationReport validate_state_impl(
         update_category(report, report.max_reactive_balance_residual,
             q_residual, "reactive_balance", capture_identity,
             [&] { return "bus:" + bus.source_key; });
+    };
+    if (preferred_balance_bus >= 0 &&
+        preferred_balance_bus < static_cast<int>(nb)) {
+        validate_balance_bus(static_cast<std::size_t>(preferred_balance_bus));
+        if (rejection_proven()) {
+            return report;
+        }
+    }
+    for (std::size_t i = 0; i < nb; ++i) {
+        if (static_cast<int>(i) == preferred_balance_bus) {
+            continue;
+        }
+        validate_balance_bus(i);
         if (rejection_proven()) {
             return report;
         }
     }
 
-    for (std::size_t i = 0; i < nl; ++i) {
+    const auto validate_branch = [&](std::size_t i) {
         const auto& branch = data.branches[i];
         const bool outaged = contingency &&
             contingency->outaged_branch == static_cast<int>(i);
@@ -620,7 +635,7 @@ static ValidationReport validate_state_impl(
             "variable_bound", capture_identity,
             [&] { return "branch:" + branch.source_key + ":sm_slack"; });
         if (unavailable) {
-            continue;
+            return;
         }
         const int f = branch.from;
         const int t = branch.to;
@@ -651,6 +666,18 @@ static ValidationReport validate_state_impl(
             std::max(positive_part(from_squared - from_limit), positive_part(to_squared - to_limit)),
             "flow_limit", capture_identity,
             [&] { return "branch:" + branch.source_key; });
+    };
+    if (preferred_branch >= 0 && preferred_branch < static_cast<int>(nl)) {
+        validate_branch(static_cast<std::size_t>(preferred_branch));
+        if (rejection_proven()) {
+            return report;
+        }
+    }
+    for (std::size_t i = 0; i < nl; ++i) {
+        if (static_cast<int>(i) == preferred_branch) {
+            continue;
+        }
+        validate_branch(i);
         if (rejection_proven()) {
             return report;
         }
@@ -684,10 +711,13 @@ ValidationReport validate_rebuilt_contingency_trial_until_rejected(
     const AcState& state,
     const std::vector<int>& fixed_status,
     const ContingencyContext& contingency,
-    double incumbent_max_residual) {
+    double incumbent_max_residual,
+    int preferred_balance_bus,
+    int preferred_branch) {
     return validate_state_impl(
         data, ModelMode::ContingencySoft, state, fixed_status,
-        contingency, true, false, incumbent_max_residual);
+        contingency, true, false, incumbent_max_residual,
+        preferred_balance_bus, preferred_branch);
 }
 
 ValidationReport validate_rebuilt_contingency_predictor(

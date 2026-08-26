@@ -1119,6 +1119,13 @@ int run_parallel_circuit_regression() {
     require_same_validation_numbers(
         improving_cutoff_validation, lightweight_trial_validation,
         "lightweight cutoff complete improving report");
+    const auto improving_prioritized_validation =
+        gravityx::validate_rebuilt_contingency_trial_until_rejected(
+            data, fast_result.solve.state, {1}, branch_context,
+            lightweight_trial_validation.max_residual + 1e-6, 1, 1);
+    require_same_validation_numbers(
+        improving_prioritized_validation, lightweight_trial_validation,
+        "lightweight prioritized complete improving report");
     auto rejected_cutoff_state = fast_result.solve.state;
     rejected_cutoff_state.vm[0] = data.buses[0].vmax + 0.2;
     const auto rejected_cutoff_validation =

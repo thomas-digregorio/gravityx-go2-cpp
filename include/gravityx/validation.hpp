@@ -53,7 +53,9 @@ ValidationReport validate_rebuilt_contingency_trial_until_rejected(
     const AcState& state,
     const std::vector<int>& fixed_status,
     const ContingencyContext& contingency,
-    double incumbent_max_residual);
+    double incumbent_max_residual,
+    int preferred_balance_bus = -1,
+    int preferred_branch = -1);
 
 // Predictor iteration selection also needs the exact identity of the
 // dominant physical residual (for example, whether a variable-bound maximum

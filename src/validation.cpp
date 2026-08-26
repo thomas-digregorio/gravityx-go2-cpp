@@ -103,12 +103,13 @@ nlohmann::json ValidationReport::to_json() const {
     };
 }
 
-ValidationReport validate_state(
+static ValidationReport validate_state_impl(
     const CaseData& data,
     ModelMode mode,
     const AcState& state,
     const std::vector<int>& fixed_status_argument,
-    const std::optional<ContingencyContext>& contingency) {
+    const std::optional<ContingencyContext>& contingency,
+    bool skip_rebuilt_economic_and_ohms_checks) {
     const std::size_t nb = data.buses.size();
     const std::size_t ng = data.generators.size();
     const std::size_t nd = data.loads.size();
@@ -250,7 +251,7 @@ ValidationReport validate_state(
             bound_violation(state.qg[i], qg_lower, qg_upper), "variable_bound",
             "gen:" + gen.source_key + ":qg");
 
-        if (active) {
+        if (active && !skip_rebuilt_economic_and_ohms_checks) {
             const auto points = active_pwl_points(gen.cost, gen.ncost, pg_lower, pg_upper);
             double sum = 0.0;
             double power = 0.0;
@@ -321,25 +322,30 @@ ValidationReport validate_state(
         update_category(report.max_variable_bound_violation,
             bound_violation(state.demand_factor[i], bounds.first, bounds.second),
             "variable_bound", "load:" + load.source_key + ":factor");
-        const auto points = active_pwl_points(load.cost, load.ncost, load.pd_min, load.pd_max);
-        double sum = 0.0;
-        double power = 0.0;
-        for (const auto& point : points) {
-            if (load_lambda_offset >= static_cast<int>(state.load_lambda.size())) {
-                throw std::runtime_error("load lambda vector is too short");
+        if (!skip_rebuilt_economic_and_ohms_checks) {
+            const auto points = active_pwl_points(
+                load.cost, load.ncost, load.pd_min, load.pd_max);
+            double sum = 0.0;
+            double power = 0.0;
+            for (const auto& point : points) {
+                if (load_lambda_offset >=
+                    static_cast<int>(state.load_lambda.size())) {
+                    throw std::runtime_error(
+                        "load lambda vector is too short");
+                }
+                const double lambda = state.load_lambda[load_lambda_offset++];
+                sum += lambda;
+                power += point.mw * lambda;
+                update_category(report.max_variable_bound_violation,
+                    bound_violation(lambda, 0.0, 1.0), "variable_bound",
+                    "load:" + load.source_key + ":lambda");
             }
-            const double lambda = state.load_lambda[load_lambda_offset++];
-            sum += lambda;
-            power += point.mw * lambda;
-            update_category(report.max_variable_bound_violation,
-                bound_violation(lambda, 0.0, 1.0), "variable_bound",
-                "load:" + load.source_key + ":lambda");
+            update_category(report.max_pwl_sum_residual, sum - 1.0,
+                "pwl_sum", "load:" + load.source_key);
+            update_category(report.max_pwl_power_residual,
+                power - load.pd_nominal * state.demand_factor[i],
+                "pwl_power", "load:" + load.source_key);
         }
-        update_category(report.max_pwl_sum_residual, sum - 1.0, "pwl_sum",
-            "load:" + load.source_key);
-        update_category(report.max_pwl_power_residual,
-            power - load.pd_nominal * state.demand_factor[i], "pwl_power",
-            "load:" + load.source_key);
         if (mode == ModelMode::UnitCommitmentRelaxation) {
             update_category(report.max_load_ramp_violation,
                 positive_part(load.pd_nominal * state.demand_factor[i] - load.pd_prev - load.prumax * data.delta_r),
@@ -428,37 +434,56 @@ ValidationReport validate_state(
         if (unavailable) {
             continue;
         }
-        const double denominator = branch.r * branch.r + branch.x * branch.x;
-        const double g = denominator > 1e-20 ? branch.r / denominator : 0.0;
-        const double b = denominator > 1e-20 ? -branch.x / denominator : 0.0;
-        const double tm = branch.tap;
-        const double tm2 = tm * tm;
-        const double tr = tm * std::cos(branch.shift);
-        const double ti = tm * std::sin(branch.shift);
         const int f = branch.from;
         const int t = branch.to;
-        const double cross_cos_ft = state.vm[f] * state.vm[t] * std::cos(state.va[f] - state.va[t]);
-        const double cross_sin_ft = state.vm[f] * state.vm[t] * std::sin(state.va[f] - state.va[t]);
-        const double from_g_self = branch.transformer ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
-        const double from_b_self = branch.transformer ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
-        const double expected_pf = from_g_self * state.vm[f] * state.vm[f]
-            + ((-g * tr + b * ti) / tm2) * cross_cos_ft
-            + ((-b * tr - g * ti) / tm2) * cross_sin_ft;
-        const double expected_qf = -from_b_self * state.vm[f] * state.vm[f]
-            - ((-b * tr - g * ti) / tm2) * cross_cos_ft
-            + ((-g * tr + b * ti) / tm2) * cross_sin_ft;
-        const double cross_cos_tf = state.vm[t] * state.vm[f] * std::cos(state.va[t] - state.va[f]);
-        const double cross_sin_tf = state.vm[t] * state.vm[f] * std::sin(state.va[t] - state.va[f]);
-        const double expected_pt = (g + branch.g_to) * state.vm[t] * state.vm[t]
-            + ((-g * tr - b * ti) / tm2) * cross_cos_tf
-            + ((-b * tr + g * ti) / tm2) * cross_sin_tf;
-        const double expected_qt = -(b + branch.b_to) * state.vm[t] * state.vm[t]
-            - ((-b * tr + g * ti) / tm2) * cross_cos_tf
-            + ((-g * tr - b * ti) / tm2) * cross_sin_tf;
-        const double ohms = std::max({
-            std::abs(state.pf[i] - expected_pf), std::abs(state.qf[i] - expected_qf),
-            std::abs(state.pt[i] - expected_pt), std::abs(state.qt[i] - expected_qt)});
-        update_category(report.max_ohms_residual, ohms, "ohms", "branch:" + branch.source_key);
+        if (!skip_rebuilt_economic_and_ohms_checks) {
+            const double denominator =
+                branch.r * branch.r + branch.x * branch.x;
+            const double g = denominator > 1e-20
+                ? branch.r / denominator : 0.0;
+            const double b = denominator > 1e-20
+                ? -branch.x / denominator : 0.0;
+            const double tm = branch.tap;
+            const double tm2 = tm * tm;
+            const double tr = tm * std::cos(branch.shift);
+            const double ti = tm * std::sin(branch.shift);
+            const double cross_cos_ft = state.vm[f] * state.vm[t] *
+                std::cos(state.va[f] - state.va[t]);
+            const double cross_sin_ft = state.vm[f] * state.vm[t] *
+                std::sin(state.va[f] - state.va[t]);
+            const double from_g_self = branch.transformer
+                ? g / tm2 + branch.g_fr : (g + branch.g_fr) / tm2;
+            const double from_b_self = branch.transformer
+                ? b / tm2 + branch.b_fr : (b + branch.b_fr) / tm2;
+            const double expected_pf =
+                from_g_self * state.vm[f] * state.vm[f] +
+                ((-g * tr + b * ti) / tm2) * cross_cos_ft +
+                ((-b * tr - g * ti) / tm2) * cross_sin_ft;
+            const double expected_qf =
+                -from_b_self * state.vm[f] * state.vm[f] -
+                ((-b * tr - g * ti) / tm2) * cross_cos_ft +
+                ((-g * tr + b * ti) / tm2) * cross_sin_ft;
+            const double cross_cos_tf = state.vm[t] * state.vm[f] *
+                std::cos(state.va[t] - state.va[f]);
+            const double cross_sin_tf = state.vm[t] * state.vm[f] *
+                std::sin(state.va[t] - state.va[f]);
+            const double expected_pt =
+                (g + branch.g_to) * state.vm[t] * state.vm[t] +
+                ((-g * tr - b * ti) / tm2) * cross_cos_tf +
+                ((-b * tr + g * ti) / tm2) * cross_sin_tf;
+            const double expected_qt =
+                -(b + branch.b_to) * state.vm[t] * state.vm[t] -
+                ((-b * tr + g * ti) / tm2) * cross_cos_tf +
+                ((-g * tr - b * ti) / tm2) * cross_sin_tf;
+            const double ohms = std::max({
+                std::abs(state.pf[i] - expected_pf),
+                std::abs(state.qf[i] - expected_qf),
+                std::abs(state.pt[i] - expected_pt),
+                std::abs(state.qt[i] - expected_qt)});
+            update_category(
+                report.max_ohms_residual, ohms, "ohms",
+                "branch:" + branch.source_key);
+        }
 
         const double start_delta = mode == ModelMode::ContingencySoft
             ? contingency->base_state.va[f] - contingency->base_state.va[t]
@@ -483,6 +508,26 @@ ValidationReport validate_state(
     }
 
     return report;
+}
+
+ValidationReport validate_state(
+    const CaseData& data,
+    ModelMode mode,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const std::optional<ContingencyContext>& contingency) {
+    return validate_state_impl(
+        data, mode, state, fixed_status, contingency, false);
+}
+
+ValidationReport validate_rebuilt_contingency_trial(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency) {
+    return validate_state_impl(
+        data, ModelMode::ContingencySoft, state, fixed_status,
+        contingency, true);
 }
 
 }  // namespace gravityx

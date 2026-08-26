@@ -36,4 +36,14 @@ ValidationReport validate_state(
     const std::vector<int>& fixed_status = {},
     const std::optional<ContingencyContext>& contingency = std::nullopt);
 
+// Trial corrections have just had their branch flows and balance slacks
+// rebuilt.  Rank them without rechecking PWL interpolation or Ohm's law;
+// every selected state is rebuilt economically and passed to validate_state
+// before it can be accepted.
+ValidationReport validate_rebuilt_contingency_trial(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency);
+
 }  // namespace gravityx

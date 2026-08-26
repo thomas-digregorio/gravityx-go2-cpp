@@ -477,6 +477,35 @@ int run_parallel_circuit_regression() {
     gravityx::ContingencyContext branch_context;
     branch_context.outaged_branch = branch_contingency.component;
     branch_context.base_state = solve.state;
+    const auto lightweight_trial_validation =
+        gravityx::validate_rebuilt_contingency_trial(
+            data, fast_result.solve.state, {1}, branch_context);
+    require_near(
+        lightweight_trial_validation.max_variable_bound_violation,
+        fast_result.validation.max_variable_bound_violation, 1e-12,
+        "lightweight trial variable bounds");
+    require_near(
+        lightweight_trial_validation.max_active_balance_residual,
+        fast_result.validation.max_active_balance_residual, 1e-12,
+        "lightweight trial active balance");
+    require_near(
+        lightweight_trial_validation.max_reactive_balance_residual,
+        fast_result.validation.max_reactive_balance_residual, 1e-12,
+        "lightweight trial reactive balance");
+    require_near(
+        lightweight_trial_validation.max_angle_violation,
+        fast_result.validation.max_angle_violation, 1e-12,
+        "lightweight trial angle limits");
+    require_near(
+        lightweight_trial_validation.max_flow_limit_violation,
+        fast_result.validation.max_flow_limit_violation, 1e-12,
+        "lightweight trial flow limits");
+    if (lightweight_trial_validation.max_pwl_sum_residual != 0.0 ||
+        lightweight_trial_validation.max_pwl_power_residual != 0.0 ||
+        lightweight_trial_validation.max_ohms_residual != 0.0) {
+        throw std::runtime_error(
+            "lightweight trial validation repeated rebuilt invariants");
+    }
     auto active_repair_reference = fast_result.solve.state;
     active_repair_reference.va[1] += 0.35;
     gravityx::rebuild_contingency_state_derived_fields(

@@ -274,6 +274,12 @@ def validate_and_normalize_evaluation_details(
         )
 
     normalized = dict(summary)
+    normalized["obj_all_cases"] = {
+        label: objectives[label] for label in sorted(expected_labels)
+    }
+    normalized["infeas_all_cases"] = {
+        label: infeasibilities[label] for label in sorted(expected_labels)
+    }
     repaired_fields: list[str] = []
     if parallel_processes > 1 and parallel_mode == "mpi":
         internal_dir.mkdir(parents=True, exist_ok=True)
@@ -283,13 +289,7 @@ def validate_and_normalize_evaluation_details(
             shutil.copy2(vendor_csv, internal_dir / "eval_summary.vendor_mpi.csv")
 
         normalized["obj_cumulative"] = serial_cumulative_objective
-        normalized["obj_all_cases"] = {
-            label: objectives[label] for label in sorted(expected_labels)
-        }
         normalized["infeas_cumulative"] = expected_infeasibility
-        normalized["infeas_all_cases"] = {
-            label: infeasibilities[label] for label in sorted(expected_labels)
-        }
         repaired_fields = [
             "obj_cumulative",
             "obj_all_cases",
@@ -572,6 +572,7 @@ def merge_serial_evaluation_shards(
     mode: str,
     metadata_name: str,
     maximum_parallel_processes: int,
+    materialize_top_level_details: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Merge an exhaustive set of independently validated vendor shards."""
     if not completed_records:
@@ -598,29 +599,64 @@ def merge_serial_evaluation_shards(
                 "serial official-evaluation shards disagree on BASECASE detail"
             )
     assert base_detail_source is not None
-    link_or_copy(base_detail_source, output_dir / "eval_detail_BASECASE.json")
-    base_log_source = completed_records[0]["solution_dir"] / "BASECASE.eval.log"
-    if base_log_source.is_file():
-        link_or_copy(base_log_source, output_dir / "BASECASE.eval.log")
-
-    for record in completed_records:
-        for label in record["labels"]:
-            detail = record["solution_dir"] / f"eval_detail_{label}.json"
-            link_or_copy(detail, output_dir / detail.name)
-            case_log = record["solution_dir"] / f"{label}.eval.log"
-            if case_log.is_file():
-                link_or_copy(case_log, output_dir / case_log.name)
-
-    detail_paths = {
-        path.stem.removeprefix("eval_detail_"): path
-        for path in output_dir.glob("eval_detail_*.json")
-    }
     objectives: dict[str, float] = {}
     infeasibilities: dict[str, bool] = {}
-    for label in ["BASECASE", *labels]:
-        detail = read_json(detail_paths[label])
-        objectives[label] = float(detail["obj"]["val"])
-        infeasibilities[label] = bool(detail["infeas"]["val"])
+    for record in completed_records:
+        shard_summary = record["summary"]
+        shard_objectives = shard_summary.get("obj_all_cases")
+        shard_infeasibilities = shard_summary.get("infeas_all_cases")
+        expected_shard_labels = {"BASECASE", *record["labels"]}
+        if not isinstance(shard_objectives, dict) or not isinstance(
+            shard_infeasibilities, dict
+        ):
+            raise RuntimeError(
+                f"official evaluator shard {record['shard_index']} has no "
+                "per-case summary"
+            )
+        if set(shard_objectives) != expected_shard_labels or set(
+            shard_infeasibilities
+        ) != expected_shard_labels:
+            raise RuntimeError(
+                f"official evaluator shard {record['shard_index']} summary "
+                "does not cover its exact label set"
+            )
+        for label in ["BASECASE", *record["labels"]]:
+            objective = float(shard_objectives[label])
+            infeasible = bool(shard_infeasibilities[label])
+            if not math.isfinite(objective):
+                raise RuntimeError(
+                    f"non-finite official objective for {label}: {objective}"
+                )
+            if label == "BASECASE" and label in objectives:
+                if not math.isclose(
+                    objectives[label], objective, rel_tol=1e-12, abs_tol=1e-6
+                ) or infeasibilities[label] != infeasible:
+                    raise RuntimeError(
+                        "serial official-evaluation shards disagree on "
+                        "BASECASE values"
+                    )
+                continue
+            if label in objectives:
+                raise RuntimeError(
+                    f"duplicate official-evaluation summary label: {label}"
+                )
+            objectives[label] = objective
+            infeasibilities[label] = infeasible
+    if set(objectives) != {"BASECASE", *labels}:
+        raise RuntimeError("merged official-evaluation values are incomplete")
+
+    if materialize_top_level_details:
+        link_or_copy(base_detail_source, output_dir / "eval_detail_BASECASE.json")
+        base_log_source = completed_records[0]["solution_dir"] / "BASECASE.eval.log"
+        if base_log_source.is_file():
+            link_or_copy(base_log_source, output_dir / "BASECASE.eval.log")
+        for record in completed_records:
+            for label in record["labels"]:
+                detail = record["solution_dir"] / f"eval_detail_{label}.json"
+                link_or_copy(detail, output_dir / detail.name)
+                case_log = record["solution_dir"] / f"{label}.eval.log"
+                if case_log.is_file():
+                    link_or_copy(case_log, output_dir / case_log.name)
     objective = objectives["BASECASE"] + math.fsum(
         objectives[label] for label in labels
     ) / len(labels)
@@ -638,12 +674,38 @@ def merge_serial_evaluation_shards(
         "infeas_all_cases": infeasibilities,
     }
     write_json(output_dir / "eval_summary.json", summary)
+    aggregate_certificate = {
+        "schema_version": 2,
+        "parallel_processes": maximum_parallel_processes,
+        "parallel_mode": mode,
+        "detail_storage": (
+            "top_level_and_sharded"
+            if materialize_top_level_details
+            else "validated_shards"
+        ),
+        "expected_contingency_count": len(labels),
+        "expected_detail_count": len(labels) + 1,
+        "observed_detail_count": len(objectives),
+        "observed_unique_detail_count": len(objectives),
+        "observed_physical_shard_detail_count": sum(
+            int(record["certificate"]["observed_detail_count"])
+            for record in completed_records
+        ),
+        "complete_label_set": True,
+        "objective_from_details": objective,
+        "reported_objective": objective,
+        "infeasible_labels": sorted(infeasible_labels),
+        "reported_infeasibility": float(len(infeasible_labels)),
+        "repaired_vendor_mpi_bookkeeping_fields": [],
+    }
     shard_metadata = {
         "mode": mode,
         "requested_shards": requested_shards,
         "active_shards": len(completed_records),
         "maximum_parallel_processes": maximum_parallel_processes,
         "base_detail_sha256": base_detail_hash,
+        "top_level_details_materialized": materialize_top_level_details,
+        "aggregate_certificate": aggregate_certificate,
         "shards": [
             {
                 "shard_index": int(record["shard_index"]),
@@ -654,6 +716,9 @@ def merge_serial_evaluation_shards(
                 "returncode": int(record["returncode"]),
                 "complete_label_set": bool(
                     record["certificate"]["complete_label_set"]
+                ),
+                "observed_detail_count": int(
+                    record["certificate"]["observed_detail_count"]
                 ),
             }
             for record in completed_records
@@ -730,6 +795,7 @@ def run_serial_evaluation_shards(
         "independent_serial_shards",
         "serial_evaluation_shards.json",
         active_shards,
+        True,
     )
 
 
@@ -934,10 +1000,15 @@ class StreamingSerialEvaluation:
                         "streaming official evaluation reached its deadline"
                     )
             time.sleep(0.05)
-        finalized_records = [
-            finalize_serial_evaluation_shard(record)
-            for record in self.completed_records
-        ]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(self.completed_records))
+        ) as executor:
+            finalized_records = list(
+                executor.map(
+                    finalize_serial_evaluation_shard,
+                    self.completed_records,
+                )
+            )
         summary, metadata = merge_serial_evaluation_shards(
             finalized_records,
             self.output_dir,
@@ -947,6 +1018,7 @@ class StreamingSerialEvaluation:
             "overlapped_serial_shards",
             "streaming_serial_evaluation_shards.json",
             self.maximum_processes,
+            False,
         )
         now = time.perf_counter()
         metadata.update(
@@ -2752,16 +2824,41 @@ def main() -> int:
                 else args.evaluation_processes
             )
         )
-        evaluation_summary, evaluation_certificate = (
-            validate_and_normalize_evaluation_details(
-                args.output_dir,
-                internal,
-                expected_evaluation_labels,
-                evaluation_summary,
-                certificate_parallel_processes,
-                evaluation_mode,
+        if (
+            serial_evaluation_metadata is not None
+            and not bool(
+                serial_evaluation_metadata.get(
+                    "top_level_details_materialized", True
+                )
             )
-        )
+        ):
+            aggregate = serial_evaluation_metadata.get("aggregate_certificate")
+            if not isinstance(aggregate, dict):
+                raise RuntimeError(
+                    "sharded official evaluation has no aggregate certificate"
+                )
+            if (
+                not bool(aggregate.get("complete_label_set", False))
+                or int(aggregate.get("expected_contingency_count", -1))
+                != len(expected_evaluation_labels)
+                or int(aggregate.get("observed_unique_detail_count", -1))
+                != len(expected_evaluation_labels) + 1
+            ):
+                raise RuntimeError(
+                    "sharded official-evaluation certificate is incomplete"
+                )
+            evaluation_certificate = dict(aggregate)
+        else:
+            evaluation_summary, evaluation_certificate = (
+                validate_and_normalize_evaluation_details(
+                    args.output_dir,
+                    internal,
+                    expected_evaluation_labels,
+                    evaluation_summary,
+                    certificate_parallel_processes,
+                    evaluation_mode,
+                )
+            )
         evaluation_certificate.update(
             {
                 "evaluator_path": str(args.evaluator.resolve()),

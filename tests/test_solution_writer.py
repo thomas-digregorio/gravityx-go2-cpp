@@ -576,17 +576,23 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             self.assertEqual(metadata["mode"], "overlapped_serial_shards")
             self.assertEqual(metadata["active_shards"], 2)
             self.assertEqual(metadata["maximum_parallel_processes"], 2)
+            self.assertFalse(metadata["top_level_details_materialized"])
+            self.assertEqual(
+                metadata["aggregate_certificate"]["observed_unique_detail_count"],
+                5,
+            )
             self.assertEqual(metadata["initial_maximum_parallel_processes"], 1)
             self.assertEqual(
                 metadata["post_screen_maximum_parallel_processes"], 2
             )
-            self.assertEqual(
-                {
-                    path.stem.removeprefix("eval_detail_")
-                    for path in output_dir.glob("eval_detail_*.json")
-                },
-                {"BASECASE", *labels},
-            )
+            self.assertEqual(list(output_dir.glob("eval_detail_*.json")), [])
+            sharded_detail_labels = {
+                path.stem.removeprefix("eval_detail_")
+                for path in (
+                    internal_dir / "streaming_serial_evaluation_shards"
+                ).glob("shard_*/solutions/eval_detail_*.json")
+            }
+            self.assertEqual(sharded_detail_labels, {"BASECASE", *labels})
 
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)

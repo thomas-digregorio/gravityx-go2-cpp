@@ -23,6 +23,7 @@ from run_experiment import (  # noqa: E402
     code2_time_limit,
     contiguous_shard_groups,
     effective_process_timeout,
+    evaluator_subprocess_environment,
     fast_screen_affinity_groups,
     longest_first_contingencies,
     progress_checkpoint_due,
@@ -406,6 +407,16 @@ class CompetitionTimingTests(unittest.TestCase):
         groups = contiguous_shard_groups(labels, 3)
         self.assertEqual([len(group) for group in groups], [3, 2, 2])
         self.assertEqual([label for group in groups for label in group], labels)
+
+    def test_evaluator_environment_prevents_nested_thread_oversubscription(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"OPENBLAS_NUM_THREADS": "24", "OMP_NUM_THREADS": "12"},
+        ):
+            environment = evaluator_subprocess_environment(1)
+        self.assertEqual(environment["OPENBLAS_NUM_THREADS"], "1")
+        self.assertEqual(environment["OMP_NUM_THREADS"], "1")
+        self.assertEqual(environment["MKL_NUM_THREADS"], "1")
 
     def test_streaming_evaluation_runs_ready_shards_and_merges_exactly(self):
         with tempfile.TemporaryDirectory() as directory:

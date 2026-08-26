@@ -37,10 +37,29 @@ DEFAULT_EVALUATOR = Path(
 )
 WSL_LIBRARY_PATH = "/home/thomasdigregorio/.local/share/gravityx-go2-cpp/env/lib"
 FINALIZATION_RESERVE_SECONDS = 1.0
+EVALUATOR_THREAD_ENVIRONMENT_VARIABLES = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
 
 
 class CompetitionTimeout(RuntimeError):
     """Raised when a GO Competition stage exhausts its wall-clock allowance."""
+
+
+def evaluator_subprocess_environment(linear_algebra_threads: int) -> dict[str, str]:
+    """Return a reproducible evaluator environment without nested oversubscription."""
+    if linear_algebra_threads < 1:
+        raise ValueError("evaluator linear-algebra threads must be positive")
+    environment = os.environ.copy()
+    value = str(linear_algebra_threads)
+    for variable in EVALUATOR_THREAD_ENVIRONMENT_VARIABLES:
+        environment[variable] = value
+    return environment
 
 
 def code2_time_limit(contingency_count: int, seconds_per_contingency: float) -> float:
@@ -490,6 +509,7 @@ def evaluate_serial_evaluation_shard(
     evaluator: Path,
     record: dict[str, Any],
     deadline: float,
+    environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run and validate one exact vendor-evaluator shard."""
     remaining = deadline - time.perf_counter()
@@ -514,6 +534,7 @@ def evaluate_serial_evaluation_shard(
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 timeout=remaining,
+                env=environment,
             )
     except subprocess.TimeoutExpired as error:
         raise CompetitionTimeout(
@@ -645,6 +666,7 @@ def run_serial_evaluation_shards(
     contingency_labels: set[str],
     shard_count: int,
     deadline: float,
+    evaluator_linear_algebra_threads: int = 1,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run unchanged vendor evaluation in independent serial shards.
 
@@ -670,6 +692,9 @@ def run_serial_evaluation_shards(
         True,
     )
     completed_records: list[dict[str, Any]] = []
+    environment = evaluator_subprocess_environment(
+        evaluator_linear_algebra_threads
+    )
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=active_shards
     ) as executor:
@@ -680,6 +705,7 @@ def run_serial_evaluation_shards(
                 evaluator,
                 record,
                 deadline,
+                environment,
             )
             for record in shard_records
         ]
@@ -711,6 +737,7 @@ class StreamingSerialEvaluation:
         shard_count: int,
         maximum_processes: int,
         deadline: float,
+        evaluator_linear_algebra_threads: int = 1,
     ) -> None:
         if maximum_processes < 1:
             raise ValueError("streaming evaluation processes must be positive")
@@ -724,6 +751,10 @@ class StreamingSerialEvaluation:
         self.requested_shards = shard_count
         self.maximum_processes = maximum_processes
         self.deadline = deadline
+        self.evaluator_linear_algebra_threads = evaluator_linear_algebra_threads
+        self.environment = evaluator_subprocess_environment(
+            evaluator_linear_algebra_threads
+        )
         groups = contiguous_shard_groups(self.labels, shard_count)
         self.records = prepare_serial_evaluation_shards(
             case_dir,
@@ -818,6 +849,7 @@ class StreamingSerialEvaluation:
                 text=True,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                env=self.environment,
             )
             started = time.perf_counter()
             if self.first_process_started is None:
@@ -902,6 +934,9 @@ class StreamingSerialEvaluation:
                     else 0.0
                 ),
                 "completed_before_tail_wait": completed_before_tail_wait,
+                "evaluator_linear_algebra_threads": (
+                    self.evaluator_linear_algebra_threads
+                ),
             }
         )
         write_json(
@@ -1348,6 +1383,9 @@ def main() -> int:
         "--streaming-serial-evaluation-shards", type=int, default=1
     )
     parser.add_argument("--streaming-evaluation-processes", type=int, default=2)
+    parser.add_argument(
+        "--evaluator-linear-algebra-threads", type=int, default=1
+    )
     parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
@@ -1446,6 +1484,8 @@ def main() -> int:
         raise ValueError("streaming serial evaluation shards must be positive")
     if args.streaming_evaluation_processes < 1:
         raise ValueError("streaming evaluation processes must be positive")
+    if args.evaluator_linear_algebra_threads < 1:
+        raise ValueError("evaluator linear-algebra threads must be positive")
     if args.serial_evaluation_shards > 1 and args.evaluation_processes > 1:
         parser.error(
             "--serial-evaluation-shards cannot be combined with MPI evaluation"
@@ -1551,6 +1591,9 @@ def main() -> int:
         ),
         "streaming_evaluation_processes": (
             args.streaming_evaluation_processes
+        ),
+        "evaluator_linear_algebra_threads": (
+            args.evaluator_linear_algebra_threads
         ),
     }
 
@@ -1776,6 +1819,7 @@ def main() -> int:
             args.streaming_serial_evaluation_shards,
             args.streaming_evaluation_processes,
             evaluation_deadline,
+            args.evaluator_linear_algebra_threads,
         )
         run_status["streaming_evaluation_prepared"] = True
         checkpoint()
@@ -2526,6 +2570,7 @@ def main() -> int:
                         expected_evaluation_labels,
                         args.serial_evaluation_shards,
                         evaluation_deadline,
+                        args.evaluator_linear_algebra_threads,
                     )
                 )
             else:
@@ -2554,6 +2599,9 @@ def main() -> int:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     timeout=evaluator_timeout,
+                    env=evaluator_subprocess_environment(
+                        args.evaluator_linear_algebra_threads
+                    ),
                 )
                 (internal / "evaluation.console.log").write_text(
                     completed.stdout, encoding="utf-8"
@@ -2801,6 +2849,9 @@ def main() -> int:
         ),
         "streaming_evaluation_processes": (
             args.streaming_evaluation_processes
+        ),
+        "evaluator_linear_algebra_threads": (
+            args.evaluator_linear_algebra_threads
         ),
         "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,

@@ -397,18 +397,26 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "extended linearized AC time-limit regression failed");
     }
+    constexpr double kTestVoltageTrustRadius = 0.04;
+    constexpr double kTestAngleTrustRadius = 0.10;
     const auto lightweight_seed = gravityx::solve_linearized_ac_seed(
-        data, source_base.solve.state, {1}, 0.49, std::nullopt, false, true);
-    if (!lightweight_seed.success) {
+        data, source_base.solve.state, {1}, 0.49, std::nullopt, false, true,
+        60.0, false, false, {}, false,
+        kTestVoltageTrustRadius, kTestAngleTrustRadius);
+    if (!lightweight_seed.success ||
+        std::abs(lightweight_seed.voltage_trust_radius -
+                 kTestVoltageTrustRadius) > 1e-12 ||
+        std::abs(lightweight_seed.angle_trust_radius -
+                 kTestAngleTrustRadius) > 1e-12) {
         throw std::runtime_error(
             "lightweight linearized AC seed regression failed: " +
             lightweight_seed.status);
     }
     for (int i = 0; i < static_cast<int>(data.buses.size()); ++i) {
         if (std::abs(lightweight_seed.state.vm[i] - source_base.solve.state.vm[i]) >
-                0.05 + 1e-9 ||
+                kTestVoltageTrustRadius + 1e-9 ||
             std::abs(lightweight_seed.state.va[i] - source_base.solve.state.va[i]) >
-                0.15 + 1e-9) {
+                kTestAngleTrustRadius + 1e-9) {
             throw std::runtime_error(
                 "lightweight linearized AC seed left its trust region");
         }
@@ -426,7 +434,6 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "balance-only base Phase-I regression failed");
     }
-
     gravityx::AcModel model(data, gravityx::ModelMode::BaseSoft, {1});
     const auto solve = model.solve(0, 1e-7);
     const auto validation = gravityx::validate_state(
@@ -1117,17 +1124,40 @@ int run_validated_source_base_json(
         for (int round = 1; round <= kMaximumDynamicBaseRounds; ++round) {
             const double phase_one_time_limit_seconds =
                 dynamic_security_branches.empty() ? 60.0 : 90.0;
+            // A zero-objective targeted Phase-I model may choose any feasible
+            // point in its trust box.  When only a small security violation
+            // remains, the original 0.01/0.006 box is much larger than the
+            // required correction and can create a large nonlinear reactive
+            // mismatch.  Contract the box with the independently measured
+            // residual while retaining the original radii for coarse repair.
+            const bool use_adaptive_security_trust =
+                !dynamic_security_branches.empty() &&
+                linear_reference_residual <= 0.02;
+            const double voltage_trust_radius =
+                use_adaptive_security_trust
+                ? std::clamp(
+                    2.0 * linear_reference_residual, 0.001, 0.01)
+                : -1.0;
+            const double angle_trust_radius =
+                use_adaptive_security_trust
+                ? std::clamp(
+                    0.25 * linear_reference_residual, 0.0001, 0.006)
+                : -1.0;
             log_base_phase("dynamic_base_phase_one_start", {
                 {"round", round},
                 {"reference_residual", linear_reference_residual},
                 {"security_branch_count", dynamic_security_branches.size()},
                 {"time_limit_seconds", phase_one_time_limit_seconds},
+                {"adaptive_security_trust", use_adaptive_security_trust},
+                {"voltage_trust_radius", voltage_trust_radius},
+                {"angle_trust_radius", angle_trust_radius},
             });
             bool lightweight = true;
             auto linear = gravityx::solve_linearized_ac_seed(
                 data, linear_reference, commitment, 0.49, std::nullopt,
                 true, lightweight, phase_one_time_limit_seconds, true, true,
-                dynamic_security_branches);
+                dynamic_security_branches, false,
+                voltage_trust_radius, angle_trust_radius);
             if (!linear.success && linear.status == "Infeasible") {
                 // A local voltage/angle trust box may not contain a balance
                 // repair when the source point is several p.u. infeasible.
@@ -1137,7 +1167,8 @@ int run_validated_source_base_json(
                     data, linear_reference, commitment, 0.49, std::nullopt,
                     true, lightweight, phase_one_time_limit_seconds,
                     true, true,
-                    dynamic_security_branches);
+                    dynamic_security_branches, false,
+                    voltage_trust_radius, angle_trust_radius);
             }
             wall_seconds += linear.wall_seconds;
             auto round_json = linear.to_json(false);
@@ -1325,6 +1356,16 @@ int run_validated_source_base_json(
                 linear_reference_residual =
                     nonlinear.validation.max_residual;
             } else {
+                if (use_adaptive_security_trust &&
+                    linear_reference_residual <= 0.01) {
+                    log_base_phase("dynamic_base_phase_one_stagnation_stop", {
+                        {"round", round},
+                        {"reference_residual", linear_reference_residual},
+                        {"nonlinear_residual",
+                         nonlinear.validation.max_residual},
+                    });
+                    break;
+                }
                 linear_reference = repair_seed;
                 linear_reference_residual =
                     repair_seed_validation.max_residual;

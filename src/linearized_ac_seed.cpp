@@ -227,7 +227,9 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     bool omit_branch_security_rows,
     bool feasibility_only,
     const std::vector<int>& branch_security_subset,
-    bool force_projected_balance_phase_one) {
+    bool force_projected_balance_phase_one,
+    double voltage_trust_radius_override,
+    double angle_trust_radius_override) {
     const auto wall_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     const int ng = static_cast<int>(data.generators.size());
@@ -306,8 +308,14 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         !force_projected_balance_phase_one;
     const bool targeted_security_repair = feasibility_only && nb >= 16000 &&
         !branch_security_subset.empty();
-    const double voltage_trust_radius = targeted_security_repair ? 0.01 : 0.05;
-    const double angle_trust_radius = targeted_security_repair ? 0.006 : 0.15;
+    const double default_voltage_trust_radius =
+        targeted_security_repair ? 0.01 : 0.05;
+    const double default_angle_trust_radius =
+        targeted_security_repair ? 0.006 : 0.15;
+    const double voltage_trust_radius = voltage_trust_radius_override > 0.0
+        ? voltage_trust_radius_override : default_voltage_trust_radius;
+    const double angle_trust_radius = angle_trust_radius_override > 0.0
+        ? angle_trust_radius_override : default_angle_trust_radius;
     const bool projected_balance_slack =
         project_balance_slack &&
         (lightweight_large_seed || feasibility_only) &&

@@ -64,6 +64,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     bool omit_branch_security_rows = false,
     bool feasibility_only = false,
     const std::vector<int>& branch_security_subset = {},
-    bool force_projected_balance_phase_one = false);
+    bool force_projected_balance_phase_one = false,
+    double voltage_trust_radius_override = -1.0,
+    double angle_trust_radius_override = -1.0);
 
 }  // namespace gravityx

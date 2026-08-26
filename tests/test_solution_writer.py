@@ -28,6 +28,7 @@ from run_experiment import (  # noqa: E402
     evaluator_subprocess_environment,
     fast_screen_affinity_groups,
     longest_first_contingencies,
+    progress_log_due,
     progress_checkpoint_due,
     streamed_queue_get,
     validate_and_normalize_evaluation_details,
@@ -120,10 +121,20 @@ class SolutionWriterTests(unittest.TestCase):
 
 class CompetitionTimingTests(unittest.TestCase):
     def test_progress_checkpoint_is_throttled(self) -> None:
-        self.assertFalse(progress_checkpoint_due(10.0, 10.999))
-        self.assertTrue(progress_checkpoint_due(10.0, 11.0))
+        self.assertFalse(progress_checkpoint_due(10.0, 14.999))
+        self.assertTrue(progress_checkpoint_due(10.0, 15.0))
+        self.assertTrue(progress_checkpoint_due(10.0, 11.0, 1.0))
         with self.assertRaises(ValueError):
             progress_checkpoint_due(10.0, 9.0)
+
+    def test_progress_logging_is_batched_but_includes_boundaries(self) -> None:
+        self.assertTrue(progress_log_due(1, 6693))
+        self.assertTrue(progress_log_due(10, 6693))
+        self.assertFalse(progress_log_due(11, 6693))
+        self.assertTrue(progress_log_due(100, 6693))
+        self.assertTrue(progress_log_due(6693, 6693))
+        with self.assertRaises(ValueError):
+            progress_log_due(0, 6693)
 
     def test_parallel_evaluation_requires_and_normalizes_every_detail(self):
         with tempfile.TemporaryDirectory() as directory:

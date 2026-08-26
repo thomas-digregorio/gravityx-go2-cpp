@@ -36,7 +36,10 @@ DEFAULT_EVALUATOR = Path(
     r"C:\Users\thoma\Documents\goc2-dc-scopf-cpu\vendor\C2DataUtilities\data_utilities\evaluation.py"
 )
 WSL_LIBRARY_PATH = "/home/thomasdigregorio/.local/share/gravityx-go2-cpp/env/lib"
-FINALIZATION_RESERVE_SECONDS = 1.0
+FINALIZATION_RESERVE_SECONDS = 5.0
+PROGRESS_CHECKPOINT_INTERVAL_SECONDS = 5.0
+PROGRESS_LOG_INITIAL_COUNT = 10
+PROGRESS_LOG_INTERVAL = 100
 EVALUATOR_THREAD_ENVIRONMENT_VARIABLES = (
     "OPENBLAS_NUM_THREADS",
     "OMP_NUM_THREADS",
@@ -104,13 +107,30 @@ def code2_completed_within_limit(
 def progress_checkpoint_due(
     last_checkpoint: float,
     now: float,
-    interval_seconds: float = 1.0,
+    interval_seconds: float = PROGRESS_CHECKPOINT_INTERVAL_SECONDS,
 ) -> bool:
     if interval_seconds <= 0:
         raise ValueError("progress checkpoint interval must be positive")
     if now < last_checkpoint:
         raise ValueError("progress checkpoint clock cannot move backwards")
     return now - last_checkpoint >= interval_seconds
+
+
+def progress_log_due(
+    completed: int,
+    total: int,
+    initial_count: int = PROGRESS_LOG_INITIAL_COUNT,
+    interval: int = PROGRESS_LOG_INTERVAL,
+) -> bool:
+    if total < 1 or completed < 1 or completed > total:
+        raise ValueError("progress counts must satisfy 1 <= completed <= total")
+    if initial_count < 0 or interval < 1:
+        raise ValueError("progress log controls must be nonnegative and positive")
+    return (
+        completed <= initial_count
+        or completed == total
+        or completed % interval == 0
+    )
 
 
 def streamed_queue_get(
@@ -1724,6 +1744,11 @@ def main() -> int:
         "post_screen_streaming_evaluation_processes": (
             args.post_screen_streaming_evaluation_processes
         ),
+        "progress_checkpoint_interval_seconds": (
+            PROGRESS_CHECKPOINT_INTERVAL_SECONDS
+        ),
+        "progress_log_initial_count": PROGRESS_LOG_INITIAL_COUNT,
+        "progress_log_interval": PROGRESS_LOG_INTERVAL,
         "vendor_evaluator_reference": (
             str(args.vendor_evaluator_reference.resolve())
             if args.vendor_evaluator_reference is not None
@@ -2080,11 +2105,12 @@ def main() -> int:
             run_status["completed_contingency_count"] = len(records)
             run_status["last_completed_contingency"] = label
             progress_checkpoint()
-            print(
-                f"completed {len(records)}/{len(contingencies)}: "
-                f"{label} on {execution_phase} worker {worker_id}",
-                flush=True,
-            )
+            if progress_log_due(len(records), len(contingencies)):
+                print(
+                    f"completed {len(records)}/{len(contingencies)}: "
+                    f"{label} on {execution_phase} worker {worker_id}",
+                    flush=True,
+                )
         if streaming_evaluation is not None:
             streaming_evaluation.mark_completed(label)
 

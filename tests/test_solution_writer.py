@@ -37,7 +37,9 @@ from run_experiment import (  # noqa: E402
     write_solution,
 )
 from fast_official_evaluator import (  # noqa: E402
+    install_in_memory_summary_aggregation,
     read_generated_solution,
+    suppress_verbose_timing_output,
     skip_dataframe_copy,
 )
 
@@ -495,6 +497,79 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
             np.testing.assert_allclose(
                 target.swsh_xst, [[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
             )
+
+            numeric_solution = Path(directory) / "solution_numeric.txt"
+            numeric_text = (
+                solution.read_text(encoding="utf-8")
+                .replace("L1", "1")
+                .replace("G1", "2")
+                .replace("T1", "3")
+            )
+            numeric_solution.write_text(numeric_text, encoding="utf-8")
+            target.load_map = {(101, "1"): 0}
+            target.gen_map = {(101, "2"): 0}
+            target.xfmr_map = {(102, 101, "3"): 0}
+            read_generated_solution(target, numeric_solution)
+            self.assertEqual(
+                set(target._gravityx_numeric_layout),
+                {"bus", "load", "generator", "line", "transformer", "switched shunt"},
+            )
+            numeric_solution.write_text(
+                numeric_text.replace("101, 1.01, 0.1", "101, 1.02, 0.1"),
+                encoding="utf-8",
+            )
+            read_generated_solution(target, numeric_solution)
+            np.testing.assert_allclose(target.bus_volt_mag, [1.02, 0.99])
+
+    def test_fast_evaluator_reuses_exact_written_summaries_in_memory(self):
+        class FakeEvaluation:
+            def __init__(self):
+                self.summary_all_cases = {}
+                self.summary = {"obj": {"val": 1.0}}
+                self.ctg_label = ["CTG_A"]
+                self.writes = []
+
+            def write_detail(
+                self, path, case, detail_csv=False, detail_json=False
+            ):
+                self.writes.append((path, case, detail_csv, detail_json))
+
+            def json_to_summary_all_cases(self, path):
+                raise AssertionError(f"unexpected disk reread from {path}")
+
+        module = SimpleNamespace(
+            Evaluation=FakeEvaluation,
+            clean_string=lambda value: value.strip(),
+        )
+        install_in_memory_summary_aggregation(module)
+        evaluation = module.Evaluation()
+        evaluation.write_detail("out", "BASECASE", detail_json=True)
+        evaluation.summary["obj"]["val"] = 2.0
+        evaluation.write_detail("out", "CTG_A", detail_json=True)
+        evaluation.summary["obj"]["val"] = 3.0
+        evaluation.json_to_summary_all_cases("out")
+
+        self.assertEqual(
+            evaluation.writes,
+            [
+                ("out", "BASECASE", False, True),
+                ("out", "CTG_A", False, True),
+            ],
+        )
+        self.assertEqual(
+            evaluation.summary_all_cases["BASECASE"]["obj"]["val"], 1.0
+        )
+        self.assertEqual(
+            evaluation.summary_all_cases["CTG_A"]["obj"]["val"], 2.0
+        )
+
+    def test_fast_evaluator_quiet_mode_only_replaces_print(self):
+        original = object()
+        module = SimpleNamespace(print=original, marker=object())
+        marker = module.marker
+        suppress_verbose_timing_output(module)
+        self.assertIs(module.marker, marker)
+        self.assertIsNone(module.print("suppressed"))
 
     def test_streaming_evaluation_runs_ready_shards_and_merges_exactly(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1452,6 +1452,7 @@ for line in sys.stdin:
                 time.perf_counter() + 30.0,
                 1,
                 1,
+                completion_order_groups=True,
                 persistent_evaluator_processes=True,
             )
             for label in labels:

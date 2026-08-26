@@ -1358,7 +1358,7 @@ class StreamingSerialEvaluation:
                 self.evaluator,
                 self.environment,
                 self.internal_dir
-                / "streaming_serial_evaluation_shards"
+                / "persistent_streaming_evaluator_workers"
                 / f"persistent_worker_{worker_id:03d}.log",
             )
             self.persistent_workers.append(worker)

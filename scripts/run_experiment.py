@@ -205,6 +205,26 @@ def reject_onedrive(path: Path) -> None:
         raise ValueError(f"refusing OneDrive path: {path}")
 
 
+def require_minimum_free_space(path: Path, minimum_gb: float) -> float:
+    """Fail before a run if its destination volume lacks the requested space."""
+
+    if not math.isfinite(minimum_gb) or minimum_gb < 0.0:
+        raise ValueError("minimum free space must be finite and nonnegative")
+    probe = path.resolve()
+    while not probe.exists():
+        if probe.parent == probe:
+            raise ValueError(f"cannot resolve output volume for {path}")
+        probe = probe.parent
+    free_gb = shutil.disk_usage(probe).free / (1024.0**3)
+    if free_gb < minimum_gb:
+        raise RuntimeError(
+            "insufficient free disk space for cold run: "
+            f"available={free_gb:.2f} GB, required={minimum_gb:.2f} GB, "
+            f"volume_path={probe}"
+        )
+    return free_gb
+
+
 def to_wsl(path: Path) -> str:
     path = path.resolve()
     reject_onedrive(path)
@@ -955,6 +975,13 @@ def merge_serial_evaluation_shards(
                 "last_label": record["labels"][-1],
                 "wall_seconds": float(record["wall_seconds"]),
                 "returncode": int(record["returncode"]),
+                "persistent_evaluator_worker_id": record.get(
+                    "persistent_evaluator_worker_id"
+                ),
+                "evaluator_reported_wall_seconds": record.get(
+                    "evaluator_reported_wall_seconds"
+                ),
+                "static_case_cache": record.get("static_case_cache"),
                 "complete_label_set": bool(
                     record["certificate"]["complete_label_set"]
                 ),
@@ -1040,6 +1067,121 @@ def run_serial_evaluation_shards(
     )
 
 
+class PersistentEvaluatorProcess:
+    """One long-lived exact-evaluator subprocess serving serial shards."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        python: Path,
+        evaluator: Path,
+        environment: dict[str, str],
+        log_path: Path,
+    ) -> None:
+        self.worker_id = worker_id
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_handle = self.log_path.open("w", encoding="utf-8")
+        self.process = subprocess.Popen(
+            [str(python), str(evaluator), "--persistent-server"],
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            env=environment,
+        )
+        self.task_count = 0
+
+    def _read_result(self, request_id: int) -> dict[str, Any]:
+        assert self.process.stdout is not None
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                returncode = self.process.wait()
+                raise RuntimeError(
+                    "persistent official evaluator exited before replying: "
+                    f"worker={self.worker_id}, returncode={returncode}"
+                )
+            self.log_handle.write(line)
+            self.log_handle.flush()
+            stripped = line.rstrip("\r\n")
+            prefix = "GRAVITYX_EVALUATION_RESULT "
+            if not stripped.startswith(prefix):
+                continue
+            response = json.loads(stripped[len(prefix) :])
+            if int(response.get("request_id", -1)) != request_id:
+                raise RuntimeError(
+                    "persistent official evaluator replied to the wrong shard: "
+                    f"worker={self.worker_id}, expected={request_id}, "
+                    f"observed={response.get('request_id')}"
+                )
+            return response
+
+    def evaluate(
+        self,
+        record: dict[str, Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        if time.perf_counter() >= deadline:
+            raise CompetitionTimeout(
+                "persistent official evaluation reached its deadline"
+            )
+        request_id = int(record["shard_index"])
+        request = {
+            "request_id": request_id,
+            "case_dir": str(record["case_dir"]),
+            "solution_dir": str(record["solution_dir"]),
+        }
+        assert self.process.stdin is not None
+        self.process.stdin.write(
+            json.dumps(request, separators=(",", ":")) + "\n"
+        )
+        self.process.stdin.flush()
+        response = self._read_result(request_id)
+        self.task_count += 1
+        if not bool(response.get("success", False)):
+            raise RuntimeError(
+                "persistent official evaluator shard failed: "
+                f"worker={self.worker_id}, index={request_id}, "
+                f"error={response.get('error')}"
+            )
+        return response
+
+    def terminate(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if not self.log_handle.closed:
+            self.log_handle.close()
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            try:
+                assert self.process.stdin is not None
+                self.process.stdin.write('{"stop":true}\n')
+                self.process.stdin.flush()
+                self.process.stdin.close()
+                assert self.process.stdout is not None
+                for line in self.process.stdout:
+                    self.log_handle.write(line)
+                returncode = self.process.wait(timeout=2.0)
+                if returncode != 0:
+                    raise RuntimeError(
+                        "persistent official evaluator stopped with status "
+                        f"{returncode}: worker={self.worker_id}"
+                    )
+            except Exception:
+                self.terminate()
+                raise
+        if not self.log_handle.closed:
+            self.log_handle.close()
+
+
 class StreamingSerialEvaluation:
     """Overlap referenced evaluator-equation shards with contingency generation."""
 
@@ -1058,6 +1200,7 @@ class StreamingSerialEvaluation:
         post_screen_maximum_processes: int | None = None,
         vendor_evaluator_reference: Path | None = None,
         completion_order_groups: bool = False,
+        persistent_evaluator_processes: bool = False,
     ) -> None:
         if maximum_processes < 0:
             raise ValueError(
@@ -1096,6 +1239,7 @@ class StreamingSerialEvaluation:
             vendor_evaluator_reference,
         )
         self.vendor_evaluator_reference = vendor_evaluator_reference
+        self.persistent_evaluator_processes = persistent_evaluator_processes
         groups = contiguous_shard_groups(self.labels, shard_count)
         if completion_order_groups:
             self.dynamic_group_sizes = [len(group) for group in groups]
@@ -1129,6 +1273,16 @@ class StreamingSerialEvaluation:
             int, concurrent.futures.Future[dict[str, Any]]
         ] = {}
         self.finalization_executor_shutdown = False
+        self.evaluator_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=post_screen_maximum_processes
+            )
+            if persistent_evaluator_processes
+            else None
+        )
+        self.evaluator_executor_shutdown = False
+        self.persistent_workers: list[PersistentEvaluatorProcess] = []
+        self.available_persistent_workers: list[PersistentEvaluatorProcess] = []
         self.lock = threading.RLock()
         self.aborted = False
         self.first_process_started: float | None = None
@@ -1137,18 +1291,27 @@ class StreamingSerialEvaluation:
 
     def _abort_locked(self) -> None:
         self.aborted = True
-        for record in list(self.running_records.values()):
-            process = record["process"]
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=1.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            log = record.get("log_handle")
-            if log is not None and not log.closed:
-                log.close()
+        if self.persistent_evaluator_processes:
+            for record in list(self.running_records.values()):
+                future = record.get("evaluation_future")
+                if future is not None:
+                    future.cancel()
+            for worker in self.persistent_workers:
+                worker.terminate()
+            self.available_persistent_workers.clear()
+        else:
+            for record in list(self.running_records.values()):
+                process = record["process"]
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                log = record.get("log_handle")
+                if log is not None and not log.closed:
+                    log.close()
         self.running_records.clear()
         for future in self.finalization_futures.values():
             future.cancel()
@@ -1162,13 +1325,84 @@ class StreamingSerialEvaluation:
             cancel_futures=not wait,
         )
 
+    def _shutdown_evaluator_executor(self, wait: bool) -> None:
+        if self.evaluator_executor_shutdown:
+            return
+        self.evaluator_executor_shutdown = True
+        if self.persistent_evaluator_processes:
+            for worker in self.persistent_workers:
+                if self.aborted:
+                    worker.terminate()
+                else:
+                    worker.stop()
+        if self.evaluator_executor is not None:
+            self.evaluator_executor.shutdown(
+                wait=wait,
+                cancel_futures=not wait,
+            )
+
     def abort(self) -> None:
         with self.lock:
             self._abort_locked()
+        self._shutdown_evaluator_executor(False)
         self._shutdown_finalization_executor(False)
+
+    def _ensure_persistent_workers_locked(self) -> None:
+        if not self.persistent_evaluator_processes:
+            return
+        while len(self.persistent_workers) < self.maximum_processes:
+            worker_id = len(self.persistent_workers)
+            worker = PersistentEvaluatorProcess(
+                worker_id,
+                self.python,
+                self.evaluator,
+                self.environment,
+                self.internal_dir
+                / "streaming_serial_evaluation_shards"
+                / f"persistent_worker_{worker_id:03d}.log",
+            )
+            self.persistent_workers.append(worker)
+            self.available_persistent_workers.append(worker)
 
     def _collect_finished_locked(self) -> None:
         for shard_index, record in list(self.running_records.items()):
+            if self.persistent_evaluator_processes:
+                future = record["evaluation_future"]
+                if not future.done():
+                    continue
+                worker = record["evaluator_worker"]
+                try:
+                    response = future.result()
+                except Exception as error:
+                    self._abort_locked()
+                    raise RuntimeError(
+                        "streaming persistent official evaluator shard failed: "
+                        f"index={shard_index}"
+                    ) from error
+                record["returncode"] = 0
+                record["wall_seconds"] = (
+                    time.perf_counter() - float(record["process_started"])
+                )
+                record["evaluator_reported_wall_seconds"] = float(
+                    response["wall_seconds"]
+                )
+                record["persistent_evaluator_worker_id"] = worker.worker_id
+                record["static_case_cache"] = response.get(
+                    "static_case_cache", {}
+                )
+                del record["evaluation_future"]
+                del record["evaluator_worker"]
+                del record["process_started"]
+                del self.running_records[shard_index]
+                self.available_persistent_workers.append(worker)
+                self.last_process_finished = time.perf_counter()
+                self.finalization_futures[shard_index] = (
+                    self.finalization_executor.submit(
+                        finalize_serial_evaluation_shard,
+                        record,
+                    )
+                )
+                continue
             process = record["process"]
             returncode = process.poll()
             if returncode is None:
@@ -1207,6 +1441,7 @@ class StreamingSerialEvaluation:
 
     def _launch_ready_locked(self) -> None:
         self._collect_finished_locked()
+        self._ensure_persistent_workers_locked()
         while (
             self.ready_records
             and len(self.running_records) < self.maximum_processes
@@ -1217,6 +1452,24 @@ class StreamingSerialEvaluation:
                     "streaming official evaluation reached its deadline"
                 )
             record = self.ready_records.pop(0)
+            if self.persistent_evaluator_processes:
+                if not self.available_persistent_workers:
+                    self.ready_records.insert(0, record)
+                    break
+                worker = self.available_persistent_workers.pop(0)
+                started = time.perf_counter()
+                if self.first_process_started is None:
+                    self.first_process_started = started
+                assert self.evaluator_executor is not None
+                record["evaluation_future"] = self.evaluator_executor.submit(
+                    worker.evaluate,
+                    record,
+                    self.deadline,
+                )
+                record["evaluator_worker"] = worker
+                record["process_started"] = started
+                self.running_records[int(record["shard_index"])] = record
+                continue
             command = [
                 str(self.python),
                 str(self.evaluator),
@@ -1425,6 +1678,16 @@ class StreamingSerialEvaluation:
                         if self.completion_order_groups
                         else "configured_schedule_order"
                     ),
+                    "persistent_evaluator_processes": (
+                        self.persistent_evaluator_processes
+                    ),
+                    "persistent_evaluator_process_count": len(
+                        self.persistent_workers
+                    ),
+                    "persistent_evaluator_task_counts": {
+                        str(worker.worker_id): worker.task_count
+                        for worker in self.persistent_workers
+                    },
                 }
             )
             write_json(
@@ -1433,6 +1696,7 @@ class StreamingSerialEvaluation:
             )
             return summary, metadata
         finally:
+            self._shutdown_evaluator_executor(not self.aborted)
             self._shutdown_finalization_executor(not self.aborted)
 
 
@@ -1691,9 +1955,10 @@ class AffinityScreenWorkQueue:
     affinity group exposes its unattempted siblings as singleton tasks. The
     completed member still provides the group's initial related-outage seed,
     while the hidden serial tail becomes available to every idle worker.
-    When measured heavy-label times are supplied, heavy groups use
-    longest-predicted-work-first order. Unprofiled siblings receive the
-    smallest measured heavy time so group size remains represented.
+    When measured screen times are supplied, heavy groups use
+    longest-predicted-work-first order. A schema-v2 timing profile can cover
+    light siblings too; any unprofiled sibling receives the smallest measured
+    time so group size remains represented.
 
     ``remaining`` counts queued plus active groups across both lanes. Idle
     workers therefore wait while another worker can still create urgent
@@ -1720,9 +1985,12 @@ class AffinityScreenWorkQueue:
             )
         heavy_labels = heavy_labels or set()
         heavy_label_seconds = heavy_label_seconds or {}
-        if not set(heavy_label_seconds).issubset(heavy_labels):
+        all_group_labels = {
+            str(item["label"]) for group in groups for item in group
+        }
+        if not set(heavy_label_seconds).issubset(all_group_labels):
             raise ValueError(
-                "profiled heavy times must refer only to profiled heavy labels"
+                "profiled screen times must refer only to scheduled labels"
             )
         if heavy_labels and heavy_worker_count == 0:
             raise ValueError("profiled heavy groups require at least one heavy worker")
@@ -1738,14 +2006,14 @@ class AffinityScreenWorkQueue:
         ] = queue.Queue()
         heavy_groups: list[tuple[float, int, list[dict[str, Any]]]] = []
         bulk_groups: list[list[dict[str, Any]]] = []
-        default_heavy_seconds = (
+        default_profiled_seconds = (
             min(heavy_label_seconds.values()) if heavy_label_seconds else 0.0
         )
         for original_position, group in enumerate(groups):
             if any(str(item["label"]) in heavy_labels for item in group):
                 estimated_seconds = sum(
                     heavy_label_seconds.get(
-                        str(item["label"]), default_heavy_seconds
+                        str(item["label"]), default_profiled_seconds
                     )
                     for item in group
                 )
@@ -2047,8 +2315,11 @@ def load_fast_screen_heavy_profile(
     """Load timing-only heavy classification and group-ordering data."""
     reject_onedrive(path)
     raw = read_json(path)
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-        raise ValueError("fast-screen heavy profile must use schema_version 1")
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+        raise ValueError(
+            "fast-screen heavy profile must use schema_version 1 or 2"
+        )
+    schema_version = int(raw["schema_version"])
     if raw.get("case_sha256") != case_sha256:
         raise ValueError("fast-screen heavy profile case hash does not match")
     threshold = float(raw.get("heavy_threshold_seconds", math.nan))
@@ -2058,7 +2329,8 @@ def load_fast_screen_heavy_profile(
     if not isinstance(entries, list) or not entries:
         raise ValueError("fast-screen heavy profile contingencies must be nonempty")
 
-    labels: set[str] = set()
+    profiled_labels: set[str] = set()
+    heavy_labels: set[str] = set()
     measured_by_label: dict[str, float] = {}
     measured_seconds: list[float] = []
     for entry in entries:
@@ -2070,31 +2342,40 @@ def load_fast_screen_heavy_profile(
         )
         if label not in contingency_labels:
             raise ValueError(f"unknown profiled fast-screen label: {label}")
-        if label in labels:
+        if label in profiled_labels:
             raise ValueError(f"duplicate profiled fast-screen label: {label}")
-        if not math.isfinite(measured) or measured < threshold:
+        if not math.isfinite(measured) or measured < 0.0:
             raise ValueError(
                 f"invalid profiled fast-screen time for {label}: {measured}"
             )
-        labels.add(label)
+        if schema_version == 1 and measured < threshold:
+            raise ValueError(
+                f"invalid profiled fast-screen time for {label}: {measured}"
+            )
+        profiled_labels.add(label)
+        if measured >= threshold:
+            heavy_labels.add(label)
         measured_by_label[label] = measured
         measured_seconds.append(measured)
+    if not heavy_labels:
+        raise ValueError("fast-screen profile contains no heavy labels")
 
     metadata = {
         "path": str(path.resolve()),
         "sha256": sha256(path),
-        "schema_version": 1,
+        "schema_version": schema_version,
         "heavy_threshold_seconds": threshold,
-        "profiled_contingency_count": len(labels),
+        "profiled_contingency_count": len(profiled_labels),
+        "profiled_heavy_contingency_count": len(heavy_labels),
         "measured_solver_seconds_sum": sum(measured_seconds),
         "uses_prior_solution_state": False,
         "dispatch_semantics": (
             "timing-only heavy-lane classification and descending predicted "
-            "group-work ordering; no primal, dual, commitment, network, or "
-            "solver state"
+            "group-work ordering using every available timing; no primal, "
+            "dual, commitment, network, or solver state"
         ),
     }
-    return labels, measured_by_label, metadata
+    return heavy_labels, measured_by_label, metadata
 
 
 def load_fallback_schedule_profile(
@@ -2195,6 +2476,7 @@ def main() -> int:
     parser.add_argument("--case-json", type=Path, required=True)
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--minimum-free-space-gb", type=float, default=0.0)
     parser.add_argument("--executable", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--fast-screen-executable", type=Path)
     parser.add_argument("--workers", type=int, default=8)
@@ -2221,6 +2503,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--streaming-evaluation-completion-order-shards", action="store_true"
+    )
+    parser.add_argument(
+        "--streaming-persistent-evaluator-processes", action="store_true"
     )
     parser.add_argument(
         "--evaluator-linear-algebra-threads", type=int, default=1
@@ -2412,6 +2697,14 @@ def main() -> int:
             "--streaming-evaluation-completion-order-shards requires "
             "streaming evaluation shards"
         )
+    if args.streaming_persistent_evaluator_processes and (
+        args.streaming_serial_evaluation_shards <= 1
+        or args.vendor_evaluator_reference is None
+    ):
+        parser.error(
+            "--streaming-persistent-evaluator-processes requires streaming "
+            "evaluation shards and --vendor-evaluator-reference"
+        )
     if args.evaluation_processes > 1 and args.mpiexec is None:
         parser.error("--evaluation-processes greater than one requires --mpiexec")
     if args.mpiexec is not None:
@@ -2437,6 +2730,9 @@ def main() -> int:
         raise ValueError("evaluation and finalization reserves exhaust the end-to-end limit")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError(f"cold-run output directory is not empty: {args.output_dir}")
+    initial_free_space_gb = require_minimum_free_space(
+        args.output_dir, args.minimum_free_space_gb
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -2482,6 +2778,8 @@ def main() -> int:
         "success": False,
         "stage": "initializing",
         "started_at_utc": started_utc,
+        "initial_free_space_gb": initial_free_space_gb,
+        "minimum_free_space_gb": args.minimum_free_space_gb,
         "git_revision": git_revision(),
         "base_exact_executable": str(args.executable.resolve()),
         "base_exact_executable_sha256": sha256(args.executable),
@@ -2544,6 +2842,9 @@ def main() -> int:
         ),
         "streaming_evaluation_completion_order_shards": (
             args.streaming_evaluation_completion_order_shards
+        ),
+        "streaming_persistent_evaluator_processes": (
+            args.streaming_persistent_evaluator_processes
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads
@@ -2816,6 +3117,7 @@ def main() -> int:
             args.post_screen_streaming_evaluation_processes,
             args.vendor_evaluator_reference,
             args.streaming_evaluation_completion_order_shards,
+            args.streaming_persistent_evaluator_processes,
         )
         run_status["streaming_evaluation_prepared"] = True
         checkpoint()
@@ -4016,6 +4318,9 @@ def main() -> int:
         ),
         "streaming_evaluation_completion_order_shards": (
             args.streaming_evaluation_completion_order_shards
+        ),
+        "streaming_persistent_evaluator_processes": (
+            args.streaming_persistent_evaluator_processes
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads

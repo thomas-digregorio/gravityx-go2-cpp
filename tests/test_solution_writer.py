@@ -34,6 +34,7 @@ from run_experiment import (  # noqa: E402
     longest_first_contingencies,
     progress_log_due,
     progress_checkpoint_due,
+    require_minimum_free_space,
     streamed_queue_get,
     validate_and_normalize_evaluation_details,
     validate_in_memory_evaluation_certificate,
@@ -43,7 +44,9 @@ from run_experiment import (  # noqa: E402
     write_solution,
 )
 from fast_official_evaluator import (  # noqa: E402
+    install_compact_output_mode,
     install_in_memory_summary_aggregation,
+    install_static_case_read_cache,
     read_generated_solution,
     suppress_verbose_timing_output,
     skip_dataframe_copy,
@@ -691,6 +694,47 @@ class CompetitionTimingTests(unittest.TestCase):
                     path, "different-hash", {"A", "B", "C"}
                 )
 
+    def test_full_screen_profile_classifies_heavy_and_keeps_all_timings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "full_profile.json"
+            write_json(
+                path,
+                {
+                    "schema_version": 2,
+                    "case_sha256": "case-hash",
+                    "heavy_threshold_seconds": 5.0,
+                    "contingencies": [
+                        {
+                            "label": "HEAVY",
+                            "measured_solver_wall_seconds": 7.0,
+                        },
+                        {
+                            "label": "LIGHT",
+                            "measured_solver_wall_seconds": 1.25,
+                        },
+                    ],
+                },
+            )
+            labels, measured, metadata = load_fast_screen_heavy_profile(
+                path, "case-hash", {"HEAVY", "LIGHT"}
+            )
+            self.assertEqual(labels, {"HEAVY"})
+            self.assertEqual(measured, {"HEAVY": 7.0, "LIGHT": 1.25})
+            self.assertEqual(metadata["profiled_contingency_count"], 2)
+            self.assertEqual(metadata["profiled_heavy_contingency_count"], 1)
+
+            work = AffinityScreenWorkQueue(
+                [[{"label": "HEAVY"}, {"label": "LIGHT"}]],
+                worker_count=1,
+                heavy_labels=labels,
+                heavy_worker_count=1,
+                heavy_label_seconds=measured,
+            )
+            _, group = work.get(threading.Event(), worker_id=0)
+            self.assertEqual(
+                group[0]["fast_screen_profiled_group_wall_seconds"], 8.25
+            )
+
     def test_fast_screen_profile_measurements_parse_and_merge_by_maximum(self):
         with tempfile.TemporaryDirectory() as directory:
             logs = Path(directory)
@@ -970,6 +1014,106 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
                 capture["objectives"], {"BASECASE": 1.0, "CTG_A": 2.0}
             )
 
+    def test_static_case_cache_restores_pristine_independent_state(self):
+        class FakeReader:
+            read_count = 0
+
+            def read(self, file_name):
+                type(self).read_count += 1
+                self.source = str(file_name)
+                self.nested = {"values": [type(self).read_count]}
+
+        class FakeSupplemental(FakeReader):
+            read_count = 0
+
+        module = SimpleNamespace(
+            data=SimpleNamespace(Raw=FakeReader, Sup=FakeSupplemental)
+        )
+        statistics = install_static_case_read_cache(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "case.raw"
+            linked = root / "linked.raw"
+            source.write_text("case\n", encoding="utf-8")
+            linked.hardlink_to(source)
+
+            first = module.data.Raw()
+            first.read(source)
+            first.nested["values"][0] = 999
+            second = module.data.Raw()
+            second.read(linked)
+
+            self.assertEqual(FakeReader.read_count, 1)
+            self.assertEqual(second.nested, {"values": [1]})
+            self.assertIsNot(first.nested, second.nested)
+            self.assertEqual(statistics["raw_misses"], 1)
+            self.assertEqual(statistics["raw_hits"], 1)
+
+    def test_compact_evaluator_output_keeps_vendor_summary_calculation(self):
+        class FakeEvaluation:
+            def __init__(self):
+                self.summary_all_cases = {}
+                self.summary = {
+                    "obj": {"val": 1.0},
+                    "infeas": {"val": False},
+                }
+                self.ctg_label = ["CTG_A"]
+                self.summary_steps = []
+
+            def write_detail(self, path, case, **kwargs):
+                if kwargs.get("detail_json"):
+                    output = Path(path)
+                    output.mkdir(parents=True, exist_ok=True)
+                    (output / f"eval_detail_{case}.json").write_text(
+                        json.dumps(self.summary), encoding="utf-8"
+                    )
+
+            def write_final_summary_and_detail(self, path):
+                raise AssertionError(f"redundant final writers called for {path}")
+
+            def json_to_summary_all_cases(self, path):
+                raise AssertionError(f"unexpected disk reread from {path}")
+
+            def summary_all_cases_to_summary(self):
+                self.summary_steps.append("calculate")
+
+            def write_summary_json(self, path):
+                self.summary_steps.append("write_json")
+                (Path(path) / "eval_summary.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+
+            def write_sol_change(self, path, case):
+                raise AssertionError((path, case))
+
+        module = SimpleNamespace(
+            Evaluation=FakeEvaluation,
+            clean_string=lambda value: value,
+        )
+        install_in_memory_summary_aggregation(module)
+        install_compact_output_mode(module)
+        with tempfile.TemporaryDirectory() as directory:
+            evaluation = module.Evaluation()
+            evaluation.write_detail(directory, "BASECASE", detail_json=True)
+            evaluation.summary["obj"]["val"] = 2.0
+            evaluation.write_detail(directory, "CTG_A", detail_json=True)
+            evaluation.write_final_summary_and_detail(directory)
+            evaluation.write_sol_change(directory, "CTG_A")
+
+            self.assertEqual(
+                evaluation.summary_steps, ["calculate", "write_json"]
+            )
+            capture = json.loads(
+                (
+                    Path(directory)
+                    / "gravityx_in_memory_detail_certificate.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                capture["final_summary_mode"],
+                "vendor_summary_json_without_redundant_aggregate_artifacts",
+            )
+
     def test_in_memory_evaluator_certificate_validates_exact_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -1221,6 +1365,110 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             finally:
                 manager.abort()
 
+    def test_streaming_shards_reuse_persistent_evaluator_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "case"
+            output_dir = root / "output"
+            internal_dir = output_dir / "internal"
+            case_dir.mkdir()
+            output_dir.mkdir()
+            (case_dir / "case.raw").write_text("raw\n", encoding="utf-8")
+            (case_dir / "case.json").write_text("{}\n", encoding="utf-8")
+            labels = ["CTG_A", "CTG_B", "CTG_C", "CTG_D"]
+            (case_dir / "case.con").write_text(
+                "".join(f"CONTINGENCY {label}\nEND\n" for label in labels)
+                + "END\n",
+                encoding="utf-8",
+            )
+            (output_dir / "solution_BASECASE.txt").write_text(
+                "base\n", encoding="utf-8"
+            )
+            evaluator = root / "persistent_fake_evaluator.py"
+            evaluator.write_text(
+                """
+import json
+from pathlib import Path
+import sys
+import time
+
+assert sys.argv[1] == "--persistent-server"
+print("GRAVITYX_EVALUATOR_READY", flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("stop"):
+        break
+    case_dir = Path(request["case_dir"])
+    solution_dir = Path(request["solution_dir"])
+    labels = [
+        row.split()[1]
+        for row in (case_dir / "case.con").read_text(encoding="utf-8").splitlines()
+        if row.startswith("CONTINGENCY ")
+    ]
+    objectives = {"BASECASE": 10.0}
+    infeasibilities = {"BASECASE": False}
+    for label in labels:
+        objectives[label] = float(ord(label[-1]) - ord("A") + 1)
+        infeasibilities[label] = False
+    for label, objective in objectives.items():
+        (solution_dir / f"eval_detail_{label}.json").write_text(
+            json.dumps({
+                "obj": {"val": objective},
+                "infeas": {"val": False},
+            }),
+            encoding="utf-8",
+        )
+    (solution_dir / "eval_summary.json").write_text(
+        json.dumps({
+            "solutions_exist": True,
+            "num_ctg": len(labels),
+            "obj": 10.0 + sum(objectives[label] for label in labels) / len(labels),
+            "infeas": 0.0,
+        }),
+        encoding="utf-8",
+    )
+    print(
+        "GRAVITYX_EVALUATION_RESULT "
+        + json.dumps({
+            "request_id": request["request_id"],
+            "success": True,
+            "wall_seconds": 0.01,
+            "static_case_cache": {"raw_hits": request["request_id"]},
+        }),
+        flush=True,
+    )
+""".lstrip(),
+                encoding="utf-8",
+            )
+            manager = StreamingSerialEvaluation(
+                Path(sys.executable),
+                evaluator,
+                case_dir,
+                output_dir,
+                internal_dir,
+                labels,
+                4,
+                1,
+                time.perf_counter() + 30.0,
+                1,
+                1,
+                persistent_evaluator_processes=True,
+            )
+            for label in labels:
+                (output_dir / f"solution_{label}.txt").write_text(
+                    f"{label}\n", encoding="utf-8"
+                )
+                manager.mark_completed(label)
+            summary, metadata = manager.finish()
+
+            self.assertEqual(summary["num_ctg"], 4)
+            self.assertEqual(summary["infeas"], 0.0)
+            self.assertTrue(metadata["persistent_evaluator_processes"])
+            self.assertEqual(metadata["persistent_evaluator_process_count"], 1)
+            self.assertEqual(
+                metadata["persistent_evaluator_task_counts"], {"0": 4}
+            )
+
     def test_code2_budget_uses_contingency_count(self):
         self.assertEqual(code2_time_limit(105, 2.0), 210.0)
         self.assertEqual(code2_time_limit(0, 2.0), 0.0)
@@ -1228,6 +1476,17 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
     def test_process_timeout_is_bounded_by_stage_deadline(self):
         self.assertEqual(effective_process_timeout(300.0, 120.0, now=100.0), 20.0)
         self.assertEqual(effective_process_timeout(5.0, 120.0, now=100.0), 5.0)
+
+    def test_cold_run_free_space_guard_fails_before_writing(self):
+        usage = SimpleNamespace(total=100 * 1024**3, used=99 * 1024**3, free=1 * 1024**3)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "future" / "run"
+            with mock.patch("run_experiment.shutil.disk_usage", return_value=usage):
+                with self.assertRaisesRegex(RuntimeError, "insufficient free disk"):
+                    require_minimum_free_space(destination, 2.0)
+                self.assertEqual(
+                    require_minimum_free_space(destination, 1.0), 1.0
+                )
 
     def test_code2_timeout_is_not_reported_within_limit(self):
         self.assertFalse(code2_completed_within_limit(475.9, 476.0, True))

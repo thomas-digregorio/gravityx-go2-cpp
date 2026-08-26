@@ -9,7 +9,9 @@ copy.  It also retains each already-written per-case summary in memory so the
 vendor final writer does not reread the same JSON files, and suppresses the
 vendor's per-function timing prints.  The official case loader, equations,
 tolerances, objective, infeasibility logic, per-case detail writer, and final
-output writers remain the referenced vendor module.
+summary calculation remain the referenced vendor module.  Optional persistent
+mode reuses pristine parsed static inputs and omits only redundant aggregate
+CSV/JSON and solution-change artifacts after preserving every per-case detail.
 
 This parser intentionally accepts only the canonical section order emitted by
 GravityX's C++ solution writer.  It validates every row count and source key
@@ -25,6 +27,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from types import ModuleType
 from typing import Any, Iterable
 import warnings
@@ -667,7 +670,21 @@ def install_in_memory_summary_aggregation(module: ModuleType) -> None:
         self: Any,
         path: str | os.PathLike[str],
     ) -> Any:
-        result = original_write_final_summary_and_detail(self, path)
+        compact_final_summary = bool(
+            getattr(module, "_gravityx_compact_final_summary", False)
+        )
+        if compact_final_summary:
+            # Keep the vendor's summary construction and JSON writer, but omit
+            # redundant aggregate CSV/JSON and sol-change artifacts.  Every
+            # unchanged per-case detail JSON remains on disk and is certified
+            # below.  The runner independently recomputes the scalar objective
+            # and infeasibility from those details.
+            self.json_to_summary_all_cases(path)
+            self.summary_all_cases_to_summary()
+            self.write_summary_json(path)
+            result = None
+        else:
+            result = original_write_final_summary_and_detail(self, path)
         expected = {"BASECASE", *self.ctg_label}
         observed = set(self.summary_all_cases)
         detail_files = getattr(self, "_gravityx_written_detail_files", {})
@@ -696,6 +713,11 @@ def install_in_memory_summary_aggregation(module: ModuleType) -> None:
             "detail_files": {
                 label: detail_files[label] for label in sorted(expected)
             },
+            "final_summary_mode": (
+                "vendor_summary_json_without_redundant_aggregate_artifacts"
+                if compact_final_summary
+                else "unchanged_vendor_final_writers"
+            ),
         }
         certificate_path = Path(path) / IN_MEMORY_DETAIL_CERTIFICATE_NAME
         with certificate_path.open(
@@ -710,6 +732,140 @@ def install_in_memory_summary_aggregation(module: ModuleType) -> None:
     module.Evaluation.write_final_summary_and_detail = (
         write_final_summary_and_capture_certificate
     )
+
+
+def install_compact_output_mode(module: ModuleType) -> None:
+    """Omit evaluator artifacts not consumed by the exhaustive certificate."""
+
+    module._gravityx_compact_final_summary = True
+
+    def skip_sol_change(self: Any, path: str, case: str) -> None:
+        del self, path, case
+
+    module.Evaluation.write_sol_change = skip_sol_change
+
+
+def install_static_case_read_cache(module: ModuleType) -> dict[str, int]:
+    """Reuse immutable RAW and supplemental parses in a persistent process.
+
+    Evaluation instances continue to be constructed from scratch for every
+    shard.  Only the parsed state of hard-linked, byte-identical ``case.raw``
+    and ``case.json`` inputs is shared.  Contingency files are always parsed
+    anew because each shard has a different exact label subset.
+    """
+
+    statistics = {
+        "raw_hits": 0,
+        "raw_misses": 0,
+        "supplemental_hits": 0,
+        "supplemental_misses": 0,
+    }
+
+    def patch_reader(reader_class: type[Any], name: str) -> None:
+        original_read = reader_class.read
+        cached_states: list[tuple[Path, dict[str, Any]]] = []
+
+        def cached_read(
+            self: Any,
+            file_name: str | os.PathLike[str],
+        ) -> Any:
+            candidate = Path(file_name).resolve()
+            for source, state in cached_states:
+                try:
+                    identical_file = os.path.samefile(candidate, source)
+                except OSError:
+                    identical_file = False
+                if identical_file:
+                    # Vendor cost/setup routines normalize some nested case
+                    # structures in place.  Restore an independent copy of
+                    # the pristine parsed state for every shard so reuse can
+                    # never carry mutated model data across evaluations.
+                    self.__dict__.update(copy.deepcopy(state))
+                    statistics[f"{name}_hits"] += 1
+                    return None
+            result = original_read(self, file_name)
+            # Capture an immutable baseline before the returned objects are
+            # handed to Evaluation, whose cost setup mutates nested values.
+            cached_states.append(
+                (candidate, copy.deepcopy(self.__dict__))
+            )
+            statistics[f"{name}_misses"] += 1
+            return result
+
+        reader_class.read = cached_read
+
+    patch_reader(module.data.Raw, "raw")
+    patch_reader(module.data.Sup, "supplemental")
+    module._gravityx_static_case_cache_statistics = statistics
+    return statistics
+
+
+def run_persistent_server(module: ModuleType) -> int:
+    """Evaluate a sequence of exact shards without restarting Python."""
+
+    install_static_case_read_cache(module)
+    install_compact_output_mode(module)
+    print("GRAVITYX_EVALUATOR_READY", flush=True)
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        started = time.perf_counter()
+        request_id: str | int | None = None
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("persistent evaluator request must be an object")
+            if request.get("stop") is True:
+                print("GRAVITYX_EVALUATOR_STOPPED", flush=True)
+                return 0
+            request_id = request.get("request_id")
+            case_dir = Path(str(request["case_dir"])).resolve()
+            solution_dir = Path(str(request["solution_dir"])).resolve()
+            result = module.run_main(
+                case_dir,
+                solution_dir,
+                False,
+                False,
+                True,
+                None,
+            )
+            summary_path = solution_dir / "eval_summary.json"
+            certificate_path = (
+                solution_dir / IN_MEMORY_DETAIL_CERTIFICATE_NAME
+            )
+            success = (
+                isinstance(result, tuple)
+                and len(result) >= 3
+                and bool(result[2])
+                and summary_path.is_file()
+                and certificate_path.is_file()
+            )
+            response = {
+                "request_id": request_id,
+                "success": success,
+                "wall_seconds": time.perf_counter() - started,
+                "static_case_cache": dict(
+                    module._gravityx_static_case_cache_statistics
+                ),
+            }
+            if not success:
+                response["error"] = (
+                    "referenced evaluator did not produce complete shard artifacts"
+                )
+        except Exception as error:
+            response = {
+                "request_id": request_id,
+                "success": False,
+                "wall_seconds": time.perf_counter() - started,
+                "error": f"{type(error).__name__}: {error}",
+            }
+        print(
+            "GRAVITYX_EVALUATION_RESULT "
+            + json.dumps(response, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
+    return 0
 
 
 def suppress_verbose_timing_output(module: ModuleType) -> None:
@@ -751,6 +907,8 @@ def main() -> int:
         )
     module = load_vendor_evaluator(Path(raw_path).resolve())
     install_fast_parser(module)
+    if len(sys.argv) == 2 and sys.argv[1] == "--persistent-server":
+        return run_persistent_server(module)
     module.main()
     return 0
 

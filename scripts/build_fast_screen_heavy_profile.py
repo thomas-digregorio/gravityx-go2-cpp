@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a timing-only heavy-screen profile from a prior partial/full run."""
+"""Build a timing-only screen-scheduling profile from prior cold runs."""
 
 from __future__ import annotations
 
@@ -72,8 +72,10 @@ def existing_profile_measurements(
 ) -> dict[str, float]:
     """Read timing-only measurements from a previously validated profile."""
     raw = read_json(path)
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
-        raise ValueError("existing heavy profile must use schema_version 1")
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+        raise ValueError(
+            "existing heavy profile must use schema_version 1 or 2"
+        )
     if raw.get("case_sha256") != expected_case_sha256:
         raise ValueError("existing heavy profile case hash does not match")
     entries = raw.get("contingencies")
@@ -115,6 +117,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--threshold", type=float, default=5.0)
     parser.add_argument("--require-complete-coverage", action="store_true")
+    parser.add_argument(
+        "--include-all-measurements",
+        action="store_true",
+        help=(
+            "Write schema v2 with every measured time while using threshold "
+            "only for heavy-lane classification."
+        ),
+    )
     args = parser.parse_args()
 
     for path in (
@@ -161,9 +171,12 @@ def main() -> int:
             "measured_solver_wall_seconds": measured[label],
         }
         for label in sorted(measured)
-        if measured[label] >= args.threshold
+        if args.include_all_measurements or measured[label] >= args.threshold
     ]
-    if not selected:
+    heavy_count = sum(
+        measured[label] >= args.threshold for label in measured
+    )
+    if not selected or heavy_count == 0:
         raise ValueError("no measured screens meet the heavy threshold")
 
     sources: list[dict[str, Any]] = []
@@ -190,7 +203,7 @@ def main() -> int:
             }
         )
     profile = {
-        "schema_version": 1,
+        "schema_version": 2 if args.include_all_measurements else 1,
         "purpose": (
             "Scheduling-only heavy-screen concurrency profile. Contains no "
             "primal, dual, commitment, network, or solver state. Repeated "
@@ -212,6 +225,7 @@ def main() -> int:
             {
                 "output": str(args.output),
                 "profiled_contingency_count": len(selected),
+                "profiled_heavy_contingency_count": heavy_count,
                 "measured_task_count": len(measured),
                 "measurement_run_count": len(measurement_sets),
                 "threshold_seconds": args.threshold,

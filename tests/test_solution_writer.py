@@ -124,7 +124,7 @@ class SolutionWriterTests(unittest.TestCase):
 class CompetitionTimingTests(unittest.TestCase):
     def test_compact_summary_uses_measured_short_finalization_reserve(self) -> None:
         self.assertEqual(finalization_reserve_seconds(False), 5.0)
-        self.assertEqual(finalization_reserve_seconds(True), 1.0)
+        self.assertEqual(finalization_reserve_seconds(True), 0.5)
 
     def test_progress_checkpoint_is_throttled(self) -> None:
         self.assertFalse(progress_checkpoint_due(10.0, 14.999))

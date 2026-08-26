@@ -4,6 +4,7 @@
 .data/
 .toolchain/
 runs/
+diagnostics/
 results/*.json
 results/*.csv
 *.log

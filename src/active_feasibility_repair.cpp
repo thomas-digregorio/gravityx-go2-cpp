@@ -516,6 +516,17 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         cost[angle_down_offset + i] = 1e-3 / angle_scale[i];
     }
     for (int i = 0; include_reactive && i < nb; ++i) {
+        const double required_upward_move = std::max(
+            0.0, data.buses[i].vmin - output.state.vm[i]);
+        const double required_downward_move = std::max(
+            0.0, output.state.vm[i] - data.buses[i].vmax);
+        if (required_upward_move > voltage_trust_radius + 1e-12 ||
+            required_downward_move > voltage_trust_radius + 1e-12) {
+            output.status = "reference_voltage_outside_trust_region";
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            return output;
+        }
         const double upward_room = std::min(
             voltage_trust_radius,
             std::max(0.0, data.buses[i].vmax - output.state.vm[i]));
@@ -526,6 +537,15 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             upward_room * voltage_scale[i];
         upper[voltage_down_offset + i] =
             downward_room * voltage_scale[i];
+        // The split movement variables describe the LP point itself.  If the
+        // nonlinear reference is outside a source voltage bound, require the
+        // LP to return inside that bound rather than clamping only after the
+        // balance rows have been solved.  Post-solve clamping alone changes
+        // branch injections and invalidates the claimed linearized point.
+        lower[voltage_up_offset + i] =
+            required_upward_move * voltage_scale[i];
+        lower[voltage_down_offset + i] =
+            required_downward_move * voltage_scale[i];
         cost[voltage_up_offset + i] = 1e-3 / voltage_scale[i];
         cost[voltage_down_offset + i] = 1e-3 / voltage_scale[i];
     }

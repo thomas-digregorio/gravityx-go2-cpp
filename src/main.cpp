@@ -20,8 +20,10 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <queue>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace gravity;
 
@@ -77,6 +79,380 @@ void require_near(double actual, double expected, double tolerance, const std::s
     }
 }
 
+bool bounded_fast_newton_rescue_candidate(
+    const gravityx::ValidationReport& validation) {
+    return validation.max_residual <= 0.2 &&
+        (validation.worst_category == "active_balance" ||
+         validation.worst_category == "reactive_balance");
+}
+
+struct PassivePocket {
+    int boundary_branch{-1};
+    int outside_bus{-1};
+    std::vector<int> buses;
+};
+
+std::vector<PassivePocket> find_small_passive_outage_pockets(
+    const gravityx::CaseData& data,
+    int outaged_branch,
+    std::size_t maximum_pocket_buses = 64,
+    nlohmann::json* diagnostics = nullptr) {
+    std::vector<PassivePocket> pockets;
+    if (outaged_branch < 0 ||
+        outaged_branch >= static_cast<int>(data.branches.size())) {
+        return pockets;
+    }
+    const auto& outage = data.branches[outaged_branch];
+    const int nb = static_cast<int>(data.buses.size());
+    const int nl = static_cast<int>(data.branches.size());
+    const auto incident_branches = [&](int bus) {
+        std::vector<int> result = data.buses[bus].branches_from;
+        result.insert(
+            result.end(), data.buses[bus].branches_to.begin(),
+            data.buses[bus].branches_to.end());
+        return result;
+    };
+    const auto other_bus = [&](int branch, int bus) {
+        return data.branches[branch].from == bus
+            ? data.branches[branch].to : data.branches[branch].from;
+    };
+
+    // Only bridges close to an endpoint of the newly opened branch can bound
+    // the passive pocket created by that outage.  Limit the discovery radius
+    // and every bridge-side search so this remains negligible on the largest
+    // cases.
+    constexpr int kDiscoveryDepth = 4;
+    std::vector<int> depth(static_cast<std::size_t>(nb), -1);
+    std::vector<unsigned char> candidate_seen(
+        static_cast<std::size_t>(nl), 0);
+    std::vector<int> candidate_branches;
+    std::queue<int> discovery;
+    for (int endpoint : {outage.from, outage.to}) {
+        if (depth[endpoint] < 0) {
+            depth[endpoint] = 0;
+            discovery.push(endpoint);
+        }
+    }
+    while (!discovery.empty()) {
+        const int bus = discovery.front();
+        discovery.pop();
+        for (int branch : incident_branches(bus)) {
+            if (branch == outaged_branch ||
+                data.branches[branch].status == 0) {
+                continue;
+            }
+            if (!candidate_seen[branch]) {
+                candidate_seen[branch] = 1;
+                candidate_branches.push_back(branch);
+            }
+            const int neighbor = other_bus(branch, bus);
+            if (depth[bus] < kDiscoveryDepth && depth[neighbor] < 0) {
+                depth[neighbor] = depth[bus] + 1;
+                discovery.push(neighbor);
+            }
+        }
+    }
+
+    std::vector<int> visited(static_cast<std::size_t>(nb), 0);
+    int visit_token = 0;
+    int rejected_oversized_or_nonbridge = 0;
+    int rejected_without_outage_endpoint = 0;
+    int rejected_nonpassive = 0;
+    int rejected_nonunit_ratio = 0;
+    nlohmann::json rejected_nonpassive_details =
+        nlohmann::json::array();
+    std::vector<unsigned char> accepted_side(
+        static_cast<std::size_t>(2 * nl), 0);
+    for (int boundary_branch : candidate_branches) {
+        const auto& boundary = data.branches[boundary_branch];
+        for (int side = 0; side < 2; ++side) {
+            const int start = side == 0 ? boundary.from : boundary.to;
+            const int outside = side == 0 ? boundary.to : boundary.from;
+            const int side_key = 2 * boundary_branch + side;
+            if (accepted_side[side_key]) {
+                continue;
+            }
+            ++visit_token;
+            std::queue<int> queue;
+            std::vector<int> component;
+            visited[start] = visit_token;
+            queue.push(start);
+            bool oversized = false;
+            while (!queue.empty() && !oversized) {
+                const int bus = queue.front();
+                queue.pop();
+                component.push_back(bus);
+                if (component.size() > maximum_pocket_buses) {
+                    oversized = true;
+                    break;
+                }
+                for (int branch : incident_branches(bus)) {
+                    if (branch == outaged_branch ||
+                        branch == boundary_branch ||
+                        data.branches[branch].status == 0) {
+                        continue;
+                    }
+                    const int neighbor = other_bus(branch, bus);
+                    if (visited[neighbor] != visit_token) {
+                        visited[neighbor] = visit_token;
+                        queue.push(neighbor);
+                    }
+                }
+            }
+            if (oversized || visited[outside] == visit_token) {
+                ++rejected_oversized_or_nonbridge;
+                continue;
+            }
+            const bool contains_outage_endpoint =
+                visited[outage.from] == visit_token ||
+                visited[outage.to] == visit_token;
+            if (!contains_outage_endpoint) {
+                ++rejected_without_outage_endpoint;
+                continue;
+            }
+            bool passive = true;
+            bool unit_ratio = true;
+            for (int bus : component) {
+                const auto& source_bus = data.buses[bus];
+                // Loads and source-dispatchable shunts remain subject to their
+                // exact corrective bounds below.  Do not apply this candidate
+                // transformation to generation or a reference bus.
+                if (!source_bus.generators.empty() || source_bus.type == 3) {
+                    rejected_nonpassive_details.push_back({
+                        {"boundary_branch",
+                         data.branches[boundary_branch].source_key},
+                        {"bus", source_bus.source_key},
+                        {"generator_count", source_bus.generators.size()},
+                        {"load_count", source_bus.loads.size()},
+                        {"shunt_count", source_bus.shunts.size()},
+                        {"bus_type", source_bus.type},
+                        {"component_size", component.size()},
+                    });
+                    passive = false;
+                    break;
+                }
+                for (int branch : incident_branches(bus)) {
+                    if (branch == outaged_branch ||
+                        data.branches[branch].status == 0) {
+                        continue;
+                    }
+                    const auto& source_branch = data.branches[branch];
+                    if (std::abs(source_branch.tap - 1.0) > 1e-9 ||
+                        std::abs(source_branch.shift) > 1e-9) {
+                        unit_ratio = false;
+                        break;
+                    }
+                }
+                if (!unit_ratio) {
+                    break;
+                }
+            }
+            if (!passive) {
+                ++rejected_nonpassive;
+                continue;
+            }
+            if (!unit_ratio) {
+                ++rejected_nonunit_ratio;
+                continue;
+            }
+            std::sort(component.begin(), component.end());
+            accepted_side[side_key] = 1;
+            pockets.push_back({
+                boundary_branch,
+                outside,
+                std::move(component),
+            });
+        }
+    }
+    if (diagnostics != nullptr) {
+        *diagnostics = {
+            {"candidate_branch_count", candidate_branches.size()},
+            {"accepted_pocket_count", pockets.size()},
+            {"rejected_oversized_or_nonbridge",
+             rejected_oversized_or_nonbridge},
+            {"rejected_without_outage_endpoint",
+             rejected_without_outage_endpoint},
+            {"rejected_nonpassive", rejected_nonpassive},
+            {"rejected_nonpassive_details",
+             std::move(rejected_nonpassive_details)},
+            {"rejected_nonunit_ratio", rejected_nonunit_ratio},
+        };
+    }
+    return pockets;
+}
+
+struct PassivePocketRepair {
+    std::optional<gravityx::FastPowerFlowResult> result;
+    nlohmann::json diagnostics;
+};
+
+std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
+    const gravityx::CaseData& data,
+    const gravityx::AcState& base_state,
+    const std::vector<int>& commitment,
+    const gravityx::Contingency& contingency,
+    const gravityx::ContingencyContext& context,
+    const gravityx::AcState& reference,
+    const gravityx::ValidationReport& reference_validation) {
+    if (contingency.type != gravityx::ContingencyType::Branch) {
+        return std::nullopt;
+    }
+    const auto wall_start = std::chrono::steady_clock::now();
+    nlohmann::json search_diagnostics;
+    const auto pockets = find_small_passive_outage_pockets(
+        data, contingency.component, 64, &search_diagnostics);
+    nlohmann::json candidates = nlohmann::json::array();
+    int rejected_voltage_bounds = 0;
+    std::optional<gravityx::FastPowerFlowResult> best;
+    for (const auto& pocket : pockets) {
+        const double boundary_vm = reference.vm[pocket.outside_bus];
+        bool voltage_bounds_allow_equalization = true;
+        for (int bus : pocket.buses) {
+            if (boundary_vm < data.buses[bus].vmin - 1e-12 ||
+                boundary_vm > data.buses[bus].vmax + 1e-12) {
+                voltage_bounds_allow_equalization = false;
+                break;
+            }
+        }
+        if (!voltage_bounds_allow_equalization) {
+            ++rejected_voltage_bounds;
+            continue;
+        }
+        auto candidate = reference;
+        nlohmann::json shunt_changes = nlohmann::json::array();
+        if (candidate.shunt_steps.size() == data.shunts.size() &&
+            candidate.shunt_bs.size() == data.shunts.size()) {
+            for (int bus : pocket.buses) {
+                for (int shunt_index : data.buses[bus].shunts) {
+                    const auto& shunt = data.shunts[shunt_index];
+                    if (!shunt.dispatchable ||
+                        shunt.block_maximum_steps.size() !=
+                            shunt.block_susceptance.size()) {
+                        continue;
+                    }
+                    std::size_t configuration_count = 1;
+                    for (int maximum : shunt.block_maximum_steps) {
+                        if (maximum < 0 ||
+                            configuration_count >
+                                4096 / static_cast<std::size_t>(maximum + 1)) {
+                            configuration_count = 0;
+                            break;
+                        }
+                        configuration_count *=
+                            static_cast<std::size_t>(maximum + 1);
+                    }
+                    if (configuration_count == 0 ||
+                        configuration_count > 4096) {
+                        continue;
+                    }
+                    const auto original_steps =
+                        candidate.shunt_steps[shunt_index];
+                    std::vector<int> best_steps = original_steps;
+                    double best_bs = candidate.shunt_bs[shunt_index];
+                    int best_movement = std::numeric_limits<int>::max();
+                    for (std::size_t code = 0;
+                         code < configuration_count; ++code) {
+                        std::size_t remaining = code;
+                        std::vector<int> steps(
+                            shunt.block_maximum_steps.size(), 0);
+                        double bs = 0.0;
+                        int movement = 0;
+                        for (std::size_t block = 0;
+                             block < steps.size(); ++block) {
+                            const int radix =
+                                shunt.block_maximum_steps[block] + 1;
+                            steps[block] = static_cast<int>(
+                                remaining % static_cast<std::size_t>(radix));
+                            remaining /= static_cast<std::size_t>(radix);
+                            bs += static_cast<double>(steps[block]) *
+                                shunt.block_susceptance[block];
+                            if (block < original_steps.size()) {
+                                movement += std::abs(
+                                    steps[block] - original_steps[block]);
+                            }
+                        }
+                        if (std::abs(bs) + 1e-12 < std::abs(best_bs) ||
+                            (std::abs(std::abs(bs) - std::abs(best_bs)) <=
+                                 1e-12 &&
+                             movement < best_movement)) {
+                            best_steps = std::move(steps);
+                            best_bs = bs;
+                            best_movement = movement;
+                        }
+                    }
+                    if (best_steps != original_steps) {
+                        shunt_changes.push_back({
+                            {"shunt", shunt.source_key},
+                            {"before_bs", candidate.shunt_bs[shunt_index]},
+                            {"after_bs", best_bs},
+                            {"before_steps", original_steps},
+                            {"after_steps", best_steps},
+                        });
+                        candidate.shunt_steps[shunt_index] =
+                            std::move(best_steps);
+                        candidate.shunt_bs[shunt_index] = best_bs;
+                    }
+                }
+            }
+        }
+        for (int bus : pocket.buses) {
+            candidate.vm[bus] = boundary_vm;
+            candidate.va[bus] = reference.va[pocket.outside_bus];
+        }
+        const double objective =
+            gravityx::rebuild_contingency_state_derived_fields(
+                data, base_state, commitment, contingency, candidate);
+        const auto validation = gravityx::validate_state(
+            data, gravityx::ModelMode::ContingencySoft,
+            candidate, commitment, context);
+        nlohmann::json bus_keys = nlohmann::json::array();
+        for (int bus : pocket.buses) {
+            bus_keys.push_back(data.buses[bus].source_key);
+        }
+        candidates.push_back({
+            {"boundary_branch",
+             data.branches[pocket.boundary_branch].source_key},
+            {"outside_bus", data.buses[pocket.outside_bus].source_key},
+            {"pocket_buses", std::move(bus_keys)},
+            {"shunt_changes", std::move(shunt_changes)},
+            {"validation", validation.to_json()},
+        });
+        const double best_residual = best
+            ? best->validation.max_residual
+            : reference_validation.max_residual;
+        if (validation.max_residual + 1e-12 >= best_residual) {
+            continue;
+        }
+        gravityx::FastPowerFlowResult result;
+        result.converged = false;
+        result.feasible = validation.max_residual <= 1e-5;
+        result.solve.status = result.feasible ? 0 : 1;
+        result.solve.objective = objective;
+        result.solve.state = std::move(candidate);
+        result.validation = validation;
+        result.failure_reason = result.feasible
+            ? std::string{}
+            : "passive outage-pocket equalization requires further repair";
+        best = std::move(result);
+    }
+    const double wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    if (best) {
+        best->wall_seconds = wall_seconds;
+        best->solve.wall_seconds = wall_seconds;
+    }
+    return PassivePocketRepair{
+        std::move(best),
+        {
+            {"search", std::move(search_diagnostics)},
+            {"rejected_voltage_bounds", rejected_voltage_bounds},
+            {"candidate_count", candidates.size()},
+            {"candidates", std::move(candidates)},
+            {"wall_seconds", wall_seconds},
+        },
+    };
+}
+
 int run_component_tests() {
     const auto points = gravityx::active_pwl_points(
         {0.0, 0.0, 10.0, 100.0, 20.0, 300.0}, 3, 5.0, 15.0);
@@ -129,12 +505,68 @@ int run_component_tests() {
         throw std::runtime_error(
             "component test failed: invalid nonconverged candidate was accepted");
     }
+    gravityx::ValidationReport rescue_validation;
+    rescue_validation.max_residual = 0.15;
+    rescue_validation.worst_category = "reactive_balance";
+    if (!bounded_fast_newton_rescue_candidate(rescue_validation)) {
+        throw std::runtime_error(
+            "component test failed: reactive fast-Newton rescue was not eligible");
+    }
+    rescue_validation.worst_category = "flow_limit";
+    if (bounded_fast_newton_rescue_candidate(rescue_validation)) {
+        throw std::runtime_error(
+            "component test failed: non-balance fast-Newton rescue was eligible");
+    }
+    rescue_validation.worst_category = "active_balance";
+    rescue_validation.max_residual = 0.21;
+    if (bounded_fast_newton_rescue_candidate(rescue_validation)) {
+        throw std::runtime_error(
+            "component test failed: oversized fast-Newton rescue was eligible");
+    }
     feasible_validation.max_residual = 1e-8;
     nonconverged_feasible.objective = std::numeric_limits<double>::quiet_NaN();
     if (gravityx::validated_candidate_is_feasible(
             nonconverged_feasible, feasible_validation, 1e-5)) {
         throw std::runtime_error(
             "component test failed: nonfinite candidate was accepted");
+    }
+
+    gravityx::CaseData passive_pocket_case;
+    passive_pocket_case.buses.resize(4);
+    passive_pocket_case.generators.resize(1);
+    passive_pocket_case.loads.resize(1);
+    passive_pocket_case.buses[0].generators = {0};
+    passive_pocket_case.buses[3].loads = {0};
+    passive_pocket_case.branches.resize(3);
+    for (auto& branch : passive_pocket_case.branches) {
+        branch.status = 1;
+        branch.tap = 1.0;
+        branch.shift = 0.0;
+    }
+    passive_pocket_case.branches[0].from = 0;
+    passive_pocket_case.branches[0].to = 1;
+    passive_pocket_case.branches[1].from = 1;
+    passive_pocket_case.branches[1].to = 2;
+    passive_pocket_case.branches[2].from = 2;
+    passive_pocket_case.branches[2].to = 3;
+    passive_pocket_case.buses[0].branches_from = {0};
+    passive_pocket_case.buses[1].branches_to = {0};
+    passive_pocket_case.buses[1].branches_from = {1};
+    passive_pocket_case.buses[2].branches_to = {1};
+    passive_pocket_case.buses[2].branches_from = {2};
+    passive_pocket_case.buses[3].branches_to = {2};
+    const auto passive_pockets = find_small_passive_outage_pockets(
+        passive_pocket_case, 2, 8);
+    const auto expected_pocket = std::find_if(
+        passive_pockets.begin(), passive_pockets.end(),
+        [](const PassivePocket& pocket) {
+            return pocket.boundary_branch == 0 &&
+                pocket.outside_bus == 0 &&
+                pocket.buses == std::vector<int>({1, 2});
+        });
+    if (expected_pocket == passive_pockets.end()) {
+        throw std::runtime_error(
+            "component test failed: passive outage pocket was not found");
     }
 
     gravityx::CaseData seed_case;
@@ -690,6 +1122,22 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "screened active feasibility repair regression failed: " +
             screened_active_repair.status);
+    }
+    auto voltage_bound_reference = fast_result.solve.state;
+    voltage_bound_reference.vm[1] = data.buses[1].vmin - 0.05;
+    gravityx::rebuild_contingency_state_derived_fields(
+        data, solve.state, {1}, branch_contingency,
+        voltage_bound_reference);
+    const auto voltage_bound_repair =
+        gravityx::solve_linearized_active_feasibility_repair(
+            data, voltage_bound_reference, {1}, branch_context,
+            0.49, 0.5, 5.0, 0.1, true, true);
+    if (!voltage_bound_repair.success ||
+        voltage_bound_repair.state.vm[1] < data.buses[1].vmin - 1e-9 ||
+        voltage_bound_repair.maximum_voltage_change < 0.05 - 1e-9) {
+        throw std::runtime_error(
+            "active feasibility repair did not enforce an out-of-bound "
+            "reference voltage: " + voltage_bound_repair.status);
     }
     auto active_repair_state = active_repair.state;
     gravityx::rebuild_contingency_state_derived_fields(
@@ -1789,6 +2237,16 @@ bool solve_loaded_contingency(
     const bool reused_fast_screen_reference = precomputed_fast_state != nullptr;
     bool rolling_seed_fast_screen_selected = false;
     bool bounded_fast_newton_rescue_selected = false;
+    bool passive_pocket_repair_selected = false;
+    nlohmann::json passive_pocket_repair_diagnostics = nullptr;
+    bool bounded_fast_linearized_repair_selected = false;
+    bool bounded_fast_postlinear_newton_selected = false;
+    std::optional<gravityx::ActiveFeasibilityRepairResult>
+        bounded_fast_linearized_repair;
+    nlohmann::json bounded_fast_linearized_repair_attempts =
+        nlohmann::json::array();
+    std::optional<gravityx::FastPowerFlowResult>
+        bounded_fast_postlinear_newton;
     std::optional<std::string> selected_direct_seed_label;
     if (precomputed_fast_state) {
         fast_result.emplace();
@@ -1860,8 +2318,7 @@ bool solve_loaded_contingency(
             }
         }
         if (fast_only && !fast_result->feasible &&
-            fast_result->validation.worst_category == "active_balance" &&
-            fast_result->validation.max_residual <= 0.2) {
+            bounded_fast_newton_rescue_candidate(fast_result->validation)) {
             const double prior_screen_seconds = fast_result->wall_seconds;
             const auto rescue_start = std::chrono::steady_clock::now();
             gravityx::FastPowerFlowOptions rescue_options;
@@ -1877,14 +2334,280 @@ bool solve_loaded_contingency(
                     std::chrono::steady_clock::now() - rescue_start).count();
             rescue_result.wall_seconds = combined_wall_seconds;
             rescue_result.solve.wall_seconds = combined_wall_seconds;
-            if (rescue_result.feasible) {
+            // Retain a strictly better validated rescue even when it has not
+            // crossed the feasibility tolerance.  This preserves the actual
+            // rescue diagnostics and gives any exact fallback the best known
+            // state, without weakening the independent feasibility gate.
+            if (rescue_result.feasible ||
+                rescue_result.validation.max_residual + 1e-12 <
+                    fast_result->validation.max_residual) {
                 fast_result = std::move(rescue_result);
-                bounded_fast_newton_rescue_selected = true;
+                bounded_fast_newton_rescue_selected = fast_result->feasible;
+            }
+            if (!fast_result->feasible &&
+                fast_result->validation.max_residual <= 0.2 &&
+                match->type == gravityx::ContingencyType::Branch) {
+                auto pocket_repair = try_passive_outage_pocket_repair(
+                    data, base.state, base.commitment, *match, context,
+                    fast_result->solve.state, fast_result->validation);
+                if (pocket_repair) {
+                    passive_pocket_repair_diagnostics =
+                        std::move(pocket_repair->diagnostics);
+                    if (pocket_repair->result) {
+                        const double combined_pocket_wall_seconds =
+                            fast_result->wall_seconds +
+                            pocket_repair->result->wall_seconds;
+                        pocket_repair->result->wall_seconds =
+                            combined_pocket_wall_seconds;
+                        pocket_repair->result->solve.wall_seconds =
+                            combined_pocket_wall_seconds;
+                        if (pocket_repair->result->feasible ||
+                            pocket_repair->result->validation.max_residual +
+                                    1e-12 <
+                                fast_result->validation.max_residual) {
+                            fast_result =
+                                std::move(*pocket_repair->result);
+                            passive_pocket_repair_selected =
+                                fast_result->feasible;
+                        }
+                    }
+                }
+            }
+            if (!fast_result->feasible &&
+                fast_result->validation.worst_category == "variable_bound" &&
+                fast_result->validation.max_residual <= 0.1) {
+                double wall_after_linearized_repair =
+                    fast_result->wall_seconds;
+                auto linearized_reference = fast_result->solve.state;
+                bool linearized_repair_produced_candidate = false;
+                constexpr int kMaximumCompactRepairRounds = 3;
+                for (int compact_round = 1;
+                     compact_round <= kMaximumCompactRepairRounds;
+                     ++compact_round) {
+                    bounded_fast_linearized_repair =
+                        gravityx::solve_linearized_active_feasibility_repair(
+                            data, linearized_reference, base.commitment,
+                            context, 0.45, 0.15, 5.0, 0.1, true, true);
+                    wall_after_linearized_repair +=
+                        bounded_fast_linearized_repair->wall_seconds;
+                    auto compact_attempt =
+                        bounded_fast_linearized_repair->to_json(false);
+                    compact_attempt["round"] = compact_round;
+                    if (!bounded_fast_linearized_repair->success) {
+                        compact_attempt["exact_validation"] = nullptr;
+                        bounded_fast_linearized_repair_attempts.push_back(
+                            std::move(compact_attempt));
+                        bounded_fast_linearized_repair =
+                            gravityx::solve_linearized_active_feasibility_repair(
+                                data, linearized_reference, base.commitment,
+                                context, 0.49, 0.5, 5.0, 0.2, true, true);
+                        wall_after_linearized_repair +=
+                            bounded_fast_linearized_repair->wall_seconds;
+                        compact_attempt =
+                            bounded_fast_linearized_repair->to_json(false);
+                        compact_attempt["round"] = compact_round;
+                        compact_attempt["wide_trust_retry"] = true;
+                        if (!bounded_fast_linearized_repair->success) {
+                            compact_attempt["exact_validation"] = nullptr;
+                            bounded_fast_linearized_repair_attempts.push_back(
+                                std::move(compact_attempt));
+                            break;
+                        }
+                    }
+                    linearized_repair_produced_candidate = true;
+                    auto linearized_state =
+                        bounded_fast_linearized_repair->state;
+                    const double linearized_objective =
+                        gravityx::rebuild_contingency_state_derived_fields(
+                            data, base.state, base.commitment, *match,
+                            linearized_state);
+                    const auto linearized_validation =
+                        gravityx::validate_state(
+                            data, gravityx::ModelMode::ContingencySoft,
+                            linearized_state, base.commitment, context);
+                    compact_attempt["exact_objective"] =
+                        linearized_objective;
+                    compact_attempt["exact_validation"] =
+                        linearized_validation.to_json();
+                    const bool improved =
+                        linearized_validation.max_residual + 1e-12 <
+                        fast_result->validation.max_residual;
+                    compact_attempt["selected_as_best"] = improved;
+                    bounded_fast_linearized_repair_attempts.push_back(
+                        std::move(compact_attempt));
+                    linearized_reference = linearized_state;
+                    if (improved) {
+                        gravityx::FastPowerFlowResult linearized_result;
+                        linearized_result.converged = false;
+                        linearized_result.feasible =
+                            linearized_validation.max_residual <= 1e-5;
+                        linearized_result.wall_seconds =
+                            wall_after_linearized_repair;
+                        linearized_result.failure_reason =
+                            linearized_result.feasible
+                            ? std::string{}
+                            : "compact linearized feasibility repair requires "
+                              "nonlinear polish";
+                        linearized_result.solve.status =
+                            linearized_result.feasible ? 0 : 1;
+                        linearized_result.solve.objective =
+                            linearized_objective;
+                        linearized_result.solve.wall_seconds =
+                            wall_after_linearized_repair;
+                        linearized_result.solve.state = linearized_state;
+                        linearized_result.validation = linearized_validation;
+                        fast_result = std::move(linearized_result);
+                        bounded_fast_linearized_repair_selected =
+                            fast_result->feasible;
+                    }
+                    if (fast_result->feasible) {
+                        break;
+                    }
+                }
+                if (!fast_result->feasible &&
+                    linearized_repair_produced_candidate) {
+                    gravityx::FastPowerFlowOptions postlinear_options;
+                    postlinear_options.max_newton_iterations = 20;
+                    postlinear_options.max_active_redispatch_passes = 6;
+                    postlinear_options.max_reactive_limit_passes = 6;
+                    gravityx::FastContingencyPowerFlow postlinear_solver(
+                        data, base.state, base.commitment,
+                        postlinear_options);
+                    bounded_fast_postlinear_newton = postlinear_solver.solve(
+                        *match, linearized_reference);
+                    const double combined_postlinear_wall_seconds =
+                        wall_after_linearized_repair +
+                        bounded_fast_postlinear_newton->wall_seconds;
+                    bounded_fast_postlinear_newton->wall_seconds =
+                        combined_postlinear_wall_seconds;
+                    bounded_fast_postlinear_newton->solve.wall_seconds =
+                        combined_postlinear_wall_seconds;
+                    if (bounded_fast_postlinear_newton->feasible ||
+                        bounded_fast_postlinear_newton->validation
+                                .max_residual + 1e-12 <
+                            fast_result->validation.max_residual) {
+                        fast_result = *bounded_fast_postlinear_newton;
+                        bounded_fast_postlinear_newton_selected =
+                            fast_result->feasible;
+                    }
+                    constexpr int kMaximumPostNewtonRecenters = 2;
+                    for (int recenter_round = 1;
+                         !fast_result->feasible &&
+                         fast_result->validation.max_residual <= 0.1 &&
+                         recenter_round <= kMaximumPostNewtonRecenters;
+                         ++recenter_round) {
+                        const double residual_before_recenter =
+                            fast_result->validation.max_residual;
+                        bounded_fast_linearized_repair =
+                            gravityx::solve_linearized_active_feasibility_repair(
+                                data, fast_result->solve.state,
+                                base.commitment, context,
+                                0.49, 0.5, 5.0, 0.2, true, true);
+                        const double wall_after_recenter =
+                            fast_result->wall_seconds +
+                            bounded_fast_linearized_repair->wall_seconds;
+                        auto recenter_attempt =
+                            bounded_fast_linearized_repair->to_json(false);
+                        recenter_attempt["phase"] =
+                            "post_newton_recenter";
+                        recenter_attempt["round"] = recenter_round;
+                        if (!bounded_fast_linearized_repair->success) {
+                            recenter_attempt["exact_validation"] = nullptr;
+                            bounded_fast_linearized_repair_attempts.push_back(
+                                std::move(recenter_attempt));
+                            break;
+                        }
+                        auto recentered_state =
+                            bounded_fast_linearized_repair->state;
+                        const double recentered_objective =
+                            gravityx::rebuild_contingency_state_derived_fields(
+                                data, base.state, base.commitment, *match,
+                                recentered_state);
+                        const auto recentered_validation =
+                            gravityx::validate_state(
+                                data, gravityx::ModelMode::ContingencySoft,
+                                recentered_state, base.commitment, context);
+                        recenter_attempt["exact_objective"] =
+                            recentered_objective;
+                        recenter_attempt["exact_validation"] =
+                            recentered_validation.to_json();
+                        const bool recentered_improved =
+                            recentered_validation.max_residual + 1e-12 <
+                            fast_result->validation.max_residual;
+                        recenter_attempt["selected_as_best"] =
+                            recentered_improved;
+                        if (recentered_improved) {
+                            gravityx::FastPowerFlowResult recentered_result;
+                            recentered_result.converged = false;
+                            recentered_result.feasible =
+                                recentered_validation.max_residual <= 1e-5;
+                            recentered_result.wall_seconds =
+                                wall_after_recenter;
+                            recentered_result.solve.status =
+                                recentered_result.feasible ? 0 : 1;
+                            recentered_result.solve.objective =
+                                recentered_objective;
+                            recentered_result.solve.wall_seconds =
+                                wall_after_recenter;
+                            recentered_result.solve.state = recentered_state;
+                            recentered_result.validation =
+                                recentered_validation;
+                            fast_result = std::move(recentered_result);
+                            bounded_fast_linearized_repair_selected =
+                                fast_result->feasible;
+                        }
+                        if (!fast_result->feasible) {
+                            gravityx::FastPowerFlowOptions recentered_options;
+                            recentered_options.max_newton_iterations = 20;
+                            recentered_options.max_active_redispatch_passes = 6;
+                            recentered_options.max_reactive_limit_passes = 6;
+                            gravityx::FastContingencyPowerFlow
+                                recentered_solver(
+                                    data, base.state, base.commitment,
+                                    recentered_options);
+                            auto recentered_newton =
+                                recentered_solver.solve(
+                                    *match, recentered_state);
+                            const double combined_recenter_wall_seconds =
+                                wall_after_recenter +
+                                recentered_newton.wall_seconds;
+                            recentered_newton.wall_seconds =
+                                combined_recenter_wall_seconds;
+                            recentered_newton.solve.wall_seconds =
+                                combined_recenter_wall_seconds;
+                            recenter_attempt["nonlinear_polish"] =
+                                recentered_newton.to_json();
+                            if (recentered_newton.feasible ||
+                                recentered_newton.validation.max_residual +
+                                        1e-12 <
+                                    fast_result->validation.max_residual) {
+                                bounded_fast_postlinear_newton =
+                                    recentered_newton;
+                                fast_result = std::move(recentered_newton);
+                                bounded_fast_postlinear_newton_selected =
+                                    fast_result->feasible;
+                            }
+                        }
+                        bounded_fast_linearized_repair_attempts.push_back(
+                            std::move(recenter_attempt));
+                        if (fast_result->feasible ||
+                            fast_result->validation.max_residual + 1e-12 >=
+                                residual_before_recenter) {
+                            break;
+                        }
+                    }
+                }
             }
         }
         if (fast_result->feasible) {
             const std::string solution_method =
-                bounded_fast_newton_rescue_selected
+                bounded_fast_postlinear_newton_selected
+                ? "bounded_fast_linearized_repair_plus_newton"
+                : bounded_fast_linearized_repair_selected
+                ? "bounded_fast_linearized_feasibility_repair"
+                : passive_pocket_repair_selected
+                ? "small_outage_pocket_equalization"
+                : bounded_fast_newton_rescue_selected
                 ? "bounded_fast_newton_rescue"
                 : rolling_seed_fast_screen_selected
                 ? "rolling_corrective_seed_direct_screen"
@@ -1911,6 +2634,18 @@ bool solve_loaded_contingency(
                           {"failure_reason", fast_result->failure_reason},
                           {"wall_seconds", fast_result->wall_seconds},
                       })},
+                {"bounded_fast_linearized_repair",
+                 bounded_fast_linearized_repair
+                     ? bounded_fast_linearized_repair->to_json(false)
+                     : nlohmann::json(nullptr)},
+                {"bounded_fast_linearized_repair_attempts",
+                 bounded_fast_linearized_repair_attempts},
+                {"bounded_fast_postlinear_newton",
+                 bounded_fast_postlinear_newton
+                     ? bounded_fast_postlinear_newton->to_json()
+                     : nlohmann::json(nullptr)},
+                {"passive_pocket_repair",
+                 passive_pocket_repair_diagnostics},
                 {"rolling_corrective_seed_label",
                  selected_direct_seed_label
                      ? nlohmann::json(*selected_direct_seed_label)
@@ -1955,6 +2690,18 @@ bool solve_loaded_contingency(
                 {"solution_method", "fast_newton_screen_failed"},
                 {"fast_power_flow_screen", true},
                 {"fast_screen", fast_result->to_json()},
+                {"bounded_fast_linearized_repair",
+                 bounded_fast_linearized_repair
+                     ? bounded_fast_linearized_repair->to_json(false)
+                     : nlohmann::json(nullptr)},
+                {"bounded_fast_linearized_repair_attempts",
+                 bounded_fast_linearized_repair_attempts},
+                {"bounded_fast_postlinear_newton",
+                 bounded_fast_postlinear_newton
+                     ? bounded_fast_postlinear_newton->to_json()
+                     : nlohmann::json(nullptr)},
+                {"passive_pocket_repair",
+                 passive_pocket_repair_diagnostics},
                 {"resident_parametric_model", false},
                 {"acceptable_termination_enabled", false},
                 {"resident_model_created", false},

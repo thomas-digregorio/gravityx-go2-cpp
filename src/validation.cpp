@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -275,7 +276,9 @@ static ValidationReport validate_state_impl(
     const std::vector<int>& fixed_status_argument,
     const std::optional<ContingencyContext>& contingency,
     bool skip_rebuilt_economic_and_ohms_checks,
-    bool capture_identity) {
+    bool capture_identity,
+    double incumbent_max_residual =
+        std::numeric_limits<double>::infinity()) {
     const std::size_t nb = data.buses.size();
     const std::size_t ng = data.generators.size();
     const std::size_t nd = data.loads.size();
@@ -333,6 +336,10 @@ static ValidationReport validate_state_impl(
     }
 
     ValidationReport report;
+    const auto rejection_proven = [&]() {
+        return std::isfinite(incumbent_max_residual) &&
+            report.max_residual + 1e-10 >= incumbent_max_residual;
+    };
 
     for (std::size_t i = 0; i < nb; ++i) {
         update_category(report, report.max_variable_bound_violation,
@@ -343,6 +350,9 @@ static ValidationReport validate_state_impl(
             update_category(report, report.max_reference_angle_residual,
                 state.va[i], "reference_angle", capture_identity,
                 [&] { return "bus:" + data.buses[i].source_key; });
+        }
+        if (rejection_proven()) {
+            return report;
         }
     }
 
@@ -470,6 +480,9 @@ static ValidationReport validate_state_impl(
                 positive_part(su + sd - 1.0), "generator", capture_identity,
                 [&] { return "gen:" + gen.source_key + ":exclusive"; });
         }
+        if (rejection_proven()) {
+            return report;
+        }
     }
 
     int load_lambda_offset = 0;
@@ -524,6 +537,9 @@ static ValidationReport validate_state_impl(
                     return "load:" + load.source_key + ":contingency_down";
                 });
         }
+        if (rejection_proven()) {
+            return report;
+        }
     }
 
     for (std::size_t i = 0; i < nb; ++i) {
@@ -573,6 +589,9 @@ static ValidationReport validate_state_impl(
         update_category(report, report.max_reactive_balance_residual,
             q_residual, "reactive_balance", capture_identity,
             [&] { return "bus:" + bus.source_key; });
+        if (rejection_proven()) {
+            return report;
+        }
     }
 
     for (std::size_t i = 0; i < nl; ++i) {
@@ -632,6 +651,9 @@ static ValidationReport validate_state_impl(
             std::max(positive_part(from_squared - from_limit), positive_part(to_squared - to_limit)),
             "flow_limit", capture_identity,
             [&] { return "branch:" + branch.source_key; });
+        if (rejection_proven()) {
+            return report;
+        }
     }
 
     return report;
@@ -655,6 +677,17 @@ ValidationReport validate_rebuilt_contingency_trial(
     return validate_state_impl(
         data, ModelMode::ContingencySoft, state, fixed_status,
         contingency, true, false);
+}
+
+ValidationReport validate_rebuilt_contingency_trial_until_rejected(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency,
+    double incumbent_max_residual) {
+    return validate_state_impl(
+        data, ModelMode::ContingencySoft, state, fixed_status,
+        contingency, true, false, incumbent_max_residual);
 }
 
 ValidationReport validate_rebuilt_contingency_predictor(

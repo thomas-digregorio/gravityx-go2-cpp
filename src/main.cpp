@@ -1112,6 +1112,22 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "lightweight trial validation repeated rebuilt invariants");
     }
+    const auto improving_cutoff_validation =
+        gravityx::validate_rebuilt_contingency_trial_until_rejected(
+            data, fast_result.solve.state, {1}, branch_context,
+            lightweight_trial_validation.max_residual + 1e-6);
+    require_same_validation_numbers(
+        improving_cutoff_validation, lightweight_trial_validation,
+        "lightweight cutoff complete improving report");
+    auto rejected_cutoff_state = fast_result.solve.state;
+    rejected_cutoff_state.vm[0] = data.buses[0].vmax + 0.2;
+    const auto rejected_cutoff_validation =
+        gravityx::validate_rebuilt_contingency_trial_until_rejected(
+            data, rejected_cutoff_state, {1}, branch_context, 0.1);
+    if (rejected_cutoff_validation.max_residual + 1e-10 < 0.1) {
+        throw std::runtime_error(
+            "lightweight cutoff validation did not prove rejection");
+    }
     auto predictor_identity_state = fast_result.solve.state;
     predictor_identity_state.vm[0] = data.buses[0].vmax + 0.2;
     gravityx::rebuild_contingency_state_derived_fields(

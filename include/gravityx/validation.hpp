@@ -44,6 +44,17 @@ ValidationReport validate_rebuilt_contingency_trial(
     const std::vector<int>& fixed_status,
     const ContingencyContext& contingency);
 
+// Rank an internal rebuilt trial against a known incumbent residual. The
+// returned report is complete whenever the trial can improve the incumbent.
+// Once a partial maximum proves that the caller's strict 1e-10 improvement
+// test cannot pass, the remaining invariant scans are skipped.
+ValidationReport validate_rebuilt_contingency_trial_until_rejected(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency,
+    double incumbent_max_residual);
+
 // Predictor iteration selection also needs the exact identity of the
 // dominant physical residual (for example, whether a variable-bound maximum
 // is a branch apparent-power slack).  Preserve that routing information while

@@ -3801,8 +3801,14 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             0.5, 1e-7);
                     trial.p_delta = trial_balance.active;
                     trial.q_delta = trial_balance.reactive;
-                    return validate_rebuilt_contingency_trial(
-                        data_, trial, commitment_, *direct_context);
+                    if (options_.capture_diagnostics) {
+                        return validate_rebuilt_contingency_trial(
+                            data_, trial, commitment_, *direct_context);
+                    }
+                    return
+                        validate_rebuilt_contingency_trial_until_rejected(
+                            data_, trial, commitment_, *direct_context,
+                            selected_validation.max_residual);
                 };
                 const auto try_damped_corrections = [&]
                     (FixedJacobianPredictorCache& cache) {

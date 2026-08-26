@@ -2,12 +2,14 @@
 
 import concurrent.futures
 import json
+import numpy as np
 import queue
 import tempfile
 from pathlib import Path
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -33,6 +35,10 @@ from run_experiment import (  # noqa: E402
     write_contingency_subset,
     write_json,
     write_solution,
+)
+from fast_official_evaluator import (  # noqa: E402
+    read_generated_solution,
+    skip_dataframe_copy,
 )
 
 
@@ -413,10 +419,82 @@ class CompetitionTimingTests(unittest.TestCase):
             "os.environ",
             {"OPENBLAS_NUM_THREADS": "24", "OMP_NUM_THREADS": "12"},
         ):
-            environment = evaluator_subprocess_environment(1)
+            environment = evaluator_subprocess_environment(
+                1, Path("referenced_vendor_evaluator.py")
+            )
         self.assertEqual(environment["OPENBLAS_NUM_THREADS"], "1")
         self.assertEqual(environment["OMP_NUM_THREADS"], "1")
         self.assertEqual(environment["MKL_NUM_THREADS"], "1")
+        self.assertTrue(
+            environment["GRAVITYX_VENDOR_EVALUATOR"].endswith(
+                "referenced_vendor_evaluator.py"
+            )
+        )
+
+    def test_fast_evaluator_parser_populates_vendor_arrays_from_canonical_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            solution = Path(directory) / "solution.txt"
+            solution.write_text(
+                """--bus section
+i, v, theta
+101, 1.01, 0.1
+102, 0.99, -0.2
+--load section
+i, id, t
+101, L1, 0.75
+--generator section
+i, id, p, q, x
+101, G1, 1.2, -0.3, 1
+--line section
+iorig, idest, id, x
+101, 102, 1, 1
+--transformer section
+iorig, idest, id, x, xst
+102, 101, T1, 1, -2
+--switched shunt section
+i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
+102, 1, 2, 3
+""",
+                encoding="utf-8",
+            )
+            target = SimpleNamespace(
+                num_bus_read=2,
+                num_load_read=1,
+                num_gen_read=1,
+                num_line_read=1,
+                num_xfmr_read=1,
+                num_swsh_read=1,
+                bus_map={101: 0, 102: 1},
+                load_map={(101, "L1"): 0},
+                gen_map={(101, "G1"): 0},
+                line_map={(101, 102, "1"): 0},
+                xfmr_map={(102, 101, "T1"): 0},
+                swsh_map={102: 0},
+                bus_volt_mag=np.zeros(2),
+                bus_volt_ang=np.zeros(2),
+                load_t=np.zeros(1),
+                gen_pow_real=np.zeros(1),
+                gen_pow_imag=np.zeros(1),
+                gen_xon=np.zeros(1),
+                line_xsw=np.zeros(1),
+                xfmr_xsw=np.zeros(1),
+                xfmr_xst=np.zeros(1),
+                swsh_xst=np.zeros((1, 8)),
+            )
+            read_generated_solution(target, solution)
+            skip_dataframe_copy(target)
+            np.testing.assert_allclose(target.bus_volt_mag, [1.01, 0.99])
+            np.testing.assert_allclose(target.bus_volt_ang, [0.1, -0.2])
+            np.testing.assert_allclose(target.load_t, [0.75])
+            np.testing.assert_allclose(target.gen_pow_real, [1.2])
+            np.testing.assert_allclose(target.gen_pow_imag, [-0.3])
+            np.testing.assert_allclose(target.gen_xon, [1.0])
+            np.testing.assert_allclose(target.line_xsw, [1.0])
+            np.testing.assert_allclose(target.xfmr_xsw, [1.0])
+            np.testing.assert_allclose(target.xfmr_xst, [-2.0])
+            np.testing.assert_allclose(
+                target.swsh_xst, [[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+            )
 
     def test_streaming_evaluation_runs_ready_shards_and_merges_exactly(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -483,6 +561,8 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
                 2,
                 1,
                 time.perf_counter() + 30.0,
+                1,
+                2,
             )
             for label in labels:
                 (output_dir / f"solution_{label}.txt").write_text(
@@ -495,7 +575,11 @@ objective = 10.0 + sum(details[label]["obj"]["val"] for label in labels) / len(l
             self.assertEqual(summary["infeas"], 0.0)
             self.assertEqual(metadata["mode"], "overlapped_serial_shards")
             self.assertEqual(metadata["active_shards"], 2)
-            self.assertEqual(metadata["maximum_parallel_processes"], 1)
+            self.assertEqual(metadata["maximum_parallel_processes"], 2)
+            self.assertEqual(metadata["initial_maximum_parallel_processes"], 1)
+            self.assertEqual(
+                metadata["post_screen_maximum_parallel_processes"], 2
+            )
             self.assertEqual(
                 {
                     path.stem.removeprefix("eval_detail_")

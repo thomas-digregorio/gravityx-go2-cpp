@@ -45,13 +45,17 @@ EVALUATOR_THREAD_ENVIRONMENT_VARIABLES = (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
 )
+VENDOR_EVALUATOR_ENVIRONMENT_VARIABLE = "GRAVITYX_VENDOR_EVALUATOR"
 
 
 class CompetitionTimeout(RuntimeError):
     """Raised when a GO Competition stage exhausts its wall-clock allowance."""
 
 
-def evaluator_subprocess_environment(linear_algebra_threads: int) -> dict[str, str]:
+def evaluator_subprocess_environment(
+    linear_algebra_threads: int,
+    vendor_evaluator_reference: Path | None = None,
+) -> dict[str, str]:
     """Return a reproducible evaluator environment without nested oversubscription."""
     if linear_algebra_threads < 1:
         raise ValueError("evaluator linear-algebra threads must be positive")
@@ -59,6 +63,10 @@ def evaluator_subprocess_environment(linear_algebra_threads: int) -> dict[str, s
     value = str(linear_algebra_threads)
     for variable in EVALUATOR_THREAD_ENVIRONMENT_VARIABLES:
         environment[variable] = value
+    if vendor_evaluator_reference is not None:
+        environment[VENDOR_EVALUATOR_ENVIRONMENT_VARIABLE] = str(
+            vendor_evaluator_reference.resolve()
+        )
     return environment
 
 
@@ -667,8 +675,9 @@ def run_serial_evaluation_shards(
     shard_count: int,
     deadline: float,
     evaluator_linear_algebra_threads: int = 1,
+    vendor_evaluator_reference: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run unchanged vendor evaluation in independent serial shards.
+    """Run referenced evaluator equations in independent serial shards.
 
     The vendor MPI dispatcher uses nonblocking object sends without retaining
     their request buffers and can corrupt messages on large jobs.  Independent
@@ -693,7 +702,8 @@ def run_serial_evaluation_shards(
     )
     completed_records: list[dict[str, Any]] = []
     environment = evaluator_subprocess_environment(
-        evaluator_linear_algebra_threads
+        evaluator_linear_algebra_threads,
+        vendor_evaluator_reference,
     )
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=active_shards
@@ -724,7 +734,7 @@ def run_serial_evaluation_shards(
 
 
 class StreamingSerialEvaluation:
-    """Overlap exact unchanged-vendor shards with contingency generation."""
+    """Overlap referenced evaluator-equation shards with contingency generation."""
 
     def __init__(
         self,
@@ -738,9 +748,18 @@ class StreamingSerialEvaluation:
         maximum_processes: int,
         deadline: float,
         evaluator_linear_algebra_threads: int = 1,
+        post_screen_maximum_processes: int | None = None,
+        vendor_evaluator_reference: Path | None = None,
     ) -> None:
         if maximum_processes < 1:
             raise ValueError("streaming evaluation processes must be positive")
+        if post_screen_maximum_processes is None:
+            post_screen_maximum_processes = maximum_processes
+        if post_screen_maximum_processes < maximum_processes:
+            raise ValueError(
+                "post-screen streaming evaluation processes cannot be less "
+                "than the initial process count"
+            )
         if len(ordered_labels) != len(set(ordered_labels)):
             raise ValueError("streaming evaluation labels must be unique")
         self.python = python
@@ -749,12 +768,16 @@ class StreamingSerialEvaluation:
         self.internal_dir = internal_dir
         self.labels = list(ordered_labels)
         self.requested_shards = shard_count
+        self.initial_maximum_processes = maximum_processes
+        self.post_screen_maximum_processes = post_screen_maximum_processes
         self.maximum_processes = maximum_processes
         self.deadline = deadline
         self.evaluator_linear_algebra_threads = evaluator_linear_algebra_threads
         self.environment = evaluator_subprocess_environment(
-            evaluator_linear_algebra_threads
+            evaluator_linear_algebra_threads,
+            vendor_evaluator_reference,
         )
+        self.vendor_evaluator_reference = vendor_evaluator_reference
         groups = contiguous_shard_groups(self.labels, shard_count)
         self.records = prepare_serial_evaluation_shards(
             case_dir,
@@ -887,6 +910,7 @@ class StreamingSerialEvaluation:
     def finish(self) -> tuple[dict[str, Any], dict[str, Any]]:
         tail_started = time.perf_counter()
         with self.lock:
+            self.maximum_processes = self.post_screen_maximum_processes
             completed_before_tail_wait = len(self.completed_records)
             missing = set(self.labels) - self.completed_labels
             if missing:
@@ -936,6 +960,12 @@ class StreamingSerialEvaluation:
                 "completed_before_tail_wait": completed_before_tail_wait,
                 "evaluator_linear_algebra_threads": (
                     self.evaluator_linear_algebra_threads
+                ),
+                "initial_maximum_parallel_processes": (
+                    self.initial_maximum_processes
+                ),
+                "post_screen_maximum_parallel_processes": (
+                    self.post_screen_maximum_processes
                 ),
             }
         )
@@ -1386,6 +1416,8 @@ def main() -> int:
     parser.add_argument(
         "--evaluator-linear-algebra-threads", type=int, default=1
     )
+    parser.add_argument("--post-screen-streaming-evaluation-processes", type=int)
+    parser.add_argument("--vendor-evaluator-reference", type=Path)
     parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
@@ -1484,6 +1516,18 @@ def main() -> int:
         raise ValueError("streaming serial evaluation shards must be positive")
     if args.streaming_evaluation_processes < 1:
         raise ValueError("streaming evaluation processes must be positive")
+    if args.post_screen_streaming_evaluation_processes is None:
+        args.post_screen_streaming_evaluation_processes = (
+            args.streaming_evaluation_processes
+        )
+    if (
+        args.post_screen_streaming_evaluation_processes
+        < args.streaming_evaluation_processes
+    ):
+        raise ValueError(
+            "post-screen streaming evaluation processes cannot be less than "
+            "the initial process count"
+        )
     if args.evaluator_linear_algebra_threads < 1:
         raise ValueError("evaluator linear-algebra threads must be positive")
     if args.serial_evaluation_shards > 1 and args.evaluation_processes > 1:
@@ -1505,6 +1549,13 @@ def main() -> int:
         parser.error("--evaluation-processes greater than one requires --mpiexec")
     if args.mpiexec is not None:
         reject_onedrive(args.mpiexec)
+    if args.vendor_evaluator_reference is not None:
+        reject_onedrive(args.vendor_evaluator_reference)
+        if not args.vendor_evaluator_reference.is_file():
+            raise ValueError(
+                "vendor evaluator reference does not exist: "
+                f"{args.vendor_evaluator_reference}"
+            )
     if args.code1_time_limit <= 0:
         raise ValueError("Code1 time limit must be positive")
     if args.total_time_limit <= 0:
@@ -1560,7 +1611,10 @@ def main() -> int:
             "time_limit_seconds": args.total_time_limit,
             "evaluation_reserve_seconds": args.evaluation_reserve,
             "finalization_reserve_seconds": FINALIZATION_RESERVE_SECONDS,
-            "measurement_boundary": "normalized-case loading through official evaluation and result serialization",
+            "measurement_boundary": (
+                "normalized-case loading through referenced official evaluator "
+                "equations and result serialization"
+            ),
         },
         "completed_contingency_count": 0,
         "resident_contingency_model": args.resident_contingency_model,
@@ -1594,6 +1648,24 @@ def main() -> int:
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads
+        ),
+        "post_screen_streaming_evaluation_processes": (
+            args.post_screen_streaming_evaluation_processes
+        ),
+        "vendor_evaluator_reference": (
+            str(args.vendor_evaluator_reference.resolve())
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "vendor_evaluator_reference_sha256": (
+            sha256(args.vendor_evaluator_reference)
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "evaluator_parser_mode": (
+            "canonical_one_pass_with_referenced_vendor_equations"
+            if args.vendor_evaluator_reference is not None
+            else "native_vendor_parser_and_equations"
         ),
     }
 
@@ -1820,6 +1892,8 @@ def main() -> int:
             args.streaming_evaluation_processes,
             evaluation_deadline,
             args.evaluator_linear_algebra_threads,
+            args.post_screen_streaming_evaluation_processes,
+            args.vendor_evaluator_reference,
         )
         run_status["streaming_evaluation_prepared"] = True
         checkpoint()
@@ -2571,6 +2645,7 @@ def main() -> int:
                         args.serial_evaluation_shards,
                         evaluation_deadline,
                         args.evaluator_linear_algebra_threads,
+                        args.vendor_evaluator_reference,
                     )
                 )
             else:
@@ -2600,7 +2675,8 @@ def main() -> int:
                     stderr=subprocess.STDOUT,
                     timeout=evaluator_timeout,
                     env=evaluator_subprocess_environment(
-                        args.evaluator_linear_algebra_threads
+                        args.evaluator_linear_algebra_threads,
+                        args.vendor_evaluator_reference,
                     ),
                 )
                 (internal / "evaluation.console.log").write_text(
@@ -2668,7 +2744,7 @@ def main() -> int:
             )
         )
         certificate_parallel_processes = (
-            args.streaming_evaluation_processes
+            args.post_screen_streaming_evaluation_processes
             if streaming_evaluation is not None
             else (
                 min(args.serial_evaluation_shards, len(contingencies))
@@ -2690,6 +2766,21 @@ def main() -> int:
             {
                 "evaluator_path": str(args.evaluator.resolve()),
                 "evaluator_sha256": sha256(args.evaluator),
+                "vendor_evaluator_reference": (
+                    str(args.vendor_evaluator_reference.resolve())
+                    if args.vendor_evaluator_reference is not None
+                    else None
+                ),
+                "vendor_evaluator_reference_sha256": (
+                    sha256(args.vendor_evaluator_reference)
+                    if args.vendor_evaluator_reference is not None
+                    else None
+                ),
+                "evaluator_parser_mode": (
+                    "canonical_one_pass_with_referenced_vendor_equations"
+                    if args.vendor_evaluator_reference is not None
+                    else "native_vendor_parser_and_equations"
+                ),
                 "python_path": str(args.python.resolve()),
                 "mpiexec_path": (
                     str(args.mpiexec.resolve()) if args.mpiexec is not None else None
@@ -2852,6 +2943,24 @@ def main() -> int:
         ),
         "evaluator_linear_algebra_threads": (
             args.evaluator_linear_algebra_threads
+        ),
+        "post_screen_streaming_evaluation_processes": (
+            args.post_screen_streaming_evaluation_processes
+        ),
+        "vendor_evaluator_reference": (
+            str(args.vendor_evaluator_reference.resolve())
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "vendor_evaluator_reference_sha256": (
+            sha256(args.vendor_evaluator_reference)
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "evaluator_parser_mode": (
+            "canonical_one_pass_with_referenced_vendor_equations"
+            if args.vendor_evaluator_reference is not None
+            else "native_vendor_parser_and_equations"
         ),
         "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,

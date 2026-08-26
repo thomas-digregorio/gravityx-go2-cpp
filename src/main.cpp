@@ -81,9 +81,16 @@ void require_near(double actual, double expected, double tolerance, const std::s
 
 bool bounded_fast_newton_rescue_candidate(
     const gravityx::ValidationReport& validation) {
-    return validation.max_residual <= 0.2 &&
+    return validation.max_residual <= 0.35 &&
         (validation.worst_category == "active_balance" ||
          validation.worst_category == "reactive_balance");
+}
+
+bool bounded_fast_candidate_repair_candidate(
+    const gravityx::ValidationReport& validation) {
+    return bounded_fast_newton_rescue_candidate(validation) ||
+        (validation.max_residual <= 0.1 &&
+         validation.worst_category == "variable_bound");
 }
 
 struct PassivePocket {
@@ -518,10 +525,17 @@ int run_component_tests() {
             "component test failed: non-balance fast-Newton rescue was eligible");
     }
     rescue_validation.worst_category = "active_balance";
-    rescue_validation.max_residual = 0.21;
+    rescue_validation.max_residual = 0.36;
     if (bounded_fast_newton_rescue_candidate(rescue_validation)) {
         throw std::runtime_error(
             "component test failed: oversized fast-Newton rescue was eligible");
+    }
+    rescue_validation.worst_category = "variable_bound";
+    rescue_validation.max_residual = 0.05;
+    if (bounded_fast_newton_rescue_candidate(rescue_validation) ||
+        !bounded_fast_candidate_repair_candidate(rescue_validation)) {
+        throw std::runtime_error(
+            "component test failed: bounded security repair routing failed");
     }
     feasible_validation.max_residual = 1e-8;
     nonconverged_feasible.objective = std::numeric_limits<double>::quiet_NaN();
@@ -926,6 +940,20 @@ int run_parallel_circuit_regression() {
             .worst_identity.empty()) {
         throw std::runtime_error(
             "rolling corrective candidate was not screened directly");
+    }
+    auto globally_shifted_candidate = fast_result.solve.state;
+    for (double& angle : globally_shifted_candidate.va) {
+        angle += 0.123;
+    }
+    const auto normalized_gauge_screen = fast_screen.screen_candidate(
+        branch_contingency, globally_shifted_candidate);
+    if (!normalized_gauge_screen.feasible ||
+        normalized_gauge_screen.validation.max_residual > 1e-5 ||
+        normalized_gauge_screen.validation.max_reference_angle_residual >
+            1e-12) {
+        throw std::runtime_error(
+            "source reference-angle gauge normalization regression failed: " +
+            normalized_gauge_screen.failure_reason);
     }
     auto contingency_rating_data = data;
     contingency_rating_data.branches[1].rate_a = 0.1;
@@ -2337,7 +2365,8 @@ bool solve_loaded_contingency(
             }
         }
         if (fast_only && !fast_result->feasible &&
-            bounded_fast_newton_rescue_candidate(fast_result->validation)) {
+            bounded_fast_candidate_repair_candidate(
+                fast_result->validation)) {
             const double prior_screen_seconds = fast_result->wall_seconds;
             const auto rescue_start = std::chrono::steady_clock::now();
             gravityx::FastPowerFlowOptions rescue_options;

@@ -853,6 +853,38 @@ std::vector<std::vector<int>> connected_components(
     return result;
 }
 
+void normalize_source_reference_angles(
+    const CaseData& data,
+    int outaged_branch,
+    std::vector<double>& va) {
+    if (va.size() != data.buses.size()) {
+        throw std::runtime_error(
+            "cannot normalize source reference angles with invalid dimensions");
+    }
+    // The Newton and fixed-Jacobian systems may use any available-generator
+    // bus as their numerical slack after a generator outage.  The source
+    // model's angle constraint is different: every type-3 bus must remain at
+    // zero radians.  A component-wide angle translation leaves all branch
+    // angle differences, AC flows, and operating controls unchanged, so
+    // restore that source gauge before independently validating a candidate.
+    for (const auto& component : connected_components(data, outaged_branch)) {
+        int source_reference = -1;
+        for (int bus : component) {
+            if (data.buses[bus].type == 3) {
+                source_reference = bus;
+                break;
+            }
+        }
+        if (source_reference < 0) {
+            continue;
+        }
+        const double offset = va[source_reference];
+        for (int bus : component) {
+            va[bus] -= offset;
+        }
+    }
+}
+
 }  // namespace
 
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
@@ -2354,21 +2386,7 @@ ValidatedSourceBaseResult build_validated_source_base(
             data.buses[i].vm_start, data.buses[i].vmin, data.buses[i].vmax);
         state.va[i] = data.buses[i].va_start;
     }
-    for (const auto& component : connected_components(data, -1)) {
-        int reference = -1;
-        for (int bus : component) {
-            if (data.buses[bus].type == 3) {
-                reference = bus;
-                break;
-            }
-        }
-        if (reference >= 0) {
-            const double offset = state.va[reference];
-            for (int bus : component) {
-                state.va[bus] -= offset;
-            }
-        }
-    }
+    normalize_source_reference_angles(data, -1, state.va);
 
     state.pg.assign(data.generators.size(), 0.0);
     state.qg.assign(data.generators.size(), 0.0);
@@ -2581,6 +2599,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     AcState direct_state = initial_state;
     direct_state.pg = pg;
     direct_state.qg = qg;
+    normalize_source_reference_angles(data_, outaged_branch, direct_state.va);
     compute_branch_flows(data_, outaged_branch, !base_mode, direct_state);
     const auto direct_balance = nodal_balance_slack_seed(
         data_, direct_state, 0.5, 1e-7);
@@ -2896,6 +2915,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                  ++predictor_iteration) {
                 const auto projection_validation_start =
                     std::chrono::steady_clock::now();
+                normalize_source_reference_angles(
+                    data_, outaged_branch, predictor_state.va);
                 // The predictor changes only the physical controls below.
                 // Recompute branch flows once here, then seed nodal slacks
                 // after the local P/Q projections have finished.  Calling
@@ -3488,6 +3509,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 }
                 const auto project_trial_reactive_and_validate =
                     [&](AcState& trial) {
+                    normalize_source_reference_angles(
+                        data_, outaged_branch, trial.va);
                     // Correction trials need fresh nonlinear branch flows,
                     // but their nodal slacks are only meaningful after the
                     // local active/reactive redispatch below.  Avoid the
@@ -5566,6 +5589,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         output.solve.status = 2;
         output.solve.iterations = output.fixed_jacobian_predictor_iterations;
         output.solve.state = best_intermediate_state;
+        normalize_source_reference_angles(
+            data_, outaged_branch, output.solve.state.va);
         output.solve.objective = rebuild_contingency_state_derived_fields(
             data_, base_state_, commitment_, *contingency,
             output.solve.state);
@@ -6173,21 +6198,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
     }
 
-    for (const auto& component : components) {
-        int angle_reference = -1;
-        for (int bus : component) {
-            if (data_.buses[bus].type == 3) {
-                angle_reference = bus;
-                break;
-            }
-        }
-        if (angle_reference >= 0) {
-            const double offset = va[angle_reference];
-            for (int bus : component) {
-                va[bus] -= offset;
-            }
-        }
-    }
+    normalize_source_reference_angles(data_, outaged_branch, va);
     for (int bus = 0; bus < nb; ++bus) {
         vm[bus] = std::clamp(
             vm[bus], data_.buses[bus].vmin, data_.buses[bus].vmax);
@@ -6657,21 +6668,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 break;
             }
 
-            for (const auto& component : components) {
-                int angle_reference = -1;
-                for (int bus : component) {
-                    if (data_.buses[bus].type == 3) {
-                        angle_reference = bus;
-                        break;
-                    }
-                }
-                if (angle_reference >= 0) {
-                    const double offset = state.va[angle_reference];
-                    for (int bus : component) {
-                        state.va[bus] -= offset;
-                    }
-                }
-            }
+            normalize_source_reference_angles(
+                data_, outaged_branch, state.va);
             refresh_network_fields();
             const ValidationReport polished_validation =
                 validate_candidate(state);

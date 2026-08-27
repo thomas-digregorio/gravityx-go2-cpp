@@ -18,6 +18,20 @@ std::vector<double> vector_or_empty(const nlohmann::json& value, const char* key
     return item->get<std::vector<double>>();
 }
 
+std::vector<std::vector<int>> integer_matrix_or_empty(
+    const nlohmann::json& value,
+    const char* key) {
+    const auto item = value.find(key);
+    if (item == value.end() || item->is_null()) {
+        return {};
+    }
+    if (!item->is_array()) {
+        throw std::runtime_error(
+            std::string("state field is not an array: ") + key);
+    }
+    return item->get<std::vector<std::vector<int>>>();
+}
+
 }  // namespace
 
 nlohmann::json ac_state_to_json(const AcState& state) {
@@ -27,6 +41,8 @@ nlohmann::json ac_state_to_json(const AcState& state) {
         {"pg", state.pg},
         {"qg", state.qg},
         {"demand_factor", state.demand_factor},
+        {"shunt_bs", state.shunt_bs},
+        {"shunt_steps", state.shunt_steps},
         {"pf", state.pf},
         {"qf", state.qf},
         {"pt", state.pt},
@@ -42,6 +58,23 @@ nlohmann::json ac_state_to_json(const AcState& state) {
     };
 }
 
+nlohmann::json ac_submission_state_to_json(const AcState& state) {
+    nlohmann::json value = {
+        {"vm", state.vm},
+        {"va", state.va},
+        {"pg", state.pg},
+        {"qg", state.qg},
+        {"demand_factor", state.demand_factor},
+    };
+    if (!state.shunt_bs.empty()) {
+        value["shunt_bs"] = state.shunt_bs;
+    }
+    if (!state.shunt_steps.empty()) {
+        value["shunt_steps"] = state.shunt_steps;
+    }
+    return value;
+}
+
 AcState ac_state_from_json(const nlohmann::json& value) {
     if (!value.is_object()) {
         throw std::runtime_error("AC state must be a JSON object");
@@ -52,6 +85,8 @@ AcState ac_state_from_json(const nlohmann::json& value) {
     state.pg = vector_or_empty(value, "pg");
     state.qg = vector_or_empty(value, "qg");
     state.demand_factor = vector_or_empty(value, "demand_factor");
+    state.shunt_bs = vector_or_empty(value, "shunt_bs");
+    state.shunt_steps = integer_matrix_or_empty(value, "shunt_steps");
     state.pf = vector_or_empty(value, "pf");
     state.qf = vector_or_empty(value, "qf");
     state.pt = vector_or_empty(value, "pt");
@@ -72,10 +107,19 @@ nlohmann::json solve_result_to_json(const SolveResult& result, bool include_stat
         {"status", result.status},
         {"objective", result.objective},
         {"wall_seconds", result.wall_seconds},
+        {"iterations", result.iterations},
+        {"resident_reoptimization", result.resident_reoptimization},
+        {"acceptable_termination_enabled", result.acceptable_termination_enabled},
     };
     if (include_state) {
         value["state"] = ac_state_to_json(result.state);
     }
+    return value;
+}
+
+nlohmann::json solve_result_to_submission_json(const SolveResult& result) {
+    auto value = solve_result_to_json(result, false);
+    value["state"] = ac_submission_state_to_json(result.state);
     return value;
 }
 

@@ -1,0 +1,30 @@
+{
+  "event": "GO Competition Challenge 2 Final Event",
+  "division": 1,
+  "code1_time_limit_seconds": 300,
+  "code2_seconds_per_contingency": 2,
+  "experiment_end_to_end_time_limit_seconds": 300,
+  "evaluation_reserve_seconds": 7,
+  "contingency_execution_mode": "8 persistent isolated process workers with a canonical-label dynamic queue",
+  "timing_semantics": "Code1 and Code2 retain their historical stage clocks; this experiment additionally imposes a stricter 300-second end-to-end cap",
+  "network_models": {
+    "C2FEN00617": [
+      "005",
+      "017",
+      "024",
+      "062",
+      "073"
+    ],
+    "C2FEN02020": [
+      "025",
+      "121",
+      "134",
+      "260",
+      "262"
+    ]
+  },
+  "sources": {
+    "scoring": "https://data.openei.org/files/6197/Challenge_2_Scoring.pdf",
+    "dataset": "https://data.openei.org/submissions/6197"
+  }
+}

@@ -1,8 +1,10 @@
 .deps/
+.eval-mpi-env/
 .build*/
 .data/
 .toolchain/
 runs/
+diagnostics/
 results/*.json
 results/*.csv
 *.log

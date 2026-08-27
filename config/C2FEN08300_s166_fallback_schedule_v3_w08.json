@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "case_sha256": "6ead1a631345205dfdc7d38a262ab41c0de639cbf466cb7fb8f7ba3fafefaef0",
+  "worker_count": 8,
+  "purpose": "Scheduling-only profile for the robust lightweight round-2 base. Labels come from an exhaustive fast screen; wall times come from the prior cold scenario-166 run. Contains no primal, dual, commitment, or network state.",
+  "assignments": [
+    {"label": "CTG_000034", "worker": 0, "predicted_wall_seconds": 55.261707643},
+    {"label": "CTG_000323", "worker": 0, "predicted_wall_seconds": 53.470678597},
+    {"label": "CTG_000495", "worker": 0, "predicted_wall_seconds": 44.149416339},
+
+    {"label": "CTG_000035", "worker": 1, "predicted_wall_seconds": 58.464595875},
+    {"label": "CTG_000365", "worker": 1, "predicted_wall_seconds": 48.197509737},
+    {"label": "CTG_000361", "worker": 1, "predicted_wall_seconds": 48.156668891},
+
+    {"label": "CTG_000360", "worker": 2, "predicted_wall_seconds": 34.004832076},
+    {"label": "CTG_000367", "worker": 2, "predicted_wall_seconds": 31.341712900},
+    {"label": "CTG_000019", "worker": 2, "predicted_wall_seconds": 29.937353883},
+    {"label": "CTG_000033", "worker": 2, "predicted_wall_seconds": 29.228967904},
+    {"label": "CTG_000390", "worker": 2, "predicted_wall_seconds": 28.816838477},
+
+    {"label": "CTG_000036", "worker": 3, "predicted_wall_seconds": 32.365452354},
+    {"label": "CTG_000009", "worker": 3, "predicted_wall_seconds": 31.955157560},
+    {"label": "CTG_000025", "worker": 3, "predicted_wall_seconds": 31.173944924},
+    {"label": "CTG_000331", "worker": 3, "predicted_wall_seconds": 30.828605859},
+    {"label": "CTG_000451", "worker": 3, "predicted_wall_seconds": 27.010000000},
+
+    {"label": "CTG_000452", "worker": 4, "predicted_wall_seconds": 61.329512103},
+    {"label": "CTG_000023", "worker": 4, "predicted_wall_seconds": 46.501281615},
+    {"label": "CTG_000003", "worker": 4, "predicted_wall_seconds": 27.639544720},
+    {"label": "CTG_000317", "worker": 4, "predicted_wall_seconds": 19.320000000},
+
+    {"label": "CTG_000468", "worker": 5, "predicted_wall_seconds": 63.739074781},
+    {"label": "CTG_000017", "worker": 5, "predicted_wall_seconds": 62.328674788},
+    {"label": "CTG_000389", "worker": 5, "predicted_wall_seconds": 27.673349302},
+
+    {"label": "CTG_000339", "worker": 6, "predicted_wall_seconds": 91.695377500},
+    {"label": "CTG_000008", "worker": 6, "predicted_wall_seconds": 30.251413644},
+    {"label": "CTG_000119", "worker": 6, "predicted_wall_seconds": 29.571369591},
+
+    {"label": "CTG_000321", "worker": 7, "predicted_wall_seconds": 35.256377934},
+    {"label": "CTG_000024", "worker": 7, "predicted_wall_seconds": 30.315834960},
+    {"label": "CTG_000018", "worker": 7, "predicted_wall_seconds": 30.027575332},
+    {"label": "CTG_000482", "worker": 7, "predicted_wall_seconds": 29.897822913},
+    {"label": "CTG_000486", "worker": 7, "predicted_wall_seconds": 27.901490610}
+  ]
+}

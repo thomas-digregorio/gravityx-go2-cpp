@@ -39,6 +39,31 @@ std::vector<double> doubles(const json& array) {
     return values;
 }
 
+std::string source_identifier(const json& item, std::size_t position) {
+    const auto& value = item.at("source_id").at(position);
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_number_integer()) {
+        return std::to_string(value.get<long long>());
+    }
+    if (value.is_number_unsigned()) {
+        return std::to_string(value.get<unsigned long long>());
+    }
+    throw std::runtime_error("source identifier is not a string or integer");
+}
+
+int source_integer(const json& item, std::size_t position) {
+    const auto& value = item.at("source_id").at(position);
+    if (value.is_number_integer() || value.is_number_unsigned()) {
+        return value.get<int>();
+    }
+    if (value.is_string()) {
+        return std::stoi(value.get<std::string>());
+    }
+    throw std::runtime_error("source identifier is not an integer");
+}
+
 }  // namespace
 
 CaseData CaseData::load(const std::string& path) {
@@ -71,6 +96,7 @@ CaseData CaseData::load(const std::string& path) {
         bus.vmax = item.at("vmax").get<double>();
         bus.vm_start = value_or(item, "vm_start", value_or(item, "vm", 1.0));
         bus.va_start = value_or(item, "va_start", value_or(item, "va", 0.0));
+        bus.present = item.value("present", true);
         return bus;
     });
     for (int position = 0; position < static_cast<int>(data.buses.size()); ++position) {
@@ -109,6 +135,9 @@ CaseData CaseData::load(const std::string& path) {
         gen.sdcost = item.at("sdcost").get<double>();
         gen.ncost = item.at("ncost").get<int>();
         gen.cost = doubles(item.at("cost"));
+        gen.present = item.value("present", true);
+        gen.source_bus = source_integer(item, 1);
+        gen.source_id = source_identifier(item, 2);
         return gen;
     });
 
@@ -133,6 +162,9 @@ CaseData CaseData::load(const std::string& path) {
         load.z_start = std::abs(load.pd_nominal) > 1e-12 ? pd / load.pd_nominal : 1.0;
         load.ncost = item.at("ncost").get<int>();
         load.cost = doubles(item.at("cost"));
+        load.present = item.value("present", true);
+        load.source_bus = source_integer(item, 1);
+        load.source_id = source_identifier(item, 2);
         return load;
     });
 
@@ -143,6 +175,28 @@ CaseData CaseData::load(const std::string& path) {
         shunt.bus = bus_pos(item.at("shunt_bus").get<int>());
         shunt.gs = item.at("gs").get<double>();
         shunt.bs = item.at("bs").get<double>();
+        shunt.dispatchable = item.value("dispatchable", false);
+        if (item.contains("xst")) {
+            shunt.steps = item.at("xst").get<std::vector<int>>();
+        }
+        if (item.contains("blocks")) {
+            for (const auto& block : item.at("blocks")) {
+                if (!block.is_array() || block.size() != 2) {
+                    throw std::runtime_error(
+                        "invalid switched-shunt block: " +
+                        shunt.source_key);
+                }
+                shunt.block_maximum_steps.push_back(
+                    block.at(0).get<int>());
+                shunt.block_susceptance.push_back(
+                    block.at(1).get<double>());
+            }
+        }
+        if (shunt.steps.size() < shunt.block_maximum_steps.size()) {
+            shunt.steps.resize(shunt.block_maximum_steps.size(), 0);
+        }
+        shunt.present = item.value("present", true);
+        shunt.source_bus = source_integer(item, 1);
         return shunt;
     });
 
@@ -150,6 +204,12 @@ CaseData CaseData::load(const std::string& path) {
         Branch branch;
         branch.source_key = key;
         branch.index = item.at("index").get<int>();
+        branch.status = item.value(
+            "br_status", item.value("status_prev", 1));
+        if (branch.status != 0 && branch.status != 1) {
+            throw std::runtime_error(
+                "branch status is not binary: " + branch.source_key);
+        }
         branch.from = bus_pos(item.at("f_bus").get<int>());
         branch.to = bus_pos(item.at("t_bus").get<int>());
         branch.transformer = item.at("transformer").get<bool>();
@@ -161,9 +221,44 @@ CaseData CaseData::load(const std::string& path) {
         branch.b_to = item.at("b_to").get<double>();
         branch.tap = item.at("tap").get<double>();
         branch.shift = item.at("shift").get<double>();
+        const double denominator = branch.r * branch.r + branch.x * branch.x;
+        const double g = denominator > 1e-20
+            ? branch.r / denominator : 0.0;
+        const double b = denominator > 1e-20
+            ? -branch.x / denominator : 0.0;
+        const double tap_squared = branch.tap * branch.tap;
+        const double tap_real = branch.tap * std::cos(branch.shift);
+        const double tap_imag = branch.tap * std::sin(branch.shift);
+        branch.flow_from_g_self = branch.transformer
+            ? g / tap_squared + branch.g_fr
+            : (g + branch.g_fr) / tap_squared;
+        branch.flow_from_b_self = branch.transformer
+            ? b / tap_squared + branch.b_fr
+            : (b + branch.b_fr) / tap_squared;
+        branch.flow_to_g_self = g + branch.g_to;
+        branch.flow_to_b_self = b + branch.b_to;
+        branch.flow_from_cross_cos =
+            (-g * tap_real + b * tap_imag) / tap_squared;
+        branch.flow_from_cross_sin =
+            (-b * tap_real - g * tap_imag) / tap_squared;
+        branch.flow_to_cross_cos =
+            (-g * tap_real - b * tap_imag) / tap_squared;
+        branch.flow_to_cross_sin =
+            (-b * tap_real + g * tap_imag) / tap_squared;
+        branch.flow_coefficients_valid = true;
         branch.angmin = item.at("angmin").get<double>();
         branch.angmax = item.at("angmax").get<double>();
         branch.rate_a = item.at("rate_a").get<double>();
+        branch.rate_b = item.value("rate_b", branch.rate_a);
+        branch.rate_c = item.value("rate_c", branch.rate_a);
+        branch.present = item.value("present", true);
+        branch.source_from = source_integer(item, 1);
+        branch.source_to = source_integer(item, 2);
+        branch.source_id = source_identifier(
+            item, branch.transformer ? 4 : 3);
+        branch.control_mode = item.value("control_mode", 0);
+        branch.tm_step = item.value("tm_step", 0);
+        branch.ta_step = item.value("ta_step", 0);
         return branch;
     });
 

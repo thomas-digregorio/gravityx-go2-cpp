@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """Run one cold Gravity C++ GO2 experiment and the official evaluator.
 
-All optimization subprocesses use the pinned Gravity C++ executable.  Python
-only orchestrates isolated contingency processes, writes the official text
-format, records provenance, and invokes the official evaluator.
+Optimization subprocesses use pinned Gravity C++ executables from one source
+revision. Python only orchestrates isolated contingency processes, writes the
+official text format, records provenance, and invokes the official evaluator.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
+import csv
 import concurrent.futures
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import queue
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -31,11 +37,226 @@ DEFAULT_EVALUATOR = Path(
     r"C:\Users\thoma\Documents\goc2-dc-scopf-cpu\vendor\C2DataUtilities\data_utilities\evaluation.py"
 )
 WSL_LIBRARY_PATH = "/home/thomasdigregorio/.local/share/gravityx-go2-cpp/env/lib"
+FINALIZATION_RESERVE_SECONDS = 5.0
+COMPACT_FINALIZATION_RESERVE_SECONDS = 0.5
+PROGRESS_CHECKPOINT_INTERVAL_SECONDS = 5.0
+PROGRESS_LOG_INITIAL_COUNT = 10
+PROGRESS_LOG_INTERVAL = 100
+EVALUATOR_THREAD_ENVIRONMENT_VARIABLES = (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+VENDOR_EVALUATOR_ENVIRONMENT_VARIABLE = "GRAVITYX_VENDOR_EVALUATOR"
+IN_MEMORY_DETAIL_CERTIFICATE_NAME = (
+    "gravityx_in_memory_detail_certificate.json"
+)
+
+
+class CompetitionTimeout(RuntimeError):
+    """Raised when a GO Competition stage exhausts its wall-clock allowance."""
+
+
+def evaluator_subprocess_environment(
+    linear_algebra_threads: int,
+    vendor_evaluator_reference: Path | None = None,
+) -> dict[str, str]:
+    """Return a reproducible evaluator environment without nested oversubscription."""
+    if linear_algebra_threads < 1:
+        raise ValueError("evaluator linear-algebra threads must be positive")
+    environment = os.environ.copy()
+    value = str(linear_algebra_threads)
+    for variable in EVALUATOR_THREAD_ENVIRONMENT_VARIABLES:
+        environment[variable] = value
+    if vendor_evaluator_reference is not None:
+        environment[VENDOR_EVALUATOR_ENVIRONMENT_VARIABLE] = str(
+            vendor_evaluator_reference.resolve()
+        )
+    return environment
+
+
+def evaluator_priority_popen_options(
+    below_normal_priority: bool,
+) -> dict[str, int]:
+    """Return an explicit Windows priority class for overlapping evaluators."""
+
+    if not below_normal_priority:
+        return {}
+    if os.name != "nt":
+        raise ValueError(
+            "below-normal evaluator priority is supported only on Windows"
+        )
+    return {
+        "creationflags": int(subprocess.BELOW_NORMAL_PRIORITY_CLASS),
+    }
+
+
+def persistent_evaluator_protocol_markers_present(evaluator: Path) -> bool:
+    """Return whether an evaluator advertises the persistent shard protocol."""
+
+    try:
+        source = evaluator.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return all(
+        marker in source
+        for marker in (
+            "--persistent-server",
+            "GRAVITYX_EVALUATOR_READY",
+            "GRAVITYX_EVALUATION_RESULT",
+        )
+    )
+
+
+def code2_time_limit(contingency_count: int, seconds_per_contingency: float) -> float:
+    if contingency_count < 0:
+        raise ValueError("contingency count cannot be negative")
+    if seconds_per_contingency <= 0:
+        raise ValueError("seconds per contingency must be positive")
+    return contingency_count * seconds_per_contingency
+
+
+def idle_screen_evaluation_process_target(
+    initial_processes: int,
+    post_screen_processes: int,
+    screen_workers: int,
+    remaining_screen_groups: int,
+) -> int:
+    """Replace drained screen-group capacity with evaluator processes."""
+    if initial_processes < 0:
+        raise ValueError("initial evaluator process count cannot be negative")
+    if post_screen_processes < max(1, initial_processes):
+        raise ValueError("post-screen evaluator process count is invalid")
+    if screen_workers < 1:
+        raise ValueError("screen worker count must be positive")
+    if remaining_screen_groups < 0:
+        raise ValueError("remaining screen group count cannot be negative")
+    released = max(0, screen_workers - remaining_screen_groups)
+    return min(post_screen_processes, initial_processes + released)
+
+
+def finalization_reserve_seconds(
+    compact_summary: bool,
+    configured_seconds: float | None = None,
+) -> float:
+    if configured_seconds is not None:
+        if not math.isfinite(configured_seconds) or configured_seconds <= 0.0:
+            raise ValueError("finalization reserve must be positive and finite")
+        return configured_seconds
+    return (
+        COMPACT_FINALIZATION_RESERVE_SECONDS
+        if compact_summary
+        else FINALIZATION_RESERVE_SECONDS
+    )
+
+
+def effective_process_timeout(
+    per_process_timeout: float,
+    stage_deadline: float,
+    now: float | None = None,
+) -> float:
+    if per_process_timeout <= 0:
+        raise ValueError("per-process timeout must be positive")
+    remaining = stage_deadline - (time.perf_counter() if now is None else now)
+    if remaining <= 0:
+        raise CompetitionTimeout("competition stage deadline has expired")
+    return min(per_process_timeout, remaining)
+
+
+def code2_completed_within_limit(
+    elapsed_seconds: float,
+    limit_seconds: float,
+    timed_out: bool,
+) -> bool:
+    if elapsed_seconds < 0 or limit_seconds <= 0:
+        raise ValueError("Code2 elapsed and limit values must be positive")
+    return not timed_out and elapsed_seconds <= limit_seconds
+
+
+def progress_checkpoint_due(
+    last_checkpoint: float,
+    now: float,
+    interval_seconds: float = PROGRESS_CHECKPOINT_INTERVAL_SECONDS,
+) -> bool:
+    if interval_seconds <= 0:
+        raise ValueError("progress checkpoint interval must be positive")
+    if now < last_checkpoint:
+        raise ValueError("progress checkpoint clock cannot move backwards")
+    return now - last_checkpoint >= interval_seconds
+
+
+def progress_log_due(
+    completed: int,
+    total: int,
+    initial_count: int = PROGRESS_LOG_INITIAL_COUNT,
+    interval: int = PROGRESS_LOG_INTERVAL,
+) -> bool:
+    if total < 1 or completed < 1 or completed > total:
+        raise ValueError("progress counts must satisfy 1 <= completed <= total")
+    if initial_count < 0 or interval < 1:
+        raise ValueError("progress log controls must be nonnegative and positive")
+    return (
+        completed <= initial_count
+        or completed == total
+        or completed % interval == 0
+    )
+
+
+def streamed_queue_get(
+    task_queue: queue.Queue[dict[str, Any]],
+    screening_finished: threading.Event,
+    abort: threading.Event,
+    poll_seconds: float = 0.1,
+    profiled_queue: queue.PriorityQueue[
+        tuple[float, int, str, dict[str, Any]]
+    ] | None = None,
+) -> dict[str, Any] | None:
+    """Wait for streamed fallback work until screening is complete or aborted.
+
+    Measured fallback durations define one global longest-first priority queue.
+    Any available worker can claim its next item, so neither stale worker
+    affinity nor fast-screen completion order can strand a long corrective LP.
+    """
+    while not abort.is_set():
+        if profiled_queue is not None:
+            try:
+                return profiled_queue.get_nowait()[3]
+            except queue.Empty:
+                pass
+        try:
+            return task_queue.get(timeout=poll_seconds)
+        except queue.Empty:
+            if screening_finished.is_set():
+                return None
+    return None
 
 
 def reject_onedrive(path: Path) -> None:
     if "onedrive" in str(path.resolve()).lower():
         raise ValueError(f"refusing OneDrive path: {path}")
+
+
+def require_minimum_free_space(path: Path, minimum_gb: float) -> float:
+    """Fail before a run if its destination volume lacks the requested space."""
+
+    if not math.isfinite(minimum_gb) or minimum_gb < 0.0:
+        raise ValueError("minimum free space must be finite and nonnegative")
+    probe = path.resolve()
+    while not probe.exists():
+        if probe.parent == probe:
+            raise ValueError(f"cannot resolve output volume for {path}")
+        probe = probe.parent
+    free_gb = shutil.disk_usage(probe).free / (1024.0**3)
+    if free_gb < minimum_gb:
+        raise RuntimeError(
+            "insufficient free disk space for cold run: "
+            f"available={free_gb:.2f} GB, required={minimum_gb:.2f} GB, "
+            f"volume_path={probe}"
+        )
+    return free_gb
 
 
 def to_wsl(path: Path) -> str:
@@ -62,11 +283,1542 @@ def read_json(path: Path) -> Any:
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    # Keep the atomic-write name independent of the destination basename.  A
+    # repeated basename can push an otherwise valid Windows path over the
+    # legacy MAX_PATH boundary (the shard certificate exposed this at exactly
+    # 260 characters).
+    temporary = path.parent / (
+        f".{os.getpid():x}.{threading.get_ident():x}.tmp"
+    )
     with temporary.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, indent=2, sort_keys=True)
         stream.write("\n")
-    temporary.replace(path)
+    delays = (0.01, 0.02, 0.04, 0.08, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10)
+    for attempt, delay in enumerate(delays):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == len(delays) - 1:
+                raise
+            time.sleep(delay)
+
+
+def validate_and_normalize_evaluation_details(
+    output_dir: Path,
+    internal_dir: Path,
+    expected_contingency_labels: set[str],
+    summary: dict[str, Any],
+    parallel_processes: int,
+    parallel_mode: str = "mpi",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require exhaustive official details and repair stale MPI bookkeeping."""
+    if parallel_mode not in {
+        "serial",
+        "mpi",
+        "serial_shards",
+        "streaming_serial_shards",
+    }:
+        raise ValueError(f"invalid evaluation parallel mode: {parallel_mode}")
+    expected_labels = {"BASECASE", *expected_contingency_labels}
+    detail_paths = {
+        path.stem.removeprefix("eval_detail_"): path
+        for path in output_dir.glob("eval_detail_*.json")
+    }
+    actual_labels = set(detail_paths)
+    missing = sorted(expected_labels - actual_labels)
+    extra = sorted(actual_labels - expected_labels)
+    if missing or extra:
+        raise RuntimeError(
+            "official evaluator detail-set mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    objectives: dict[str, float] = {}
+    infeasibilities: dict[str, bool] = {}
+    for label in sorted(expected_labels):
+        detail = read_json(detail_paths[label])
+        try:
+            objective = float(detail["obj"]["val"])
+            infeasible = bool(detail["infeas"]["val"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid official evaluator detail for {label}"
+            ) from error
+        if not math.isfinite(objective):
+            raise RuntimeError(
+                f"non-finite official objective for {label}: {objective}"
+            )
+        objectives[label] = objective
+        infeasibilities[label] = infeasible
+
+    contingency_count = len(expected_contingency_labels)
+    if int(summary.get("num_ctg", -1)) != contingency_count:
+        raise RuntimeError(
+            "official evaluator contingency count mismatch: "
+            f"summary={summary.get('num_ctg')}, expected={contingency_count}"
+        )
+    expected_objective = objectives["BASECASE"]
+    if contingency_count:
+        expected_objective += math.fsum(
+            objectives[label] for label in sorted(expected_contingency_labels)
+        ) / contingency_count
+    serial_cumulative_objective = objectives["BASECASE"]
+    for label in sorted(expected_contingency_labels):
+        serial_cumulative_objective += objectives[label] / contingency_count
+    reported_objective = float(summary.get("obj", math.nan))
+    if not math.isclose(
+        reported_objective,
+        expected_objective,
+        rel_tol=1e-12,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError(
+            "official evaluator objective disagrees with its detail files: "
+            f"summary={reported_objective}, details={expected_objective}"
+        )
+
+    infeasible_labels = sorted(
+        label for label, infeasible in infeasibilities.items() if infeasible
+    )
+    expected_infeasibility = float(len(infeasible_labels))
+    reported_infeasibility = float(summary.get("infeas", math.nan))
+    if reported_infeasibility != expected_infeasibility:
+        raise RuntimeError(
+            "official evaluator infeasibility disagrees with its detail files: "
+            f"summary={reported_infeasibility}, details={expected_infeasibility}"
+        )
+
+    normalized = dict(summary)
+    normalized["obj_all_cases"] = {
+        label: objectives[label] for label in sorted(expected_labels)
+    }
+    normalized["infeas_all_cases"] = {
+        label: infeasibilities[label] for label in sorted(expected_labels)
+    }
+    repaired_fields: list[str] = []
+    if parallel_processes > 1 and parallel_mode == "mpi":
+        internal_dir.mkdir(parents=True, exist_ok=True)
+        write_json(internal_dir / "eval_summary.vendor_mpi.json", summary)
+        vendor_csv = output_dir / "eval_summary.csv"
+        if vendor_csv.exists():
+            shutil.copy2(vendor_csv, internal_dir / "eval_summary.vendor_mpi.csv")
+
+        normalized["obj_cumulative"] = serial_cumulative_objective
+        normalized["infeas_cumulative"] = expected_infeasibility
+        repaired_fields = [
+            "obj_cumulative",
+            "obj_all_cases",
+            "infeas_cumulative",
+            "infeas_all_cases",
+        ]
+        write_json(output_dir / "eval_summary.json", normalized)
+
+        if vendor_csv.exists():
+            with vendor_csv.open("r", encoding="utf-8", newline="") as stream:
+                rows = list(csv.reader(stream))
+            for row in rows:
+                if row and row[0] in repaired_fields:
+                    row[1:] = [str(normalized[row[0]])]
+            with vendor_csv.open("w", encoding="utf-8", newline="") as stream:
+                csv.writer(stream).writerows(rows)
+
+    certificate = {
+        "schema_version": 1,
+        "parallel_processes": parallel_processes,
+        "parallel_mode": parallel_mode,
+        "expected_contingency_count": contingency_count,
+        "expected_detail_count": contingency_count + 1,
+        "observed_detail_count": len(detail_paths),
+        "complete_label_set": True,
+        "objective_from_details": expected_objective,
+        "serial_cumulative_objective_from_details": serial_cumulative_objective,
+        "reported_objective": reported_objective,
+        "infeasible_labels": infeasible_labels,
+        "reported_infeasibility": reported_infeasibility,
+        "repaired_vendor_mpi_bookkeeping_fields": repaired_fields,
+    }
+    write_json(internal_dir / "official_evaluation_certificate.json", certificate)
+    return normalized, certificate
+
+
+def validate_in_memory_evaluation_certificate(
+    output_dir: Path,
+    internal_dir: Path,
+    expected_contingency_labels: set[str],
+    summary: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate the fast evaluator's exact post-detail-write capture."""
+
+    capture_path = output_dir / IN_MEMORY_DETAIL_CERTIFICATE_NAME
+    capture = read_json(capture_path)
+    expected_labels = {"BASECASE", *expected_contingency_labels}
+    if (
+        int(capture.get("schema_version", -1)) != 1
+        or capture.get("capture_point")
+        != "immediately_after_unchanged_vendor_write_detail_returned"
+        or not bool(capture.get("vendor_detail_json_files_preserved", False))
+    ):
+        raise RuntimeError("invalid in-memory evaluator capture provenance")
+
+    raw_objectives = capture.get("objectives")
+    raw_infeasibilities = capture.get("infeasibilities")
+    raw_detail_files = capture.get("detail_files")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            raw_objectives,
+            raw_infeasibilities,
+            raw_detail_files,
+        )
+    ):
+        raise RuntimeError("in-memory evaluator capture is incomplete")
+    if (
+        set(raw_objectives) != expected_labels
+        or set(raw_infeasibilities) != expected_labels
+        or set(raw_detail_files) != expected_labels
+        or int(capture.get("expected_detail_count", -1)) != len(expected_labels)
+        or int(capture.get("observed_detail_count", -1)) != len(expected_labels)
+    ):
+        raise RuntimeError(
+            "in-memory evaluator capture label-set mismatch"
+        )
+
+    objectives = {
+        label: float(raw_objectives[label]) for label in expected_labels
+    }
+    infeasibilities = {
+        label: bool(raw_infeasibilities[label]) for label in expected_labels
+    }
+    if any(not math.isfinite(value) for value in objectives.values()):
+        raise RuntimeError("in-memory evaluator capture has a non-finite objective")
+
+    expected_names = {
+        f"eval_detail_{label}.json": label for label in expected_labels
+    }
+    observed_entries: dict[str, os.DirEntry[str]] = {}
+    with os.scandir(output_dir) as entries:
+        for entry in entries:
+            if entry.is_file() and entry.name.startswith("eval_detail_") and (
+                entry.name.endswith(".json")
+            ):
+                observed_entries[entry.name] = entry
+    if set(observed_entries) != set(expected_names):
+        raise RuntimeError(
+            "captured evaluator detail-file set does not match expected labels"
+        )
+    for file_name, label in expected_names.items():
+        record = raw_detail_files[label]
+        if (
+            not isinstance(record, dict)
+            or record.get("name") != file_name
+            or int(record.get("size", -1))
+            != observed_entries[file_name].stat().st_size
+        ):
+            raise RuntimeError(
+                f"captured evaluator detail artifact changed for {label}"
+            )
+
+    summary_objectives = summary.get("obj_all_cases")
+    summary_infeasibilities = summary.get("infeas_all_cases")
+    if not isinstance(summary_objectives, dict) or not isinstance(
+        summary_infeasibilities, dict
+    ):
+        raise RuntimeError("vendor summary has no captured per-case values")
+    if set(summary_objectives) != expected_labels or set(
+        summary_infeasibilities
+    ) != expected_labels:
+        raise RuntimeError("vendor summary per-case label set is incomplete")
+    for label in expected_labels:
+        if not math.isclose(
+            float(summary_objectives[label]),
+            objectives[label],
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ) or bool(summary_infeasibilities[label]) != infeasibilities[label]:
+            raise RuntimeError(
+                f"vendor summary disagrees with its captured detail for {label}"
+            )
+
+    contingency_count = len(expected_contingency_labels)
+    if int(summary.get("num_ctg", -1)) != contingency_count:
+        raise RuntimeError("captured evaluator contingency count mismatch")
+    expected_objective = objectives["BASECASE"]
+    if contingency_count:
+        expected_objective += math.fsum(
+            objectives[label]
+            for label in sorted(expected_contingency_labels)
+        ) / contingency_count
+    reported_objective = float(summary.get("obj", math.nan))
+    if not math.isclose(
+        reported_objective,
+        expected_objective,
+        rel_tol=1e-12,
+        abs_tol=1e-6,
+    ):
+        raise RuntimeError(
+            "vendor summary objective disagrees with captured details"
+        )
+    infeasible_labels = sorted(
+        label for label, value in infeasibilities.items() if value
+    )
+    reported_infeasibility = float(summary.get("infeas", math.nan))
+    if reported_infeasibility != float(len(infeasible_labels)):
+        raise RuntimeError(
+            "vendor summary infeasibility disagrees with captured details"
+        )
+
+    normalized = dict(summary)
+    normalized["obj_all_cases"] = {
+        label: objectives[label] for label in sorted(expected_labels)
+    }
+    normalized["infeas_all_cases"] = {
+        label: infeasibilities[label] for label in sorted(expected_labels)
+    }
+    certificate = {
+        "schema_version": 2,
+        "parallel_processes": 1,
+        "parallel_mode": "serial",
+        "expected_contingency_count": contingency_count,
+        "expected_detail_count": len(expected_labels),
+        "observed_detail_count": len(observed_entries),
+        "complete_label_set": True,
+        "objective_from_details": expected_objective,
+        "serial_cumulative_objective_from_details": expected_objective,
+        "reported_objective": reported_objective,
+        "infeasible_labels": infeasible_labels,
+        "reported_infeasibility": reported_infeasibility,
+        "repaired_vendor_mpi_bookkeeping_fields": [],
+        "detail_value_source": "post_vendor_write_detail_in_memory_capture",
+        "detail_files_verified_by_name_and_size": True,
+        "detail_json_files_reparsed": False,
+        "capture_certificate_sha256": sha256(capture_path),
+    }
+    write_json(internal_dir / "official_evaluation_certificate.json", certificate)
+    return normalized, certificate
+
+
+def read_contingency_blocks(path: Path) -> dict[str, list[str]]:
+    """Read source CON blocks without treating the final END as a contingency."""
+    blocks: dict[str, list[str]] = {}
+    active_label: str | None = None
+    active_lines: list[str] = []
+    with path.open("r", encoding="utf-8") as stream:
+        for raw_line in stream:
+            line = raw_line.rstrip("\r\n")
+            stripped = line.strip()
+            if stripped.startswith("CONTINGENCY "):
+                if active_label is not None:
+                    raise RuntimeError(
+                        f"CON contingency {active_label} is missing END"
+                    )
+                fields = stripped.split()
+                if len(fields) != 2 or not fields[1]:
+                    raise RuntimeError(f"invalid CON contingency row: {line}")
+                active_label = fields[1]
+                if active_label in blocks:
+                    raise RuntimeError(
+                        f"duplicate CON contingency label: {active_label}"
+                    )
+                active_lines = [line]
+                continue
+            if active_label is None:
+                continue
+            active_lines.append(line)
+            if stripped == "END":
+                blocks[active_label] = active_lines
+                active_label = None
+                active_lines = []
+    if active_label is not None:
+        raise RuntimeError(f"CON contingency {active_label} is missing END")
+    return blocks
+
+
+def write_contingency_subset(
+    source_con: Path,
+    destination_con: Path,
+    labels: list[str],
+) -> None:
+    """Write a deterministic valid CON file for exactly the requested labels."""
+    blocks = read_contingency_blocks(source_con)
+    missing = [label for label in labels if label not in blocks]
+    if missing:
+        raise RuntimeError(f"CON source is missing contingency labels: {missing}")
+    destination_con.parent.mkdir(parents=True, exist_ok=True)
+    with destination_con.open("w", encoding="utf-8", newline="\n") as stream:
+        for label in labels:
+            for line in blocks[label]:
+                stream.write(line)
+                stream.write("\n")
+        stream.write("END\n")
+
+
+def link_or_copy(source: Path, destination: Path) -> str:
+    """Prefer a same-volume hard link and fall back to a byte-for-byte copy."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination)
+        return "hardlink"
+    except OSError:
+        shutil.copy2(source, destination)
+        return "copy"
+
+
+def contiguous_shard_groups(
+    labels: list[str],
+    shard_count: int,
+) -> list[list[str]]:
+    """Partition an ordered schedule into balanced contiguous shards."""
+    if shard_count < 1:
+        raise ValueError("shard count must be positive")
+    if not labels:
+        raise ValueError("evaluation sharding requires contingencies")
+    active_shards = min(shard_count, len(labels))
+    minimum_size, remainder = divmod(len(labels), active_shards)
+    groups: list[list[str]] = []
+    offset = 0
+    for shard_index in range(active_shards):
+        size = minimum_size + (1 if shard_index < remainder else 0)
+        groups.append(labels[offset : offset + size])
+        offset += size
+    if offset != len(labels) or any(not group for group in groups):
+        raise RuntimeError("invalid contiguous evaluation shard partition")
+    return groups
+
+
+def completion_order_shard_groups(
+    labels: list[str],
+    shard_count: int,
+    tail_sizes: list[int] | None = None,
+) -> list[list[str]]:
+    """Balance early shards and taper the completion-order validation tail."""
+
+    if not tail_sizes:
+        return contiguous_shard_groups(labels, shard_count)
+    if any(size < 1 for size in tail_sizes):
+        raise ValueError("completion-order tail shard sizes must be positive")
+    active_shards = min(shard_count, len(labels))
+    if len(tail_sizes) >= active_shards:
+        raise ValueError(
+            "completion-order tail sizes must leave at least one prefix shard"
+        )
+    tail_count = sum(tail_sizes)
+    if tail_count >= len(labels):
+        raise ValueError(
+            "completion-order tail sizes must leave labels for prefix shards"
+        )
+    prefix_shards = active_shards - len(tail_sizes)
+    prefix_count = len(labels) - tail_count
+    groups = contiguous_shard_groups(
+        labels[:prefix_count], prefix_shards
+    )
+    offset = prefix_count
+    for size in tail_sizes:
+        groups.append(labels[offset : offset + size])
+        offset += size
+    if offset != len(labels) or len(groups) != active_shards:
+        raise RuntimeError("invalid tapered completion-order shard partition")
+    return groups
+
+
+def prepare_serial_evaluation_shards(
+    case_dir: Path,
+    output_dir: Path,
+    internal_dir: Path,
+    groups: list[list[str]],
+    root_name: str,
+    materialize_all_solutions: bool,
+    *,
+    start_index: int = 0,
+    allow_existing_root: bool = False,
+) -> list[dict[str, Any]]:
+    """Prepare immutable inputs for exact vendor-evaluator subprocesses."""
+    if not groups or any(not group for group in groups):
+        raise ValueError("serial evaluation groups must be nonempty")
+    if start_index < 0:
+        raise ValueError("serial evaluation start index cannot be negative")
+    shard_root = internal_dir / root_name
+    if shard_root.exists():
+        if not allow_existing_root:
+            raise RuntimeError(
+                f"serial evaluation shard directory already exists: {shard_root}"
+            )
+    else:
+        if allow_existing_root:
+            raise RuntimeError(
+                f"serial evaluation shard directory is missing: {shard_root}"
+            )
+        shard_root.mkdir(parents=True)
+
+    case_files = [case_dir / name for name in ("case.raw", "case.json")]
+    for path in [*case_files, case_dir / "case.con"]:
+        if not path.is_file():
+            raise RuntimeError(f"official evaluation input is missing: {path}")
+    base_solution = output_dir / "solution_BASECASE.txt"
+    if not base_solution.is_file():
+        raise RuntimeError("official evaluation base solution is missing")
+
+    seen_labels: set[str] = set()
+    shard_records: list[dict[str, Any]] = []
+    for group_offset, group in enumerate(groups):
+        shard_index = start_index + group_offset
+        duplicates = seen_labels.intersection(group)
+        if duplicates:
+            raise ValueError(
+                "duplicate labels across serial evaluation shards: "
+                + ", ".join(sorted(duplicates))
+            )
+        seen_labels.update(group)
+        shard_dir = shard_root / f"shard_{shard_index:03d}"
+        shard_case = shard_dir / "case"
+        shard_solutions = shard_dir / "solutions"
+        shard_case.mkdir(parents=True)
+        shard_solutions.mkdir(parents=True)
+        input_materialization: dict[str, str] = {}
+        for source in case_files:
+            input_materialization[source.name] = link_or_copy(
+                source, shard_case / source.name
+            )
+        write_contingency_subset(
+            case_dir / "case.con", shard_case / "case.con", group
+        )
+        input_materialization["solution_BASECASE.txt"] = link_or_copy(
+            base_solution, shard_solutions / "solution_BASECASE.txt"
+        )
+        if materialize_all_solutions:
+            for label in group:
+                solution = output_dir / f"solution_{label}.txt"
+                if not solution.is_file():
+                    raise RuntimeError(
+                        f"official evaluation solution is missing: {solution}"
+                    )
+                link_or_copy(solution, shard_solutions / solution.name)
+        shard_records.append(
+            {
+                "shard_index": shard_index,
+                "labels": list(group),
+                "case_dir": shard_case,
+                "solution_dir": shard_solutions,
+                "console_log": shard_dir / "evaluation.console.log",
+                "input_materialization": input_materialization,
+            }
+        )
+    return shard_records
+
+
+def finalize_serial_evaluation_shard(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate one completed unchanged-vendor serial evaluation shard."""
+    summary_path = record["solution_dir"] / "eval_summary.json"
+    if not summary_path.is_file():
+        raise RuntimeError(
+            f"official evaluator shard {record['shard_index']} wrote no summary"
+        )
+    summary = read_json(summary_path)
+    capture_path = (
+        record["solution_dir"] / IN_MEMORY_DETAIL_CERTIFICATE_NAME
+    )
+    if capture_path.is_file():
+        normalized, certificate = validate_in_memory_evaluation_certificate(
+            record["solution_dir"],
+            record["solution_dir"] / "internal_validation",
+            set(record["labels"]),
+            summary,
+        )
+    else:
+        normalized, certificate = validate_and_normalize_evaluation_details(
+            record["solution_dir"],
+            record["solution_dir"] / "internal_validation",
+            set(record["labels"]),
+            summary,
+            1,
+            "serial",
+        )
+    return {
+        **record,
+        "summary": normalized,
+        "certificate": certificate,
+    }
+
+
+def evaluate_serial_evaluation_shard(
+    python: Path,
+    evaluator: Path,
+    record: dict[str, Any],
+    deadline: float,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run and validate one exact vendor-evaluator shard."""
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0.0:
+        raise CompetitionTimeout(
+            "serial official-evaluation shard deadline has expired"
+        )
+    command = [
+        str(python),
+        str(evaluator),
+        "1",
+        str(record["case_dir"]),
+        str(record["solution_dir"]),
+    ]
+    started = time.perf_counter()
+    try:
+        with record["console_log"].open("w", encoding="utf-8") as log:
+            completed = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=remaining,
+                env=environment,
+            )
+    except subprocess.TimeoutExpired as error:
+        raise CompetitionTimeout(
+            f"official evaluator shard {record['shard_index']} reached the deadline"
+        ) from error
+    wall_seconds = time.perf_counter() - started
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "official evaluator shard failed: "
+            f"index={record['shard_index']}, returncode={completed.returncode}"
+        )
+    return finalize_serial_evaluation_shard(
+        {
+            **record,
+            "returncode": completed.returncode,
+            "wall_seconds": wall_seconds,
+        }
+    )
+
+
+def merge_serial_evaluation_shards(
+    completed_records: list[dict[str, Any]],
+    output_dir: Path,
+    internal_dir: Path,
+    labels: list[str],
+    requested_shards: int,
+    mode: str,
+    metadata_name: str,
+    maximum_parallel_processes: int,
+    materialize_top_level_details: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Merge an exhaustive set of independently validated vendor shards."""
+    if not completed_records:
+        raise RuntimeError("no official evaluation shards completed")
+    completed_records.sort(key=lambda record: int(record["shard_index"]))
+    observed_labels = [
+        label for record in completed_records for label in record["labels"]
+    ]
+    if len(observed_labels) != len(set(observed_labels)):
+        raise RuntimeError("official evaluation shards contain duplicate labels")
+    if set(observed_labels) != set(labels):
+        raise RuntimeError("official evaluation shards do not cover the exact label set")
+
+    base_detail_hash: str | None = None
+    base_detail_source: Path | None = None
+    for record in completed_records:
+        detail = record["solution_dir"] / "eval_detail_BASECASE.json"
+        detail_hash = sha256(detail)
+        if base_detail_hash is None:
+            base_detail_hash = detail_hash
+            base_detail_source = detail
+        elif detail_hash != base_detail_hash:
+            raise RuntimeError(
+                "serial official-evaluation shards disagree on BASECASE detail"
+            )
+    assert base_detail_source is not None
+    objectives: dict[str, float] = {}
+    infeasibilities: dict[str, bool] = {}
+    for record in completed_records:
+        shard_summary = record["summary"]
+        shard_objectives = shard_summary.get("obj_all_cases")
+        shard_infeasibilities = shard_summary.get("infeas_all_cases")
+        expected_shard_labels = {"BASECASE", *record["labels"]}
+        if not isinstance(shard_objectives, dict) or not isinstance(
+            shard_infeasibilities, dict
+        ):
+            raise RuntimeError(
+                f"official evaluator shard {record['shard_index']} has no "
+                "per-case summary"
+            )
+        if set(shard_objectives) != expected_shard_labels or set(
+            shard_infeasibilities
+        ) != expected_shard_labels:
+            raise RuntimeError(
+                f"official evaluator shard {record['shard_index']} summary "
+                "does not cover its exact label set"
+            )
+        for label in ["BASECASE", *record["labels"]]:
+            objective = float(shard_objectives[label])
+            infeasible = bool(shard_infeasibilities[label])
+            if not math.isfinite(objective):
+                raise RuntimeError(
+                    f"non-finite official objective for {label}: {objective}"
+                )
+            if label == "BASECASE" and label in objectives:
+                if not math.isclose(
+                    objectives[label], objective, rel_tol=1e-12, abs_tol=1e-6
+                ) or infeasibilities[label] != infeasible:
+                    raise RuntimeError(
+                        "serial official-evaluation shards disagree on "
+                        "BASECASE values"
+                    )
+                continue
+            if label in objectives:
+                raise RuntimeError(
+                    f"duplicate official-evaluation summary label: {label}"
+                )
+            objectives[label] = objective
+            infeasibilities[label] = infeasible
+    if set(objectives) != {"BASECASE", *labels}:
+        raise RuntimeError("merged official-evaluation values are incomplete")
+
+    if materialize_top_level_details:
+        link_or_copy(base_detail_source, output_dir / "eval_detail_BASECASE.json")
+        base_log_source = completed_records[0]["solution_dir"] / "BASECASE.eval.log"
+        if base_log_source.is_file():
+            link_or_copy(base_log_source, output_dir / "BASECASE.eval.log")
+        for record in completed_records:
+            for label in record["labels"]:
+                detail = record["solution_dir"] / f"eval_detail_{label}.json"
+                link_or_copy(detail, output_dir / detail.name)
+                case_log = record["solution_dir"] / f"{label}.eval.log"
+                if case_log.is_file():
+                    link_or_copy(case_log, output_dir / case_log.name)
+    objective = objectives["BASECASE"] + math.fsum(
+        objectives[label] for label in labels
+    ) / len(labels)
+    infeasible_labels = [
+        label for label in ["BASECASE", *labels] if infeasibilities[label]
+    ]
+    summary = {
+        "solutions_exist": True,
+        "num_ctg": len(labels),
+        "obj": objective,
+        "infeas": float(len(infeasible_labels)),
+        "obj_cumulative": objective,
+        "obj_all_cases": objectives,
+        "infeas_cumulative": float(len(infeasible_labels)),
+        "infeas_all_cases": infeasibilities,
+    }
+    write_json(output_dir / "eval_summary.json", summary)
+    aggregate_certificate = {
+        "schema_version": 2,
+        "parallel_processes": maximum_parallel_processes,
+        "parallel_mode": mode,
+        "detail_storage": (
+            "top_level_and_sharded"
+            if materialize_top_level_details
+            else "validated_shards"
+        ),
+        "expected_contingency_count": len(labels),
+        "expected_detail_count": len(labels) + 1,
+        "observed_detail_count": len(objectives),
+        "observed_unique_detail_count": len(objectives),
+        "observed_physical_shard_detail_count": sum(
+            int(record["certificate"]["observed_detail_count"])
+            for record in completed_records
+        ),
+        "complete_label_set": True,
+        "objective_from_details": objective,
+        "reported_objective": objective,
+        "infeasible_labels": sorted(infeasible_labels),
+        "reported_infeasibility": float(len(infeasible_labels)),
+        "repaired_vendor_mpi_bookkeeping_fields": [],
+    }
+    shard_metadata = {
+        "mode": mode,
+        "requested_shards": requested_shards,
+        "active_shards": len(completed_records),
+        "maximum_parallel_processes": maximum_parallel_processes,
+        "base_detail_sha256": base_detail_hash,
+        "top_level_details_materialized": materialize_top_level_details,
+        "aggregate_certificate": aggregate_certificate,
+        "shards": [
+            {
+                "shard_index": int(record["shard_index"]),
+                "contingency_count": len(record["labels"]),
+                "first_label": record["labels"][0],
+                "last_label": record["labels"][-1],
+                "wall_seconds": float(record["wall_seconds"]),
+                "returncode": int(record["returncode"]),
+                "persistent_evaluator_worker_id": record.get(
+                    "persistent_evaluator_worker_id"
+                ),
+                "evaluator_reported_wall_seconds": record.get(
+                    "evaluator_reported_wall_seconds"
+                ),
+                "static_case_cache": record.get("static_case_cache"),
+                "complete_label_set": bool(
+                    record["certificate"]["complete_label_set"]
+                ),
+                "observed_detail_count": int(
+                    record["certificate"]["observed_detail_count"]
+                ),
+            }
+            for record in completed_records
+        ],
+    }
+    write_json(
+        internal_dir / metadata_name, shard_metadata
+    )
+    return summary, shard_metadata
+
+
+def run_serial_evaluation_shards(
+    python: Path,
+    evaluator: Path,
+    case_dir: Path,
+    output_dir: Path,
+    internal_dir: Path,
+    contingency_labels: set[str],
+    shard_count: int,
+    deadline: float,
+    evaluator_linear_algebra_threads: int = 1,
+    vendor_evaluator_reference: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run referenced evaluator equations in independent serial shards.
+
+    The vendor MPI dispatcher uses nonblocking object sends without retaining
+    their request buffers and can corrupt messages on large jobs.  Independent
+    serial processes avoid that transport layer while preserving the exact
+    vendor parser and per-case equations.  Every detail is required and merged
+    by label before the ordinary exhaustive certificate is applied.
+    """
+    labels = sorted(contingency_labels)
+    if shard_count < 2:
+        raise ValueError("serial evaluation sharding requires at least two shards")
+    if not labels:
+        raise ValueError("serial evaluation sharding requires contingencies")
+    active_shards = min(shard_count, len(labels))
+    groups = [labels[index::active_shards] for index in range(active_shards)]
+    shard_records = prepare_serial_evaluation_shards(
+        case_dir,
+        output_dir,
+        internal_dir,
+        groups,
+        "serial_evaluation_shards",
+        True,
+    )
+    completed_records: list[dict[str, Any]] = []
+    environment = evaluator_subprocess_environment(
+        evaluator_linear_algebra_threads,
+        vendor_evaluator_reference,
+    )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=active_shards
+    ) as executor:
+        futures = [
+            executor.submit(
+                evaluate_serial_evaluation_shard,
+                python,
+                evaluator,
+                record,
+                deadline,
+                environment,
+            )
+            for record in shard_records
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            completed_records.append(future.result())
+    return merge_serial_evaluation_shards(
+        completed_records,
+        output_dir,
+        internal_dir,
+        labels,
+        shard_count,
+        "independent_serial_shards",
+        "serial_evaluation_shards.json",
+        active_shards,
+        True,
+    )
+
+
+class PersistentEvaluatorProcess:
+    """One long-lived exact-evaluator subprocess serving serial shards."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        python: Path,
+        evaluator: Path,
+        environment: dict[str, str],
+        log_path: Path,
+        below_normal_priority: bool = False,
+    ) -> None:
+        self.worker_id = worker_id
+        self.log_path = log_path
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log_handle = self.log_path.open("w", encoding="utf-8")
+        self.process = subprocess.Popen(
+            [str(python), str(evaluator), "--persistent-server"],
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            env=environment,
+            **evaluator_priority_popen_options(below_normal_priority),
+        )
+        self.task_count = 0
+        try:
+            self._wait_until_ready()
+        except Exception:
+            self.terminate()
+            raise
+
+    def _wait_until_ready(self) -> None:
+        assert self.process.stdout is not None
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                returncode = self.process.wait()
+                raise RuntimeError(
+                    "persistent official evaluator exited before its ready "
+                    f"handshake: worker={self.worker_id}, returncode={returncode}"
+                )
+            self.log_handle.write(line)
+            self.log_handle.flush()
+            if line.rstrip("\r\n") == "GRAVITYX_EVALUATOR_READY":
+                return
+
+    def _read_result(self, request_id: int) -> dict[str, Any]:
+        assert self.process.stdout is not None
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                returncode = self.process.wait()
+                raise RuntimeError(
+                    "persistent official evaluator exited before replying: "
+                    f"worker={self.worker_id}, returncode={returncode}"
+                )
+            self.log_handle.write(line)
+            self.log_handle.flush()
+            stripped = line.rstrip("\r\n")
+            prefix = "GRAVITYX_EVALUATION_RESULT "
+            if not stripped.startswith(prefix):
+                continue
+            response = json.loads(stripped[len(prefix) :])
+            if int(response.get("request_id", -1)) != request_id:
+                raise RuntimeError(
+                    "persistent official evaluator replied to the wrong shard: "
+                    f"worker={self.worker_id}, expected={request_id}, "
+                    f"observed={response.get('request_id')}"
+                )
+            return response
+
+    def evaluate(
+        self,
+        record: dict[str, Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        if time.perf_counter() >= deadline:
+            raise CompetitionTimeout(
+                "persistent official evaluation reached its deadline"
+            )
+        request_id = int(record["shard_index"])
+        request = {
+            "request_id": request_id,
+            "case_dir": str(record["case_dir"]),
+            "solution_dir": str(record["solution_dir"]),
+        }
+        assert self.process.stdin is not None
+        self.process.stdin.write(
+            json.dumps(request, separators=(",", ":")) + "\n"
+        )
+        self.process.stdin.flush()
+        response = self._read_result(request_id)
+        self.task_count += 1
+        if not bool(response.get("success", False)):
+            raise RuntimeError(
+                "persistent official evaluator shard failed: "
+                f"worker={self.worker_id}, index={request_id}, "
+                f"error={response.get('error')}"
+            )
+        return response
+
+    def terminate(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        for stream in (self.process.stdin, self.process.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
+        if not self.log_handle.closed:
+            self.log_handle.close()
+
+    def stop(self) -> None:
+        if self.process.poll() is None:
+            try:
+                assert self.process.stdin is not None
+                self.process.stdin.write('{"stop":true}\n')
+                self.process.stdin.flush()
+                self.process.stdin.close()
+                assert self.process.stdout is not None
+                for line in self.process.stdout:
+                    self.log_handle.write(line)
+                returncode = self.process.wait(timeout=2.0)
+                if returncode != 0:
+                    raise RuntimeError(
+                        "persistent official evaluator stopped with status "
+                        f"{returncode}: worker={self.worker_id}"
+                    )
+            except Exception:
+                self.terminate()
+                raise
+        for stream in (self.process.stdin, self.process.stdout):
+            if stream is not None and not stream.closed:
+                stream.close()
+        if not self.log_handle.closed:
+            self.log_handle.close()
+
+
+class StreamingSerialEvaluation:
+    """Overlap referenced evaluator-equation shards with contingency generation."""
+
+    def __init__(
+        self,
+        python: Path,
+        evaluator: Path,
+        case_dir: Path,
+        output_dir: Path,
+        internal_dir: Path,
+        ordered_labels: list[str],
+        shard_count: int,
+        maximum_processes: int,
+        deadline: float,
+        evaluator_linear_algebra_threads: int = 1,
+        post_screen_maximum_processes: int | None = None,
+        vendor_evaluator_reference: Path | None = None,
+        completion_order_groups: bool = False,
+        completion_order_tail_sizes: list[int] | None = None,
+        persistent_evaluator_processes: bool = False,
+        evaluator_below_normal_priority: bool = False,
+    ) -> None:
+        if maximum_processes < 0:
+            raise ValueError(
+                "initial streaming evaluation processes cannot be negative"
+            )
+        if post_screen_maximum_processes is None:
+            post_screen_maximum_processes = maximum_processes
+        if post_screen_maximum_processes < 1:
+            raise ValueError(
+                "post-screen streaming evaluation processes must be positive"
+            )
+        if post_screen_maximum_processes < maximum_processes:
+            raise ValueError(
+                "post-screen streaming evaluation processes cannot be less "
+                "than the initial process count"
+            )
+        if len(ordered_labels) != len(set(ordered_labels)):
+            raise ValueError("streaming evaluation labels must be unique")
+        self.python = python
+        self.evaluator = evaluator
+        self.output_dir = output_dir
+        self.internal_dir = internal_dir
+        self.case_dir = case_dir
+        self.labels = list(ordered_labels)
+        self.label_set = set(self.labels)
+        self.requested_shards = shard_count
+        self.active_shards = min(shard_count, len(self.labels))
+        self.completion_order_groups = completion_order_groups
+        self.completion_order_tail_sizes = list(
+            completion_order_tail_sizes or []
+        )
+        if self.completion_order_tail_sizes and not completion_order_groups:
+            raise ValueError(
+                "completion-order tail sizes require completion-order groups"
+            )
+        self.initial_maximum_processes = maximum_processes
+        self.post_screen_maximum_processes = post_screen_maximum_processes
+        self.maximum_processes = maximum_processes
+        self.deadline = deadline
+        self.evaluator_linear_algebra_threads = evaluator_linear_algebra_threads
+        self.environment = evaluator_subprocess_environment(
+            evaluator_linear_algebra_threads,
+            vendor_evaluator_reference,
+        )
+        self.vendor_evaluator_reference = vendor_evaluator_reference
+        self.persistent_evaluator_processes = persistent_evaluator_processes
+        self.evaluator_below_normal_priority = evaluator_below_normal_priority
+        groups = completion_order_shard_groups(
+            self.labels,
+            shard_count,
+            self.completion_order_tail_sizes,
+        )
+        if completion_order_groups:
+            self.dynamic_group_sizes = [len(group) for group in groups]
+            self.dynamic_group_labels: list[str] = []
+            self.dynamic_next_shard_index = 0
+            self.records: list[dict[str, Any]] = []
+        else:
+            self.dynamic_group_sizes = []
+            self.dynamic_group_labels = []
+            self.dynamic_next_shard_index = 0
+            self.records = prepare_serial_evaluation_shards(
+                case_dir,
+                output_dir,
+                internal_dir,
+                groups,
+                "streaming_serial_evaluation_shards",
+                False,
+            )
+        self.record_by_label: dict[str, dict[str, Any]] = {}
+        for record in self.records:
+            record["pending_labels"] = set(record["labels"])
+            for label in record["labels"]:
+                self.record_by_label[label] = record
+        self.completed_labels: set[str] = set()
+        self.ready_records: list[dict[str, Any]] = []
+        self.running_records: dict[int, dict[str, Any]] = {}
+        self.finalization_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, self.active_shards)
+        )
+        self.finalization_futures: dict[
+            int, concurrent.futures.Future[dict[str, Any]]
+        ] = {}
+        self.finalization_executor_shutdown = False
+        self.evaluator_executor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=post_screen_maximum_processes
+            )
+            if persistent_evaluator_processes
+            else None
+        )
+        self.evaluator_executor_shutdown = False
+        self.persistent_workers: list[PersistentEvaluatorProcess] = []
+        self.available_persistent_workers: list[PersistentEvaluatorProcess] = []
+        self.lock = threading.RLock()
+        self.aborted = False
+        self.first_process_started: float | None = None
+        self.last_process_finished: float | None = None
+        self.screen_idle_promotion_events: list[dict[str, int]] = []
+
+    def _abort_locked(self) -> None:
+        self.aborted = True
+        if self.persistent_evaluator_processes:
+            for record in list(self.running_records.values()):
+                future = record.get("evaluation_future")
+                if future is not None:
+                    future.cancel()
+            for worker in self.persistent_workers:
+                worker.terminate()
+            self.available_persistent_workers.clear()
+        else:
+            for record in list(self.running_records.values()):
+                process = record["process"]
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                log = record.get("log_handle")
+                if log is not None and not log.closed:
+                    log.close()
+        self.running_records.clear()
+        for future in self.finalization_futures.values():
+            future.cancel()
+
+    def _shutdown_finalization_executor(self, wait: bool) -> None:
+        if self.finalization_executor_shutdown:
+            return
+        self.finalization_executor_shutdown = True
+        self.finalization_executor.shutdown(
+            wait=wait,
+            cancel_futures=not wait,
+        )
+
+    def _shutdown_evaluator_executor(self, wait: bool) -> None:
+        if self.evaluator_executor_shutdown:
+            return
+        self.evaluator_executor_shutdown = True
+        if self.persistent_evaluator_processes:
+            for worker in self.persistent_workers:
+                if self.aborted:
+                    worker.terminate()
+                else:
+                    worker.stop()
+        if self.evaluator_executor is not None:
+            self.evaluator_executor.shutdown(
+                wait=wait,
+                cancel_futures=not wait,
+            )
+
+    def abort(self) -> None:
+        with self.lock:
+            self._abort_locked()
+        self._shutdown_evaluator_executor(False)
+        self._shutdown_finalization_executor(False)
+
+    def _ensure_persistent_workers_locked(self) -> None:
+        if not self.persistent_evaluator_processes:
+            return
+        while len(self.persistent_workers) < self.maximum_processes:
+            worker_id = len(self.persistent_workers)
+            worker = PersistentEvaluatorProcess(
+                worker_id,
+                self.python,
+                self.evaluator,
+                self.environment,
+                self.internal_dir
+                / "persistent_streaming_evaluator_workers"
+                / f"persistent_worker_{worker_id:03d}.log",
+                self.evaluator_below_normal_priority,
+            )
+            self.persistent_workers.append(worker)
+            self.available_persistent_workers.append(worker)
+
+    def _collect_finished_locked(self) -> None:
+        for shard_index, record in list(self.running_records.items()):
+            if self.persistent_evaluator_processes:
+                future = record["evaluation_future"]
+                if not future.done():
+                    continue
+                worker = record["evaluator_worker"]
+                try:
+                    response = future.result()
+                except Exception as error:
+                    self._abort_locked()
+                    raise RuntimeError(
+                        "streaming persistent official evaluator shard failed: "
+                        f"index={shard_index}"
+                    ) from error
+                record["returncode"] = 0
+                record["wall_seconds"] = (
+                    time.perf_counter() - float(record["process_started"])
+                )
+                record["evaluator_reported_wall_seconds"] = float(
+                    response["wall_seconds"]
+                )
+                record["persistent_evaluator_worker_id"] = worker.worker_id
+                record["static_case_cache"] = response.get(
+                    "static_case_cache", {}
+                )
+                del record["evaluation_future"]
+                del record["evaluator_worker"]
+                del record["process_started"]
+                del self.running_records[shard_index]
+                self.available_persistent_workers.append(worker)
+                self.last_process_finished = time.perf_counter()
+                self.finalization_futures[shard_index] = (
+                    self.finalization_executor.submit(
+                        finalize_serial_evaluation_shard,
+                        record,
+                    )
+                )
+                continue
+            process = record["process"]
+            returncode = process.poll()
+            if returncode is None:
+                continue
+            log = record["log_handle"]
+            if not log.closed:
+                log.close()
+            record["returncode"] = returncode
+            record["wall_seconds"] = (
+                time.perf_counter() - float(record["process_started"])
+            )
+            del record["process"]
+            del record["log_handle"]
+            del record["process_started"]
+            del self.running_records[shard_index]
+            self.last_process_finished = time.perf_counter()
+            if returncode != 0:
+                self._abort_locked()
+                raise RuntimeError(
+                    "streaming official evaluator shard failed: "
+                    f"index={shard_index}, returncode={returncode}"
+                )
+            self.finalization_futures[shard_index] = (
+                self.finalization_executor.submit(
+                    finalize_serial_evaluation_shard,
+                    record,
+                )
+            )
+        for shard_index, future in self.finalization_futures.items():
+            if future.done() and future.exception() is not None:
+                self._abort_locked()
+                raise RuntimeError(
+                    "streaming official evaluator shard validation failed: "
+                    f"index={shard_index}"
+                ) from future.exception()
+
+    def _launch_ready_locked(self) -> None:
+        self._collect_finished_locked()
+        self._ensure_persistent_workers_locked()
+        while (
+            self.ready_records
+            and len(self.running_records) < self.maximum_processes
+        ):
+            if time.perf_counter() >= self.deadline:
+                self._abort_locked()
+                raise CompetitionTimeout(
+                    "streaming official evaluation reached its deadline"
+                )
+            record = self.ready_records.pop(0)
+            if self.persistent_evaluator_processes:
+                if not self.available_persistent_workers:
+                    self.ready_records.insert(0, record)
+                    break
+                worker = self.available_persistent_workers.pop(0)
+                started = time.perf_counter()
+                if self.first_process_started is None:
+                    self.first_process_started = started
+                assert self.evaluator_executor is not None
+                record["evaluation_future"] = self.evaluator_executor.submit(
+                    worker.evaluate,
+                    record,
+                    self.deadline,
+                )
+                record["evaluator_worker"] = worker
+                record["process_started"] = started
+                self.running_records[int(record["shard_index"])] = record
+                continue
+            command = [
+                str(self.python),
+                str(self.evaluator),
+                "1",
+                str(record["case_dir"]),
+                str(record["solution_dir"]),
+            ]
+            log = record["console_log"].open("w", encoding="utf-8")
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=self.environment,
+                **evaluator_priority_popen_options(
+                    self.evaluator_below_normal_priority
+                ),
+            )
+            started = time.perf_counter()
+            if self.first_process_started is None:
+                self.first_process_started = started
+            record["process"] = process
+            record["log_handle"] = log
+            record["process_started"] = started
+            self.running_records[int(record["shard_index"])] = record
+
+    def mark_completed(self, label: str) -> None:
+        if label not in self.label_set:
+            raise RuntimeError(f"unknown streaming evaluation label: {label}")
+        with self.lock:
+            if self.aborted:
+                raise CompetitionTimeout("streaming official evaluation was aborted")
+            if label in self.completed_labels:
+                raise RuntimeError(
+                    f"duplicate streaming evaluation completion: {label}"
+                )
+            source = self.output_dir / f"solution_{label}.txt"
+            if not source.is_file() or source.stat().st_size <= 0:
+                raise RuntimeError(
+                    "streaming official evaluation solution is incomplete: "
+                    f"{source}"
+                )
+            self.completed_labels.add(label)
+            if self.completion_order_groups:
+                self.dynamic_group_labels.append(label)
+                shard_index = self.dynamic_next_shard_index
+                if shard_index >= len(self.dynamic_group_sizes):
+                    raise RuntimeError(
+                        "streaming completion-order shard count overflow"
+                    )
+                target_size = self.dynamic_group_sizes[shard_index]
+                if len(self.dynamic_group_labels) == target_size:
+                    prepared = prepare_serial_evaluation_shards(
+                        self.case_dir,
+                        self.output_dir,
+                        self.internal_dir,
+                        [list(self.dynamic_group_labels)],
+                        "streaming_serial_evaluation_shards",
+                        True,
+                        start_index=shard_index,
+                        allow_existing_root=shard_index > 0,
+                    )
+                    record = prepared[0]
+                    record["pending_labels"] = set()
+                    self.records.append(record)
+                    self.ready_records.append(record)
+                    self.dynamic_group_labels.clear()
+                    self.dynamic_next_shard_index += 1
+                elif len(self.dynamic_group_labels) > target_size:
+                    raise RuntimeError(
+                        "streaming completion-order shard size overflow"
+                    )
+            else:
+                record = self.record_by_label[label]
+                destination = record["solution_dir"] / source.name
+                link_or_copy(source, destination)
+                record["pending_labels"].remove(label)
+                if not record["pending_labels"]:
+                    self.ready_records.append(record)
+            self._launch_ready_locked()
+
+    def promote_maximum_processes(
+        self,
+        maximum_processes: int,
+        remaining_screen_groups: int,
+    ) -> None:
+        """Monotonically release drained screen capacity to evaluation."""
+        if maximum_processes < 0:
+            raise ValueError("streaming evaluator process count is negative")
+        with self.lock:
+            if self.aborted:
+                raise CompetitionTimeout(
+                    "streaming official evaluation was aborted"
+                )
+            target = min(
+                self.post_screen_maximum_processes,
+                max(self.maximum_processes, maximum_processes),
+            )
+            if target == self.maximum_processes:
+                return
+            self.maximum_processes = target
+            self.screen_idle_promotion_events.append(
+                {
+                    "maximum_processes": target,
+                    "remaining_screen_groups": remaining_screen_groups,
+                }
+            )
+            self._launch_ready_locked()
+
+    def finish(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        tail_started = time.perf_counter()
+        try:
+            with self.lock:
+                pre_tail_maximum_processes = self.maximum_processes
+                self.maximum_processes = self.post_screen_maximum_processes
+                completed_before_tail_wait = len(self.finalization_futures)
+                missing = set(self.labels) - self.completed_labels
+                if missing:
+                    self._abort_locked()
+                    raise RuntimeError(
+                        "streaming official evaluation is missing completed solutions: "
+                        + ", ".join(sorted(missing))
+                    )
+                if self.completion_order_groups and (
+                    self.dynamic_group_labels
+                    or self.dynamic_next_shard_index != self.active_shards
+                    or len(self.records) != self.active_shards
+                ):
+                    self._abort_locked()
+                    raise RuntimeError(
+                        "streaming completion-order shards are incomplete"
+                    )
+            while True:
+                with self.lock:
+                    if self.aborted:
+                        raise CompetitionTimeout(
+                            "streaming official evaluation was aborted"
+                        )
+                    self._launch_ready_locked()
+                    if len(self.finalization_futures) == len(self.records):
+                        break
+                    if time.perf_counter() >= self.deadline:
+                        self._abort_locked()
+                        raise CompetitionTimeout(
+                            "streaming official evaluation reached its deadline"
+                        )
+                time.sleep(0.05)
+            remaining = self.deadline - time.perf_counter()
+            if remaining <= 0.0:
+                with self.lock:
+                    self._abort_locked()
+                raise CompetitionTimeout(
+                    "streaming official evaluation validation reached its deadline"
+                )
+            done, pending = concurrent.futures.wait(
+                self.finalization_futures.values(),
+                timeout=remaining,
+            )
+            if pending:
+                with self.lock:
+                    self._abort_locked()
+                raise CompetitionTimeout(
+                    "streaming official evaluation validation reached its deadline"
+                )
+            finalized_records = [
+                self.finalization_futures[index].result()
+                for index in sorted(self.finalization_futures)
+            ]
+            summary, metadata = merge_serial_evaluation_shards(
+                finalized_records,
+                self.output_dir,
+                self.internal_dir,
+                sorted(self.labels),
+                self.requested_shards,
+                "overlapped_serial_shards",
+                "streaming_serial_evaluation_shards.json",
+                self.maximum_processes,
+                False,
+            )
+            now = time.perf_counter()
+            metadata.update(
+                {
+                    "tail_wait_seconds": now - tail_started,
+                    "overlap_span_seconds": (
+                        now - self.first_process_started
+                        if self.first_process_started is not None
+                        else 0.0
+                    ),
+                    "completed_before_tail_wait": completed_before_tail_wait,
+                    "incremental_shard_validation": True,
+                    "shard_validation_workers": min(8, len(self.records)),
+                    "evaluator_linear_algebra_threads": (
+                        self.evaluator_linear_algebra_threads
+                    ),
+                    "initial_maximum_parallel_processes": (
+                        self.initial_maximum_processes
+                    ),
+                    "post_screen_maximum_parallel_processes": (
+                        self.post_screen_maximum_processes
+                    ),
+                    "pre_tail_maximum_parallel_processes": (
+                        pre_tail_maximum_processes
+                    ),
+                    "screen_idle_promotion_events": list(
+                        self.screen_idle_promotion_events
+                    ),
+                    "shard_grouping": (
+                        "solution_completion_order"
+                        if self.completion_order_groups
+                        else "configured_schedule_order"
+                    ),
+                    "completion_order_tail_shard_sizes": list(
+                        self.completion_order_tail_sizes
+                    ),
+                    "persistent_evaluator_processes": (
+                        self.persistent_evaluator_processes
+                    ),
+                    "evaluator_below_normal_priority": (
+                        self.evaluator_below_normal_priority
+                    ),
+                    "persistent_evaluator_process_count": len(
+                        self.persistent_workers
+                    ),
+                    "persistent_evaluator_task_counts": {
+                        str(worker.worker_id): worker.task_count
+                        for worker in self.persistent_workers
+                    },
+                }
+            )
+            write_json(
+                self.internal_dir / "streaming_serial_evaluation_shards.json",
+                metadata,
+            )
+            return summary, metadata
+        finally:
+            self._shutdown_evaluator_executor(not self.aborted)
+            self._shutdown_finalization_executor(not self.aborted)
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:
@@ -155,10 +1907,18 @@ def write_solution(
             "i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8",
         ]
     )
-    for shunt in shunts:
+    state_shunt_steps = state.get("shunt_steps")
+    for position, shunt in enumerate(shunts):
         if shunt.get("present", True) and shunt.get("dispatchable", False):
             source = shunt["source_id"]
-            values = [str(source[1]), *(str(int(value)) for value in shunt.get("xst", []))]
+            steps = shunt.get("xst", [])
+            if (
+                isinstance(state_shunt_steps, list)
+                and position < len(state_shunt_steps)
+                and isinstance(state_shunt_steps[position], list)
+            ):
+                steps = state_shunt_steps[position]
+            values = [str(source[1]), *(str(int(value)) for value in steps)]
             lines.append(", ".join(values))
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -172,14 +1932,16 @@ def safe_label(label: str) -> str:
     return value
 
 
-def run_cpp(
+def cpp_command(
     executable: Path,
     distro: str,
     arguments: list[str],
-    log_path: Path,
     timeout: float,
-) -> subprocess.CompletedProcess[str]:
-    command = [
+) -> list[str]:
+    if timeout <= 0:
+        raise ValueError("C++ subprocess timeout must be positive")
+    inner_timeout = max(timeout, 0.001)
+    return [
         "wsl",
         "-d",
         distro,
@@ -188,9 +1950,167 @@ def run_cpp(
         f"LD_LIBRARY_PATH={WSL_LIBRARY_PATH}",
         "OMP_NUM_THREADS=1",
         "OPENBLAS_NUM_THREADS=1",
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=5s",
+        f"{inner_timeout:.3f}s",
         to_wsl(executable),
         *arguments,
     ]
+
+
+def stage_wsl_worker_inputs(
+    distro: str,
+    case_json: Path,
+    base_json: Path,
+    deadline: float,
+) -> tuple[str, str, dict[str, Any]]:
+    """Copy immutable worker inputs once to WSL tmpfs and verify their hashes."""
+
+    for path in (case_json, base_json):
+        reject_onedrive(path)
+        if not path.is_file():
+            raise ValueError(f"worker input does not exist: {path}")
+    token = f"{os.getpid():x}_{time.time_ns():x}"
+    destinations = {
+        "case": f"/dev/shm/gravityx_go2_{token}_case.json",
+        "base": f"/dev/shm/gravityx_go2_{token}_base.json",
+    }
+    expected_hashes = {
+        "case": sha256(case_json),
+        "base": sha256(base_json),
+    }
+    started = time.perf_counter()
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.0:
+            raise CompetitionTimeout(
+                "WSL worker-input staging reached the end-to-end work deadline"
+            )
+        return remaining
+
+    copied: list[str] = []
+    try:
+        for name, source in (("case", case_json), ("base", base_json)):
+            completed = subprocess.run(
+                [
+                    "wsl",
+                    "-d",
+                    distro,
+                    "--",
+                    "cp",
+                    "--",
+                    to_wsl(source),
+                    destinations[name],
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=remaining_timeout(),
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    "WSL worker-input staging failed: "
+                    f"name={name}, returncode={completed.returncode}, "
+                    f"output={completed.stdout.strip()}"
+                )
+            copied.append(destinations[name])
+        verified = subprocess.run(
+            [
+                "wsl",
+                "-d",
+                distro,
+                "--",
+                "sha256sum",
+                destinations["case"],
+                destinations["base"],
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=remaining_timeout(),
+        )
+        if verified.returncode != 0:
+            raise RuntimeError(
+                "WSL staged-input hash command failed: "
+                f"returncode={verified.returncode}, "
+                f"output={verified.stdout.strip()}"
+            )
+        observed_hashes: dict[str, str] = {}
+        destination_to_name = {
+            value: name for name, value in destinations.items()
+        }
+        for line in verified.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] in destination_to_name:
+                observed_hashes[destination_to_name[fields[1]]] = fields[0].lower()
+        if observed_hashes != expected_hashes:
+            raise RuntimeError(
+                "WSL staged-input hash mismatch: "
+                f"expected={expected_hashes}, observed={observed_hashes}"
+            )
+    except Exception:
+        if copied:
+            try:
+                subprocess.run(
+                    ["wsl", "-d", distro, "--", "rm", "-f", "--", *copied],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+        raise
+
+    def cleanup() -> None:
+        try:
+            subprocess.run(
+                [
+                    "wsl",
+                    "-d",
+                    distro,
+                    "--",
+                    "rm",
+                    "-f",
+                    "--",
+                    destinations["case"],
+                    destinations["base"],
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+
+    atexit.register(cleanup)
+    metadata = {
+        "mode": "single_copy_to_wsl_tmpfs_with_sha256_verification",
+        "wall_seconds": time.perf_counter() - started,
+        "destinations": destinations,
+        "sha256": expected_hashes,
+        "cleanup": "registered_with_atexit",
+    }
+    return destinations["case"], destinations["base"], metadata
+
+
+def run_cpp(
+    executable: Path,
+    distro: str,
+    arguments: list[str],
+    log_path: Path,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    if timeout <= 0:
+        raise ValueError("C++ subprocess timeout must be positive")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    inner_timeout = max(timeout, 0.001)
+    command = cpp_command(executable, distro, arguments, inner_timeout)
     started = time.perf_counter()
     try:
         completed = subprocess.run(
@@ -199,17 +2119,23 @@ def run_cpp(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
+            timeout=inner_timeout + 10.0,
         )
     except subprocess.TimeoutExpired as error:
         output = error.stdout or ""
         if isinstance(output, bytes):
             output = output.decode(errors="replace")
-        log_path.write_text(output + "\nTIMEOUT\n", encoding="utf-8")
-        raise RuntimeError(f"C++ subprocess timed out after {timeout}s: {arguments}") from error
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(completed.stdout, encoding="utf-8")
+        log_path.write_text(output + "\nOUTER_TIMEOUT\n", encoding="utf-8")
+        raise CompetitionTimeout(
+            f"C++ subprocess exceeded its {inner_timeout:.3f}s inner deadline: {arguments}"
+        ) from error
+    output = completed.stdout or ""
+    timed_out = completed.returncode == 124
+    if timed_out:
+        output += "\nTIMEOUT\n"
+    log_path.write_text(output, encoding="utf-8")
     completed.wall_seconds = time.perf_counter() - started  # type: ignore[attr-defined]
+    completed.timed_out = timed_out  # type: ignore[attr-defined]
     return completed
 
 
@@ -217,6 +2143,582 @@ def contingency_records(case: dict[str, Any]) -> list[dict[str, Any]]:
     records = [dict(item) for item in case["gen_contingencies"]]
     records.extend(dict(item) for item in case["branch_contingencies"])
     return sorted(records, key=lambda item: item["label"])
+
+
+def longest_first_contingencies(
+    case: dict[str, Any],
+    base_state: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    generators = ordered(case, "gen")
+    branches = ordered(case, "branch")
+    generator_position = {
+        int(item["index"]): position for position, item in enumerate(generators)
+    }
+    branch_position = {
+        int(item["index"]): position for position, item in enumerate(branches)
+    }
+    scheduled: list[dict[str, Any]] = []
+    for source in records:
+        item = dict(source)
+        component = int(item["idx"])
+        if item["type"] == "gen":
+            position = generator_position[component]
+            score = math.hypot(
+                float(base_state["pg"][position]),
+                float(base_state["qg"][position]),
+            )
+        else:
+            position = branch_position[component]
+            score = max(
+                math.hypot(
+                    float(base_state["pf"][position]),
+                    float(base_state["qf"][position]),
+                ),
+                math.hypot(
+                    float(base_state["pt"][position]),
+                    float(base_state["qt"][position]),
+                ),
+            )
+        item["schedule_score_base_apparent_power"] = score
+        scheduled.append(item)
+    scheduled.sort(
+        key=lambda item: (
+            -float(item["schedule_score_base_apparent_power"]),
+            str(item["label"]),
+        )
+    )
+    for rank, item in enumerate(scheduled, start=1):
+        item["schedule_rank"] = rank
+    return scheduled
+
+
+class AffinityScreenWorkQueue:
+    """Serve affinity groups through optional heavy and bulk worker lanes.
+
+    A verified corrective state is useful to later outages in the same
+    affinity group, so successful groups remain serial on one resident
+    worker. Once a fast screen requires exact fallback, however, it produced
+    no verified state to reuse. The unattempted siblings are then independent
+    work and should be made immediately available to idle workers instead of
+    extending one worker's critical path.
+
+    A timing-only profile can classify groups containing known expensive
+    screens. Only the first ``heavy_worker_count`` workers consume that queue;
+    every other worker starts on the bulk queue. Heavy workers help with bulk
+    work after their lane drains. Once the queued bulk groups have drained,
+    otherwise-idle bulk workers may spill into the remaining heavy queue even
+    while another bulk group is still active. Any newly exposed urgent bulk
+    work regains priority on the next dispatch. This preserves the
+    expensive-screen concurrency cap while queued bulk work exists without
+    imposing an all-bulk-workers barrier before the heavy final critical path.
+    At that same transition, a worker finishing one member of an active heavy
+    affinity group exposes its unattempted siblings as singleton tasks. The
+    completed member still provides the group's initial related-outage seed,
+    while the hidden serial tail becomes available to every idle worker.
+    When measured screen times are supplied, heavy groups use
+    longest-predicted-work-first order. A schema-v2 timing profile can cover
+    light siblings too; any unprofiled sibling receives the smallest measured
+    time so group size remains represented.
+
+    ``remaining`` counts queued plus active groups across both lanes. Idle
+    workers therefore wait while another worker can still create urgent
+    singleton work, and exit only after every original or split group has
+    called ``task_done``.
+    """
+
+    def __init__(
+        self,
+        groups: list[list[dict[str, Any]]],
+        worker_count: int,
+        heavy_labels: set[str] | None = None,
+        heavy_worker_count: int = 0,
+        heavy_label_seconds: dict[str, float] | None = None,
+    ):
+        if any(not group for group in groups):
+            raise ValueError("affinity screen groups must be nonempty")
+        if worker_count < 1:
+            raise ValueError("affinity screen worker count must be positive")
+        if heavy_worker_count < 0 or heavy_worker_count > worker_count:
+            raise ValueError(
+                "affinity heavy worker count must be between zero and "
+                "the total worker count"
+            )
+        heavy_labels = heavy_labels or set()
+        heavy_label_seconds = heavy_label_seconds or {}
+        all_group_labels = {
+            str(item["label"]) for group in groups for item in group
+        }
+        if not set(heavy_label_seconds).issubset(all_group_labels):
+            raise ValueError(
+                "profiled screen times must refer only to scheduled labels"
+            )
+        if heavy_labels and heavy_worker_count == 0:
+            raise ValueError("profiled heavy groups require at least one heavy worker")
+        if not heavy_labels and heavy_worker_count != 0:
+            raise ValueError("heavy workers require at least one profiled label")
+        self._scheduled_heavy: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+        self._scheduled_bulk: queue.Queue[list[dict[str, Any]]] = queue.Queue()
+        self._urgent_heavy: queue.Queue[
+            tuple[int, list[dict[str, Any]]]
+        ] = queue.Queue()
+        self._urgent_bulk: queue.Queue[
+            tuple[int, list[dict[str, Any]]]
+        ] = queue.Queue()
+        heavy_groups: list[tuple[float, int, list[dict[str, Any]]]] = []
+        bulk_groups: list[list[dict[str, Any]]] = []
+        default_profiled_seconds = (
+            min(heavy_label_seconds.values()) if heavy_label_seconds else 0.0
+        )
+        for original_position, group in enumerate(groups):
+            if any(str(item["label"]) in heavy_labels for item in group):
+                estimated_seconds = sum(
+                    heavy_label_seconds.get(
+                        str(item["label"]), default_profiled_seconds
+                    )
+                    for item in group
+                )
+                for item in group:
+                    item["fast_screen_profiled_group_wall_seconds"] = (
+                        estimated_seconds
+                    )
+                heavy_groups.append((estimated_seconds, original_position, group))
+            else:
+                bulk_groups.append(group)
+        if heavy_label_seconds:
+            heavy_groups.sort(key=lambda item: (-item[0], item[1]))
+        for dispatch_rank, (_, _, group) in enumerate(heavy_groups, start=1):
+            for item in group:
+                item["fast_screen_profiled_heavy_dispatch_rank"] = dispatch_rank
+            self._scheduled_heavy.put(group)
+        for group in bulk_groups:
+            self._scheduled_bulk.put(group)
+        heavy_group_count = len(heavy_groups)
+        self._condition = threading.Condition()
+        self._remaining = len(groups)
+        self._remaining_heavy = heavy_group_count
+        self._remaining_bulk = len(groups) - heavy_group_count
+        # An all-heavy calibration intentionally measures the configured
+        # heavy cap. Spill is a transition after a real bulk lane drains, not
+        # a way to bypass that cap when no bulk work existed initially.
+        self._heavy_spill_enabled = self._remaining_bulk > 0
+        self._worker_count = worker_count
+        self._heavy_worker_count = heavy_worker_count
+        self._initial_heavy_group_count = heavy_group_count
+
+    def _get_urgent(
+        self,
+        urgent_queue: queue.Queue[tuple[int, list[dict[str, Any]]]],
+        source: str,
+        worker_id: int,
+        eligible_worker_count: int,
+    ) -> tuple[tuple[str, list[dict[str, Any]]] | None, bool]:
+        try:
+            origin_worker_id, group = urgent_queue.get_nowait()
+        except queue.Empty:
+            return None, False
+        if origin_worker_id != worker_id or eligible_worker_count == 1:
+            return (source, group), False
+        # Do not let the worker that exposed parallel work reclaim it
+        # immediately. Preserve queue accounting while giving a waiting peer
+        # in the same lane the opportunity to take the sibling.
+        urgent_queue.put((origin_worker_id, group))
+        urgent_queue.task_done()
+        return None, True
+
+    def get(
+        self,
+        abort: threading.Event,
+        worker_id: int,
+        poll_seconds: float = 0.05,
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        while not abort.is_set():
+            deferred_own_split = False
+            heavy_worker = worker_id < self._heavy_worker_count
+            with self._condition:
+                bulk_queues_drained = (
+                    self._scheduled_bulk.empty()
+                    and self._urgent_bulk.empty()
+                )
+                heavy_spill = (
+                    not heavy_worker
+                    and self._heavy_spill_enabled
+                    and bulk_queues_drained
+                )
+            eligible_urgent = (
+                [
+                    (self._urgent_heavy, "urgent_heavy"),
+                    (self._urgent_bulk, "urgent_bulk"),
+                ]
+                if heavy_worker
+                else (
+                    [(self._urgent_heavy, "urgent_heavy")]
+                    if heavy_spill
+                    else [(self._urgent_bulk, "urgent_bulk")]
+                )
+            )
+            for urgent_queue, source in eligible_urgent:
+                work, deferred = self._get_urgent(
+                    urgent_queue,
+                    source,
+                    worker_id,
+                    (
+                        (
+                            self._worker_count
+                            if heavy_spill
+                            else self._heavy_worker_count
+                        )
+                        if source == "urgent_heavy"
+                        else self._worker_count
+                    ),
+                )
+                deferred_own_split = deferred_own_split or deferred
+                if work is not None:
+                    return work
+            eligible_scheduled = (
+                [
+                    (self._scheduled_heavy, "heavy"),
+                    (self._scheduled_bulk, "bulk"),
+                ]
+                if heavy_worker
+                else (
+                    [(self._scheduled_heavy, "heavy")]
+                    if heavy_spill
+                    else [(self._scheduled_bulk, "bulk")]
+                )
+            )
+            for scheduled_queue, source in eligible_scheduled:
+                try:
+                    return source, scheduled_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            with self._condition:
+                if self._remaining == 0:
+                    return None
+                self._condition.wait(
+                    timeout=(
+                        min(poll_seconds, 0.005)
+                        if deferred_own_split
+                        else poll_seconds
+                    )
+                )
+        return None
+
+    def requeue_remaining_as_singletons(
+        self,
+        group: list[dict[str, Any]],
+        first_unattempted_position: int,
+        origin_worker_id: int,
+        source: str,
+    ) -> int:
+        remaining = group[first_unattempted_position:]
+        if not remaining:
+            return 0
+        heavy = source in {"heavy", "urgent_heavy"}
+        urgent_queue = self._urgent_heavy if heavy else self._urgent_bulk
+        with self._condition:
+            for item in remaining:
+                urgent_queue.put((origin_worker_id, [item]))
+            self._remaining += len(remaining)
+            if heavy:
+                self._remaining_heavy += len(remaining)
+            else:
+                self._remaining_bulk += len(remaining)
+            self._condition.notify_all()
+        return len(remaining)
+
+    def task_done(self, source: str) -> None:
+        source_queues = {
+            "heavy": self._scheduled_heavy,
+            "bulk": self._scheduled_bulk,
+            "urgent_heavy": self._urgent_heavy,
+            "urgent_bulk": self._urgent_bulk,
+        }
+        if source not in source_queues:
+            raise ValueError(f"unknown affinity screen queue source: {source}")
+        source_queue = source_queues[source]
+        source_queue.task_done()
+        with self._condition:
+            if self._remaining <= 0:
+                raise RuntimeError("affinity screen queue task accounting underflow")
+            self._remaining -= 1
+            if source in {"heavy", "urgent_heavy"}:
+                if self._remaining_heavy <= 0:
+                    raise RuntimeError(
+                        "affinity heavy-lane task accounting underflow"
+                    )
+                self._remaining_heavy -= 1
+            else:
+                if self._remaining_bulk <= 0:
+                    raise RuntimeError(
+                        "affinity bulk-lane task accounting underflow"
+                    )
+                self._remaining_bulk -= 1
+            self._condition.notify_all()
+
+    @property
+    def remaining_group_count(self) -> int:
+        with self._condition:
+            return self._remaining
+
+    @property
+    def initial_heavy_group_count(self) -> int:
+        return self._initial_heavy_group_count
+
+    def worker_lane(self, worker_id: int) -> str:
+        return "heavy" if worker_id < self._heavy_worker_count else "bulk"
+
+    def should_split_heavy_group(self, source: str) -> bool:
+        """Expose hidden heavy siblings once no queued bulk work remains."""
+        if source not in {"heavy", "urgent_heavy"}:
+            return False
+        with self._condition:
+            return (
+                self._heavy_spill_enabled
+                and self._scheduled_bulk.empty()
+                and self._urgent_bulk.empty()
+            )
+
+
+def fast_screen_affinity_groups(
+    case: dict[str, Any],
+    base_state: dict[str, Any],
+    records: list[dict[str, Any]],
+    difficult_groups_first: bool = True,
+) -> list[list[dict[str, Any]]]:
+    """Group related outages for rolling corrective-state reuse.
+
+    Generator outages at the same bus can translate a verified corrective
+    state between colocated units.  Branch outages sharing a from-bus tend to
+    perturb the same local equations, so they can also benefit from the prior
+    verified state.  Groups remain independent queue entries, preserving
+    dynamic load balancing between persistent workers.
+    """
+    generators = ordered(case, "gen")
+    branches = ordered(case, "branch")
+    generator_position = {
+        int(item["index"]): position for position, item in enumerate(generators)
+    }
+    branch_position = {
+        int(item["index"]): position for position, item in enumerate(branches)
+    }
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for source in records:
+        item = dict(source)
+        component = int(item["idx"])
+        if item["type"] == "gen":
+            position = generator_position[component]
+            component_data = generators[position]
+            affinity_key = ("gen_bus", int(component_data["gen_bus"]))
+            score = math.hypot(
+                float(base_state["pg"][position]),
+                float(base_state["qg"][position]),
+            )
+        else:
+            position = branch_position[component]
+            component_data = branches[position]
+            affinity_key = ("branch_from_bus", int(component_data["f_bus"]))
+            score = max(
+                math.hypot(
+                    float(base_state["pf"][position]),
+                    float(base_state["qf"][position]),
+                ),
+                math.hypot(
+                    float(base_state["pt"][position]),
+                    float(base_state["qt"][position]),
+                ),
+            )
+        item["fast_screen_affinity_type"] = affinity_key[0]
+        item["fast_screen_affinity_value"] = affinity_key[1]
+        item["fast_screen_affinity_score"] = score
+        grouped.setdefault(affinity_key, []).append(item)
+
+    groups = list(grouped.values())
+    for group in groups:
+        # Establish a low-disturbance verified seed first, then translate it
+        # through progressively larger colocated/local outages.
+        group.sort(
+            key=lambda item: (
+                float(item["fast_screen_affinity_score"]),
+                str(item["label"]),
+            )
+        )
+        for position, item in enumerate(group, start=1):
+            item["fast_screen_affinity_position"] = position
+            item["fast_screen_affinity_size"] = len(group)
+
+    # Difficult-first avoids final stragglers; easy-first is an explicit
+    # alternative that builds each resident worker's corrective-state bank
+    # before it reaches the largest disturbances.
+    groups.sort(
+        key=lambda group: (
+            (
+                -float(group[0]["fast_screen_affinity_score"])
+                if difficult_groups_first
+                else float(group[0]["fast_screen_affinity_score"])
+            ),
+            -len(group),
+            str(group[0]["fast_screen_affinity_type"]),
+            int(group[0]["fast_screen_affinity_value"]),
+        )
+    )
+    for rank, group in enumerate(groups, start=1):
+        for item in group:
+            item["fast_screen_affinity_group_rank"] = rank
+    return groups
+
+
+def load_fast_screen_heavy_profile(
+    path: Path,
+    case_sha256: str,
+    contingency_labels: set[str],
+) -> tuple[set[str], dict[str, float], dict[str, Any]]:
+    """Load timing-only heavy classification and group-ordering data."""
+    reject_onedrive(path)
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+        raise ValueError(
+            "fast-screen heavy profile must use schema_version 1 or 2"
+        )
+    schema_version = int(raw["schema_version"])
+    if raw.get("case_sha256") != case_sha256:
+        raise ValueError("fast-screen heavy profile case hash does not match")
+    threshold = float(raw.get("heavy_threshold_seconds", math.nan))
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("fast-screen heavy profile threshold must be positive")
+    entries = raw.get("contingencies")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("fast-screen heavy profile contingencies must be nonempty")
+
+    profiled_labels: set[str] = set()
+    heavy_labels: set[str] = set()
+    measured_by_label: dict[str, float] = {}
+    measured_seconds: list[float] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("fast-screen heavy profile entry must be an object")
+        label = str(entry.get("label", ""))
+        measured = float(
+            entry.get("measured_solver_wall_seconds", math.nan)
+        )
+        if label not in contingency_labels:
+            raise ValueError(f"unknown profiled fast-screen label: {label}")
+        if label in profiled_labels:
+            raise ValueError(f"duplicate profiled fast-screen label: {label}")
+        if not math.isfinite(measured) or measured < 0.0:
+            raise ValueError(
+                f"invalid profiled fast-screen time for {label}: {measured}"
+            )
+        if schema_version == 1 and measured < threshold:
+            raise ValueError(
+                f"invalid profiled fast-screen time for {label}: {measured}"
+            )
+        profiled_labels.add(label)
+        if measured >= threshold:
+            heavy_labels.add(label)
+        measured_by_label[label] = measured
+        measured_seconds.append(measured)
+    if not heavy_labels:
+        raise ValueError("fast-screen profile contains no heavy labels")
+
+    metadata = {
+        "path": str(path.resolve()),
+        "sha256": sha256(path),
+        "schema_version": schema_version,
+        "heavy_threshold_seconds": threshold,
+        "profiled_contingency_count": len(profiled_labels),
+        "profiled_heavy_contingency_count": len(heavy_labels),
+        "measured_solver_seconds_sum": sum(measured_seconds),
+        "uses_prior_solution_state": False,
+        "dispatch_semantics": (
+            "timing-only heavy-lane classification and descending predicted "
+            "group-work ordering using every available timing; no primal, "
+            "dual, commitment, network, or solver state"
+        ),
+    }
+    return heavy_labels, measured_by_label, metadata
+
+
+def load_fallback_schedule_profile(
+    path: Path,
+    case_sha256: str,
+    contingency_labels: set[str],
+    worker_count: int,
+) -> tuple[dict[str, dict[str, float | int]], dict[str, Any]]:
+    reject_onedrive(path)
+    raw = read_json(path)
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+        raise ValueError("fallback schedule profile must use schema_version 1")
+    if raw.get("case_sha256") != case_sha256:
+        raise ValueError("fallback schedule profile case hash does not match")
+    if int(raw.get("worker_count", -1)) != worker_count:
+        raise ValueError("fallback schedule profile worker count does not match")
+    assignments = raw.get("assignments")
+    if not isinstance(assignments, list) or not assignments:
+        raise ValueError("fallback schedule profile assignments must be nonempty")
+
+    by_label: dict[str, dict[str, float | int]] = {}
+    predicted_loads = [0.0] * worker_count
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise ValueError("fallback schedule assignment must be an object")
+        label = str(assignment.get("label", ""))
+        worker = int(assignment.get("worker", -1))
+        predicted = float(assignment.get("predicted_wall_seconds", math.nan))
+        if label not in contingency_labels:
+            raise ValueError(f"unknown profiled contingency label: {label}")
+        if label in by_label:
+            raise ValueError(f"duplicate profiled contingency label: {label}")
+        if worker < 0 or worker >= worker_count:
+            raise ValueError(f"invalid profiled worker for {label}: {worker}")
+        if not math.isfinite(predicted) or predicted <= 0.0:
+            raise ValueError(f"invalid predicted wall time for {label}: {predicted}")
+        by_label[label] = {
+            "worker": worker,
+            "predicted_wall_seconds": predicted,
+        }
+        predicted_loads[worker] += predicted
+
+    metadata = {
+        "path": str(path.resolve()),
+        "sha256": sha256(path),
+        "schema_version": 1,
+        "worker_count": worker_count,
+        "assignment_count": len(by_label),
+        "predicted_worker_load_seconds": predicted_loads,
+        "worker_assignments_used_for_dispatch": False,
+        "dispatch_priority": "descending predicted wall seconds",
+        "uses_prior_solution_state": False,
+    }
+    return by_label, metadata
+
+
+def apply_fallback_schedule_profile(
+    contingencies: list[dict[str, Any]],
+    profile: dict[str, dict[str, float | int]],
+) -> list[dict[str, Any]]:
+    scheduled = [dict(item) for item in contingencies]
+    prior_rank = {
+        str(item["label"]): int(item.get("schedule_rank", position + 1))
+        for position, item in enumerate(scheduled)
+    }
+    scheduled.sort(
+        key=lambda item: (
+            0 if str(item["label"]) in profile else 1,
+            -float(profile[str(item["label"])]["predicted_wall_seconds"])
+            if str(item["label"]) in profile else prior_rank[str(item["label"])],
+            str(item["label"]),
+        )
+    )
+    for rank, item in enumerate(scheduled, start=1):
+        item["schedule_rank"] = rank
+        assignment = profile.get(str(item["label"]))
+        if assignment is not None:
+            item["profiled_fallback_worker"] = int(assignment["worker"])
+            item["profiled_fallback_wall_seconds"] = float(
+                assignment["predicted_wall_seconds"]
+            )
+    return scheduled
 
 
 def git_revision() -> str | None:
@@ -235,154 +2737,2102 @@ def main() -> int:
     parser.add_argument("--case-json", type=Path, required=True)
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--minimum-free-space-gb", type=float, default=0.0)
     parser.add_argument("--executable", type=Path, default=DEFAULT_EXE)
-    parser.add_argument("--workers", type=int, default=22)
+    parser.add_argument("--fast-screen-executable", type=Path)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--fast-workers", type=int, default=8)
+    parser.add_argument("--post-screen-workers", type=int)
     parser.add_argument("--distro", default="Ubuntu-24.04")
     parser.add_argument("--base-timeout", type=float, default=900.0)
     parser.add_argument("--contingency-timeout", type=float, default=300.0)
+    parser.add_argument("--code1-time-limit", type=float, default=300.0)
+    parser.add_argument("--code2-seconds-per-contingency", type=float, default=2.0)
+    parser.add_argument("--total-time-limit", type=float, default=300.0)
+    parser.add_argument("--evaluation-reserve", type=float, default=7.0)
+    parser.add_argument("--finalization-reserve", type=float)
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     parser.add_argument("--evaluator", type=Path, default=DEFAULT_EVALUATOR)
+    parser.add_argument("--evaluation-processes", type=int, default=1)
+    parser.add_argument("--serial-evaluation-shards", type=int, default=1)
+    parser.add_argument(
+        "--streaming-serial-evaluation-shards", type=int, default=1
+    )
+    parser.add_argument("--streaming-evaluation-processes", type=int, default=2)
+    parser.add_argument(
+        "--streaming-evaluation-idle-screen-ramp", action="store_true"
+    )
+    parser.add_argument(
+        "--streaming-evaluation-completion-order-shards", action="store_true"
+    )
+    parser.add_argument(
+        "--streaming-evaluation-tail-shard-sizes",
+        help="Comma-separated final completion-order shard sizes.",
+    )
+    parser.add_argument(
+        "--streaming-persistent-evaluator-processes", action="store_true"
+    )
+    parser.add_argument(
+        "--streaming-evaluator-below-normal-priority", action="store_true"
+    )
+    parser.add_argument(
+        "--evaluator-linear-algebra-threads", type=int, default=1
+    )
+    parser.add_argument("--post-screen-streaming-evaluation-processes", type=int)
+    parser.add_argument("--vendor-evaluator-reference", type=Path)
+    parser.add_argument("--mpiexec", type=Path)
     parser.add_argument("--skip-evaluation", action="store_true")
+    parser.add_argument("--compact-final-summary", action="store_true")
+    parser.add_argument("--resident-contingency-model", action="store_true")
+    parser.add_argument("--ipopt-acceptable-termination", action="store_true")
+    parser.add_argument("--fast-power-flow-screen", action="store_true")
+    parser.add_argument("--cpp-solution-writer", action="store_true")
+    parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
+    parser.add_argument("--fast-screen-easy-first", action="store_true")
+    parser.add_argument("--fast-screen-heavy-profile", type=Path)
+    parser.add_argument("--fast-screen-heavy-workers", type=int, default=0)
+    parser.add_argument("--wsl-fast-screen-scratch", action="store_true")
+    parser.add_argument("--wsl-stage-worker-inputs", action="store_true")
+    parser.add_argument("--source-status-base", action="store_true")
+    parser.add_argument("--validated-source-base", action="store_true")
+    parser.add_argument("--robust-contingency-base", action="store_true")
+    parser.add_argument("--two-stage-contingency-screen", action="store_true")
+    parser.add_argument(
+        "--defer-fallback-until-screen-complete", action="store_true"
+    )
+    parser.add_argument("--linearized-contingency-fallback", action="store_true")
+    parser.add_argument("--linearized-contingency-only", action="store_true")
+    parser.add_argument("--longest-first-schedule", action="store_true")
+    parser.add_argument("--fallback-schedule-profile", type=Path)
     args = parser.parse_args()
+
+    if (
+        args.streaming_persistent_evaluator_processes
+        and not persistent_evaluator_protocol_markers_present(args.evaluator)
+    ):
+        parser.error(
+            "--streaming-persistent-evaluator-processes requires an evaluator "
+            "implementing the persistent shard protocol; pass "
+            "--evaluator scripts/fast_official_evaluator.py"
+        )
+    if args.streaming_evaluator_below_normal_priority and os.name != "nt":
+        parser.error(
+            "--streaming-evaluator-below-normal-priority is supported only "
+            "on Windows"
+        )
+    if args.ipopt_acceptable_termination and not args.resident_contingency_model:
+        parser.error(
+            "--ipopt-acceptable-termination requires --resident-contingency-model"
+        )
+    if args.two_stage_contingency_screen and not args.fast_power_flow_screen:
+        parser.error(
+            "--two-stage-contingency-screen requires --fast-power-flow-screen"
+        )
+    if (args.fast_screen_affinity_schedule and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--fast-screen-affinity-schedule requires "
+            "--two-stage-contingency-screen"
+        )
+    if (args.fast_screen_easy_first and
+            not args.fast_screen_affinity_schedule):
+        parser.error(
+            "--fast-screen-easy-first requires "
+            "--fast-screen-affinity-schedule"
+        )
+    if ((args.fast_screen_heavy_profile is None) !=
+            (args.fast_screen_heavy_workers == 0)):
+        parser.error(
+            "--fast-screen-heavy-profile and a positive "
+            "--fast-screen-heavy-workers must be provided together"
+        )
+    if (args.fast_screen_heavy_profile is not None and
+            not args.fast_screen_affinity_schedule):
+        parser.error(
+            "--fast-screen-heavy-profile requires "
+            "--fast-screen-affinity-schedule"
+        )
+    if args.fast_screen_heavy_workers < 0:
+        parser.error("--fast-screen-heavy-workers must be nonnegative")
+    if args.fast_screen_heavy_workers > args.fast_workers:
+        parser.error(
+            "--fast-screen-heavy-workers cannot exceed --fast-workers"
+        )
+    if args.wsl_fast_screen_scratch and not (
+        args.two_stage_contingency_screen and args.cpp_solution_writer
+    ):
+        parser.error(
+            "--wsl-fast-screen-scratch requires "
+            "--two-stage-contingency-screen and --cpp-solution-writer"
+        )
+    if (args.defer_fallback_until_screen_complete and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--defer-fallback-until-screen-complete requires "
+            "--two-stage-contingency-screen"
+        )
+    if args.robust_contingency_base and not args.validated_source_base:
+        parser.error(
+            "--robust-contingency-base requires --validated-source-base"
+        )
+    if (args.linearized_contingency_only and
+            not args.linearized_contingency_fallback):
+        parser.error(
+            "--linearized-contingency-only requires "
+            "--linearized-contingency-fallback"
+        )
+    if (args.fallback_schedule_profile is not None and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--fallback-schedule-profile requires "
+            "--two-stage-contingency-screen"
+        )
+    if (args.fast_screen_executable is not None and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--fast-screen-executable requires "
+            "--two-stage-contingency-screen"
+        )
 
     for path in (args.case_json, args.case_dir, args.output_dir, args.executable):
         reject_onedrive(path)
+    fast_screen_executable = args.fast_screen_executable or args.executable
+    reject_onedrive(fast_screen_executable)
+    for label, executable in (
+        ("base/exact", args.executable),
+        ("fast-screen", fast_screen_executable),
+    ):
+        if not executable.is_file():
+            raise ValueError(f"{label} executable does not exist: {executable}")
+    if args.fallback_schedule_profile is not None:
+        reject_onedrive(args.fallback_schedule_profile)
+    if args.fast_screen_heavy_profile is not None:
+        reject_onedrive(args.fast_screen_heavy_profile)
     if args.workers < 1:
         raise ValueError("workers must be positive")
+    if args.fast_workers < 1:
+        raise ValueError("fast workers must be positive")
+    if args.post_screen_workers is None:
+        args.post_screen_workers = args.workers
+    if args.post_screen_workers < args.workers:
+        parser.error("--post-screen-workers cannot be less than --workers")
+    if (args.post_screen_workers > args.workers and
+            not args.two_stage_contingency_screen):
+        parser.error(
+            "--post-screen-workers expansion requires "
+            "--two-stage-contingency-screen"
+        )
+    if args.evaluation_processes < 1:
+        raise ValueError("evaluation processes must be positive")
+    if args.serial_evaluation_shards < 1:
+        raise ValueError("serial evaluation shards must be positive")
+    if args.streaming_serial_evaluation_shards < 1:
+        raise ValueError("streaming serial evaluation shards must be positive")
+    if args.streaming_evaluation_processes < 0:
+        raise ValueError(
+            "initial streaming evaluation processes cannot be negative"
+        )
+    if args.post_screen_streaming_evaluation_processes is None:
+        args.post_screen_streaming_evaluation_processes = (
+            max(1, args.streaming_evaluation_processes)
+        )
+    if args.post_screen_streaming_evaluation_processes < 1:
+        raise ValueError(
+            "post-screen streaming evaluation processes must be positive"
+        )
+    if (
+        args.post_screen_streaming_evaluation_processes
+        < args.streaming_evaluation_processes
+    ):
+        raise ValueError(
+            "post-screen streaming evaluation processes cannot be less than "
+            "the initial process count"
+        )
+    if args.evaluator_linear_algebra_threads < 1:
+        raise ValueError("evaluator linear-algebra threads must be positive")
+    if args.serial_evaluation_shards > 1 and args.evaluation_processes > 1:
+        parser.error(
+            "--serial-evaluation-shards cannot be combined with MPI evaluation"
+        )
+    if args.streaming_serial_evaluation_shards > 1:
+        if args.serial_evaluation_shards > 1 or args.evaluation_processes > 1:
+            parser.error(
+                "--streaming-serial-evaluation-shards cannot be combined "
+                "with post-Code2 sharded or MPI evaluation"
+            )
+        if args.skip_evaluation:
+            parser.error(
+                "--streaming-serial-evaluation-shards cannot be combined "
+                "with --skip-evaluation"
+            )
+    if args.streaming_evaluation_idle_screen_ramp and not (
+        args.two_stage_contingency_screen
+        and args.streaming_serial_evaluation_shards > 1
+    ):
+        parser.error(
+            "--streaming-evaluation-idle-screen-ramp requires "
+            "--two-stage-contingency-screen and streaming evaluation shards"
+        )
+    if args.streaming_evaluation_completion_order_shards and (
+        args.streaming_serial_evaluation_shards <= 1
+    ):
+        parser.error(
+            "--streaming-evaluation-completion-order-shards requires "
+            "streaming evaluation shards"
+        )
+    streaming_evaluation_tail_shard_sizes: list[int] = []
+    if args.streaming_evaluation_tail_shard_sizes:
+        try:
+            streaming_evaluation_tail_shard_sizes = [
+                int(value)
+                for value in args.streaming_evaluation_tail_shard_sizes.split(",")
+            ]
+        except ValueError as error:
+            parser.error(
+                "--streaming-evaluation-tail-shard-sizes must contain integers"
+            )
+        if (
+            not args.streaming_evaluation_completion_order_shards
+            or any(size < 1 for size in streaming_evaluation_tail_shard_sizes)
+        ):
+            parser.error(
+                "--streaming-evaluation-tail-shard-sizes requires positive "
+                "sizes and completion-order shards"
+            )
+    if args.streaming_persistent_evaluator_processes and (
+        args.streaming_serial_evaluation_shards <= 1
+        or args.vendor_evaluator_reference is None
+    ):
+        parser.error(
+            "--streaming-persistent-evaluator-processes requires streaming "
+            "evaluation shards and --vendor-evaluator-reference"
+        )
+    if args.evaluation_processes > 1 and args.mpiexec is None:
+        parser.error("--evaluation-processes greater than one requires --mpiexec")
+    if args.mpiexec is not None:
+        reject_onedrive(args.mpiexec)
+    if args.vendor_evaluator_reference is not None:
+        reject_onedrive(args.vendor_evaluator_reference)
+        if not args.vendor_evaluator_reference.is_file():
+            raise ValueError(
+                "vendor evaluator reference does not exist: "
+                f"{args.vendor_evaluator_reference}"
+            )
+    if args.code1_time_limit <= 0:
+        raise ValueError("Code1 time limit must be positive")
+    if args.total_time_limit <= 0:
+        raise ValueError("end-to-end time limit must be positive")
+    if args.evaluation_reserve <= 0:
+        raise ValueError("evaluation reserve must be positive")
+    finalization_reserve = finalization_reserve_seconds(
+        args.compact_final_summary,
+        args.finalization_reserve,
+    )
+    if args.evaluation_reserve + finalization_reserve >= args.total_time_limit:
+        raise ValueError("evaluation and finalization reserves exhaust the end-to-end limit")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError(f"cold-run output directory is not empty: {args.output_dir}")
+    initial_free_space_gb = require_minimum_free_space(
+        args.output_dir, args.minimum_free_space_gb
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    case = read_json(args.case_json)
     started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     wall_start = time.perf_counter()
+    total_deadline = wall_start + args.total_time_limit
+    evaluation_deadline = total_deadline - finalization_reserve
+    work_deadline = evaluation_deadline - args.evaluation_reserve
+
+    case = read_json(args.case_json)
+    contingencies = contingency_records(case)
+    case_json_sha256 = sha256(args.case_json)
+    fast_screen_heavy_labels: set[str] = set()
+    fast_screen_heavy_seconds: dict[str, float] = {}
+    fast_screen_heavy_profile_metadata: dict[str, Any] | None = None
+    if args.fast_screen_heavy_profile is not None:
+        (
+            fast_screen_heavy_labels,
+            fast_screen_heavy_seconds,
+            fast_screen_heavy_profile_metadata,
+        ) = load_fast_screen_heavy_profile(
+            args.fast_screen_heavy_profile,
+            case_json_sha256,
+            {str(item["label"]) for item in contingencies},
+        )
+    fallback_schedule: dict[str, dict[str, float | int]] = {}
+    fallback_schedule_metadata: dict[str, Any] | None = None
+    if args.fallback_schedule_profile is not None:
+        fallback_schedule, fallback_schedule_metadata = (
+            load_fallback_schedule_profile(
+                args.fallback_schedule_profile,
+                case_json_sha256,
+                {str(item["label"]) for item in contingencies},
+                min(args.workers, len(contingencies)),
+            )
+        )
+    code2_limit = code2_time_limit(
+        len(contingencies), args.code2_seconds_per_contingency
+    )
     internal = args.output_dir / "internal"
     base_json = internal / "base.json"
+    records: list[dict[str, Any]] = []
+    run_status: dict[str, Any] = {
+        "success": False,
+        "stage": "initializing",
+        "started_at_utc": started_utc,
+        "initial_free_space_gb": initial_free_space_gb,
+        "minimum_free_space_gb": args.minimum_free_space_gb,
+        "git_revision": git_revision(),
+        "evaluator": str(args.evaluator.resolve()),
+        "evaluator_sha256": sha256(args.evaluator),
+        "base_exact_executable": str(args.executable.resolve()),
+        "base_exact_executable_sha256": sha256(args.executable),
+        "fast_screen_executable": str(fast_screen_executable.resolve()),
+        "fast_screen_executable_sha256": sha256(fast_screen_executable),
+        "mixed_build_fast_screen": (
+            args.executable.resolve() != fast_screen_executable.resolve()
+        ),
+        "competition_timing": {
+            "division": 1,
+            "code1_time_limit_seconds": args.code1_time_limit,
+            "code2_seconds_per_contingency": args.code2_seconds_per_contingency,
+            "code2_time_limit_seconds": code2_limit,
+            "contingency_count": len(contingencies),
+            "timing_semantics": "Code1 and Code2 are separate wall-clock stages",
+        },
+        "end_to_end_timing": {
+            "time_limit_seconds": args.total_time_limit,
+            "evaluation_reserve_seconds": args.evaluation_reserve,
+            "finalization_reserve_seconds": finalization_reserve,
+            "measurement_boundary": (
+                "normalized-case loading through referenced official evaluator "
+                "equations and result serialization"
+            ),
+        },
+        "completed_contingency_count": 0,
+        "resident_contingency_model": args.resident_contingency_model,
+        "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "fast_power_flow_screen": args.fast_power_flow_screen,
+        "cpp_solution_writer": args.cpp_solution_writer,
+        "fast_screen_easy_first": args.fast_screen_easy_first,
+        "fast_screen_heavy_profile": fast_screen_heavy_profile_metadata,
+        "fast_screen_heavy_worker_count": args.fast_screen_heavy_workers,
+        "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
+        "wsl_stage_worker_inputs": args.wsl_stage_worker_inputs,
+        "source_status_base": args.source_status_base,
+        "validated_source_base": args.validated_source_base,
+        "robust_contingency_base": args.robust_contingency_base,
+        "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "defer_fallback_until_screen_complete": (
+            args.defer_fallback_until_screen_complete
+        ),
+        "initial_corrective_worker_count": args.workers,
+        "post_screen_corrective_worker_count": args.post_screen_workers,
+        "streaming_fallback_overlap": False,
+        "linearized_contingency_fallback": args.linearized_contingency_fallback,
+        "linearized_contingency_only": args.linearized_contingency_only,
+        "longest_first_schedule": args.longest_first_schedule,
+        "fallback_schedule_profile": fallback_schedule_metadata,
+        "profiled_fallback_global_priority": bool(fallback_schedule),
+        "evaluation_processes": args.evaluation_processes,
+        "serial_evaluation_shards": args.serial_evaluation_shards,
+        "streaming_serial_evaluation_shards": (
+            args.streaming_serial_evaluation_shards
+        ),
+        "streaming_evaluation_processes": (
+            args.streaming_evaluation_processes
+        ),
+        "streaming_evaluation_idle_screen_ramp": (
+            args.streaming_evaluation_idle_screen_ramp
+        ),
+        "streaming_evaluation_completion_order_shards": (
+            args.streaming_evaluation_completion_order_shards
+        ),
+        "streaming_evaluation_tail_shard_sizes": (
+            streaming_evaluation_tail_shard_sizes
+        ),
+        "streaming_persistent_evaluator_processes": (
+            args.streaming_persistent_evaluator_processes
+        ),
+        "streaming_evaluator_below_normal_priority": (
+            args.streaming_evaluator_below_normal_priority
+        ),
+        "evaluator_linear_algebra_threads": (
+            args.evaluator_linear_algebra_threads
+        ),
+        "post_screen_streaming_evaluation_processes": (
+            args.post_screen_streaming_evaluation_processes
+        ),
+        "progress_checkpoint_interval_seconds": (
+            PROGRESS_CHECKPOINT_INTERVAL_SECONDS
+        ),
+        "progress_log_initial_count": PROGRESS_LOG_INITIAL_COUNT,
+        "progress_log_interval": PROGRESS_LOG_INTERVAL,
+        "vendor_evaluator_reference": (
+            str(args.vendor_evaluator_reference.resolve())
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "vendor_evaluator_reference_sha256": (
+            sha256(args.vendor_evaluator_reference)
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "evaluator_parser_mode": (
+            "canonical_binary_numeric_with_line_and_string_fallback_and_"
+            "in_memory_summary_with_referenced_vendor_equations"
+            if args.vendor_evaluator_reference is not None
+            else "native_vendor_parser_and_equations"
+        ),
+    }
+
+    def checkpoint() -> None:
+        write_json(args.output_dir / "run_status.json", run_status)
+
+    last_progress_checkpoint = wall_start
+
+    def progress_checkpoint() -> None:
+        nonlocal last_progress_checkpoint
+        now = time.perf_counter()
+        if progress_checkpoint_due(last_progress_checkpoint, now):
+            checkpoint()
+            last_progress_checkpoint = now
+
+    checkpoint()
 
     base_start = time.perf_counter()
-    base_process = run_cpp(
-        args.executable,
-        args.distro,
-        ["run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"],
-        internal / "base.console.log",
-        args.base_timeout,
-    )
+    try:
+        base_deadline = min(
+            base_start + args.code1_time_limit,
+            work_deadline,
+        )
+        base_timeout = effective_process_timeout(
+            min(args.base_timeout, args.code1_time_limit),
+            base_deadline,
+        )
+        run_status.update(
+            {
+                "stage": "code1",
+                "base_effective_timeout_seconds": base_timeout,
+            }
+        )
+        checkpoint()
+        if args.validated_source_base:
+            base_arguments = [
+                "validated-source-base-json",
+                to_wsl(args.case_json),
+                to_wsl(base_json),
+                "fast-only",
+            ]
+            if args.robust_contingency_base:
+                base_arguments.append("robust-contingency-seed")
+        else:
+            base_arguments = [
+                "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
+            ]
+            if args.source_status_base:
+                base_arguments.append("source-only")
+        base_process = run_cpp(
+            args.executable,
+            args.distro,
+            base_arguments,
+            internal / "base.console.log",
+            base_timeout,
+        )
+    except Exception as error:
+        run_status.update(
+            {
+                "stage": "code1",
+                "base_process_wall_seconds": time.perf_counter() - base_start,
+                "code1_within_limit": False,
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                "error": str(error),
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        raise
     base_wall = time.perf_counter() - base_start
+    run_status.update(
+        {
+            "stage": "code1",
+            "base_process_wall_seconds": base_wall,
+            "code1_within_limit": base_wall <= args.code1_time_limit,
+        }
+    )
     if base_process.returncode != 0:
-        raise RuntimeError("cold C++ base/IBR solve failed; see internal/base.console.log")
+        base_timed_out = bool(getattr(base_process, "timed_out", False))
+        run_status["error"] = (
+            "Code1 reached its competition or end-to-end work deadline"
+            if base_timed_out
+            else "cold C++ base/IBR solve failed"
+        )
+        run_status.update(
+            {
+                "code1_within_limit": (
+                    not base_timed_out and base_wall <= args.code1_time_limit
+                ),
+                "code1_timed_out": base_timed_out,
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        if base_timed_out:
+            raise CompetitionTimeout(run_status["error"])
+        raise RuntimeError(f"{run_status['error']}; see internal/base.console.log")
+    if base_wall > args.code1_time_limit:
+        run_status["error"] = "Code1 completed after its competition deadline"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    if time.perf_counter() > work_deadline:
+        run_status["error"] = "Code1 exhausted the time reserved for Code2 and evaluation"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
     base = read_json(base_json)
     if not base.get("success", False):
+        run_status["error"] = "cold C++ base/IBR result was not successful"
+        checkpoint()
         raise RuntimeError("cold C++ base/IBR result was not successful")
     commitment = [int(value) for value in base["commitment"]]
     base_state = base["selected_state"]
     write_solution(args.output_dir / "solution_BASECASE.txt", case, base_state, commitment)
-
-    contingencies = contingency_records(case)
-    contingency_start = time.perf_counter()
-
-    def solve_one(item: dict[str, Any]) -> dict[str, Any]:
-        label = str(item["label"])
-        stem = safe_label(label)
-        result_path = internal / "contingencies" / f"{stem}.json"
-        log_path = internal / "logs" / f"{stem}.log"
-        process = run_cpp(
-            args.executable,
-            args.distro,
-            [
-                "solve-contingency",
-                to_wsl(args.case_json),
-                to_wsl(base_json),
-                label,
-                to_wsl(result_path),
-                "0",
-            ],
-            log_path,
-            args.contingency_timeout,
+    if args.longest_first_schedule:
+        contingencies = longest_first_contingencies(case, base_state, contingencies)
+        schedule_mode = "descending base apparent power, deterministic label tie-break"
+    else:
+        contingencies = [dict(item) for item in contingencies]
+        for rank, item in enumerate(contingencies, start=1):
+            item["schedule_rank"] = rank
+        schedule_mode = "deterministic label order"
+    if fallback_schedule:
+        contingencies = apply_fallback_schedule_profile(
+            contingencies, fallback_schedule
         )
-        if process.returncode != 0:
-            raise RuntimeError(f"contingency {label} failed; see {log_path}")
-        result = read_json(result_path)
-        if not result.get("success", False):
-            raise RuntimeError(f"contingency {label} did not pass independent validation")
-        write_solution(
-            args.output_dir / f"solution_{label}.txt",
+        schedule_mode = (
+            "global descending profiled fallback wall time, then "
+            + schedule_mode
+        )
+    fast_screen_groups: list[list[dict[str, Any]]] | None = None
+    if args.fast_screen_affinity_schedule:
+        fast_screen_groups = fast_screen_affinity_groups(
             case,
-            result["solve"]["state"],
-            commitment,
-            item,
+            base_state,
+            contingencies,
+            difficult_groups_first=not args.fast_screen_easy_first,
         )
+        contingencies = [
+            item for group in fast_screen_groups for item in group
+        ]
+        schedule_mode = (
+            "dynamic affinity groups with low-disturbance seed first within "
+            + (
+                "globally easy-first groups, then "
+                if args.fast_screen_easy_first
+                else "globally difficult-first groups, then "
+            )
+            + (
+                "fallback- or drained-bulk-triggered parallel group "
+                "splitting, then "
+            )
+            + (
+                "descending timing-profiled heavy group work, then "
+                f"{args.fast_screen_heavy_workers}-worker heavy lane, then "
+                if fast_screen_heavy_labels
+                else ""
+            )
+            + schedule_mode
+        )
+    run_status.update(
+        {
+            "stage": "code2",
+            "base_success": True,
+            "base_algorithm_wall_seconds": base["wall_seconds"],
+            "contingency_schedule_mode": schedule_mode,
+            "contingency_schedule": [
+                {
+                    "label": item["label"],
+                    "rank": item["schedule_rank"],
+                    "score": item.get("schedule_score_base_apparent_power"),
+                    "profiled_fallback_worker": item.get(
+                        "profiled_fallback_worker"
+                    ),
+                    "profiled_fallback_wall_seconds": item.get(
+                        "profiled_fallback_wall_seconds"
+                    ),
+                    "fast_screen_affinity_type": item.get(
+                        "fast_screen_affinity_type"
+                    ),
+                    "fast_screen_affinity_value": item.get(
+                        "fast_screen_affinity_value"
+                    ),
+                    "fast_screen_affinity_group_rank": item.get(
+                        "fast_screen_affinity_group_rank"
+                    ),
+                    "fast_screen_affinity_position": item.get(
+                        "fast_screen_affinity_position"
+                    ),
+                    "fast_screen_affinity_size": item.get(
+                        "fast_screen_affinity_size"
+                    ),
+                    "fast_screen_profiled_group_wall_seconds": item.get(
+                        "fast_screen_profiled_group_wall_seconds"
+                    ),
+                    "fast_screen_profiled_heavy_dispatch_rank": item.get(
+                        "fast_screen_profiled_heavy_dispatch_rank"
+                    ),
+                }
+                for item in contingencies
+            ],
+        }
+    )
+    checkpoint()
+
+    worker_case_argument = to_wsl(args.case_json)
+    worker_base_argument = to_wsl(base_json)
+    worker_input_staging: dict[str, Any] | None = None
+    if args.wsl_stage_worker_inputs:
+        (
+            worker_case_argument,
+            worker_base_argument,
+            worker_input_staging,
+        ) = stage_wsl_worker_inputs(
+            args.distro,
+            args.case_json,
+            base_json,
+            work_deadline,
+        )
+        run_status["worker_input_staging"] = worker_input_staging
+        checkpoint()
+
+    streaming_evaluation: StreamingSerialEvaluation | None = None
+    if args.streaming_serial_evaluation_shards > 1:
+        for path in (args.python, args.evaluator):
+            reject_onedrive(path)
+        stale_evaluation_outputs = [
+            path
+            for pattern in (
+                "eval_detail_*.json",
+                "eval_summary.json",
+                "eval_summary.csv",
+                "eval_detail.json",
+                "eval_detail.csv",
+                "sol_change_*.csv",
+                "sol_change.csv",
+            )
+            for path in args.output_dir.glob(pattern)
+        ]
+        if stale_evaluation_outputs:
+            raise RuntimeError(
+                "refusing stale official-evaluation artifacts: "
+                + ", ".join(
+                    sorted(path.name for path in stale_evaluation_outputs)
+                )
+            )
+        streaming_evaluation = StreamingSerialEvaluation(
+            args.python,
+            args.evaluator,
+            args.case_dir,
+            args.output_dir,
+            internal,
+            [str(item["label"]) for item in contingencies],
+            args.streaming_serial_evaluation_shards,
+            args.streaming_evaluation_processes,
+            evaluation_deadline,
+            args.evaluator_linear_algebra_threads,
+            args.post_screen_streaming_evaluation_processes,
+            args.vendor_evaluator_reference,
+            args.streaming_evaluation_completion_order_shards,
+            streaming_evaluation_tail_shard_sizes,
+            args.streaming_persistent_evaluator_processes,
+            args.streaming_evaluator_below_normal_priority,
+        )
+        run_status["streaming_evaluation_prepared"] = True
+        checkpoint()
+
+    contingency_start = time.perf_counter()
+    code2_deadline = contingency_start + code2_limit
+    contingency_deadline = min(code2_deadline, work_deadline)
+    contingency_deadline_name = (
+        "end-to-end work deadline"
+        if work_deadline <= code2_deadline
+        else "Code2 competition deadline"
+    )
+    abort_contingencies = threading.Event()
+    progress_lock = threading.Lock()
+    worker_records: list[dict[str, Any]] = []
+    screen_records: list[dict[str, Any]] = []
+    fast_worker_count = 0
+    fast_screen_wall = 0.0
+
+    def contingency_record(
+        item: dict[str, Any],
+        result: dict[str, Any],
+        worker_id: int,
+        execution_phase: str,
+    ) -> dict[str, Any]:
         return {
-            "label": label,
+            "label": str(item["label"]),
             "type": item["type"],
             "source_index": int(item["idx"]),
-            "process_wall_seconds": process.wall_seconds,  # type: ignore[attr-defined]
+            "schedule_rank": int(item["schedule_rank"]),
+            "schedule_score_base_apparent_power": item.get(
+                "schedule_score_base_apparent_power"
+            ),
+            "worker_id": worker_id,
+            "profiled_fallback_worker": item.get("profiled_fallback_worker"),
+            "profiled_fallback_wall_seconds": item.get(
+                "profiled_fallback_wall_seconds"
+            ),
+            "fast_screen_affinity_type": item.get(
+                "fast_screen_affinity_type"
+            ),
+            "fast_screen_affinity_value": item.get(
+                "fast_screen_affinity_value"
+            ),
+            "fast_screen_affinity_group_rank": item.get(
+                "fast_screen_affinity_group_rank"
+            ),
+            "fast_screen_affinity_position": item.get(
+                "fast_screen_affinity_position"
+            ),
+            "fast_screen_affinity_size": item.get(
+                "fast_screen_affinity_size"
+            ),
+            "profiled_fallback_stolen": (
+                item.get("profiled_fallback_worker") is not None
+                and int(item["profiled_fallback_worker"]) != worker_id
+            ),
+            "execution_phase": execution_phase,
             "solver_wall_seconds": result["solve"]["wall_seconds"],
             "objective": result["solve"]["objective"],
             "max_residual": result["validation"]["max_residual"],
+            "solver_status": result["solve"]["status"],
+            "solver_iterations": result["solve"].get("iterations", -1),
+            "resident_reoptimization": result["solve"].get(
+                "resident_reoptimization", False
+            ),
+            "acceptable_termination_enabled": result["solve"].get(
+                "acceptable_termination_enabled", False
+            ),
+            "model_preparation_wall_seconds": result.get(
+                "model_preparation_wall_seconds", 0.0
+            ),
+            "solver_status_success": result.get("solver_status_success", False),
+            "accepted_feasible_nonconverged": result.get(
+                "accepted_feasible_nonconverged", False
+            ),
+            "solution_method": result.get("solution_method", "ipopt_corrective"),
+            "fast_power_flow_screen": result.get(
+                "fast_power_flow_screen", False
+            ),
+            "fast_screen": result.get("fast_screen"),
+            "precomputed_fast_screen_reference": result.get(
+                "precomputed_fast_screen_reference", False
+            ),
         }
 
-    records: list[dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(solve_one, item): item for item in contingencies}
+    def save_secure_result(
+        item: dict[str, Any],
+        result: dict[str, Any],
+        worker_id: int,
+        execution_phase: str,
+    ) -> None:
+        label = str(item["label"])
+        solution_path = args.output_dir / f"solution_{label}.txt"
+        if args.cpp_solution_writer:
+            if not solution_path.is_file() or solution_path.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"C++ worker did not write a complete solution for {label}"
+                )
+        else:
+            write_solution(
+                solution_path,
+                case,
+                result["solve"]["state"],
+                commitment,
+                item,
+            )
+        record = contingency_record(item, result, worker_id, execution_phase)
+        with progress_lock:
+            records.append(record)
+            run_status["completed_contingency_count"] = len(records)
+            run_status["last_completed_contingency"] = label
+            progress_checkpoint()
+            if progress_log_due(len(records), len(contingencies)):
+                print(
+                    f"completed {len(records)}/{len(contingencies)}: "
+                    f"{label} on {execution_phase} worker {worker_id}",
+                    flush=True,
+                )
+        if streaming_evaluation is not None:
+            streaming_evaluation.mark_completed(label)
+
+    exact_contingencies = list(contingencies)
+    task_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    worker_count = min(args.workers, len(contingencies))
+    post_screen_worker_count = min(
+        args.post_screen_workers, len(contingencies)
+    )
+    profiled_task_queue: queue.PriorityQueue[
+        tuple[float, int, str, dict[str, Any]]
+    ] = queue.PriorityQueue()
+    screening_finished = threading.Event()
+    fast_pool: concurrent.futures.ThreadPoolExecutor | None = None
+    fast_futures: dict[
+        concurrent.futures.Future[dict[str, Any]], int
+    ] = {}
+    if args.two_stage_contingency_screen:
+        fast_screen_start = time.perf_counter()
+        if args.fast_screen_affinity_schedule:
+            assert fast_screen_groups is not None
+            screen_groups = fast_screen_groups
+        else:
+            screen_groups = [[item] for item in contingencies]
+        fast_worker_count = min(args.fast_workers, len(contingencies))
+        screen_work = AffinityScreenWorkQueue(
+            screen_groups,
+            fast_worker_count,
+            heavy_labels=fast_screen_heavy_labels,
+            heavy_worker_count=args.fast_screen_heavy_workers,
+            heavy_label_seconds=fast_screen_heavy_seconds,
+        )
+        profiled_group_seconds = {
+            str(item["label"]): item.get(
+                "fast_screen_profiled_group_wall_seconds"
+            )
+            for group in screen_groups
+            for item in group
+        }
+        profiled_dispatch_ranks = {
+            str(item["label"]): item.get(
+                "fast_screen_profiled_heavy_dispatch_rank"
+            )
+            for group in screen_groups
+            for item in group
+        }
+        for schedule_entry in run_status["contingency_schedule"]:
+            schedule_entry["fast_screen_profiled_group_wall_seconds"] = (
+                profiled_group_seconds.get(str(schedule_entry["label"]))
+            )
+            schedule_entry["fast_screen_profiled_heavy_dispatch_rank"] = (
+                profiled_dispatch_ranks.get(str(schedule_entry["label"]))
+            )
+        run_status["fast_screen_profiled_heavy_group_count"] = (
+            screen_work.initial_heavy_group_count
+        )
+        fallback_items: list[dict[str, Any]] = []
+
+        def screen_worker(worker_id: int) -> dict[str, Any]:
+            log_path = (
+                internal / "fast_screen_worker_logs" / f"worker_{worker_id:03d}.log"
+            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            task_timeout = effective_process_timeout(
+                args.contingency_timeout, contingency_deadline
+            )
+            command = cpp_command(
+                fast_screen_executable,
+                args.distro,
+                [
+                    "contingency-worker",
+                    worker_case_argument,
+                    worker_base_argument,
+                    "0",
+                    "fast-pf",
+                    "fast-only",
+                ],
+                task_timeout,
+            )
+            started = time.perf_counter()
+            output_lines: list[str] = []
+            assigned_labels: list[str] = []
+            affinity_split_group_count = 0
+            affinity_split_contingency_count = 0
+            process = subprocess.Popen(
+                command,
+                text=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+            )
+
+            def read_until(prefix: str) -> str:
+                assert process.stdout is not None
+                while True:
+                    line = process.stdout.readline()
+                    if line == "":
+                        return_code = process.wait()
+                        if return_code == 124:
+                            raise CompetitionTimeout(
+                                f"fast-screen worker {worker_id} reached the "
+                                f"{contingency_deadline_name}"
+                            )
+                        raise RuntimeError(
+                            f"fast-screen worker {worker_id} exited with status "
+                            f"{return_code}; see {log_path}"
+                        )
+                    output_lines.append(line)
+                    stripped = line.rstrip("\r\n")
+                    if stripped.startswith(prefix):
+                        return stripped[len(prefix):].strip()
+
+            try:
+                read_until("GRAVITYX_WORKER_READY")
+                while not abort_contingencies.is_set():
+                    work = screen_work.get(abort_contingencies, worker_id)
+                    if work is None:
+                        break
+                    work_source, group = work
+                    for group_position, item in enumerate(group):
+                        if abort_contingencies.is_set():
+                            break
+                        label = str(item["label"])
+                        assigned_labels.append(label)
+                        result_path = (
+                            internal / "contingencies" / f"{safe_label(label)}.json"
+                        )
+                        assert process.stdin is not None
+                        task = {
+                            "label": label,
+                            "output_path": (
+                                f"/dev/shm/gravityx_go2_{os.getpid()}_"
+                                f"{worker_id:03d}.json"
+                                if args.wsl_fast_screen_scratch
+                                else to_wsl(result_path)
+                            ),
+                        }
+                        if args.wsl_fast_screen_scratch:
+                            task["fallback_output_path"] = to_wsl(
+                                result_path
+                            )
+                            task["remove_output_after_result"] = True
+                        if args.cpp_solution_writer:
+                            task["solution_path"] = to_wsl(
+                                args.output_dir / f"solution_{label}.txt"
+                            )
+                        task_started = time.perf_counter()
+                        process.stdin.write(
+                            json.dumps(task, separators=(",", ":")) + "\n"
+                        )
+                        process.stdin.flush()
+                        acknowledgement = json.loads(
+                            read_until("GRAVITYX_TASK_RESULT ")
+                        )
+                        task_wall_seconds = time.perf_counter() - task_started
+                        if (acknowledgement.get("label") != label or
+                                not acknowledgement.get("success", False)):
+                            raise RuntimeError(
+                                f"fast screen {label} failed to execute on worker "
+                                f"{worker_id}; see {log_path}"
+                            )
+                        if time.perf_counter() > contingency_deadline:
+                            raise CompetitionTimeout(
+                                f"fast screen {label} finished after the "
+                                f"{contingency_deadline_name}"
+                            )
+                        if args.cpp_solution_writer:
+                            result = acknowledgement.get("result_summary")
+                            if not isinstance(result, dict):
+                                raise RuntimeError(
+                                    f"fast screen {label} returned no compact "
+                                    "result summary"
+                                )
+                        else:
+                            result = read_json(result_path)
+                        solve_wall_seconds = float(
+                            result["solve"]["wall_seconds"]
+                        )
+                        solution_write_seconds = float(
+                            acknowledgement.get("solution_write_seconds", 0.0)
+                        )
+                        orchestration_unattributed_seconds = max(
+                            0.0,
+                            task_wall_seconds
+                            - solve_wall_seconds
+                            - solution_write_seconds,
+                        )
+                        output_lines.append(
+                            "GRAVITYX_ORCHESTRATION "
+                            + json.dumps(
+                                {
+                                    "label": label,
+                                    "task_wall_seconds": task_wall_seconds,
+                                    "solver_wall_seconds": solve_wall_seconds,
+                                    "solution_write_seconds": (
+                                        solution_write_seconds
+                                    ),
+                                    "unattributed_seconds": (
+                                        orchestration_unattributed_seconds
+                                    ),
+                                },
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        )
+                        split_count = 0
+                        if result.get("success", False):
+                            save_secure_result(item, result, worker_id, "fast_screen")
+                            if screen_work.should_split_heavy_group(work_source):
+                                split_count = (
+                                    screen_work.requeue_remaining_as_singletons(
+                                        group,
+                                        group_position + 1,
+                                        worker_id,
+                                        work_source,
+                                    )
+                                )
+                        elif result.get("screen_completed", False):
+                            if (args.wsl_fast_screen_scratch and
+                                    not acknowledgement.get(
+                                        "fallback_result_persisted", False
+                                    )):
+                                raise RuntimeError(
+                                    f"fast screen {label} did not persist its "
+                                    "fallback seed"
+                                )
+                            with progress_lock:
+                                fallback_items.append(item)
+                                assignment = fallback_schedule.get(label)
+                                if assignment is None:
+                                    task_queue.put(item)
+                                else:
+                                    profiled_task_queue.put(
+                                        (
+                                            -float(
+                                                assignment["predicted_wall_seconds"]
+                                            ),
+                                            int(item["schedule_rank"]),
+                                            label,
+                                            item,
+                                        )
+                                    )
+                            split_count = (
+                                screen_work.requeue_remaining_as_singletons(
+                                    group,
+                                    group_position + 1,
+                                    worker_id,
+                                    work_source,
+                                )
+                            )
+                            if split_count:
+                                affinity_split_group_count += 1
+                                affinity_split_contingency_count += split_count
+                        else:
+                            raise RuntimeError(
+                                f"fast screen {label} returned an incomplete result"
+                            )
+                        with progress_lock:
+                            screen_records.append(
+                                {
+                                    "label": label,
+                                    "worker_id": worker_id,
+                                    "feasible": bool(result.get("success", False)),
+                                    "wall_seconds": result["solve"]["wall_seconds"],
+                                    "task_wall_seconds": task_wall_seconds,
+                                    "solution_write_seconds": (
+                                        solution_write_seconds
+                                    ),
+                                    "orchestration_unattributed_seconds": (
+                                        orchestration_unattributed_seconds
+                                    ),
+                                    "max_residual": result["validation"]["max_residual"],
+                                    "failure_reason": (
+                                        result.get("fast_screen") or {}
+                                    ).get("failure_reason", ""),
+                                }
+                            )
+                            run_status["screened_contingency_count"] = len(screen_records)
+                            run_status["fast_screen_fallback_count"] = len(fallback_items)
+                            progress_checkpoint()
+                        if split_count:
+                            break
+                    screen_work.task_done(work_source)
+                    if args.streaming_evaluation_idle_screen_ramp:
+                        assert streaming_evaluation is not None
+                        remaining_screen_groups = (
+                            screen_work.remaining_group_count
+                        )
+                        target_processes = (
+                            idle_screen_evaluation_process_target(
+                                args.streaming_evaluation_processes,
+                                args.post_screen_streaming_evaluation_processes,
+                                fast_worker_count,
+                                remaining_screen_groups,
+                            )
+                        )
+                        streaming_evaluation.promote_maximum_processes(
+                            target_processes,
+                            remaining_screen_groups,
+                        )
+                if process.poll() is None:
+                    assert process.stdin is not None
+                    process.stdin.write('{"stop":true}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                    assert process.stdout is not None
+                    output_lines.extend(process.stdout.readlines())
+                return_code = process.wait(timeout=10.0)
+                if return_code != 0:
+                    raise RuntimeError(
+                        f"fast-screen worker {worker_id} exited with status "
+                        f"{return_code}; see {log_path}"
+                    )
+                return {
+                    "phase": "fast_screen",
+                    "worker_id": worker_id,
+                    "task_count": len(assigned_labels),
+                    "process_wall_seconds": time.perf_counter() - started,
+                    "labels": assigned_labels,
+                    "screen_lane": screen_work.worker_lane(worker_id),
+                    "affinity_split_group_count": affinity_split_group_count,
+                    "affinity_split_contingency_count": (
+                        affinity_split_contingency_count
+                    ),
+                }
+            except Exception:
+                abort_contingencies.set()
+                raise
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                log_path.write_text("".join(output_lines), encoding="utf-8")
+
+        fast_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=fast_worker_count
+        )
+        fast_futures = {
+            fast_pool.submit(screen_worker, worker_id): worker_id
+            for worker_id in range(fast_worker_count)
+        }
+    else:
+        for item in exact_contingencies:
+            task_queue.put(item)
+        screening_finished.set()
+
+    if not args.two_stage_contingency_screen:
+        worker_count = min(args.workers, len(exact_contingencies))
+
+    def solve_worker(worker_id: int) -> dict[str, Any]:
+        if abort_contingencies.is_set():
+            raise CompetitionTimeout("Code2 was cancelled after another worker failed")
+        log_path = internal / "worker_logs" / f"worker_{worker_id:03d}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        task_timeout = effective_process_timeout(
+            args.contingency_timeout, contingency_deadline
+        )
+        worker_arguments = [
+            "contingency-worker",
+            worker_case_argument,
+            worker_base_argument,
+            "0",
+        ]
+        if args.resident_contingency_model:
+            worker_arguments.append("resident")
+        if args.ipopt_acceptable_termination:
+            worker_arguments.append("acceptable")
+        # Recompute the fast-screen candidate in second-stage workers as well.
+        # The linearized repair uses that candidate as its reference; dropping
+        # it between stages can make an otherwise tractable trust-region LP
+        # appear infeasible.
+        if args.fast_power_flow_screen:
+            worker_arguments.append("fast-pf")
+        if args.linearized_contingency_fallback:
+            worker_arguments.append("linearized")
+        if args.linearized_contingency_only:
+            worker_arguments.append("linearized-only")
+        command = cpp_command(
+            args.executable,
+            args.distro,
+            worker_arguments,
+            task_timeout,
+        )
+        started = time.perf_counter()
+        output_lines: list[str] = []
+        assigned_labels: list[str] = []
+        stolen_labels: list[str] = []
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+        )
+
+        def read_until(prefix: str) -> str:
+            assert process.stdout is not None
+            while True:
+                line = process.stdout.readline()
+                if line == "":
+                    return_code = process.wait()
+                    if return_code == 124:
+                        raise CompetitionTimeout(
+                            f"contingency worker {worker_id} reached the "
+                            f"{contingency_deadline_name}"
+                        )
+                    raise RuntimeError(
+                        f"contingency worker {worker_id} exited with status "
+                        f"{return_code}; see {log_path}"
+                    )
+                output_lines.append(line)
+                stripped = line.rstrip("\r\n")
+                if stripped.startswith(prefix):
+                    return stripped[len(prefix):].strip()
+
+        try:
+            read_until("GRAVITYX_WORKER_READY")
+            if args.defer_fallback_until_screen_complete:
+                while not screening_finished.wait(timeout=0.1):
+                    if abort_contingencies.is_set():
+                        raise CompetitionTimeout(
+                            "corrective fallback cancelled during fast screening"
+                        )
+            while not abort_contingencies.is_set():
+                item = streamed_queue_get(
+                    task_queue,
+                    screening_finished,
+                    abort_contingencies,
+                    profiled_queue=(
+                        profiled_task_queue if fallback_schedule else None
+                    ),
+                )
+                if item is None:
+                    break
+                label = str(item["label"])
+                assigned_labels.append(label)
+                profiled_worker = item.get("profiled_fallback_worker")
+                if (
+                    profiled_worker is not None
+                    and int(profiled_worker) != worker_id
+                ):
+                    stolen_labels.append(label)
+                result_path = internal / "contingencies" / f"{safe_label(label)}.json"
+                task = {
+                    "label": label,
+                    "output_path": to_wsl(result_path),
+                }
+                if args.cpp_solution_writer:
+                    task["solution_path"] = to_wsl(
+                        args.output_dir / f"solution_{label}.txt"
+                    )
+                if args.two_stage_contingency_screen:
+                    task["fast_screen_path"] = to_wsl(result_path)
+                assert process.stdin is not None
+                process.stdin.write(
+                    json.dumps(
+                        task,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                process.stdin.flush()
+                print(
+                    f"started fallback: {label} on corrective worker "
+                    f"{worker_id}",
+                    flush=True,
+                )
+                acknowledgement = json.loads(
+                    read_until("GRAVITYX_TASK_RESULT ")
+                )
+                if acknowledgement.get("label") != label:
+                    raise RuntimeError(
+                        f"contingency worker {worker_id} acknowledged the wrong task"
+                    )
+                if (args.two_stage_contingency_screen and
+                        not acknowledgement.get(
+                            "precomputed_fast_screen_reference", False)):
+                    raise RuntimeError(
+                        f"contingency worker {worker_id} did not accept the "
+                        f"precomputed fast-screen reference for {label}"
+                    )
+                if not acknowledgement.get("success", False):
+                    raise RuntimeError(
+                        f"contingency {label} failed in worker {worker_id}; see {log_path}"
+                    )
+                if time.perf_counter() > contingency_deadline:
+                    raise CompetitionTimeout(
+                        f"contingency {label} finished after the "
+                        f"{contingency_deadline_name}"
+                    )
+                if args.cpp_solution_writer:
+                    result = acknowledgement.get("result_summary")
+                    if not isinstance(result, dict):
+                        raise RuntimeError(
+                            f"contingency {label} returned no compact result summary"
+                        )
+                else:
+                    result = read_json(result_path)
+                if not result.get("success", False):
+                    raise RuntimeError(
+                        f"contingency {label} did not pass independent validation"
+                    )
+                save_secure_result(
+                    item,
+                    result,
+                    worker_id,
+                    (
+                        "linearized_fallback"
+                        if args.linearized_contingency_fallback
+                        else "exact_fallback"
+                    )
+                    if args.two_stage_contingency_screen
+                    else "combined_screen_and_fallback",
+                )
+            if process.poll() is None:
+                assert process.stdin is not None
+                process.stdin.write('{"stop":true}\n')
+                process.stdin.flush()
+                process.stdin.close()
+                assert process.stdout is not None
+                output_lines.extend(process.stdout.readlines())
+            return_code = process.wait(timeout=10.0)
+            if return_code != 0:
+                if return_code == 124:
+                    raise CompetitionTimeout(
+                        f"contingency worker {worker_id} reached the "
+                        f"{contingency_deadline_name}"
+                    )
+                raise RuntimeError(
+                    f"contingency worker {worker_id} exited with status "
+                    f"{return_code}; see {log_path}"
+                )
+            return {
+                "phase": (
+                    "linearized_fallback"
+                    if args.linearized_contingency_fallback
+                    else "exact_fallback"
+                ),
+                "worker_id": worker_id,
+                "task_count": len(assigned_labels),
+                "process_wall_seconds": time.perf_counter() - started,
+                "labels": assigned_labels,
+                "profiled_stolen_labels": stolen_labels,
+            }
+        except Exception:
+            abort_contingencies.set()
+            raise
+        finally:
+            if process.poll() is None:
+                try:
+                    assert process.stdin is not None
+                    process.stdin.write('{"stop":true}\n')
+                    process.stdin.flush()
+                    process.stdin.close()
+                    process.wait(timeout=2.0)
+                except Exception:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            log_path.write_text("".join(output_lines), encoding="utf-8")
+
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, post_screen_worker_count)
+    )
+    futures: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+    try:
+        futures = {
+            pool.submit(solve_worker, worker_id): worker_id
+            for worker_id in range(worker_count)
+        }
+        if args.two_stage_contingency_screen:
+            assert fast_pool is not None
+            for future in concurrent.futures.as_completed(fast_futures):
+                worker_records.append(future.result())
+            fast_pool.shutdown(wait=True)
+            fast_pool = None
+            fast_screen_wall = time.perf_counter() - fast_screen_start
+            if len(screen_records) != len(contingencies):
+                raise RuntimeError(
+                    f"fast-screen queue completed {len(screen_records)} of "
+                    f"{len(contingencies)} tasks"
+                )
+            exact_contingencies = sorted(
+                fallback_items, key=lambda item: int(item["schedule_rank"])
+            )
+            run_status["fast_screen_feasible_count"] = sum(
+                bool(item["feasible"]) for item in screen_records
+            )
+            run_status["fast_screen_fallback_count"] = len(exact_contingencies)
+            fast_screen_workers = [
+                item
+                for item in worker_records
+                if item.get("phase") == "fast_screen"
+            ]
+            run_status["fast_screen_affinity_split_group_count"] = sum(
+                int(item.get("affinity_split_group_count", 0))
+                for item in fast_screen_workers
+            )
+            run_status["fast_screen_affinity_split_contingency_count"] = sum(
+                int(item.get("affinity_split_contingency_count", 0))
+                for item in fast_screen_workers
+            )
+            run_status["streaming_fallback_overlap"] = (
+                not args.defer_fallback_until_screen_complete
+            )
+            if post_screen_worker_count > worker_count:
+                for worker_id in range(worker_count, post_screen_worker_count):
+                    future = pool.submit(solve_worker, worker_id)
+                    futures[future] = worker_id
+                print(
+                    "expanded corrective worker pool after screening: "
+                    f"{worker_count} -> {post_screen_worker_count}",
+                    flush=True,
+                )
+            run_status["active_post_screen_corrective_worker_count"] = (
+                post_screen_worker_count
+            )
+            checkpoint()
+            screening_finished.set()
         for future in concurrent.futures.as_completed(futures):
-            records.append(future.result())
-            print(f"completed {len(records)}/{len(contingencies)}: {records[-1]['label']}", flush=True)
+            worker = future.result()
+            worker_records.append(
+                {
+                    "phase": worker.get("phase", "exact_fallback"),
+                    "worker_id": worker["worker_id"],
+                    "task_count": worker["task_count"],
+                    "process_wall_seconds": worker["process_wall_seconds"],
+                    "labels": worker["labels"],
+                    "profiled_stolen_labels": worker.get(
+                        "profiled_stolen_labels", []
+                    ),
+                }
+            )
+            with progress_lock:
+                run_status["completed_worker_count"] = len(worker_records)
+                run_status["last_completed_worker"] = worker["worker_id"]
+                checkpoint()
+    except Exception as error:
+        abort_contingencies.set()
+        screening_finished.set()
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
+        for future in fast_futures:
+            future.cancel()
+        for future in futures:
+            future.cancel()
+        if fast_pool is not None:
+            fast_pool.shutdown(wait=True, cancel_futures=True)
+        pool.shutdown(wait=True, cancel_futures=True)
+        contingency_wall = time.perf_counter() - contingency_start
+        timed_out = isinstance(error, CompetitionTimeout)
+        run_status.update(
+            {
+                "stage": "code2",
+                "code2_within_limit": code2_completed_within_limit(
+                    contingency_wall, code2_limit, timed_out
+                ),
+                "code2_timed_out": timed_out,
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                "contingency_parallel_wall_seconds": contingency_wall,
+                "error": str(error),
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        raise
+    else:
+        pool.shutdown(wait=True)
+    if len(records) != len(contingencies):
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
+        raise RuntimeError(
+            f"dynamic contingency queue completed {len(records)} of "
+            f"{len(contingencies)} tasks"
+        )
     records.sort(key=lambda item: item["label"])
+    worker_records.sort(key=lambda item: item["worker_id"])
     contingency_wall = time.perf_counter() - contingency_start
+    run_status.update(
+        {
+            "code2_within_limit": contingency_wall <= code2_limit,
+            "contingency_parallel_wall_seconds": contingency_wall,
+        }
+    )
+    if contingency_wall > code2_limit:
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
+        run_status["error"] = "Code2 completed after its competition deadline"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    if time.perf_counter() > work_deadline:
+        if streaming_evaluation is not None:
+            streaming_evaluation.abort()
+        run_status["error"] = "Code2 exhausted the time reserved for official evaluation"
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    checkpoint()
 
     evaluation_wall = 0.0
+    evaluation_tail_wall = 0.0
     evaluation_summary: dict[str, Any] | None = None
+    evaluation_certificate: dict[str, Any] | None = None
+    serial_evaluation_metadata: dict[str, Any] | None = None
     if not args.skip_evaluation:
         for path in (args.python, args.evaluator):
             reject_onedrive(path)
+        if args.mpiexec is not None:
+            reject_onedrive(args.mpiexec)
+        if streaming_evaluation is None:
+            stale_evaluation_outputs = [
+                path
+                for pattern in (
+                    "eval_detail_*.json",
+                    "eval_summary.json",
+                    "eval_summary.csv",
+                    "eval_detail.json",
+                    "eval_detail.csv",
+                    "sol_change_*.csv",
+                    "sol_change.csv",
+                )
+                for path in args.output_dir.glob(pattern)
+            ]
+            if stale_evaluation_outputs:
+                raise RuntimeError(
+                    "refusing stale official-evaluation artifacts: "
+                    + ", ".join(
+                        sorted(path.name for path in stale_evaluation_outputs)
+                    )
+                )
         evaluation_start = time.perf_counter()
-        completed = subprocess.run(
-            [str(args.python), str(args.evaluator), "1", str(args.case_dir), str(args.output_dir)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+        expected_evaluation_labels = {
+            str(item["label"]) for item in contingencies
+        }
+        try:
+            if streaming_evaluation is not None:
+                evaluation_summary, serial_evaluation_metadata = (
+                    streaming_evaluation.finish()
+                )
+            elif args.serial_evaluation_shards > 1:
+                evaluation_summary, serial_evaluation_metadata = (
+                    run_serial_evaluation_shards(
+                        args.python,
+                        args.evaluator,
+                        args.case_dir,
+                        args.output_dir,
+                        internal,
+                        expected_evaluation_labels,
+                        args.serial_evaluation_shards,
+                        evaluation_deadline,
+                        args.evaluator_linear_algebra_threads,
+                        args.vendor_evaluator_reference,
+                    )
+                )
+            else:
+                evaluator_timeout = effective_process_timeout(
+                    args.total_time_limit,
+                    evaluation_deadline,
+                )
+                evaluator_command = [
+                    str(args.python),
+                    str(args.evaluator),
+                    "1",
+                    str(args.case_dir),
+                    str(args.output_dir),
+                ]
+                if args.evaluation_processes > 1:
+                    evaluator_command = [
+                        str(args.mpiexec),
+                        "-np",
+                        str(args.evaluation_processes),
+                        *evaluator_command,
+                    ]
+                completed = subprocess.run(
+                    evaluator_command,
+                    check=False,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=evaluator_timeout,
+                    env=evaluator_subprocess_environment(
+                        args.evaluator_linear_algebra_threads,
+                        args.vendor_evaluator_reference,
+                    ),
+                )
+                (internal / "evaluation.console.log").write_text(
+                    completed.stdout, encoding="utf-8"
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        "official evaluator failed; see internal/evaluation.console.log"
+                    )
+                evaluation_summary = read_json(
+                    args.output_dir / "eval_summary.json"
+                )
+        except (subprocess.TimeoutExpired, CompetitionTimeout) as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                output = error.stdout or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                (internal / "evaluation.console.log").write_text(
+                    output + "\nEND_TO_END_TIMEOUT\n", encoding="utf-8"
+                )
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": "official evaluator reached the end-to-end deadline",
+                    "end_to_end_within_limit": False,
+                    "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
+            raise CompetitionTimeout(run_status["error"]) from error
+        except Exception as error:
+            if streaming_evaluation is not None:
+                streaming_evaluation.abort()
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": str(error),
+                    "end_to_end_within_limit": (
+                        time.perf_counter() <= total_deadline
+                    ),
+                    "finished_at_utc": dt.datetime.now(
+                        dt.timezone.utc
+                    ).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
+            raise
+        evaluation_tail_wall = time.perf_counter() - evaluation_start
+        evaluation_wall = (
+            float(serial_evaluation_metadata["overlap_span_seconds"])
+            if streaming_evaluation is not None
+            and serial_evaluation_metadata is not None
+            else evaluation_tail_wall
         )
-        evaluation_wall = time.perf_counter() - evaluation_start
-        (internal / "evaluation.console.log").write_text(completed.stdout, encoding="utf-8")
-        if completed.returncode != 0:
-            raise RuntimeError("official evaluator failed; see internal/evaluation.console.log")
-        evaluation_summary = read_json(args.output_dir / "eval_summary.json")
+        assert evaluation_summary is not None
+        evaluation_mode = (
+            "streaming_serial_shards"
+            if streaming_evaluation is not None
+            else (
+                "serial_shards"
+                if args.serial_evaluation_shards > 1
+                else ("mpi" if args.evaluation_processes > 1 else "serial")
+            )
+        )
+        certificate_parallel_processes = (
+            args.post_screen_streaming_evaluation_processes
+            if streaming_evaluation is not None
+            else (
+                min(args.serial_evaluation_shards, len(contingencies))
+                if args.serial_evaluation_shards > 1
+                else args.evaluation_processes
+            )
+        )
+        if (
+            serial_evaluation_metadata is not None
+            and not bool(
+                serial_evaluation_metadata.get(
+                    "top_level_details_materialized", True
+                )
+            )
+        ):
+            aggregate = serial_evaluation_metadata.get("aggregate_certificate")
+            if not isinstance(aggregate, dict):
+                raise RuntimeError(
+                    "sharded official evaluation has no aggregate certificate"
+                )
+            if (
+                not bool(aggregate.get("complete_label_set", False))
+                or int(aggregate.get("expected_contingency_count", -1))
+                != len(expected_evaluation_labels)
+                or int(aggregate.get("observed_unique_detail_count", -1))
+                != len(expected_evaluation_labels) + 1
+            ):
+                raise RuntimeError(
+                    "sharded official-evaluation certificate is incomplete"
+                )
+            evaluation_certificate = dict(aggregate)
+        else:
+            evaluation_summary, evaluation_certificate = (
+                validate_and_normalize_evaluation_details(
+                    args.output_dir,
+                    internal,
+                    expected_evaluation_labels,
+                    evaluation_summary,
+                    certificate_parallel_processes,
+                    evaluation_mode,
+                )
+            )
+        evaluation_certificate.update(
+            {
+                "evaluator_path": str(args.evaluator.resolve()),
+                "evaluator_sha256": sha256(args.evaluator),
+                "vendor_evaluator_reference": (
+                    str(args.vendor_evaluator_reference.resolve())
+                    if args.vendor_evaluator_reference is not None
+                    else None
+                ),
+                "vendor_evaluator_reference_sha256": (
+                    sha256(args.vendor_evaluator_reference)
+                    if args.vendor_evaluator_reference is not None
+                    else None
+                ),
+                "evaluator_parser_mode": (
+                    "canonical_binary_numeric_with_line_and_string_fallback_and_"
+                    "in_memory_summary_with_referenced_vendor_equations"
+                    if args.vendor_evaluator_reference is not None
+                    else "native_vendor_parser_and_equations"
+                ),
+                "python_path": str(args.python.resolve()),
+                "mpiexec_path": (
+                    str(args.mpiexec.resolve()) if args.mpiexec is not None else None
+                ),
+                "mpiexec_sha256": (
+                    sha256(args.mpiexec) if args.mpiexec is not None else None
+                ),
+                "serial_evaluation_shards": serial_evaluation_metadata,
+                "streaming_evaluation": streaming_evaluation is not None,
+            }
+        )
+        write_json(
+            internal / "official_evaluation_certificate.json",
+            evaluation_certificate,
+        )
+        infeasible_cases = [
+            label
+            for label, infeasible in evaluation_summary.get("infeas_all_cases", {}).items()
+            if bool(infeasible)
+        ]
+        if (
+            not bool(evaluation_summary.get("solutions_exist", False))
+            or float(evaluation_summary.get("infeas", 1.0)) != 0.0
+            or infeasible_cases
+        ):
+            run_status.update(
+                {
+                    "stage": "evaluation",
+                    "error": "official evaluator did not certify every case feasible",
+                    "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                    "official_infeasibility": evaluation_summary.get("infeas"),
+                    "official_infeasible_cases": infeasible_cases,
+                    "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "total_wall_seconds": time.perf_counter() - wall_start,
+                }
+            )
+            checkpoint()
+            raise RuntimeError(run_status["error"])
+
+    if time.perf_counter() > evaluation_deadline:
+        run_status.update(
+            {
+                "stage": "evaluation",
+                "error": "official evaluation left insufficient time for result serialization",
+                "end_to_end_within_limit": time.perf_counter() <= total_deadline,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": time.perf_counter() - wall_start,
+            }
+        )
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
 
     total_wall = time.perf_counter() - wall_start
     max_residual = max((item["max_residual"] for item in records), default=0.0)
+    compact_base = (
+        {
+            "artifact": "internal/base.json",
+            "sha256": sha256(base_json),
+            "success": bool(base.get("success", False)),
+            "base_method": base.get("base_method"),
+            "wall_seconds": base.get("wall_seconds"),
+            "base_validation": base.get("base_validation"),
+            "commitment_count": sum(int(value) for value in commitment),
+            "complete_state_and_commitment_in_artifact": True,
+        }
+        if args.compact_final_summary
+        else base
+    )
     summary = {
-        "method": "Gravity C++ continuous AC-UC relaxation plus deterministic iterative batch rounding",
+        "method": (
+            "C++ source commitment with HiGHS sequential-linearized AC base, "
+            "parallel sparse-Newton screening, and isolated resident Ipopt fallback"
+            if args.validated_source_base and args.two_stage_contingency_screen
+            else (
+            "Gravity C++ source-status AC base plus validated sparse-Newton contingency screen"
+            if args.source_status_base and args.fast_power_flow_screen
+            else "Gravity C++ continuous AC-UC relaxation plus deterministic iterative batch rounding"
+            )
+        ),
         "exact_unpublished_gravityx_binary": False,
         "framework_faithful": True,
         "started_at_utc": started_utc,
         "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "git_revision": git_revision(),
+        "base_exact_executable": run_status["base_exact_executable"],
+        "base_exact_executable_sha256": run_status[
+            "base_exact_executable_sha256"
+        ],
+        "fast_screen_executable": run_status["fast_screen_executable"],
+        "fast_screen_executable_sha256": run_status[
+            "fast_screen_executable_sha256"
+        ],
+        "mixed_build_fast_screen": run_status["mixed_build_fast_screen"],
+        "compact_final_summary": args.compact_final_summary,
         "input_hashes": {
             "normalized_case_sha256": sha256(args.case_json),
             "raw_sha256": sha256(args.case_dir / "case.raw"),
             "con_sha256": sha256(args.case_dir / "case.con"),
             "json_sha256": sha256(args.case_dir / "case.json"),
         },
-        "workers": args.workers,
+        "workers": worker_count,
+        "requested_workers": args.workers,
+        "fast_workers": fast_worker_count,
+        "requested_fast_workers": args.fast_workers,
+        "resident_contingency_model": args.resident_contingency_model,
+        "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "fast_power_flow_screen": args.fast_power_flow_screen,
+        "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
+        "source_status_base": args.source_status_base,
+        "validated_source_base": args.validated_source_base,
+        "robust_contingency_base": args.robust_contingency_base,
+        "two_stage_contingency_screen": args.two_stage_contingency_screen,
+        "defer_fallback_until_screen_complete": (
+            args.defer_fallback_until_screen_complete
+        ),
+        "linearized_contingency_fallback": args.linearized_contingency_fallback,
+        "linearized_contingency_only": args.linearized_contingency_only,
+        "ipopt_acceptable_options": (
+            {
+                "acceptable_tol": 1e-3,
+                "acceptable_iter": 3,
+                "acceptable_constr_viol_tol": 5e-6,
+                "acceptable_dual_inf_tol": 1e3,
+                "acceptable_compl_inf_tol": 1e-3,
+                "acceptable_obj_change_tol": 1e-7,
+            }
+            if args.ipopt_acceptable_termination
+            else None
+        ),
+        "longest_first_schedule": args.longest_first_schedule,
+        "contingency_schedule_mode": run_status["contingency_schedule_mode"],
+        "contingency_schedule": (
+            None
+            if args.compact_final_summary
+            else run_status["contingency_schedule"]
+        ),
+        "contingency_schedule_artifact": (
+            "run_status.json#contingency_schedule"
+            if args.compact_final_summary
+            else None
+        ),
+        "contingency_execution_mode": (
+            (
+                "parallel fast-only sparse-Newton screen followed by "
+                "HiGHS sequential-linearized contingency fallback queue"
+                if args.linearized_contingency_fallback
+                else "parallel fast-only sparse-Newton screen followed by "
+                     "resident Ipopt fallback queue"
+            )
+            if args.two_stage_contingency_screen
+            else (
+            "validated sparse-Newton screen with resident Ipopt fallback per isolated worker"
+            if args.fast_power_flow_screen and args.resident_contingency_model
+            else (
+                "resident parametric model per isolated process worker with dynamic queue"
+                if args.resident_contingency_model
+                else "fresh model per task in persistent isolated process workers with dynamic queue"
+            )
+            )
+        ),
+        "competition_timing": {
+            **run_status["competition_timing"],
+            "code1_within_limit": True,
+            "code2_within_limit": True,
+        },
+        "end_to_end_timing": {
+            **run_status["end_to_end_timing"],
+            "within_limit": True,
+        },
         "base_process_wall_seconds": base_wall,
         "base_algorithm_wall_seconds": base["wall_seconds"],
         "contingency_parallel_wall_seconds": contingency_wall,
+        "fast_screen_parallel_wall_seconds": fast_screen_wall,
+        "contingency_worker_process_seconds_sum": sum(
+            item["process_wall_seconds"] for item in worker_records
+        ),
         "contingency_solver_seconds_sum": sum(item["solver_wall_seconds"] for item in records),
+        "contingency_model_preparation_seconds_sum": sum(
+            item["model_preparation_wall_seconds"] for item in records
+        ),
+        "contingency_ipopt_iterations_sum": sum(
+            max(0, int(item["solver_iterations"])) for item in records
+        ),
         "evaluation_wall_seconds": evaluation_wall,
+        "evaluation_tail_wall_seconds": evaluation_tail_wall,
+        "evaluation_processes": args.evaluation_processes,
+        "serial_evaluation_shards": args.serial_evaluation_shards,
+        "streaming_serial_evaluation_shards": (
+            args.streaming_serial_evaluation_shards
+        ),
+        "streaming_evaluation_processes": (
+            args.streaming_evaluation_processes
+        ),
+        "streaming_evaluation_idle_screen_ramp": (
+            args.streaming_evaluation_idle_screen_ramp
+        ),
+        "streaming_evaluation_completion_order_shards": (
+            args.streaming_evaluation_completion_order_shards
+        ),
+        "streaming_evaluation_tail_shard_sizes": (
+            streaming_evaluation_tail_shard_sizes
+        ),
+        "streaming_persistent_evaluator_processes": (
+            args.streaming_persistent_evaluator_processes
+        ),
+        "streaming_evaluator_below_normal_priority": (
+            args.streaming_evaluator_below_normal_priority
+        ),
+        "evaluator_linear_algebra_threads": (
+            args.evaluator_linear_algebra_threads
+        ),
+        "post_screen_streaming_evaluation_processes": (
+            args.post_screen_streaming_evaluation_processes
+        ),
+        "vendor_evaluator_reference": (
+            str(args.vendor_evaluator_reference.resolve())
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "vendor_evaluator_reference_sha256": (
+            sha256(args.vendor_evaluator_reference)
+            if args.vendor_evaluator_reference is not None
+            else None
+        ),
+        "evaluator_parser_mode": (
+            "canonical_binary_numeric_with_line_and_string_fallback_and_"
+            "in_memory_summary_with_referenced_vendor_equations"
+            if args.vendor_evaluator_reference is not None
+            else "native_vendor_parser_and_equations"
+        ),
+        "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),
+        "accepted_feasible_nonconverged_count": sum(
+            bool(item["accepted_feasible_nonconverged"]) for item in records
+        ),
+        "fast_power_flow_accepted_count": sum(
+            item["solution_method"] in {
+                "fast_newton_power_flow",
+                "direct_base_state_outage_candidate",
+            }
+            for item in records
+        ),
+        "direct_outage_candidate_accepted_count": sum(
+            item["solution_method"] == "direct_base_state_outage_candidate"
+            for item in records
+        ),
+        "ipopt_fallback_count": sum(
+            item["solution_method"] == "ipopt_corrective_fallback" for item in records
+        ),
+        "linearized_contingency_accepted_count": sum(
+            item["solution_method"] in {
+                "highs_sequential_linearized_contingency",
+                "highs_linearized_contingency_plus_fast_newton",
+            }
+            for item in records
+        ),
+        "fast_screen_fallback_count": sum(
+            not bool(item["feasible"]) for item in screen_records
+        ),
         "max_independent_contingency_residual": max_residual,
-        "base": base,
-        "contingencies": records,
+        "base": compact_base,
+        "contingency_workers": worker_records,
+        "fast_screen_records": (
+            None
+            if args.compact_final_summary
+            else sorted(screen_records, key=lambda item: item["label"])
+        ),
+        "contingencies": (
+            None if args.compact_final_summary else records
+        ),
+        "detailed_artifacts": (
+            {
+                "base_result": "internal/base.json",
+                "run_status_and_schedule": "run_status.json",
+                "fast_screen_worker_logs": "internal/fast_screen_worker_logs",
+                "corrective_worker_logs": "internal/worker_logs",
+                "official_evaluation_certificate": (
+                    "internal/official_evaluation_certificate.json"
+                ),
+                "official_evaluation_shards": (
+                    "internal/streaming_serial_evaluation_shards"
+                ),
+                "official_solution_pattern": "solution_*.txt",
+            }
+            if args.compact_final_summary
+            else None
+        ),
         "official_evaluation": evaluation_summary,
     }
     write_json(args.output_dir / "run_summary.json", summary)
+    run_status.update(
+        {
+            "success": True,
+            "stage": "complete",
+            "finished_at_utc": summary["finished_at_utc"],
+            "total_wall_seconds": total_wall,
+            "official_objective": evaluation_summary.get("obj") if evaluation_summary else None,
+            "official_infeasibility": evaluation_summary.get("infeas") if evaluation_summary else None,
+            "completed_contingency_count": len(records),
+            "accepted_feasible_nonconverged_count": summary[
+                "accepted_feasible_nonconverged_count"
+            ],
+            "end_to_end_within_limit": True,
+        }
+    )
+    checkpoint()
+    finalized_total = time.perf_counter() - wall_start
+    if finalized_total > args.total_time_limit:
+        run_status.update(
+            {
+                "success": False,
+                "stage": "finalization",
+                "error": "result serialization exceeded the end-to-end deadline",
+                "end_to_end_within_limit": False,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": finalized_total,
+            }
+        )
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
+    summary["total_wall_seconds"] = finalized_total
+    run_status["total_wall_seconds"] = finalized_total
+    write_json(args.output_dir / "run_summary.json", summary)
+    checkpoint()
+    reported_total = time.perf_counter() - wall_start
+    if reported_total > args.total_time_limit:
+        run_status.update(
+            {
+                "success": False,
+                "stage": "finalization",
+                "error": "final timing records exceeded the end-to-end deadline",
+                "end_to_end_within_limit": False,
+                "finished_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "total_wall_seconds": reported_total,
+            }
+        )
+        checkpoint()
+        raise CompetitionTimeout(run_status["error"])
     print(
         json.dumps(
             {
                 "output_dir": str(args.output_dir),
-                "total_wall_seconds": total_wall,
+                "total_wall_seconds": reported_total,
                 "base_wall_seconds": base_wall,
                 "contingency_wall_seconds": contingency_wall,
                 "objective": evaluation_summary.get("obj") if evaluation_summary else None,

@@ -1,0 +1,119 @@
+{
+  "archive": {
+    "name": "Challenge_2 Final Event 4 Synthetic Data Scenarios.zip",
+    "sha256": "8a35cf683129fdcd318bac17e3c5cf98911f4887b8d8ce52de8999276b47f6f7",
+    "source": "https://data.openei.org/submissions/6197"
+  },
+  "models": [
+    {
+      "case_id": "C2FEN00617",
+      "scenario_id": "005",
+      "counts": {"buses": 617, "generators": 94, "loads": 404, "branches": 853, "contingencies": 105},
+      "hashes": {
+        "raw_sha256": "bdadd320f4ed425e46ccc1c19242c08b079af447e478fcb095379770524b5adf",
+        "con_sha256": "1e9e4c7ff07561eeb0a77b28f938a3abdf1148896bf3f453ab5c99eb1c57cd83",
+        "json_sha256": "77c12c6218ca6aa228c6e04a862bd406740ca1a8d7d1146f9c930a950380261b",
+        "normalized_model_sha256": "5f0fa87430e8246ffaad8b8296a44e7108fb1b780b0d27cd81d0a927e9f4fa67"
+      }
+    },
+    {
+      "case_id": "C2FEN00617",
+      "scenario_id": "017",
+      "counts": {"buses": 617, "generators": 94, "loads": 405, "branches": 853, "contingencies": 103},
+      "hashes": {
+        "raw_sha256": "72fe38861daf45379abcef33c7c1819f5ce2167f8c19c5fe781eb3bd332216c8",
+        "con_sha256": "49177e22576ddac102ec3c9ab9c2b7bfe353ccf9978d33182b05d50e1906a3a8",
+        "json_sha256": "0dd6c0bf7ee09d0ff89a56bd2f20265667f4cf70e9f667af09ab332e37005563",
+        "normalized_model_sha256": "0443fcde2f504c74d95e2ea67eae8825b9de87867e8c5ec3e561ea47a9890ff6"
+      }
+    },
+    {
+      "case_id": "C2FEN00617",
+      "scenario_id": "024",
+      "counts": {"buses": 617, "generators": 94, "loads": 404, "branches": 853, "contingencies": 104},
+      "hashes": {
+        "raw_sha256": "41224a0e7b628ddb3da82427c03c7bc6b8ee91ee020aa6514b9a005478654020",
+        "con_sha256": "6eae5a5b0d1553c97e4cd871911815a9be795fa3240810c5bbab993124278125",
+        "json_sha256": "ffa87b103cb03c95bb52a29d0cdbf3da611cd085f005e868245dca5e58592031",
+        "normalized_model_sha256": "65fb963402a6f1d4ab21ccbcf42a99442031db15913ca4136cf47ad270f5078c"
+      }
+    },
+    {
+      "case_id": "C2FEN00617",
+      "scenario_id": "062",
+      "counts": {"buses": 617, "generators": 94, "loads": 404, "branches": 853, "contingencies": 103},
+      "hashes": {
+        "raw_sha256": "f46af3c4b032ebd48ae450534ced0f7d3e8ad6dea9c8046a3a0f71b370728b65",
+        "con_sha256": "2ebf90c69c0e75a8b9a0d1094c9cc45996fdf87d9c09235d0ba1e85a1601eeda",
+        "json_sha256": "ec9fe248be07a24d16602c49956909cf9f1c758e1032c484badbcc0b1fa86575",
+        "normalized_model_sha256": "f1f354eb0e1247ba9142bce812c18074af0af65720e22f249bf1c14c9beda678"
+      }
+    },
+    {
+      "case_id": "C2FEN00617",
+      "scenario_id": "073",
+      "counts": {"buses": 617, "generators": 94, "loads": 405, "branches": 853, "contingencies": 107},
+      "hashes": {
+        "raw_sha256": "1331fb2c2840fa15fb61eda7986ef70e45d7953d009aaa6e5c5e9c2f09531b99",
+        "con_sha256": "5b9ab7902d23958a511dc7beb1bbb44e98debf3e4ef0944428e37ba428a09030",
+        "json_sha256": "430a7265a922ad148a7c4ba12a330eadd570c0a1382a1fc6ec05f6a1945bd2ed",
+        "normalized_model_sha256": "08889ee067fbe4570cf6bfb26d6452207b7ba055dcdbc504c80e4643cb4c9cb1"
+      }
+    },
+    {
+      "case_id": "C2FEN02020",
+      "scenario_id": "025",
+      "counts": {"buses": 2020, "generators": 194, "loads": 1392, "branches": 2856, "contingencies": 292},
+      "hashes": {
+        "raw_sha256": "77ebe33b4381719d74e1a34a985ccdb42aadeefd8497b37c8a328580cd90a829",
+        "con_sha256": "5bf86a00fce1cee6cfe1b9220e68912a1eddc2efb0c46428d3eb7d6b2f43a1e4",
+        "json_sha256": "43237387b5c7edad04349d8a30f7b131beb5504f5db41f468e32977e42f0da0b",
+        "normalized_model_sha256": "b8e60e82747990fe5b8348619a790bafb78ec9f191143c0a83f8aed5d386fbf7"
+      }
+    },
+    {
+      "case_id": "C2FEN02020",
+      "scenario_id": "121",
+      "counts": {"buses": 2020, "generators": 194, "loads": 1392, "branches": 2856, "contingencies": 300},
+      "hashes": {
+        "raw_sha256": "084d7e096076f7f4b23238d7801e1072fa47931597ebf8380635101e5275aed9",
+        "con_sha256": "6468c20753631e6b38db7e0dc45c8f8aef226f650a26219620238eeae8630f60",
+        "json_sha256": "a0206ec13065bf55e4d9574e577f6d7ddcbd0c6cdf22b85cf92457741db2794b",
+        "normalized_model_sha256": "b842e35c61822017bf958b18c4a178144e3d96bae272c9c9af4218f873f18d23"
+      }
+    },
+    {
+      "case_id": "C2FEN02020",
+      "scenario_id": "134",
+      "counts": {"buses": 2020, "generators": 194, "loads": 1392, "branches": 2856, "contingencies": 300},
+      "hashes": {
+        "raw_sha256": "24decacdddf78a5cb8f27708ac4445fa312a35d793e8148d3441b61bf1183552",
+        "con_sha256": "d13cdfecf0f52c1c4a421d25920fb0d19ba57c2411fbc401c5d75a0b54e139e8",
+        "json_sha256": "e87e5a92909c533d6828201eeebaa1758afdfa99e27ecd6b22a9f80e3e11ea2d",
+        "normalized_model_sha256": "d7ab0c338ee8846e61f9620b14d14fa5b5ebc36c7b153777a3bce8df9e665f25"
+      }
+    },
+    {
+      "case_id": "C2FEN02020",
+      "scenario_id": "260",
+      "counts": {"buses": 2020, "generators": 194, "loads": 1392, "branches": 2856, "contingencies": 300},
+      "hashes": {
+        "raw_sha256": "9021507c3eee3e0c668ea7b03faea3b24477897ff669ddc09cb365cf6a373c9a",
+        "con_sha256": "417378a4371fa77e7df301e9de1eccde7844edc532a8d056eea43e9683e1e048",
+        "json_sha256": "134b3a3149d0a9626d66319acdc59378c2493f869b9b096d4a4a3f241199aa96",
+        "normalized_model_sha256": "c858ad365e95cd425f2e1a260687d648afc9316d59b89e31feff4f122302aed6"
+      }
+    },
+    {
+      "case_id": "C2FEN02020",
+      "scenario_id": "262",
+      "counts": {"buses": 2020, "generators": 194, "loads": 1392, "branches": 2856, "contingencies": 300},
+      "hashes": {
+        "raw_sha256": "bef914d8f53bfcefb0387fdca2b518c2205c2cc3704ef13018a62c5222d0ea34",
+        "con_sha256": "0e9b4ea449dac40a83ff856f6312302af1cbcad132671932ba6eab4f57609339",
+        "json_sha256": "3e570ebc7813e19b9d25619a48bd213cc3feaaaf285a3ce9070f58997e0eea89",
+        "normalized_model_sha256": "5aad89ebff838d9ef30da8cbf7b620bbf7f43a2f3bf9018825449ab49ae850bc"
+      }
+    }
+  ]
+}

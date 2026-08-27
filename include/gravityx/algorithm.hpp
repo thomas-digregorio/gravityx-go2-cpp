@@ -12,6 +12,7 @@ namespace gravityx {
 
 struct IbrOptions {
     int batch_count{4};
+    bool source_status_only{};
     double threshold{0.5};
     double tolerance{1e-6};
     double validation_tolerance{1e-5};
@@ -45,6 +46,11 @@ struct IbrResult {
 
     nlohmann::json to_json(bool include_state = false) const;
 };
+
+bool validated_candidate_is_feasible(
+    const SolveResult& result,
+    const ValidationReport& validation,
+    double tolerance);
 
 IbrResult run_iterative_batch_rounding(const CaseData& data, const IbrOptions& options = {});
 

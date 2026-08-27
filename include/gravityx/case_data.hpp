@@ -27,6 +27,7 @@ struct Bus {
     std::vector<int> shunts;
     std::vector<int> branches_from;
     std::vector<int> branches_to;
+    bool present{true};
 };
 
 struct Generator {
@@ -52,6 +53,9 @@ struct Generator {
     double sdcost{};
     int ncost{};
     std::vector<double> cost;
+    bool present{true};
+    int source_bus{};
+    std::string source_id;
 };
 
 struct Load {
@@ -73,6 +77,9 @@ struct Load {
     double z_start{};
     int ncost{};
     std::vector<double> cost;
+    bool present{true};
+    int source_bus{};
+    std::string source_id;
 };
 
 struct Shunt {
@@ -81,11 +88,18 @@ struct Shunt {
     int bus{};
     double gs{};
     double bs{};
+    bool dispatchable{};
+    std::vector<int> steps;
+    std::vector<int> block_maximum_steps;
+    std::vector<double> block_susceptance;
+    bool present{true};
+    int source_bus{};
 };
 
 struct Branch {
     std::string source_key;
     int index{};
+    int status{1};
     int from{};
     int to{};
     bool transformer{};
@@ -97,9 +111,33 @@ struct Branch {
     double b_to{};
     double tap{};
     double shift{};
+    // Immutable AC-flow coefficients derived from r/x, tap, phase shift,
+    // and terminal admittances at ingest. Fast contingency screening rebuilds
+    // branch flows many times for the same network, so recomputing these
+    // quantities (including sin/cos of the fixed phase shift) in every trial
+    // is pure overhead. Hand-built test fixtures may leave the cache invalid;
+    // flow routines retain the canonical formula as a fallback.
+    bool flow_coefficients_valid{false};
+    double flow_from_g_self{};
+    double flow_from_b_self{};
+    double flow_to_g_self{};
+    double flow_to_b_self{};
+    double flow_from_cross_cos{};
+    double flow_from_cross_sin{};
+    double flow_to_cross_cos{};
+    double flow_to_cross_sin{};
     double angmin{};
     double angmax{};
     double rate_a{};
+    double rate_b{};
+    double rate_c{};
+    bool present{true};
+    int source_from{};
+    int source_to{};
+    std::string source_id;
+    int control_mode{};
+    int tm_step{};
+    int ta_step{};
 };
 
 enum class ContingencyType {

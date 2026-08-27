@@ -12,8 +12,23 @@ The C++ checker recomputes, without consulting Gravity's expression graph:
 - applicable angle limits and soft thermal/current limits; and
 - the exact generator or branch removed in each contingency.
 
-An optimization result is accepted only when the Gravity/Ipopt status is
-successful and the independent maximum residual is no greater than `1e-5`.
+Base and commitment-rounding results require a successful Gravity/Ipopt status
+and an independent maximum residual no greater than `1e-5`.  A corrective
+contingency point with a finite objective is retained whenever the independent
+checker verifies the same `1e-5` residual limit, even if Ipopt terminates after
+finding that feasible point without reporting convergence.  The raw Ipopt
+status and this acceptance path are recorded, and the official evaluator must
+still certify every submitted case.
+
+The component suite also solves a two-bus AC case with two electrically
+identical parallel circuits.  This guards the branch-specific symbolic tags
+needed by the pinned Gravity revision to prevent collisions between otherwise
+identical nonlinear DAG nodes.  Every tag is a fixed parameter with value one,
+so it changes symbolic identity but not the equation value or derivative.
+The same fixture exercises the large-case lightweight linearized seed and
+checks that its voltage and angle variables remain inside the requested trust
+region.  Rows are omitted only when their affine range over that box proves
+them redundant; nonlinear acceptance still uses the complete checker.
 
 ## Tiny semantic oracle
 
@@ -44,7 +59,53 @@ GravityX implementation.
 ## Cold-run discipline
 
 `scripts/run_experiment.py` refuses a nonempty output directory.  The base
-solve starts a new process, and every corrective contingency starts in its own
-new process from the selected base state.  Contingencies are independent and
-may run concurrently.  Each process is limited to one BLAS thread to avoid
-oversubscription.
+solve starts a new process.  Corrective contingencies enter a canonical-label
+queue consumed by isolated persistent worker processes; each worker loads the
+immutable case and selected base state once, then constructs and solves a fresh
+Gravity/Ipopt model before requesting its next contingency.  This dynamic queue
+prevents long contingencies from accumulating on one static worker.  The actual
+worker assignment is recorded.  Workers run concurrently and are limited to
+one BLAS thread each to avoid oversubscription.  No contingency solution or
+optimizer state is reused by a different contingency.
+
+The registered laptop configuration uses eight persistent workers.  On the
+24-core hybrid laptop, 22 simultaneous Ipopt/MUMPS sparse factorizations
+increased isolated corrective solves from roughly 10 seconds to as much as
+80 seconds through cache and memory-bandwidth contention.  Reducing the worker
+count changes only process scheduling, not the mathematical model or the cold
+start supplied to any contingency.
+
+With `--cpp-solution-writer`, each resident worker writes its independently
+verified contingency state directly in the official text format.  The runner
+will not count the task unless that file exists and is nonempty.  Component
+tests cover section ordering and outage omission, and the large-case gate
+requires byte-for-byte equality with the original Python writer before the
+mode is used in a retained run.
+
+Each corrective model starts from the verified base state with the outaged
+component removed.  Its active- and reactive-balance slack variables are
+initialized from the independently recomputed nodal mismatch of that adjusted
+state, with a small interior margin and the unchanged source-model slack bound.
+This initialization changes neither the corrective equations nor their
+penalties; it avoids asking Ipopt to rediscover the outage-created imbalance
+from an all-zero slack start.
+
+For Final-event Division 1 experiments, the runner enforces the historical
+timing stages separately: Code1 has a 300-second wall limit and Code2 receives
+two seconds per source contingency.  A failed or timed-out run leaves a
+machine-readable `run_status.json`; a run is successful only after the official
+evaluator confirms every submitted case is feasible.  The five-scenario
+reproduction additionally enforces a stricter 300-second end-to-end limit from
+normalized-case loading through official evaluation and result serialization,
+with seven seconds reserved for evaluation and one second for finalization.
+
+For the 8,300-bus path, `--evaluation-processes` invokes the unchanged case
+evaluation through Microsoft MPI.  The vendor MPI implementation writes the
+correct per-case detail files and recomputes the top-level objective and
+infeasibility from them, but its serial-only `obj_cumulative`,
+`infeas_cumulative`, `obj_all_cases`, and `infeas_all_cases` accumulators are
+stale.  The runner therefore refuses pre-existing evaluator artifacts, requires
+exactly one detail for the base case and every source contingency, checks every
+detail's objective and infeasibility, verifies the aggregate arithmetic, archives the
+raw MPI summary, and reconstructs those bookkeeping fields.  A missing,
+extra, malformed, non-finite, or infeasible detail fails the run.

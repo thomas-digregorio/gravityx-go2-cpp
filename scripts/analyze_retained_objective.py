@@ -98,7 +98,13 @@ def _max(records: Iterable[dict[str, float]], key: str) -> float:
 def _ordered_components(
     base: dict[str, float], contingencies: list[dict[str, float]]
 ) -> list[str]:
-    keys = {
+    available = {
+        key
+        for record in [base, *contingencies]
+        for key in record
+        if key.startswith("total_")
+    }
+    nonzero = {
         key
         for record in [base, *contingencies]
         for key, value in record.items()
@@ -121,7 +127,9 @@ def _ordered_components(
         "total_xfmr_limit_cost",
         "total_xfmr_switch_cost",
     ]
-    return [key for key in preferred if key in keys] + sorted(keys - set(preferred))
+    return [key for key in preferred if key in available] + sorted(
+        nonzero - set(preferred)
+    )
 
 
 def _source_state_summary(

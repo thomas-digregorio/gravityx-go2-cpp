@@ -86,6 +86,18 @@ class RetainedObjectiveAnalysisTests(unittest.TestCase):
             self.assertEqual(report["contingency_count"], 2)
             self.assertEqual(report["base_detail_copy_count"], 2)
             self.assertEqual(report["state"]["committed_unit_count"], 1)
+            self.assertAlmostEqual(
+                report["components"]["total_gen_on_cost"]["aggregate"],
+                2.0,
+            )
+            self.assertAlmostEqual(
+                report["components"]["total_gen_su_cost"]["aggregate"],
+                0.0,
+            )
+            self.assertAlmostEqual(
+                report["components"]["total_gen_sd_cost"]["aggregate"],
+                0.0,
+            )
 
     def test_rejects_incomplete_contingency_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:

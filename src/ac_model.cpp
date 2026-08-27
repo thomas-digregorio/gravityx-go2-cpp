@@ -476,23 +476,38 @@ void AcModel::build_variables() {
     }
     demand_ = add_bounded_variable(model_, "demand_factor", demand_lower, demand_upper);
 
-    std::vector<double> flow_lower(nl), flow_upper(nl), slack_lower(nl, 0.0), slack_upper(nl, data_.sm_vio_limit);
+    std::vector<double> pf_lower(nl), pf_upper(nl);
+    std::vector<double> qf_lower(nl), qf_upper(nl);
+    std::vector<double> pt_lower(nl), pt_upper(nl);
+    std::vector<double> qt_lower(nl), qt_upper(nl);
+    std::vector<double> slack_lower(nl, 0.0);
+    std::vector<double> slack_upper(nl, data_.sm_vio_limit);
     for (std::size_t i = 0; i < nl; ++i) {
         const bool outaged = !reusable_contingencies_ && contingency_ &&
             contingency_->outaged_branch == static_cast<int>(i);
         const bool unavailable = data_.branches[i].status == 0 || outaged;
         const double rating = mode_ == ModelMode::ContingencySoft
             ? data_.branches[i].rate_c : data_.branches[i].rate_a;
-        flow_lower[i] = unavailable ? 0.0 : -rating;
-        flow_upper[i] = unavailable ? 0.0 : rating;
+        const double from_component_bound = unavailable
+            ? 0.0
+            : branch_terminal_component_bound(
+                data_, data_.branches[i], rating, true);
+        const double to_component_bound = unavailable
+            ? 0.0
+            : branch_terminal_component_bound(
+                data_, data_.branches[i], rating, false);
+        pf_lower[i] = qf_lower[i] = -from_component_bound;
+        pf_upper[i] = qf_upper[i] = from_component_bound;
+        pt_lower[i] = qt_lower[i] = -to_component_bound;
+        pt_upper[i] = qt_upper[i] = to_component_bound;
         if (unavailable) {
             slack_upper[i] = 0.0;
         }
     }
-    pf_ = add_bounded_variable(model_, "pf", flow_lower, flow_upper);
-    qf_ = add_bounded_variable(model_, "qf", flow_lower, flow_upper);
-    pt_ = add_bounded_variable(model_, "pt", flow_lower, flow_upper);
-    qt_ = add_bounded_variable(model_, "qt", flow_lower, flow_upper);
+    pf_ = add_bounded_variable(model_, "pf", pf_lower, pf_upper);
+    qf_ = add_bounded_variable(model_, "qf", qf_lower, qf_upper);
+    pt_ = add_bounded_variable(model_, "pt", pt_lower, pt_upper);
+    qt_ = add_bounded_variable(model_, "qt", qt_lower, qt_upper);
     sm_slack_ = add_bounded_variable(model_, "sm_slack", slack_lower, slack_upper);
 
     if (mode_ != ModelMode::UnitCommitmentRelaxation) {
@@ -984,12 +999,20 @@ void AcModel::set_contingency(const ContingencyContext& contingency) {
     initialize_source_point();
 }
 
-SolveResult AcModel::solve(int print_level, double tolerance) {
+SolveResult AcModel::solve(
+    int print_level,
+    double tolerance,
+    double max_cpu_seconds) {
     const auto start = std::chrono::steady_clock::now();
+    if (max_cpu_seconds == 0.0 || !std::isfinite(max_cpu_seconds)) {
+        throw std::runtime_error(
+            "Ipopt CPU limit must be negative (disabled) or finite and positive");
+    }
+    const bool bounded_solve = max_cpu_seconds > 0.0;
     int status = -1;
     int iterations = -1;
     const bool reoptimization = reusable_contingencies_ && resident_ipopt_solved_;
-    if (reusable_contingencies_) {
+    if (reusable_contingencies_ || bounded_solve) {
         if (Ipopt::IsNull(resident_ipopt_)) {
             resident_ipopt_ = IpoptApplicationFactory();
             resident_ipopt_->RethrowNonIpoptException(true);
@@ -998,6 +1021,10 @@ SolveResult AcModel::solve(int print_level, double tolerance) {
             resident_ipopt_->Options()->SetStringValue("mehrotra_algorithm", "no");
             resident_ipopt_->Options()->SetNumericValue("tol", tolerance);
             resident_ipopt_->Options()->SetIntegerValue("print_level", print_level);
+            if (bounded_solve) {
+                resident_ipopt_->Options()->SetNumericValue(
+                    "max_cpu_time", max_cpu_seconds);
+            }
             if (acceptable_termination_) {
                 resident_ipopt_->Options()->SetNumericValue("acceptable_tol", 1e-3);
                 resident_ipopt_->Options()->SetIntegerValue("acceptable_iter", 3);
@@ -1018,6 +1045,10 @@ SolveResult AcModel::solve(int print_level, double tolerance) {
         } else {
             resident_ipopt_->Options()->SetNumericValue("tol", tolerance);
             resident_ipopt_->Options()->SetIntegerValue("print_level", print_level);
+            if (bounded_solve) {
+                resident_ipopt_->Options()->SetNumericValue(
+                    "max_cpu_time", max_cpu_seconds);
+            }
             resident_ipopt_->Options()->SetNumericValue("mu_init", 0.5);
             resident_ipopt_->Options()->SetStringValue("warm_start_init_point", "yes");
             resident_ipopt_->Options()->SetStringValue("warm_start_same_structure", "no");

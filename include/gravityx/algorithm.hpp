@@ -52,6 +52,14 @@ bool validated_candidate_is_feasible(
     const ValidationReport& validation,
     double tolerance);
 
+bool verified_economic_candidate_improves_incumbent(
+    const SolveResult& incumbent,
+    const ValidationReport& incumbent_validation,
+    const SolveResult& candidate,
+    const ValidationReport& candidate_validation,
+    double validation_tolerance,
+    double objective_tolerance = 1e-9);
+
 IbrResult run_iterative_batch_rounding(const CaseData& data, const IbrOptions& options = {});
 
 }  // namespace gravityx

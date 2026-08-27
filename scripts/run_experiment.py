@@ -2795,6 +2795,9 @@ def main() -> int:
     parser.add_argument("--wsl-stage-worker-inputs", action="store_true")
     parser.add_argument("--source-status-base", action="store_true")
     parser.add_argument("--validated-source-base", action="store_true")
+    parser.add_argument(
+        "--base-economic-refinement-seconds", type=float, default=0.0
+    )
     parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
     parser.add_argument(
@@ -2874,6 +2877,17 @@ def main() -> int:
     if args.robust_contingency_base and not args.validated_source_base:
         parser.error(
             "--robust-contingency-base requires --validated-source-base"
+        )
+    if (not math.isfinite(args.base_economic_refinement_seconds) or
+            args.base_economic_refinement_seconds < 0.0):
+        parser.error(
+            "--base-economic-refinement-seconds must be finite and nonnegative"
+        )
+    if (args.base_economic_refinement_seconds > 0.0 and
+            not args.validated_source_base):
+        parser.error(
+            "--base-economic-refinement-seconds requires "
+            "--validated-source-base"
         )
     if (args.linearized_contingency_only and
             not args.linearized_contingency_fallback):
@@ -3121,6 +3135,9 @@ def main() -> int:
         "wsl_stage_worker_inputs": args.wsl_stage_worker_inputs,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
+        "base_economic_refinement_seconds": (
+            args.base_economic_refinement_seconds
+        ),
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (
@@ -3226,6 +3243,11 @@ def main() -> int:
             ]
             if args.robust_contingency_base:
                 base_arguments.append("robust-contingency-seed")
+            if args.base_economic_refinement_seconds > 0.0:
+                base_arguments.append(
+                    "economic-refinement-seconds="
+                    f"{args.base_economic_refinement_seconds:.17g}"
+                )
         else:
             base_arguments = [
                 "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
@@ -4599,6 +4621,9 @@ def main() -> int:
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,
+        "base_economic_refinement_seconds": (
+            args.base_economic_refinement_seconds
+        ),
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (

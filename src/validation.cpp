@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -399,16 +400,25 @@ static ValidationReport validate_state_impl(
         const bool unavailable = branch.status == 0 || outaged;
         const double rating = mode == ModelMode::ContingencySoft
             ? branch.rate_c : branch.rate_a;
-        const double flow_lower = unavailable ? 0.0 : -rating;
-        const double flow_upper = unavailable ? 0.0 : rating;
-        for (const auto& item : std::array<std::pair<const char*, double>, 4>{{
-                 {"pf", state.pf[i]}, {"qf", state.qf[i]},
-                 {"pt", state.pt[i]}, {"qt", state.qt[i]}}}) {
+        const double from_component_bound = unavailable
+            ? 0.0
+            : branch_terminal_component_bound(data, branch, rating, true);
+        const double to_component_bound = unavailable
+            ? 0.0
+            : branch_terminal_component_bound(data, branch, rating, false);
+        for (const auto& item :
+             std::array<std::tuple<const char*, double, double>, 4>{{
+                 {"pf", state.pf[i], from_component_bound},
+                 {"qf", state.qf[i], from_component_bound},
+                 {"pt", state.pt[i], to_component_bound},
+                 {"qt", state.qt[i], to_component_bound}}}) {
             update_category(report, report.max_variable_bound_violation,
-                bound_violation(item.second, flow_lower, flow_upper),
+                bound_violation(
+                    std::get<1>(item), -std::get<2>(item), std::get<2>(item)),
                 "variable_bound", capture_identity,
                 [&] {
-                    return "branch:" + branch.source_key + ":" + item.first;
+                    return "branch:" + branch.source_key + ":" +
+                        std::get<0>(item);
                 });
         }
         update_category(report, report.max_variable_bound_violation,

@@ -91,7 +91,10 @@ public:
         bool reusable_contingencies = false,
         bool acceptable_termination = false);
 
-    SolveResult solve(int print_level = 0, double tolerance = 1e-6);
+    SolveResult solve(
+        int print_level = 0,
+        double tolerance = 1e-6,
+        double max_cpu_seconds = -1.0);
     void initialize_from(const AcState& state);
     void set_contingency(const ContingencyContext& contingency);
     void set_commitment_bound(int generator, int status);

@@ -2668,6 +2668,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     const int outaged_branch = !base_mode &&
         contingency->type == ContingencyType::Branch
         ? contingency->component : -1;
+    const auto maximum_thermal_ratio = [&](const AcState& state) {
+        double maximum = 1.0;
+        for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
+            const double rating = branch_rating(i);
+            if (i == outaged_branch || data_.branches[i].status == 0 ||
+                rating <= 1e-12) {
+                continue;
+            }
+            const auto& branch = data_.branches[i];
+            const double slack = std::clamp(
+                state.sm_slack[i], 0.0, data_.sm_vio_limit);
+            const double from_scale = branch.transformer
+                ? 1.0 + slack : state.vm[branch.from] + slack;
+            const double to_scale = branch.transformer
+                ? 1.0 + slack : state.vm[branch.to] + slack;
+            const double from_limit = rating * std::max(1e-12, from_scale);
+            const double to_limit = rating * std::max(1e-12, to_scale);
+            maximum = std::max({
+                maximum,
+                std::hypot(state.pf[i], state.qf[i]) / from_limit,
+                std::hypot(state.pt[i], state.qt[i]) / to_limit,
+            });
+        }
+        return maximum;
+    };
     const AcState& initial_state = supplied_initial_state
         ? *supplied_initial_state : base_state_;
     if (initial_state.vm.size() != data_.buses.size() ||
@@ -3578,26 +3603,18 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     const auto consider_terminal = [&]
                         (double active_flow, double reactive_flow,
                          double voltage, bool from_side) {
-                        double active_limit = rating;
-                        double reactive_limit = rating;
-                        if (apparent_slack_dominant) {
-                            const double allowed_magnitude = rating *
-                                (branch.transformer
-                                     ? 1.0 + data_.sm_vio_limit
-                                     : voltage + data_.sm_vio_limit);
-                            active_limit = std::min(
-                                rating,
-                                std::sqrt(std::max(
-                                    0.0,
-                                    allowed_magnitude * allowed_magnitude -
-                                        reactive_flow * reactive_flow)));
-                            reactive_limit = std::min(
-                                rating,
-                                std::sqrt(std::max(
-                                    0.0,
-                                    allowed_magnitude * allowed_magnitude -
-                                        active_flow * active_flow)));
-                        }
+                        const double allowed_magnitude = rating *
+                            (branch.transformer
+                                 ? 1.0 + data_.sm_vio_limit
+                                 : voltage + data_.sm_vio_limit);
+                        const double active_limit = std::sqrt(std::max(
+                            0.0,
+                            allowed_magnitude * allowed_magnitude -
+                                reactive_flow * reactive_flow));
+                        const double reactive_limit = std::sqrt(std::max(
+                            0.0,
+                            allowed_magnitude * allowed_magnitude -
+                                active_flow * active_flow));
                         const double active_excess =
                             std::abs(active_flow) - active_limit;
                         const double reactive_excess =
@@ -3637,22 +3654,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 std::max(0.0, lower - value),
                                 std::max(0.0, value - upper));
                         };
-                        priority_residual = std::max({
-                            bound_excess(
-                                predictor_state.pf[branch_index],
-                                -rating, rating),
-                            bound_excess(
-                                predictor_state.qf[branch_index],
-                                -rating, rating),
-                            bound_excess(
-                                predictor_state.pt[branch_index],
-                                -rating, rating),
-                            bound_excess(
-                                predictor_state.qt[branch_index],
-                                -rating, rating),
-                            bound_excess(
-                                predictor_state.sm_slack[branch_index],
-                                0.0, data_.sm_vio_limit)});
+                        priority_residual = bound_excess(
+                            predictor_state.sm_slack[branch_index],
+                            0.0, data_.sm_vio_limit);
                     } else if (predictor_validation.worst_category ==
                                    "flow_limit") {
                         const double from_squared =
@@ -6131,26 +6135,13 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
              (reactive_validation.worst_category == "variable_bound" ||
               reactive_validation.worst_category == "flow_limit");
              ++scaling_pass) {
-            double maximum_component_ratio = 1.0;
-            for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
-                const double rating = branch_rating(i);
-                if (i == outaged_branch || data_.branches[i].status == 0 ||
-                    rating <= 1e-12) {
-                    continue;
-                }
-                maximum_component_ratio = std::max(
-                    maximum_component_ratio,
-                    std::max({std::abs(reactive_state.pf[i]),
-                              std::abs(reactive_state.qf[i]),
-                              std::abs(reactive_state.pt[i]),
-                              std::abs(reactive_state.qt[i])})
-                        / rating);
-            }
-            if (maximum_component_ratio <= 1.0 + 1e-12) {
+            const double thermal_ratio =
+                maximum_thermal_ratio(reactive_state);
+            if (thermal_ratio <= 1.0 + 1e-12) {
                 break;
             }
             const double scale = std::min(
-                0.9995, 0.9999 / std::sqrt(maximum_component_ratio));
+                0.9995, 0.9999 / std::sqrt(thermal_ratio));
             vm = reactive_state.vm;
             va = reactive_state.va;
             pg = reactive_state.pg;
@@ -6731,22 +6722,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             output.validation.worst_category != "flow_limit") {
             break;
         }
-        double maximum_component_ratio = 1.0;
-        for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
-            const double rating = branch_rating(i);
-            if (i == outaged_branch || data_.branches[i].status == 0 ||
-                rating <= 1e-12) {
-                continue;
-            }
-            maximum_component_ratio = std::max(maximum_component_ratio,
-                std::max({std::abs(output.solve.state.pf[i]),
-                          std::abs(output.solve.state.qf[i]),
-                          std::abs(output.solve.state.pt[i]),
-                          std::abs(output.solve.state.qt[i])})
-                    / rating);
-        }
+        const double thermal_ratio =
+            maximum_thermal_ratio(output.solve.state);
         const double scale = std::min(0.9995,
-            0.9999 / std::sqrt(maximum_component_ratio));
+            0.9999 / std::sqrt(thermal_ratio));
         bool changed = false;
         for (int bus = 0; bus < nb; ++bus) {
             const double reduced = std::max(
@@ -6967,20 +6946,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 break;
             }
 
-            double maximum_component_ratio = 1.0;
-            for (int i = 0; i < static_cast<int>(data_.branches.size()); ++i) {
-                const double rating = branch_rating(i);
-                if (i == outaged_branch || data_.branches[i].status == 0 ||
-                    rating <= 1e-12) {
-                    continue;
-                }
-                maximum_component_ratio = std::max(maximum_component_ratio,
-                    std::max({std::abs(state.pf[i]), std::abs(state.qf[i]),
-                              std::abs(state.pt[i]), std::abs(state.qt[i])})
-                        / rating);
-            }
+            const double thermal_ratio = maximum_thermal_ratio(state);
             const double scale = std::min(
-                0.9995, 0.9999 / std::sqrt(maximum_component_ratio));
+                0.9995, 0.9999 / std::sqrt(thermal_ratio));
             bool changed = false;
             for (int bus = 0; bus < nb; ++bus) {
                 const double reduced = std::max(

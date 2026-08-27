@@ -722,16 +722,26 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         const std::array<const AffineFlow*, 4> flows{
             &linearized[i].pf, &linearized[i].qf,
             &linearized[i].pt, &linearized[i].qt};
-        for (const auto* flow : flows) {
+        const double from_component_bound = branch_terminal_component_bound(
+            data, branch, rating, true);
+        const double to_component_bound = branch_terminal_component_bound(
+            data, branch, rating, false);
+        const std::array<double, 4> component_bounds{
+            from_component_bound, from_component_bound,
+            to_component_bound, to_component_bound};
+        for (std::size_t side = 0; side < flows.size(); ++side) {
+            const auto* flow = flows[side];
+            const double component_bound = component_bounds[side];
             if (lightweight_large_seed) {
                 const auto [minimum, maximum] = affine_range(*flow, branch);
-                if (minimum >= -rating && maximum <= rating) {
+                if (minimum >= -component_bound &&
+                    maximum <= component_bound) {
                     continue;
                 }
             }
             SparseRow row;
-            row.lower = -rating - flow->constant;
-            row.upper = rating - flow->constant;
+            row.lower = -component_bound - flow->constant;
+            row.upper = component_bound - flow->constant;
             append(row, vm_offset + branch.from, flow->vm_from);
             append(row, vm_offset + branch.to, flow->vm_to);
             append(row, va_offset + branch.from, flow->va_from);

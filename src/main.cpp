@@ -525,6 +525,38 @@ int run_component_tests() {
         throw std::runtime_error(
             "component test failed: validated nonconverged candidate was rejected");
     }
+    const auto serialized_nonconverged =
+        gravityx::solve_result_to_json(nonconverged_feasible, false);
+    if (serialized_nonconverged.at("status").get<int>() != -2 ||
+        serialized_nonconverged.at("objective").get<double>() != 42.0) {
+        throw std::runtime_error(
+            "component test failed: solve status serialization");
+    }
+    gravityx::SolveResult verified_incumbent = nonconverged_feasible;
+    verified_incumbent.objective = 10.0;
+    gravityx::SolveResult economic_candidate = verified_incumbent;
+    economic_candidate.objective = 20.0;
+    gravityx::ValidationReport insecure_economic_validation;
+    insecure_economic_validation.max_residual = 1e-4;
+    if (gravityx::verified_economic_candidate_improves_incumbent(
+            verified_incumbent, feasible_validation,
+            economic_candidate, insecure_economic_validation, 1e-5)) {
+        throw std::runtime_error(
+            "component test failed: insecure economic candidate replaced incumbent");
+    }
+    if (!gravityx::verified_economic_candidate_improves_incumbent(
+            verified_incumbent, feasible_validation,
+            economic_candidate, feasible_validation, 1e-5)) {
+        throw std::runtime_error(
+            "component test failed: secure improving economic candidate rejected");
+    }
+    economic_candidate.objective = 9.0;
+    if (gravityx::verified_economic_candidate_improves_incumbent(
+            verified_incumbent, feasible_validation,
+            economic_candidate, feasible_validation, 1e-5)) {
+        throw std::runtime_error(
+            "component test failed: worse economic candidate replaced incumbent");
+    }
     feasible_validation.max_residual = 1e-4;
     if (gravityx::validated_candidate_is_feasible(
             nonconverged_feasible, feasible_validation, 1e-5)) {
@@ -933,6 +965,67 @@ int run_parallel_circuit_regression() {
     if ((solve.status != 0 && solve.status != 1) || !std::isfinite(solve.objective) ||
         validation.max_residual > 1e-5) {
         throw std::runtime_error("parallel-circuit symbolic-DAG regression failed");
+    }
+    {
+        auto official_soft_limit_data = data;
+        auto official_soft_limit_state = solve.state;
+        official_soft_limit_data.sm_vio_limit = 1.0;
+        int selected_branch = -1;
+        double selected_rating = 0.0;
+        for (int i = 0;
+             i < static_cast<int>(official_soft_limit_data.branches.size());
+             ++i) {
+            const auto& branch = official_soft_limit_data.branches[i];
+            if (branch.status == 0) {
+                continue;
+            }
+            const double from_magnitude = std::hypot(
+                solve.state.pf[i], solve.state.qf[i]);
+            const double to_magnitude = std::hypot(
+                solve.state.pt[i], solve.state.qt[i]);
+            if (std::max(from_magnitude, to_magnitude) <= 1e-8) {
+                continue;
+            }
+            const double from_scale = branch.transformer
+                ? 1.0 : solve.state.vm[branch.from];
+            const double to_scale = branch.transformer
+                ? 1.0 : solve.state.vm[branch.to];
+            const double rating = std::max(
+                from_magnitude / (from_scale + 0.75),
+                to_magnitude / (to_scale + 0.75));
+            const double maximum_component = std::max({
+                std::abs(solve.state.pf[i]), std::abs(solve.state.qf[i]),
+                std::abs(solve.state.pt[i]), std::abs(solve.state.qt[i]),
+            });
+            if (maximum_component > rating + 1e-8) {
+                selected_branch = i;
+                selected_rating = rating;
+                break;
+            }
+        }
+        if (selected_branch < 0) {
+            throw std::runtime_error(
+                "component test failed: no official soft-flow fixture found");
+        }
+        official_soft_limit_data.branches[selected_branch].rate_a =
+            selected_rating;
+        gravityx::rebuild_base_state_derived_fields(
+            official_soft_limit_data, {1}, official_soft_limit_state);
+        const auto official_soft_limit_validation = gravityx::validate_state(
+            official_soft_limit_data, gravityx::ModelMode::BaseSoft,
+            official_soft_limit_state, {1});
+        const double maximum_component = std::max({
+            std::abs(official_soft_limit_state.pf[selected_branch]),
+            std::abs(official_soft_limit_state.qf[selected_branch]),
+            std::abs(official_soft_limit_state.pt[selected_branch]),
+            std::abs(official_soft_limit_state.qt[selected_branch]),
+        });
+        if (maximum_component <= selected_rating ||
+            official_soft_limit_state.sm_slack[selected_branch] <= 0.0 ||
+            official_soft_limit_validation.max_residual > 1e-5) {
+            throw std::runtime_error(
+                "component test failed: official apparent-current slack rejected");
+        }
     }
     gravityx::Contingency branch_contingency;
     branch_contingency.label = "parallel-outage";
@@ -1512,7 +1605,8 @@ int run_validated_source_base_json(
     const std::string& path,
     const std::string& output_path,
     bool allow_exact_fallback = true,
-    bool allow_large_base_newton_restart = true) {
+    bool allow_large_base_newton_restart = true,
+    double economic_refinement_seconds = 0.0) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto command_start = std::chrono::steady_clock::now();
@@ -1558,6 +1652,7 @@ int run_validated_source_base_json(
     nlohmann::json repair_json = nlohmann::json::array();
     nlohmann::json linearized_repair_json = nlohmann::json::array();
     nlohmann::json exact_repair_json = nullptr;
+    nlohmann::json economic_refinement_json = nullptr;
     bool base_optimization_performed = false;
     std::string base_method = "independently_validated_source_operating_point";
     if (!success) {
@@ -1775,12 +1870,6 @@ int run_validated_source_base_json(
                         continue;
                     }
                     const double rating = branch.rate_a;
-                    const double box_violation = std::max({
-                        std::abs(state.pf[i]) - rating,
-                        std::abs(state.qf[i]) - rating,
-                        std::abs(state.pt[i]) - rating,
-                        std::abs(state.qt[i]) - rating,
-                    });
                     const double source_delta =
                         data.buses[branch.from].va_start -
                         data.buses[branch.to].va_start;
@@ -1805,8 +1894,7 @@ int run_validated_source_base_json(
                         state.pt[i] * state.pt[i] +
                             state.qt[i] * state.qt[i] -
                             rating * rating * to_scale * to_scale);
-                    if (std::max({box_violation, angle_violation,
-                                  apparent_violation}) <=
+                    if (std::max(angle_violation, apparent_violation) <=
                             kSecurityCollectionTolerance ||
                         dynamic_security_selected[i]) {
                         continue;
@@ -1817,7 +1905,6 @@ int run_validated_source_base_json(
                     added.push_back({
                         {"component_position", static_cast<int>(i)},
                         {"source_key", branch.source_key},
-                        {"box_violation", std::max(0.0, box_violation)},
                         {"angle_violation", std::max(0.0, angle_violation)},
                         {"apparent_flow_violation",
                          std::max(0.0, apparent_violation)},
@@ -2258,6 +2345,66 @@ int run_validated_source_base_json(
             {"wall_seconds", exact_total_seconds},
         });
     }
+    if (success && economic_refinement_seconds > 0.0) {
+        const auto incumbent_solve = selected_solve;
+        const auto incumbent_validation = selected_validation;
+        const auto economic_start = std::chrono::steady_clock::now();
+        nlohmann::json attempt = {
+            {"requested_total_seconds", economic_refinement_seconds},
+            {"incumbent_objective", incumbent_solve.objective},
+            {"incumbent_validation", incumbent_validation.to_json()},
+            {"accepted", false},
+        };
+        log_base_phase("economic_refinement_start", attempt);
+        try {
+            gravityx::AcModel economic_model(
+                data, gravityx::ModelMode::BaseSoft, commitment);
+            economic_model.initialize_from(incumbent_solve.state);
+            const double construction_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - economic_start).count();
+            attempt["model_construction_seconds"] = construction_seconds;
+            const double remaining_seconds =
+                economic_refinement_seconds - construction_seconds;
+            if (remaining_seconds <= 0.0) {
+                attempt["status"] = "model_construction_exhausted_budget";
+            } else {
+                base_optimization_performed = true;
+                const auto candidate = economic_model.solve(
+                    0, 1e-6, remaining_seconds);
+                const auto candidate_validation = gravityx::validate_state(
+                    data, gravityx::ModelMode::BaseSoft,
+                    candidate.state, commitment);
+                const bool accepted =
+                    gravityx::verified_economic_candidate_improves_incumbent(
+                        incumbent_solve, incumbent_validation,
+                        candidate, candidate_validation, 1e-5);
+                attempt["status"] = "solve_completed";
+                attempt["accepted"] = accepted;
+                attempt["solve"] =
+                    gravityx::solve_result_to_json(candidate, false);
+                attempt["validation"] = candidate_validation.to_json();
+                attempt["objective_improvement"] =
+                    candidate.objective - incumbent_solve.objective;
+                if (accepted) {
+                    selected_solve = candidate;
+                    selected_validation = candidate_validation;
+                    base_method =
+                        "fixed_commitment_ipopt_market_surplus_refinement";
+                }
+            }
+        } catch (const std::exception& error) {
+            attempt["status"] = "exception_preserved_verified_incumbent";
+            attempt["error"] = error.what();
+        }
+        const double economic_total_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - economic_start).count();
+        attempt["total_wall_seconds"] = economic_total_seconds;
+        attempt["selected_objective"] = selected_solve.objective;
+        economic_refinement_json = std::move(attempt);
+        wall_seconds += economic_total_seconds;
+        log_base_phase(
+            "economic_refinement_complete", economic_refinement_json);
+    }
     gravityx::IbrResult result;
     result.success = success;
     result.wall_seconds = wall_seconds;
@@ -2273,6 +2420,7 @@ int run_validated_source_base_json(
     output["source_repair"] = repair_json;
     output["linearized_repair"] = linearized_repair_json;
     output["exact_repair"] = exact_repair_json;
+    output["economic_refinement"] = economic_refinement_json;
     write_json_file(output_path, output);
     std::cout << nlohmann::json({
         {"output", output_path},
@@ -3068,12 +3216,6 @@ bool solve_loaded_contingency(
                     }
                     const auto& branch = data.branches[i];
                     const double rating = branch.rate_c;
-                    const double box_violation = std::max({
-                        std::abs(state.pf[i]) - rating,
-                        std::abs(state.qf[i]) - rating,
-                        std::abs(state.pt[i]) - rating,
-                        std::abs(state.qt[i]) - rating,
-                    });
                     const double source_delta =
                         base.state.va[branch.from] - base.state.va[branch.to];
                     double angle_violation = 0.0;
@@ -3097,8 +3239,7 @@ bool solve_loaded_contingency(
                         state.pt[i] * state.pt[i] +
                             state.qt[i] * state.qt[i] -
                             rating * rating * to_scale * to_scale);
-                    if (std::max({box_violation, angle_violation,
-                                  apparent_violation}) <=
+                    if (std::max(angle_violation, apparent_violation) <=
                         kSecurityCollectionTolerance ||
                         dynamic_security_selected[i]) {
                         continue;
@@ -3109,7 +3250,6 @@ bool solve_loaded_contingency(
                     added.push_back({
                         {"component_position", static_cast<int>(i)},
                         {"source_key", branch.source_key},
-                        {"box_violation", std::max(0.0, box_violation)},
                         {"angle_violation", std::max(0.0, angle_violation)},
                         {"apparent_flow_violation",
                          std::max(0.0, apparent_violation)},
@@ -3984,16 +4124,28 @@ int main(int argc, char** argv) {
             }
             return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
-        if ((argc >= 4 && argc <= 6) &&
+        if ((argc >= 4 && argc <= 7) &&
             std::string(argv[1]) == "validated-source-base-json") {
             bool allow_exact_fallback = true;
             bool allow_large_base_newton_restart = true;
+            double economic_refinement_seconds = 0.0;
             for (int i = 4; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "fast-only") {
                     allow_exact_fallback = false;
                 } else if (option == "robust-contingency-seed") {
                     allow_large_base_newton_restart = false;
+                } else if (option.rfind(
+                               "economic-refinement-seconds=", 0) == 0) {
+                    economic_refinement_seconds = std::stod(
+                        option.substr(
+                            std::string(
+                                "economic-refinement-seconds=").size()));
+                    if (!std::isfinite(economic_refinement_seconds) ||
+                        economic_refinement_seconds <= 0.0) {
+                        throw std::runtime_error(
+                            "economic refinement seconds must be finite and positive");
+                    }
                 } else {
                     throw std::runtime_error(
                         "unknown validated-source-base-json option: " + option);
@@ -4001,7 +4153,8 @@ int main(int argc, char** argv) {
             }
             return run_validated_source_base_json(
                 argv[2], argv[3], allow_exact_fallback,
-                allow_large_base_newton_restart);
+                allow_large_base_newton_restart,
+                economic_refinement_seconds);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
@@ -4062,7 +4215,7 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 solve-relax CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
-                  << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only] [robust-contingency-seed]\n"
+                  << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only] [robust-contingency-seed] [economic-refinement-seconds=N]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 screen-all-contingencies CASE.json BASE.json OUTPUT.json\n"
                   << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"

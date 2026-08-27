@@ -38,6 +38,21 @@ bool validated_candidate_is_feasible(
         validation.max_residual <= tolerance;
 }
 
+bool verified_economic_candidate_improves_incumbent(
+    const SolveResult& incumbent,
+    const ValidationReport& incumbent_validation,
+    const SolveResult& candidate,
+    const ValidationReport& candidate_validation,
+    double validation_tolerance,
+    double objective_tolerance) {
+    return objective_tolerance >= 0.0 &&
+        validated_candidate_is_feasible(
+            incumbent, incumbent_validation, validation_tolerance) &&
+        validated_candidate_is_feasible(
+            candidate, candidate_validation, validation_tolerance) &&
+        candidate.objective > incumbent.objective + objective_tolerance;
+}
+
 nlohmann::json IbrRound::to_json() const {
     return {
         {"round", round},

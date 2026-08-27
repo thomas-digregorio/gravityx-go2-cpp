@@ -183,4 +183,14 @@ std::vector<PwlPoint> active_pwl_points(
     double pmax,
     double tolerance = 1e-2);
 
+// A redundant scalar bound implied by the official GO2 apparent-current
+// constraint and the source voltage/soft-margin bounds.  It is intentionally
+// wider than RATE_A/RATE_C: an individual P or Q component may exceed the
+// rating while the permitted apparent-current slack remains feasible.
+double branch_terminal_component_bound(
+    const CaseData& data,
+    const Branch& branch,
+    double rating,
+    bool from_terminal);
+
 }  // namespace gravityx

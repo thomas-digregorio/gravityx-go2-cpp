@@ -375,4 +375,19 @@ std::vector<PwlPoint> active_pwl_points(
     return active;
 }
 
+double branch_terminal_component_bound(
+    const CaseData& data,
+    const Branch& branch,
+    double rating,
+    bool from_terminal) {
+    if (!std::isfinite(rating) || rating < 0.0) {
+        throw std::runtime_error(
+            "branch terminal component bound requires a finite nonnegative rating");
+    }
+    const double voltage_upper = branch.transformer
+        ? 1.0
+        : data.buses[from_terminal ? branch.from : branch.to].vmax;
+    return rating * (voltage_upper + data.sm_vio_limit);
+}
+
 }  // namespace gravityx

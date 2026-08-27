@@ -24,6 +24,12 @@ struct LinearizedAcSeedResult {
     bool primal_start_attempted{};
     bool primal_start_accepted{};
     int primal_start_status{};
+    bool primal_start_finite{true};
+    int primal_start_nonfinite_count{};
+    double primal_start_maximum_column_violation{};
+    int primal_start_worst_column{-1};
+    double primal_start_maximum_row_violation{};
+    int primal_start_worst_row{-1};
     bool primal_basis_attempted{};
     bool primal_basis_accepted{};
     int primal_basis_status{};

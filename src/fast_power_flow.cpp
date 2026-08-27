@@ -3907,7 +3907,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                  .max_economic_linearized_phase_two_rounds;
                              ++phase_two_round) {
                             const auto phase_two = solve_linearized_ac_seed(
-                                data_, polished_state, commitment_, 0.499999,
+                                data_, polished_state, commitment_, 0.5,
                                 direct_context, false, true,
                                 options_.economic_linearized_phase_two_seconds,
                                 true, false, {}, false, 0.01, 0.05, true);

@@ -966,12 +966,17 @@ int run_parallel_circuit_regression() {
     }
     const auto compact_economic_linear_seed =
         gravityx::solve_linearized_ac_seed(
-            data, source_base.solve.state, {1}, 0.499999, std::nullopt,
+            data, source_base.solve.state, {1}, 0.5, std::nullopt,
             false, true, 10.0, true, false, {}, false,
             kTestVoltageTrustRadius, kTestAngleTrustRadius, true);
     if (!compact_economic_linear_seed.success ||
         !compact_economic_linear_seed.compact_economic_objective ||
         !compact_economic_linear_seed.primal_start_accepted ||
+        !compact_economic_linear_seed.primal_start_finite ||
+        compact_economic_linear_seed
+                .primal_start_maximum_column_violation > 1e-12 ||
+        compact_economic_linear_seed
+                .primal_start_maximum_row_violation > 1e-8 ||
         !compact_economic_linear_seed.primal_basis_attempted ||
         !compact_economic_linear_seed.primal_basis_accepted ||
         compact_economic_linear_seed.presolve_enabled ||
@@ -1546,7 +1551,7 @@ int run_parallel_circuit_regression() {
             true, false, 60.0, true, true, {1});
     const auto compact_economic_contingency_seed =
         gravityx::solve_linearized_ac_seed(
-            data, fast_result.solve.state, {1}, 0.499999, branch_context,
+            data, fast_result.solve.state, {1}, 0.5, branch_context,
             false, true, 10.0, true, false, {}, false,
             kTestVoltageTrustRadius, kTestAngleTrustRadius, true);
     if (!full_contingency_seed.success ||
@@ -1556,6 +1561,11 @@ int run_parallel_circuit_regression() {
         !compact_economic_contingency_seed.economic_objective ||
         !compact_economic_contingency_seed.compact_economic_objective ||
         !compact_economic_contingency_seed.primal_start_accepted ||
+        !compact_economic_contingency_seed.primal_start_finite ||
+        compact_economic_contingency_seed
+                .primal_start_maximum_column_violation > 1e-12 ||
+        compact_economic_contingency_seed
+                .primal_start_maximum_row_violation > 1e-8 ||
         !compact_economic_contingency_seed.primal_basis_accepted ||
         compact_economic_contingency_seed.presolve_enabled ||
         compact_economic_contingency_seed

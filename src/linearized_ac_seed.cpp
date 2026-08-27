@@ -330,6 +330,14 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"primal_start_attempted", primal_start_attempted},
         {"primal_start_accepted", primal_start_accepted},
         {"primal_start_status", primal_start_status},
+        {"primal_start_finite", primal_start_finite},
+        {"primal_start_nonfinite_count", primal_start_nonfinite_count},
+        {"primal_start_maximum_column_violation",
+         primal_start_maximum_column_violation},
+        {"primal_start_worst_column", primal_start_worst_column},
+        {"primal_start_maximum_row_violation",
+         primal_start_maximum_row_violation},
+        {"primal_start_worst_row", primal_start_worst_row},
         {"primal_basis_attempted", primal_basis_attempted},
         {"primal_basis_accepted", primal_basis_accepted},
         {"primal_basis_status", primal_basis_status},
@@ -439,8 +447,8 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         throw std::runtime_error(
             "linearized economic seed requires rebuilt branch-flow state");
     }
-    if (!(balance_slack_limit > 0.0 && balance_slack_limit < 0.5)) {
-        throw std::runtime_error("linearized AC balance slack must be in (0, 0.5)");
+    if (!(balance_slack_limit > 0.0 && balance_slack_limit <= 0.5)) {
+        throw std::runtime_error("linearized AC balance slack must be in (0, 0.5]");
     }
     if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
         throw std::runtime_error("linearized AC time limit must be positive");
@@ -1542,6 +1550,54 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     HighsStatus primal_start_status = HighsStatus::kOk;
     bool primal_basis_attempted = false;
     HighsStatus primal_basis_status = HighsStatus::kOk;
+    const auto audit_primal_start = [&](const std::vector<double>& start) {
+        output.primal_start_finite = true;
+        output.primal_start_nonfinite_count = 0;
+        output.primal_start_maximum_column_violation = 0.0;
+        output.primal_start_worst_column = -1;
+        output.primal_start_maximum_row_violation = 0.0;
+        output.primal_start_worst_row = -1;
+        for (int column = 0; column < column_count; ++column) {
+            const double value = start[column];
+            if (!std::isfinite(value)) {
+                output.primal_start_finite = false;
+                ++output.primal_start_nonfinite_count;
+                if (output.primal_start_worst_column < 0) {
+                    output.primal_start_worst_column = column;
+                }
+                continue;
+            }
+            const double violation = std::max({
+                lower[column] - value,
+                value - upper[column],
+                0.0,
+            });
+            if (violation > output.primal_start_maximum_column_violation) {
+                output.primal_start_maximum_column_violation = violation;
+                output.primal_start_worst_column = column;
+            }
+        }
+        if (!output.primal_start_finite) {
+            output.primal_start_maximum_row_violation = kHighsInf;
+            return;
+        }
+        for (int row_index = 0;
+             row_index < static_cast<int>(rows.size()); ++row_index) {
+            double activity = 0.0;
+            for (const auto& [column, coefficient] : rows[row_index].entries) {
+                activity += coefficient * start[column];
+            }
+            const double violation = std::max({
+                rows[row_index].lower - activity,
+                activity - rows[row_index].upper,
+                0.0,
+            });
+            if (violation > output.primal_start_maximum_row_violation) {
+                output.primal_start_maximum_row_violation = violation;
+                output.primal_start_worst_row = row_index;
+            }
+        }
+    };
     const char* elastic_start_override =
         std::getenv("GRAVITYX_ELASTIC_PHASE_ONE_START");
     const bool elastic_start_enabled =
@@ -1605,6 +1661,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         std::vector<HighsInt> start_indices(
             static_cast<std::size_t>(column_count));
         std::iota(start_indices.begin(), start_indices.end(), HighsInt{0});
+        audit_primal_start(primal_start);
         primal_start_status = highs.setSolution(
             static_cast<HighsInt>(column_count),
             start_indices.data(), primal_start.data());
@@ -1701,6 +1758,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         std::vector<HighsInt> start_indices(
             static_cast<std::size_t>(column_count));
         std::iota(start_indices.begin(), start_indices.end(), HighsInt{0});
+        audit_primal_start(primal_start);
         primal_start_status = highs.setSolution(
             static_cast<HighsInt>(column_count),
             start_indices.data(), primal_start.data());

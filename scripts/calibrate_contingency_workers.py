@@ -49,6 +49,7 @@ def run_trial(
     heavy_labels: set[str] | None = None,
     heavy_worker_count: int = 0,
     heavy_label_seconds: dict[str, float] | None = None,
+    economic_contingency_polish: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     if task_groups is None:
@@ -87,6 +88,8 @@ def run_trial(
             worker_arguments.append("fast-pf")
         if fast_only:
             worker_arguments.append("fast-only")
+        if economic_contingency_polish:
+            worker_arguments.append("economic-polish")
         if linearized_fallback:
             worker_arguments.append("linearized")
         command = cpp_command(
@@ -372,6 +375,9 @@ def main() -> int:
     parser.add_argument("--cooldown", type=float, default=30.0)
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--fast-only", action="store_true")
+    parser.add_argument(
+        "--economic-contingency-polish", action="store_true"
+    )
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
     parser.add_argument("--fast-screen-heavy-profile", type=Path)
@@ -392,6 +398,11 @@ def main() -> int:
         raise ValueError("worker counts must be positive")
     if args.fast_only and not args.fast_power_flow_screen:
         parser.error("--fast-only requires --fast-power-flow-screen")
+    if (args.economic_contingency_polish and
+            not args.fast_power_flow_screen):
+        parser.error(
+            "--economic-contingency-polish requires --fast-power-flow-screen"
+        )
     if args.fast_only and args.linearized_fallback:
         parser.error("--fast-only cannot be combined with --linearized-fallback")
     if args.wsl_fast_screen_scratch and not args.fast_only:
@@ -504,6 +515,7 @@ def main() -> int:
         "fast_screen_heavy_workers": args.fast_screen_heavy_workers,
         "additional_easy_task_count": args.additional_easy_task_count,
         "linearized_fallback": args.linearized_fallback,
+        "economic_contingency_polish": args.economic_contingency_polish,
         "wsl_fast_screen_scratch": args.wsl_fast_screen_scratch,
         "precomputed_fast_screen_dir": (
             str(args.precomputed_fast_screen_dir)
@@ -540,6 +552,7 @@ def main() -> int:
             heavy_labels,
             args.fast_screen_heavy_workers,
             heavy_label_seconds,
+            args.economic_contingency_polish,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

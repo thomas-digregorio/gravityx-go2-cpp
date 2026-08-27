@@ -2786,6 +2786,7 @@ def main() -> int:
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
+    parser.add_argument("--economic-contingency-polish", action="store_true")
     parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
@@ -2836,6 +2837,12 @@ def main() -> int:
     if args.two_stage_contingency_screen and not args.fast_power_flow_screen:
         parser.error(
             "--two-stage-contingency-screen requires --fast-power-flow-screen"
+        )
+    if (args.economic_contingency_polish and
+            not args.fast_power_flow_screen):
+        parser.error(
+            "--economic-contingency-polish requires "
+            "--fast-power-flow-screen"
         )
     if (args.fast_screen_affinity_schedule and
             not args.two_stage_contingency_screen):
@@ -3147,6 +3154,7 @@ def main() -> int:
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
+        "economic_contingency_polish": args.economic_contingency_polish,
         "cpp_solution_writer": args.cpp_solution_writer,
         "fast_screen_easy_first": args.fast_screen_easy_first,
         "fast_screen_heavy_profile": fast_screen_heavy_profile_metadata,
@@ -3691,17 +3699,20 @@ def main() -> int:
             task_timeout = effective_process_timeout(
                 args.contingency_timeout, contingency_deadline
             )
+            worker_arguments = [
+                "contingency-worker",
+                worker_case_argument,
+                worker_base_argument,
+                "0",
+                "fast-pf",
+                "fast-only",
+            ]
+            if args.economic_contingency_polish:
+                worker_arguments.append("economic-polish")
             command = cpp_command(
                 fast_screen_executable,
                 args.distro,
-                [
-                    "contingency-worker",
-                    worker_case_argument,
-                    worker_base_argument,
-                    "0",
-                    "fast-pf",
-                    "fast-only",
-                ],
+                worker_arguments,
                 task_timeout,
             )
             started = time.perf_counter()
@@ -4003,6 +4014,8 @@ def main() -> int:
         # appear infeasible.
         if args.fast_power_flow_screen:
             worker_arguments.append("fast-pf")
+        if args.economic_contingency_polish:
+            worker_arguments.append("economic-polish")
         if args.linearized_contingency_fallback:
             worker_arguments.append("linearized")
         if args.linearized_contingency_only:
@@ -4663,6 +4676,7 @@ def main() -> int:
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
+        "economic_contingency_polish": args.economic_contingency_polish,
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,

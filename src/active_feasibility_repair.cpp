@@ -237,11 +237,23 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"voltage_trust_radius", voltage_trust_radius},
         {"include_reactive", include_reactive},
         {"current_security_rows_only", current_security_rows_only},
+        {"include_component_box_rows", include_component_box_rows},
+        {"minimize_balance_slack", minimize_balance_slack},
         {"row_count", row_count},
         {"column_count", column_count},
         {"nonzero_count", nonzero_count},
         {"branch_security_row_count", branch_security_row_count},
         {"simplex_strategy", simplex_strategy},
+        {"simplex_iteration_limit", simplex_iteration_limit},
+        {"primal_start_attempted", primal_start_attempted},
+        {"primal_start_status", primal_start_status},
+        {"primal_start_maximum_row_violation",
+         primal_start_maximum_row_violation},
+        {"primal_start_maximum_column_violation",
+         primal_start_maximum_column_violation},
+        {"primal_basis_attempted", primal_basis_attempted},
+        {"primal_basis_status", primal_basis_status},
+        {"presolve_enabled", presolve_enabled},
         {"run_status", run_status},
         {"model_status", model_status},
         {"primal_solution_status", primal_solution_status},
@@ -251,6 +263,8 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"maximum_linearized_violation", maximum_linearized_violation},
         {"maximum_column_violation", maximum_column_violation},
         {"finite_solution_values", finite_solution_values},
+        {"canonicalized_terminal_solution",
+         canonicalized_terminal_solution},
         {"maximum_angle_change", maximum_angle_change},
         {"maximum_voltage_change", maximum_voltage_change},
         {"maximum_generation_change", maximum_generation_change},
@@ -277,7 +291,9 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     double time_limit_seconds,
     double voltage_trust_radius,
     bool include_reactive,
-    bool current_security_rows_only) {
+    bool current_security_rows_only,
+    bool include_component_box_rows,
+    bool minimize_balance_slack) {
     const auto wall_start = std::chrono::steady_clock::now();
     ActiveFeasibilityRepairResult output;
     output.balance_slack_limit = balance_slack_limit;
@@ -285,6 +301,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.voltage_trust_radius = voltage_trust_radius;
     output.include_reactive = include_reactive;
     output.current_security_rows_only = current_security_rows_only;
+    output.include_component_box_rows = include_component_box_rows;
+    output.minimize_balance_slack = minimize_balance_slack;
     output.time_limit_seconds = time_limit_seconds;
     output.state = reference;
     const int nb = static_cast<int>(data.buses.size());
@@ -505,7 +523,19 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     const int load_up_offset =
         reactive_generator_down_offset + reactive_generator_variable_count;
     const int load_down_offset = load_up_offset + nd;
-    const HighsInt column_count = load_down_offset + nd;
+    const int balance_slack_column_count =
+        minimize_balance_slack ? nb : 0;
+    const int p_positive_offset = load_down_offset + nd;
+    const int p_negative_offset =
+        p_positive_offset + balance_slack_column_count;
+    const int q_positive_offset =
+        p_negative_offset + balance_slack_column_count;
+    const int q_negative_offset =
+        q_positive_offset +
+        (include_reactive ? balance_slack_column_count : 0);
+    const HighsInt column_count =
+        q_negative_offset +
+        (include_reactive ? balance_slack_column_count : 0);
     output.column_count = static_cast<int>(column_count);
     std::vector<double> lower(static_cast<std::size_t>(column_count), 0.0);
     std::vector<double> upper(static_cast<std::size_t>(column_count), 0.0);
@@ -580,6 +610,26 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             std::abs(data.loads[i].qd_nominal), 1e-3});
         cost[load_up_offset + i] = load_movement_cost;
         cost[load_down_offset + i] = load_movement_cost;
+    }
+    if (minimize_balance_slack) {
+        // The reference point is already independently feasible with bounded
+        // signed nodal imbalance.  Explicit positive/negative columns keep
+        // that point feasible from the start and turn the repair into a true
+        // Phase-II L1 reduction instead of a hard zero-balance feasibility
+        // search that may expose no primal point before its short deadline.
+        constexpr double kBalanceSlackCost = 1e4;
+        for (int bus = 0; bus < nb; ++bus) {
+            upper[p_positive_offset + bus] = balance_slack_limit;
+            upper[p_negative_offset + bus] = balance_slack_limit;
+            cost[p_positive_offset + bus] = kBalanceSlackCost;
+            cost[p_negative_offset + bus] = kBalanceSlackCost;
+            if (include_reactive) {
+                upper[q_positive_offset + bus] = balance_slack_limit;
+                upper[q_negative_offset + bus] = balance_slack_limit;
+                cost[q_positive_offset + bus] = kBalanceSlackCost;
+                cost[q_negative_offset + bus] = kBalanceSlackCost;
+            }
+        }
     }
 
     const auto append_angle = [&](SparseRow& row, int bus, double value) {
@@ -724,18 +774,32 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     rows.reserve(static_cast<std::size_t>(2 * nb) + 4096);
     for (int bus = 0; bus < nb; ++bus) {
         auto active_row = std::move(active_balance_rows[bus]);
-        active_row.lower =
-            -balance_slack_limit - current_active_balance[bus];
-        active_row.upper =
-            balance_slack_limit - current_active_balance[bus];
+        if (minimize_balance_slack) {
+            append(active_row, p_positive_offset + bus, -1.0);
+            append(active_row, p_negative_offset + bus, 1.0);
+            active_row.lower = -current_active_balance[bus];
+            active_row.upper = -current_active_balance[bus];
+        } else {
+            active_row.lower =
+                -balance_slack_limit - current_active_balance[bus];
+            active_row.upper =
+                balance_slack_limit - current_active_balance[bus];
+        }
         normalize(active_row);
         rows.push_back(std::move(active_row));
         if (include_reactive) {
             auto reactive_row = std::move(reactive_balance_rows[bus]);
-            reactive_row.lower =
-                -balance_slack_limit - current_reactive_balance[bus];
-            reactive_row.upper =
-                balance_slack_limit - current_reactive_balance[bus];
+            if (minimize_balance_slack) {
+                append(reactive_row, q_positive_offset + bus, -1.0);
+                append(reactive_row, q_negative_offset + bus, 1.0);
+                reactive_row.lower = -current_reactive_balance[bus];
+                reactive_row.upper = -current_reactive_balance[bus];
+            } else {
+                reactive_row.lower =
+                    -balance_slack_limit - current_reactive_balance[bus];
+                reactive_row.upper =
+                    balance_slack_limit - current_reactive_balance[bus];
+            }
             normalize(reactive_row);
             rows.push_back(std::move(reactive_row));
         }
@@ -820,25 +884,28 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             continue;
         }
         const auto& branch = data.branches[i];
-        const double box_margin = std::min(
-            1e-4, std::max(0.0, 0.01 * branch.rate_c));
-        const double box_target = std::max(0.0, branch.rate_c - box_margin);
-        append_security_row(
-            output.state.pf[i], derivative[i].pf,
-            voltage_derivative[i].from.pf,
-            voltage_derivative[i].to.pf, branch, box_target);
-        append_security_row(
-            output.state.qf[i], derivative[i].qf,
-            voltage_derivative[i].from.qf,
-            voltage_derivative[i].to.qf, branch, box_target);
-        append_security_row(
-            output.state.pt[i], derivative[i].pt,
-            voltage_derivative[i].from.pt,
-            voltage_derivative[i].to.pt, branch, box_target);
-        append_security_row(
-            output.state.qt[i], derivative[i].qt,
-            voltage_derivative[i].from.qt,
-            voltage_derivative[i].to.qt, branch, box_target);
+        if (include_component_box_rows) {
+            const double box_margin = std::min(
+                1e-4, std::max(0.0, 0.01 * branch.rate_c));
+            const double box_target = std::max(
+                0.0, branch.rate_c - box_margin);
+            append_security_row(
+                output.state.pf[i], derivative[i].pf,
+                voltage_derivative[i].from.pf,
+                voltage_derivative[i].to.pf, branch, box_target);
+            append_security_row(
+                output.state.qf[i], derivative[i].qf,
+                voltage_derivative[i].from.qf,
+                voltage_derivative[i].to.qf, branch, box_target);
+            append_security_row(
+                output.state.pt[i], derivative[i].pt,
+                voltage_derivative[i].from.pt,
+                voltage_derivative[i].to.pt, branch, box_target);
+            append_security_row(
+                output.state.qt[i], derivative[i].qt,
+                voltage_derivative[i].from.qt,
+                voltage_derivative[i].to.qt, branch, box_target);
+        }
         const double from_scale = branch.transformer
             ? 1.0 + data.sm_vio_limit
             : output.state.vm[branch.from] + data.sm_vio_limit;
@@ -935,7 +1002,14 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     highs.setOptionValue(
         "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
     highs.setOptionValue("threads", 1);
-    highs.setOptionValue("presolve", "on");
+    // A supplied diagonal elastic basis is already a complete warm start for
+    // the Phase-I model.  Presolving that model can discard or remap the
+    // elastic columns before HiGHS installs the user basis, defeating the
+    // purpose of the start within this deliberately short solve.  All ordinary
+    // active-repair solves retain the existing presolve-on behavior.
+    output.presolve_enabled = !minimize_balance_slack;
+    highs.setOptionValue(
+        "presolve", output.presolve_enabled ? "on" : "off");
     highs.setOptionValue("run_crossover", "off");
     highs.setOptionValue("small_matrix_value", 1e-12);
     highs.setOptionValue("time_limit", time_limit_seconds);
@@ -947,13 +1021,28 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.solver = solver_override != nullptr
         ? std::string(solver_override) : "simplex";
     highs.setOptionValue("solver", output.solver);
-    if (current_security_rows_only && output.solver == "simplex") {
+    if ((current_security_rows_only || minimize_balance_slack) &&
+        output.solver == "simplex") {
         // This repair is a feasibility oracle.  Dual simplex can spend the
         // complete short deadline proving movement optimality without ever
         // exposing a primal-feasible basis; primal simplex prioritizes the
         // candidate that the nonlinear validator actually needs.
         output.simplex_strategy = 4;
         highs.setOptionValue("simplex_strategy", output.simplex_strategy);
+        if (minimize_balance_slack) {
+            // A wall-clock interrupt can stop HiGHS between primal-simplex
+            // updates while its default bound perturbation is still active,
+            // exposing a terminal point that violates the original column
+            // bounds even though the supplied iteration-zero basis is
+            // feasible.  Solve against the exact source bounds and stop at a
+            // completed pivot boundary first.  The outer time limit remains a
+            // hard safety cap.
+            highs.setOptionValue(
+                "primal_simplex_bound_perturbation_multiplier", 0.0);
+            output.simplex_iteration_limit = 1000;
+            highs.setOptionValue(
+                "simplex_iteration_limit", output.simplex_iteration_limit);
+        }
     }
     if (highs.addVars(column_count, lower.data(), upper.data()) !=
             HighsStatus::kOk ||
@@ -967,6 +1056,90 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         output.wall_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - wall_start).count();
         return output;
+    }
+
+    if (minimize_balance_slack) {
+        output.primal_start_attempted = true;
+        std::vector<double> primal_start(
+            static_cast<std::size_t>(column_count), 0.0);
+        HighsBasis primal_basis;
+        primal_basis.alien = true;
+        primal_basis.useful = true;
+        primal_basis.col_status.assign(
+            static_cast<std::size_t>(column_count),
+            HighsBasisStatus::kLower);
+        primal_basis.row_status.assign(
+            rows.size(), HighsBasisStatus::kBasic);
+        const auto set_balance_basic = [&] (
+            int row_index, int positive_column, int negative_column) {
+            double positive_coefficient = 0.0;
+            double negative_coefficient = 0.0;
+            for (const auto& [column, coefficient] :
+                 rows[row_index].entries) {
+                if (column == positive_column) {
+                    positive_coefficient = coefficient;
+                } else if (column == negative_column) {
+                    negative_coefficient = coefficient;
+                }
+            }
+            const double residual = -rows[row_index].lower;
+            if (residual >= 0.0) {
+                if (positive_coefficient >= 0.0) {
+                    throw std::runtime_error(
+                        "active-repair positive balance column has invalid coefficient");
+                }
+                primal_start[positive_column] =
+                    residual / -positive_coefficient;
+                primal_basis.col_status[positive_column] =
+                    HighsBasisStatus::kBasic;
+            } else {
+                if (negative_coefficient <= 0.0) {
+                    throw std::runtime_error(
+                        "active-repair negative balance column has invalid coefficient");
+                }
+                primal_start[negative_column] =
+                    -residual / negative_coefficient;
+                primal_basis.col_status[negative_column] =
+                    HighsBasisStatus::kBasic;
+            }
+            primal_basis.row_status[row_index] =
+                HighsBasisStatus::kLower;
+        };
+        for (int bus = 0; bus < nb; ++bus) {
+            const int active_row = include_reactive ? 2 * bus : bus;
+            set_balance_basic(
+                active_row, p_positive_offset + bus,
+                p_negative_offset + bus);
+            if (include_reactive) {
+                set_balance_basic(
+                    active_row + 1, q_positive_offset + bus,
+                    q_negative_offset + bus);
+            }
+        }
+        for (HighsInt column = 0; column < column_count; ++column) {
+            output.primal_start_maximum_column_violation = std::max(
+                output.primal_start_maximum_column_violation,
+                std::max({
+                    0.0,
+                    lower[column] - primal_start[column],
+                    primal_start[column] - upper[column]}));
+        }
+        for (const auto& row : rows) {
+            output.primal_start_maximum_row_violation = std::max(
+                output.primal_start_maximum_row_violation,
+                row_violation(row, primal_start));
+        }
+        std::vector<HighsInt> start_indices(
+            static_cast<std::size_t>(column_count));
+        std::iota(
+            start_indices.begin(), start_indices.end(), HighsInt{0});
+        const HighsStatus start_status = highs.setSolution(
+            column_count, start_indices.data(), primal_start.data());
+        output.primal_start_status = static_cast<int>(start_status);
+        output.primal_basis_attempted = true;
+        const HighsStatus basis_status = highs.setBasis(
+            primal_basis, "active_repair_balance_diagonal");
+        output.primal_basis_status = static_cast<int>(basis_status);
     }
 
     const HighsStatus run_status = highs.run();
@@ -987,14 +1160,93 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.status = highs.modelStatusToString(model_status);
     const bool shape_valid = solution.value_valid &&
         solution.col_value.size() == static_cast<std::size_t>(column_count);
+    std::vector<double> candidate_values;
     if (shape_valid) {
+        candidate_values = solution.col_value;
         output.finite_solution_values = true;
         for (HighsInt column = 0; column < column_count; ++column) {
-            const double value = solution.col_value[column];
+            const double value = candidate_values[column];
             if (!std::isfinite(value)) {
                 output.finite_solution_values = false;
                 break;
             }
+        }
+        if (output.finite_solution_values && minimize_balance_slack) {
+            // HiGHS can return a time- or iteration-limited primal-simplex
+            // point before it has removed tiny bound perturbations.  Project
+            // only onto the original column bounds, then recompute the
+            // dedicated balance slacks exactly.  The complete row/column audit
+            // below must still pass at 1e-7 before this point is exposed to the
+            // nonlinear validator.
+            for (HighsInt column = 0; column < column_count; ++column) {
+                candidate_values[column] = std::clamp(
+                    candidate_values[column], lower[column], upper[column]);
+            }
+            bool canonicalized = true;
+            const auto canonicalize_balance = [&] (
+                int row_index, int positive_column, int negative_column) {
+                candidate_values[positive_column] = 0.0;
+                candidate_values[negative_column] = 0.0;
+                double activity = 0.0;
+                double positive_coefficient = 0.0;
+                double negative_coefficient = 0.0;
+                for (const auto& [column, coefficient] :
+                     rows[row_index].entries) {
+                    activity += coefficient * candidate_values[column];
+                    if (column == positive_column) {
+                        positive_coefficient = coefficient;
+                    } else if (column == negative_column) {
+                        negative_coefficient = coefficient;
+                    }
+                }
+                const double required_change =
+                    rows[row_index].lower - activity;
+                if (required_change <= 0.0) {
+                    if (positive_coefficient >= 0.0) {
+                        return false;
+                    }
+                    const double value =
+                        required_change / positive_coefficient;
+                    if (value < lower[positive_column] - 1e-12 ||
+                        value > upper[positive_column] + 1e-12) {
+                        return false;
+                    }
+                    candidate_values[positive_column] = value;
+                } else {
+                    if (negative_coefficient <= 0.0) {
+                        return false;
+                    }
+                    const double value =
+                        required_change / negative_coefficient;
+                    if (value < lower[negative_column] - 1e-12 ||
+                        value > upper[negative_column] + 1e-12) {
+                        return false;
+                    }
+                    candidate_values[negative_column] = value;
+                }
+                return true;
+            };
+            for (int bus = 0; canonicalized && bus < nb; ++bus) {
+                const int active_row = include_reactive ? 2 * bus : bus;
+                canonicalized = canonicalize_balance(
+                    active_row, p_positive_offset + bus,
+                    p_negative_offset + bus);
+                if (canonicalized && include_reactive) {
+                    canonicalized = canonicalize_balance(
+                        active_row + 1, q_positive_offset + bus,
+                        q_negative_offset + bus);
+                }
+            }
+            output.canonicalized_terminal_solution = canonicalized;
+        }
+        if (output.finite_solution_values) {
+            output.objective = 0.0;
+            for (HighsInt column = 0; column < column_count; ++column) {
+                output.objective += cost[column] * candidate_values[column];
+            }
+        }
+        for (HighsInt column = 0; column < column_count; ++column) {
+            const double value = candidate_values[column];
             output.maximum_column_violation = std::max(
                 output.maximum_column_violation,
                 std::max(
@@ -1005,19 +1257,22 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             for (const auto& row : rows) {
                 output.maximum_linearized_violation = std::max(
                     output.maximum_linearized_violation,
-                    row_violation(row, solution.col_value));
+                    row_violation(row, candidate_values));
             }
         }
     }
+    const bool candidate_usable = shape_valid &&
+        (!minimize_balance_slack ||
+         output.canonicalized_terminal_solution);
     const bool optimal = run_status != HighsStatus::kError &&
-        model_status == HighsModelStatus::kOptimal && shape_valid;
+        model_status == HighsModelStatus::kOptimal && candidate_usable;
     const bool feasible_nonoptimal = run_status != HighsStatus::kError &&
-        shape_valid && info.valid &&
+        candidate_usable && info.valid &&
         info.primal_solution_status == kSolutionStatusFeasible &&
         info.num_primal_infeasibilities == 0 &&
         std::isfinite(info.max_primal_infeasibility) &&
         info.max_primal_infeasibility <= 1e-8;
-    const bool independently_feasible = shape_valid &&
+    const bool independently_feasible = candidate_usable &&
         output.finite_solution_values &&
         output.maximum_column_violation <= 1e-7 &&
         output.maximum_linearized_violation <= 1e-7;
@@ -1029,8 +1284,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             const int index = angle_index[bus];
             if (index >= 0) {
                 const double change =
-                    (solution.col_value[angle_up_offset + index] -
-                     solution.col_value[angle_down_offset + index]) /
+                    (candidate_values[angle_up_offset + index] -
+                     candidate_values[angle_down_offset + index]) /
                     angle_scale[index];
                 output.state.va[bus] += change;
                 output.maximum_angle_change = std::max(
@@ -1038,8 +1293,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             }
             if (include_reactive) {
                 const double voltage_change =
-                    (solution.col_value[voltage_up_offset + bus] -
-                     solution.col_value[voltage_down_offset + bus]) /
+                    (candidate_values[voltage_up_offset + bus] -
+                     candidate_values[voltage_down_offset + bus]) /
                     voltage_scale[bus];
                 output.state.vm[bus] = std::clamp(
                     output.state.vm[bus] + voltage_change,
@@ -1057,8 +1312,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             }
             const double prior = output.state.pg[i];
             output.state.pg[i] +=
-                solution.col_value[generator_up_offset + i] -
-                solution.col_value[generator_down_offset + i];
+                candidate_values[generator_up_offset + i] -
+                candidate_values[generator_down_offset + i];
             output.state.pg[i] = std::clamp(
                 output.state.pg[i], p_lower[i], p_upper[i]);
             output.maximum_generation_change = std::max(
@@ -1067,8 +1322,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             if (include_reactive) {
                 const double prior_reactive = output.state.qg[i];
                 output.state.qg[i] +=
-                    solution.col_value[reactive_generator_up_offset + i] -
-                    solution.col_value[reactive_generator_down_offset + i];
+                    candidate_values[reactive_generator_up_offset + i] -
+                    candidate_values[reactive_generator_down_offset + i];
                 output.state.qg[i] = std::clamp(
                     output.state.qg[i], q_lower[i], q_upper[i]);
                 output.maximum_reactive_generation_change = std::max(
@@ -1079,8 +1334,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         for (int i = 0; i < nd; ++i) {
             const double prior = load_factor[i];
             const double current = std::clamp(
-                prior + solution.col_value[load_up_offset + i] -
-                    solution.col_value[load_down_offset + i],
+                prior + candidate_values[load_up_offset + i] -
+                    candidate_values[load_down_offset + i],
                 load_factor_lower[i], load_factor_upper[i]);
             output.state.demand_factor[i] = current;
             output.maximum_load_change = std::max(

@@ -228,9 +228,16 @@ SparseEconomicRefinementResult refine_fixed_commitment_sparse(
             }
             continue;
         }
-        if (incumbent_active_balance_slack <= 0.05) {
+        // The function admitted the incumbent only after a complete nonlinear
+        // validation.  Once the fast cleanup no longer improves that verified
+        // state, another feasibility Phase I is redundant and can consume the
+        // entire economic budget.  Continue directly to the actual market-
+        // surplus LP below; it already carries bounded balance-slack columns
+        // and every proposed state must pass the same independent validator.
+        if (output.incumbent_verified) {
             fast_round["status"] =
-                "sparse_balance_refinement_stagnated";
+                "verified_balance_cleanup_stagnated_phase_one_skipped";
+            fast_round["phase_one_skipped"] = true;
             output.rounds.push_back(std::move(fast_round));
             break;
         }
@@ -383,13 +390,18 @@ SparseEconomicRefinementResult refine_fixed_commitment_sparse(
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - wall_start).count();
         const double remaining = options.time_limit_seconds - elapsed;
-        if (remaining <= 1.0) {
-            output.time_limit_reached = true;
+        // Reserve a small tail for the exact voltage-coordinate search.  On
+        // the 19k pilot those independently verified nonlinear moves produced
+        // most of the base-score gain in well under two seconds; letting an
+        // interrupted LP consume the final fraction of the budget discarded
+        // that high-value deterministic cleanup.
+        constexpr double kVerifiedCoordinateReserveSeconds = 2.0;
+        if (remaining <= kVerifiedCoordinateReserveSeconds + 0.25) {
             break;
         }
         const double lp_time_limit = std::min(
             options.linear_economic_time_limit_seconds,
-            remaining - 0.5);
+            remaining - kVerifiedCoordinateReserveSeconds);
         output.attempted = true;
         const auto linear = solve_linearized_ac_seed(
             data, reference, commitment, 0.499999, std::nullopt,

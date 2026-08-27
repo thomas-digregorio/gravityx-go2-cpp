@@ -974,6 +974,9 @@ int run_parallel_circuit_regression() {
         !compact_economic_linear_seed.primal_start_accepted ||
         !compact_economic_linear_seed.primal_basis_attempted ||
         !compact_economic_linear_seed.primal_basis_accepted ||
+        compact_economic_linear_seed.presolve_enabled ||
+        compact_economic_linear_seed
+                .primal_simplex_bound_perturbation_multiplier != 0.0 ||
         compact_economic_linear_seed.resident_segment_count < 1 ||
         compact_economic_linear_seed.feasible_segment_snapshot_count < 1 ||
         compact_economic_linear_seed.branch_security_rows_omitted == false ||
@@ -1541,9 +1544,22 @@ int run_parallel_circuit_regression() {
         gravityx::solve_linearized_ac_seed(
             data, solve.state, {1}, 0.49, branch_context,
             true, false, 60.0, true, true, {1});
+    const auto compact_economic_contingency_seed =
+        gravityx::solve_linearized_ac_seed(
+            data, fast_result.solve.state, {1}, 0.499999, branch_context,
+            false, true, 10.0, true, false, {}, false,
+            kTestVoltageTrustRadius, kTestAngleTrustRadius, true);
     if (!full_contingency_seed.success ||
         !balance_only_contingency_seed.success ||
         !subset_security_contingency_seed.success ||
+        !compact_economic_contingency_seed.success ||
+        !compact_economic_contingency_seed.economic_objective ||
+        !compact_economic_contingency_seed.compact_economic_objective ||
+        !compact_economic_contingency_seed.primal_start_accepted ||
+        !compact_economic_contingency_seed.primal_basis_accepted ||
+        compact_economic_contingency_seed.presolve_enabled ||
+        compact_economic_contingency_seed
+                .primal_simplex_bound_perturbation_multiplier != 0.0 ||
         !full_contingency_seed.model_preflight_passed ||
         !full_contingency_seed.model_construction_success ||
         full_contingency_seed.add_vars_status != 0 ||
@@ -3317,7 +3333,9 @@ bool solve_loaded_contingency(
         }
         if (fast_result->feasible) {
             const std::string solution_method =
-                bounded_fast_postlinear_newton_selected
+                fast_result->economic_balance_polish_selected
+                ? "resident_fixed_jacobian_economic_balance_polish"
+                : bounded_fast_postlinear_newton_selected
                 ? "bounded_fast_linearized_repair_plus_newton"
                 : bounded_fast_linearized_repair_selected
                 ? "bounded_fast_linearized_feasibility_repair"
@@ -4219,7 +4237,8 @@ int run_contingency_worker(
     bool fast_power_flow_screen,
     bool fast_only,
     bool linearized_fallback,
-    bool linearized_only) {
+    bool linearized_only,
+    bool economic_contingency_polish) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     const auto data = gravityx::CaseData::load(case_path);
@@ -4233,12 +4252,25 @@ int run_contingency_worker(
         throw std::runtime_error(
             "linearized-only contingency worker requires linearized mode");
     }
+    if (economic_contingency_polish && !fast_power_flow_screen) {
+        throw std::runtime_error(
+            "economic contingency polish requires fast-pf mode");
+    }
     std::unique_ptr<gravityx::AcModel> resident_model;
     std::unique_ptr<gravityx::FastContingencyPowerFlow> fast_power_flow;
     if (fast_power_flow_screen) {
         gravityx::FastPowerFlowOptions fast_options;
         fast_options.fixed_jacobian_screen_only =
             fast_only && data.buses.size() >= 16000;
+        fast_options.economic_balance_polish =
+            economic_contingency_polish;
+        if (economic_contingency_polish && data.buses.size() >= 16000) {
+            // Spend the bounded Phase-I/Phase-II work on the economically
+            // dominant 19k tail.  The threshold is evaluated only after a
+            // secure predictor exists; all other contingencies retain that
+            // independently verified incumbent unchanged.
+            fast_options.economic_balance_polish_objective_threshold = -2e6;
+        }
         const char* fast_diagnostics =
             std::getenv("GRAVITYX_FAST_PF_DIAGNOSTICS");
         fast_options.capture_diagnostics = fast_diagnostics != nullptr &&
@@ -4294,8 +4326,13 @@ int run_contingency_worker(
                 fast_screen_json.at("solve").at("state"));
         }
         std::optional<ContingencyComputation> completed_computation;
+        // A previously secure corrective point is a useful feasibility
+        // fallback, but it can carry very large paid imbalance into an
+        // unrelated outage.  Economic mode therefore starts every task from
+        // the common optimized base and consults the seed bank only after the
+        // fresh predictor fails.
         const CorrectiveSeed* rolling_corrective_seed =
-            corrective_seed_bank.empty()
+            economic_contingency_polish || corrective_seed_bank.empty()
             ? nullptr : &corrective_seed_bank.front();
         const auto solve_call_start = std::chrono::steady_clock::now();
         const bool success = solve_loaded_contingency(
@@ -4621,7 +4658,7 @@ int main(int argc, char** argv) {
             const int print_level = argc == 6 ? std::stoi(argv[5]) : 0;
             return solve_contingency_batch(argv[2], argv[3], argv[4], print_level);
         }
-        if ((argc >= 4 && argc <= 11) &&
+        if ((argc >= 4 && argc <= 12) &&
             std::string(argv[1]) == "contingency-worker") {
             const int print_level = argc >= 5 ? std::stoi(argv[4]) : 0;
             bool reusable_model = false;
@@ -4630,6 +4667,7 @@ int main(int argc, char** argv) {
             bool fast_only = false;
             bool linearized_fallback = false;
             bool linearized_only = false;
+            bool economic_contingency_polish = false;
             for (int i = 5; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "resident") {
@@ -4645,6 +4683,8 @@ int main(int argc, char** argv) {
                 } else if (option == "linearized-only") {
                     linearized_fallback = true;
                     linearized_only = true;
+                } else if (option == "economic-polish") {
+                    economic_contingency_polish = true;
                 } else {
                     throw std::runtime_error(
                         "unknown contingency-worker option: " + option);
@@ -4657,7 +4697,8 @@ int main(int argc, char** argv) {
             return run_contingency_worker(
                 argv[2], argv[3], print_level, reusable_model,
                 acceptable_termination, fast_power_flow_screen, fast_only,
-                linearized_fallback, linearized_only);
+                linearized_fallback, linearized_only,
+                economic_contingency_polish);
         }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"

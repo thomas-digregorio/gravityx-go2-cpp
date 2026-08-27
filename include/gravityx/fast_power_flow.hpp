@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -14,10 +15,19 @@ namespace gravityx {
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool fixed_jacobian_screen_only{false};
+    bool economic_balance_polish{false};
     bool minimize_active_balance_slack{false};
     bool minimize_reactive_balance_slack{false};
     double balance_cleanup_fraction{1.0};
     bool capture_diagnostics{false};
+    int max_economic_balance_polish_iterations{4};
+    int max_economic_linearized_polish_rounds{1};
+    double economic_linearized_polish_seconds{0.75};
+    double economic_linearized_trigger_slack{0.05};
+    double economic_balance_polish_objective_threshold{
+        std::numeric_limits<double>::infinity()};
+    int max_economic_linearized_phase_two_rounds{1};
+    double economic_linearized_phase_two_seconds{0.75};
     int max_newton_iterations{50};
     int max_active_redispatch_passes{20};
     int max_reactive_limit_passes{8};
@@ -42,6 +52,20 @@ struct FastPowerFlowResult {
     double fixed_jacobian_predictor_preparation_seconds{};
     ValidationReport fixed_jacobian_predictor_validation;
     nlohmann::json fixed_jacobian_predictor_trace = nlohmann::json::array();
+    bool economic_balance_polish_attempted{};
+    bool economic_balance_polish_threshold_passed{};
+    double economic_balance_polish_objective_threshold{};
+    bool economic_balance_polish_selected{};
+    int economic_balance_polish_iterations{};
+    int economic_balance_polish_backtracking_attempts{};
+    double economic_balance_polish_objective_before{};
+    double economic_balance_polish_objective_after{};
+    double economic_balance_polish_active_slack_before{};
+    double economic_balance_polish_active_slack_after{};
+    double economic_balance_polish_reactive_slack_before{};
+    double economic_balance_polish_reactive_slack_after{};
+    ValidationReport economic_balance_polish_validation;
+    nlohmann::json economic_balance_polish_trace = nlohmann::json::array();
     bool newton_candidate_selected{};
     ValidationReport newton_candidate_validation;
     bool active_only_newton_attempted{};

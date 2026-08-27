@@ -4,6 +4,7 @@
 
 #include "gravityx/active_feasibility_repair.hpp"
 #include "gravityx/fast_power_flow.hpp"
+#include "gravityx/linearized_ac_seed.hpp"
 #include "gravityx/state_io.hpp"
 
 #include <algorithm>
@@ -1025,6 +1026,7 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     std::vector<int> voltage_index;
     int angle_count{};
     int voltage_count{};
+    SparseMatrix jacobian;
     Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
     bool active_valid{};
     SparseMatrix active_jacobian;
@@ -1034,6 +1036,7 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     SparseMatrix reactive_jacobian;
     Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>>
         reactive_factorization;
+    LowRankUpdate full_outage_update;
     LowRankUpdate active_outage_update;
     LowRankUpdate reactive_outage_update;
 
@@ -1205,7 +1208,7 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
                 }
             }
         }
-        SparseMatrix jacobian(dimension, dimension);
+        jacobian.resize(dimension, dimension);
         jacobian.setFromTriplets(entries.begin(), entries.end());
         active_jacobian.resize(angle_count, angle_count);
         active_jacobian.setFromTriplets(
@@ -1302,6 +1305,7 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         const CaseData& data,
         const AcState& reference_state,
         int outaged_branch) {
+        full_outage_update = {};
         active_outage_update = {};
         reactive_outage_update = {};
         if (outaged_branch < 0 || !valid || !active_valid ||
@@ -1379,8 +1383,43 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             }
         }
 
-        std::vector<Triplet> active_difference_entries;
+        std::vector<Triplet> full_difference_entries;
         const std::array<int, 2> terminal_buses{from, to};
+        const std::array<int, 4> flow_rows{
+            angle_index[from],
+            angle_count + voltage_index[from],
+            angle_index[to],
+            angle_count + voltage_index[to],
+        };
+        for (int flow = 0; flow < 4; ++flow) {
+            const int row = flow_rows[flow];
+            if (row < 0) {
+                continue;
+            }
+            for (int variable_terminal = 0; variable_terminal < 2;
+                 ++variable_terminal) {
+                const int bus = terminal_buses[variable_terminal];
+                const int voltage_column =
+                    angle_count + voltage_index[bus];
+                full_difference_entries.emplace_back(
+                    row, voltage_column,
+                    -derivative(flow, 2 * variable_terminal));
+                const int angle_column = angle_index[bus];
+                if (angle_column >= 0) {
+                    full_difference_entries.emplace_back(
+                        row, angle_column,
+                        -derivative(flow, 1 + 2 * variable_terminal));
+                }
+            }
+        }
+        SparseMatrix full_difference(
+            angle_count + voltage_count,
+            angle_count + voltage_count);
+        full_difference.setFromTriplets(
+            full_difference_entries.begin(),
+            full_difference_entries.end());
+
+        std::vector<Triplet> active_difference_entries;
         const std::array<int, 2> active_flow_rows{0, 2};
         for (int terminal = 0; terminal < 2; ++terminal) {
             const int row = angle_index[terminal_buses[terminal]];
@@ -1425,12 +1464,15 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             reactive_difference_entries.begin(),
             reactive_difference_entries.end());
 
+        const bool full_ready = prepare_low_rank_update(
+            full_difference, factorization, full_outage_update);
         const bool active_ready = prepare_low_rank_update(
             active_difference, active_factorization, active_outage_update);
         const bool reactive_ready = prepare_low_rank_update(
             reactive_difference, reactive_factorization,
             reactive_outage_update);
-        if (!active_ready || !reactive_ready) {
+        if (!full_ready || !active_ready || !reactive_ready) {
+            full_outage_update = {};
             active_outage_update = {};
             reactive_outage_update = {};
             return false;
@@ -1479,7 +1521,8 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
                     q_spec[bus] - q_network[bus];
             }
         }
-        const Eigen::VectorXd step = factorization.solve(mismatch);
+        const Eigen::VectorXd step = solve_with_update(
+            factorization, mismatch, full_outage_update);
         if (factorization.info() != Eigen::Success || !step.allFinite()) {
             return false;
         }
@@ -2250,6 +2293,34 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          fixed_jacobian_predictor_validation.to_json()},
         {"fixed_jacobian_predictor_trace",
          fixed_jacobian_predictor_trace},
+        {"economic_balance_polish_attempted",
+         economic_balance_polish_attempted},
+        {"economic_balance_polish_threshold_passed",
+         economic_balance_polish_threshold_passed},
+        {"economic_balance_polish_objective_threshold",
+         economic_balance_polish_objective_threshold},
+        {"economic_balance_polish_selected",
+         economic_balance_polish_selected},
+        {"economic_balance_polish_iterations",
+         economic_balance_polish_iterations},
+        {"economic_balance_polish_backtracking_attempts",
+         economic_balance_polish_backtracking_attempts},
+        {"economic_balance_polish_objective_before",
+         economic_balance_polish_objective_before},
+        {"economic_balance_polish_objective_after",
+         economic_balance_polish_objective_after},
+        {"economic_balance_polish_active_slack_before",
+         economic_balance_polish_active_slack_before},
+        {"economic_balance_polish_active_slack_after",
+         economic_balance_polish_active_slack_after},
+        {"economic_balance_polish_reactive_slack_before",
+         economic_balance_polish_reactive_slack_before},
+        {"economic_balance_polish_reactive_slack_after",
+         economic_balance_polish_reactive_slack_after},
+        {"economic_balance_polish_validation",
+         economic_balance_polish_validation.to_json()},
+        {"economic_balance_polish_trace",
+         economic_balance_polish_trace},
         {"newton_candidate_selected", newton_candidate_selected},
         {"newton_candidate_validation", newton_candidate_validation.to_json()},
         {"active_only_newton_attempted", active_only_newton_attempted},
@@ -2843,9 +2914,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
           std::accumulate(
               direct_state.q_delta.begin(),
               direct_state.q_delta.end(), 0.0) > 1e-9));
+    const bool contingency_economic_cleanup_pending =
+        !base_mode && nb >= 16000 && options_.economic_balance_polish;
     if (output.direct_candidate_validation.max_residual <=
             options_.validation_tolerance &&
-        !direct_balance_cleanup_pending) {
+        !direct_balance_cleanup_pending &&
+        !contingency_economic_cleanup_pending) {
         output.converged = true;
         output.feasible = true;
         output.direct_candidate_selected = true;
@@ -2864,7 +2938,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         output.solve.wall_seconds = output.wall_seconds;
         return output;
     }
-    if (supplied_candidate_direct_only) {
+    if (supplied_candidate_direct_only &&
+        !contingency_economic_cleanup_pending) {
         output.solve.status = 2;
         output.solve.iterations = 0;
         output.solve.state = direct_state;
@@ -3403,6 +3478,564 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     "fixed_base_jacobian_predictor");
                 if (predictor_validation.max_residual <=
                     options_.validation_tolerance) {
+                    output.economic_balance_polish_objective_threshold =
+                        options_
+                            .economic_balance_polish_objective_threshold;
+                    output.economic_balance_polish_threshold_passed =
+                        predictor_objective <=
+                        options_
+                            .economic_balance_polish_objective_threshold;
+                    if (options_.economic_balance_polish &&
+                        output.economic_balance_polish_threshold_passed &&
+                        options_.max_economic_balance_polish_iterations > 0) {
+                        output.economic_balance_polish_attempted = true;
+                        const auto slack_sum = [](const std::vector<double>& values) {
+                            return std::accumulate(
+                                values.begin(), values.end(), 0.0);
+                        };
+                        output.economic_balance_polish_objective_before =
+                            predictor_objective;
+                        output.economic_balance_polish_active_slack_before =
+                            slack_sum(predictor_state.p_delta);
+                        output.economic_balance_polish_reactive_slack_before =
+                            slack_sum(predictor_state.q_delta);
+
+                        AcState polished_state = predictor_state;
+                        double polished_objective = predictor_objective;
+                        ValidationReport polished_validation =
+                            predictor_validation;
+                        bool outage_update_ready = true;
+                        if (outaged_branch >= 0) {
+                            outage_update_ready =
+                                predictor_cache_->configure_branch_outage_update(
+                                    data_, polished_state, outaged_branch);
+                        }
+                        if (!outage_update_ready) {
+                            output.economic_balance_polish_trace.push_back({
+                                {"selected", false},
+                                {"reason", "branch outage low-rank update unavailable"},
+                            });
+                        } else {
+                            const YRows polish_ybus = build_ybus(
+                                data_, outaged_branch, &polished_state);
+                            std::vector<std::vector<int>>
+                                component_generators(components.size());
+                            for (int component = 0;
+                                 component < static_cast<int>(components.size());
+                                 ++component) {
+                                for (int bus : components[component]) {
+                                    component_generators[component].insert(
+                                        component_generators[component].end(),
+                                        active_at_bus[bus].begin(),
+                                        active_at_bus[bus].end());
+                                }
+                            }
+                            const std::array<double, 10> backtracking_steps{
+                                1.0, 0.5, 0.25, 0.125, 0.0625,
+                                0.03125, 0.015625, 0.0078125,
+                                0.00390625, 0.001953125};
+                            for (int polish_iteration = 1;
+                                 polish_iteration <=
+                                     options_.max_economic_balance_polish_iterations;
+                                 ++polish_iteration) {
+                                output.economic_balance_polish_iterations =
+                                    polish_iteration;
+                                AcState raw_trial = polished_state;
+                                std::vector<double> polish_p_network;
+                                std::vector<double> polish_q_network;
+                                network_injections(
+                                    polish_ybus, raw_trial.vm, raw_trial.va,
+                                    polish_p_network, polish_q_network);
+                                std::vector<double> p_spec(nb, 0.0);
+                                std::vector<double> q_spec(nb, 0.0);
+                                const auto rebuild_specs = [&]() {
+                                    std::fill(p_spec.begin(), p_spec.end(), 0.0);
+                                    std::fill(q_spec.begin(), q_spec.end(), 0.0);
+                                    for (int generator = 0; generator < ng;
+                                         ++generator) {
+                                        if (!active[generator]) {
+                                            continue;
+                                        }
+                                        const int bus =
+                                            data_.generators[generator].bus;
+                                        p_spec[bus] += raw_trial.pg[generator];
+                                        q_spec[bus] += raw_trial.qg[generator];
+                                    }
+                                    for (int load = 0;
+                                         load < static_cast<int>(data_.loads.size());
+                                         ++load) {
+                                        const int bus = data_.loads[load].bus;
+                                        p_spec[bus] -=
+                                            data_.loads[load].pd_nominal *
+                                            raw_trial.demand_factor[load];
+                                        q_spec[bus] -=
+                                            data_.loads[load].qd_nominal *
+                                            raw_trial.demand_factor[load];
+                                    }
+                                };
+                                rebuild_specs();
+
+                                // The angle Jacobian omits one active equation
+                                // per connected component.  Absorb that exact
+                                // component loss mismatch into source-authorized
+                                // corrective generation before applying the
+                                // cached angle correction.
+                                for (int component = 0;
+                                     component < static_cast<int>(components.size());
+                                     ++component) {
+                                    const auto& generators =
+                                        component_generators[component];
+                                    if (generators.empty()) {
+                                        continue;
+                                    }
+                                    double mismatch = 0.0;
+                                    double current_generation = 0.0;
+                                    double total_lower = 0.0;
+                                    double total_upper = 0.0;
+                                    for (int bus : components[component]) {
+                                        mismatch += polish_p_network[bus] -
+                                            p_spec[bus];
+                                    }
+                                    for (int generator : generators) {
+                                        current_generation +=
+                                            raw_trial.pg[generator];
+                                        total_lower += p_lower[generator];
+                                        total_upper += p_upper[generator];
+                                    }
+                                    const double target = std::clamp(
+                                        current_generation + mismatch,
+                                        total_lower, total_upper);
+                                    static_cast<void>(allocate_total(
+                                        generators, p_lower, p_upper,
+                                        polished_state.pg, target,
+                                        raw_trial.pg));
+                                }
+
+                                // Match local reactive injections with Qg where
+                                // available.  The voltage correction handles the
+                                // remaining network-wide reactive mismatch.
+                                rebuild_specs();
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    if (active_at_bus[bus].empty()) {
+                                        continue;
+                                    }
+                                    double current_qg = 0.0;
+                                    double total_lower = 0.0;
+                                    double total_upper = 0.0;
+                                    for (int generator : active_at_bus[bus]) {
+                                        current_qg += raw_trial.qg[generator];
+                                        total_lower += q_lower[generator];
+                                        total_upper += q_upper[generator];
+                                    }
+                                    const double q_mismatch =
+                                        polish_q_network[bus] - q_spec[bus];
+                                    const double target = std::clamp(
+                                        current_qg + q_mismatch,
+                                        total_lower, total_upper);
+                                    static_cast<void>(allocate_total(
+                                        active_at_bus[bus], q_lower, q_upper,
+                                        polished_state.qg, target,
+                                        raw_trial.qg));
+                                }
+                                rebuild_specs();
+
+                                bool corrected =
+                                    predictor_cache_->apply_correction(
+                                        data_, p_spec, q_spec,
+                                        polish_p_network, polish_q_network,
+                                        raw_trial.vm, raw_trial.va);
+                                // Keep the decoupled factors as a conservative
+                                // fallback if the coupled solve is unavailable.
+                                // Every resulting candidate still goes through
+                                // the exact nonlinear rebuild and validator.
+                                if (!corrected) {
+                                    const bool active_corrected =
+                                        predictor_cache_
+                                            ->apply_active_correction(
+                                                data_, p_spec,
+                                                polish_p_network,
+                                                raw_trial.va);
+                                    if (active_corrected) {
+                                        network_injections(
+                                            polish_ybus, raw_trial.vm,
+                                            raw_trial.va, polish_p_network,
+                                            polish_q_network);
+                                    }
+                                    const bool reactive_corrected =
+                                        predictor_cache_
+                                            ->apply_reactive_correction(
+                                                data_, q_spec,
+                                                polish_q_network,
+                                                raw_trial.vm);
+                                    corrected = active_corrected ||
+                                        reactive_corrected;
+                                }
+                                if (!corrected) {
+                                    output.economic_balance_polish_trace.push_back({
+                                        {"iteration", polish_iteration},
+                                        {"selected", false},
+                                        {"reason", "cached Jacobian corrections unavailable"},
+                                    });
+                                    break;
+                                }
+                                normalize_source_reference_angles(
+                                    data_, components, raw_trial.va);
+
+                                bool selected = false;
+                                double selected_step = 0.0;
+                                double selected_objective = polished_objective;
+                                AcState selected_state = polished_state;
+                                ValidationReport selected_validation =
+                                    polished_validation;
+                                double trial_active_slack =
+                                    slack_sum(polished_state.p_delta);
+                                double trial_reactive_slack =
+                                    slack_sum(polished_state.q_delta);
+                                for (double step : backtracking_steps) {
+                                    if (step < 1.0) {
+                                        ++output
+                                            .economic_balance_polish_backtracking_attempts;
+                                    }
+                                    AcState candidate = polished_state;
+                                    for (int bus = 0; bus < nb; ++bus) {
+                                        candidate.vm[bus] += step *
+                                            (raw_trial.vm[bus] -
+                                             polished_state.vm[bus]);
+                                        candidate.va[bus] += step *
+                                            (raw_trial.va[bus] -
+                                             polished_state.va[bus]);
+                                    }
+                                    for (int generator = 0; generator < ng;
+                                         ++generator) {
+                                        candidate.pg[generator] += step *
+                                            (raw_trial.pg[generator] -
+                                             polished_state.pg[generator]);
+                                        candidate.qg[generator] += step *
+                                            (raw_trial.qg[generator] -
+                                             polished_state.qg[generator]);
+                                    }
+                                    normalize_source_reference_angles(
+                                        data_, components, candidate.va);
+                                    const double candidate_objective =
+                                        rebuild_contingency_state_derived_fields(
+                                            data_, base_state_, commitment_,
+                                            *contingency, candidate);
+                                    const auto candidate_validation =
+                                        validate_state(
+                                            data_, ModelMode::ContingencySoft,
+                                            candidate, commitment_,
+                                            direct_context);
+                                    trial_active_slack =
+                                        slack_sum(candidate.p_delta);
+                                    trial_reactive_slack =
+                                        slack_sum(candidate.q_delta);
+                                    if (candidate_validation.max_residual <=
+                                            options_.validation_tolerance &&
+                                        candidate_objective >
+                                            polished_objective + 1e-9) {
+                                        selected = true;
+                                        selected_step = step;
+                                        selected_objective =
+                                            candidate_objective;
+                                        selected_state = std::move(candidate);
+                                        selected_validation =
+                                            candidate_validation;
+                                        break;
+                                    }
+                                }
+                                output.economic_balance_polish_trace.push_back({
+                                    {"iteration", polish_iteration},
+                                    {"selected", selected},
+                                    {"selected_step", selected_step},
+                                    {"objective_before", polished_objective},
+                                    {"objective_after", selected_objective},
+                                    {"active_slack_after", trial_active_slack},
+                                    {"reactive_slack_after", trial_reactive_slack},
+                                    {"validation", selected_validation.to_json()},
+                                });
+                                if (!selected) {
+                                    break;
+                                }
+                                polished_state = std::move(selected_state);
+                                polished_objective = selected_objective;
+                                polished_validation = selected_validation;
+                                if (slack_sum(polished_state.p_delta) +
+                                        slack_sum(polished_state.q_delta) <=
+                                    1e-7) {
+                                    break;
+                                }
+                            }
+                        }
+                        for (int linearized_round = 1;
+                             linearized_round <=
+                                 options_.max_economic_linearized_polish_rounds &&
+                             slack_sum(polished_state.p_delta) +
+                                     slack_sum(polished_state.q_delta) >
+                                 options_.economic_linearized_trigger_slack;
+                             ++linearized_round) {
+                            const auto repair =
+                                solve_linearized_active_feasibility_repair(
+                                    data_, polished_state, commitment_,
+                                    *direct_context,
+                                    0.5, 0.05,
+                                    options_.economic_linearized_polish_seconds,
+                                    0.01, true, true, false, true);
+                            nlohmann::json repair_trace = {
+                                {"phase", "linearized_zero_balance"},
+                                {"round", linearized_round},
+                                {"repair", repair.to_json(false)},
+                                {"selected", false},
+                                {"selected_step", 0.0},
+                                {"objective_before", polished_objective},
+                            };
+                            if (!repair.success) {
+                                repair_trace["objective_after"] =
+                                    polished_objective;
+                                output.economic_balance_polish_trace.push_back(
+                                    std::move(repair_trace));
+                                break;
+                            }
+                            const std::array<double, 11> line_search_steps{
+                                1.0, 0.75, 0.5, 0.25, 0.125, 0.0625,
+                                0.03125, 0.015625, 0.0078125,
+                                0.00390625, 0.001953125};
+                            bool selected = false;
+                            double selected_step = 0.0;
+                            AcState selected_state = polished_state;
+                            double selected_objective = polished_objective;
+                            ValidationReport selected_validation =
+                                polished_validation;
+                            ValidationReport first_rejected_validation;
+                            bool first_rejection_recorded = false;
+                            double first_rejected_step = 0.0;
+                            for (double step : line_search_steps) {
+                                if (step < 1.0) {
+                                    ++output
+                                        .economic_balance_polish_backtracking_attempts;
+                                }
+                                AcState candidate = polished_state;
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    candidate.vm[bus] += step *
+                                        (repair.state.vm[bus] -
+                                         polished_state.vm[bus]);
+                                    candidate.va[bus] += step *
+                                        (repair.state.va[bus] -
+                                         polished_state.va[bus]);
+                                }
+                                for (int generator = 0; generator < ng;
+                                     ++generator) {
+                                    candidate.pg[generator] += step *
+                                        (repair.state.pg[generator] -
+                                         polished_state.pg[generator]);
+                                    candidate.qg[generator] += step *
+                                        (repair.state.qg[generator] -
+                                         polished_state.qg[generator]);
+                                }
+                                for (int load = 0;
+                                     load < static_cast<int>(data_.loads.size());
+                                     ++load) {
+                                    candidate.demand_factor[load] += step *
+                                        (repair.state.demand_factor[load] -
+                                         polished_state.demand_factor[load]);
+                                }
+                                normalize_source_reference_angles(
+                                    data_, components, candidate.va);
+                                const double candidate_objective =
+                                    rebuild_contingency_state_derived_fields(
+                                        data_, base_state_, commitment_,
+                                        *contingency, candidate);
+                                const auto candidate_validation =
+                                    validate_state(
+                                        data_, ModelMode::ContingencySoft,
+                                        candidate, commitment_,
+                                        direct_context);
+                                if (candidate_validation.max_residual >
+                                        options_.validation_tolerance &&
+                                    !first_rejection_recorded) {
+                                    first_rejection_recorded = true;
+                                    first_rejected_step = step;
+                                    first_rejected_validation =
+                                        candidate_validation;
+                                }
+                                if (candidate_validation.max_residual <=
+                                        options_.validation_tolerance &&
+                                    candidate_objective >
+                                        polished_objective + 1e-9) {
+                                    selected = true;
+                                    selected_step = step;
+                                    selected_state = std::move(candidate);
+                                    selected_objective = candidate_objective;
+                                    selected_validation =
+                                        candidate_validation;
+                                    break;
+                                }
+                            }
+                            repair_trace["selected"] = selected;
+                            repair_trace["selected_step"] = selected_step;
+                            repair_trace["objective_after"] =
+                                selected_objective;
+                            repair_trace["active_slack_after"] =
+                                slack_sum(selected_state.p_delta);
+                            repair_trace["reactive_slack_after"] =
+                                slack_sum(selected_state.q_delta);
+                            repair_trace["validation"] =
+                                selected_validation.to_json();
+                            if (first_rejection_recorded) {
+                                repair_trace["first_rejected_step"] =
+                                    first_rejected_step;
+                                repair_trace["first_rejected_validation"] =
+                                    first_rejected_validation.to_json();
+                            }
+                            output.economic_balance_polish_trace.push_back(
+                                std::move(repair_trace));
+                            if (!selected) {
+                                break;
+                            }
+                            polished_state = std::move(selected_state);
+                            polished_objective = selected_objective;
+                            polished_validation = selected_validation;
+                        }
+                        // Phase II: from the verified Phase-I point, solve a
+                        // short compact LP whose coefficients are the actual
+                        // source PWL generator/load marginal economics plus
+                        // the source balance-slack penalties.  The complete
+                        // primal point is supplied to HiGHS, and every trial
+                        // is rebuilt with the nonlinear GO2 objective and all
+                        // source contingency constraints before acceptance.
+                        for (int phase_two_round = 1;
+                             phase_two_round <= options_
+                                 .max_economic_linearized_phase_two_rounds;
+                             ++phase_two_round) {
+                            const auto phase_two = solve_linearized_ac_seed(
+                                data_, polished_state, commitment_, 0.499999,
+                                direct_context, false, true,
+                                options_.economic_linearized_phase_two_seconds,
+                                true, false, {}, false, 0.01, 0.05, true);
+                            nlohmann::json phase_two_trace = {
+                                {"phase", "linearized_actual_economic"},
+                                {"round", phase_two_round},
+                                {"linear_model", phase_two.to_json(false)},
+                                {"selected", false},
+                                {"selected_step", 0.0},
+                                {"objective_before", polished_objective},
+                                {"candidates", nlohmann::json::array()},
+                            };
+                            if (!phase_two.success) {
+                                phase_two_trace["objective_after"] =
+                                    polished_objective;
+                                output.economic_balance_polish_trace.push_back(
+                                    std::move(phase_two_trace));
+                                break;
+                            }
+                            const std::array<double, 11> line_search_steps{
+                                1.0, 0.75, 0.5, 0.25, 0.125, 0.0625,
+                                0.03125, 0.015625, 0.0078125,
+                                0.00390625, 0.001953125};
+                            bool selected = false;
+                            double selected_step = 0.0;
+                            AcState selected_state = polished_state;
+                            double selected_objective = polished_objective;
+                            ValidationReport selected_validation =
+                                polished_validation;
+                            for (double step : line_search_steps) {
+                                if (step < 1.0) {
+                                    ++output
+                                        .economic_balance_polish_backtracking_attempts;
+                                }
+                                AcState candidate = polished_state;
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    candidate.vm[bus] += step *
+                                        (phase_two.state.vm[bus] -
+                                         polished_state.vm[bus]);
+                                    candidate.va[bus] += step *
+                                        (phase_two.state.va[bus] -
+                                         polished_state.va[bus]);
+                                }
+                                for (int generator = 0; generator < ng;
+                                     ++generator) {
+                                    candidate.pg[generator] += step *
+                                        (phase_two.state.pg[generator] -
+                                         polished_state.pg[generator]);
+                                    candidate.qg[generator] += step *
+                                        (phase_two.state.qg[generator] -
+                                         polished_state.qg[generator]);
+                                }
+                                for (int load = 0;
+                                     load < static_cast<int>(data_.loads.size());
+                                     ++load) {
+                                    candidate.demand_factor[load] += step *
+                                        (phase_two.state.demand_factor[load] -
+                                         polished_state.demand_factor[load]);
+                                }
+                                normalize_source_reference_angles(
+                                    data_, components, candidate.va);
+                                const double candidate_objective =
+                                    rebuild_contingency_state_derived_fields(
+                                        data_, base_state_, commitment_,
+                                        *contingency, candidate);
+                                const auto candidate_validation =
+                                    validate_state(
+                                        data_, ModelMode::ContingencySoft,
+                                        candidate, commitment_,
+                                        direct_context);
+                                const bool accepted =
+                                    candidate_validation.max_residual <=
+                                        options_.validation_tolerance &&
+                                    candidate_objective >
+                                        selected_objective + 1e-9;
+                                phase_two_trace["candidates"].push_back({
+                                    {"step", step},
+                                    {"objective", candidate_objective},
+                                    {"accepted", accepted},
+                                    {"validation",
+                                     candidate_validation.to_json()},
+                                });
+                                if (accepted) {
+                                    selected = true;
+                                    selected_step = step;
+                                    selected_state = std::move(candidate);
+                                    selected_objective = candidate_objective;
+                                    selected_validation =
+                                        candidate_validation;
+                                }
+                            }
+                            phase_two_trace["selected"] = selected;
+                            phase_two_trace["selected_step"] =
+                                selected_step;
+                            phase_two_trace["objective_after"] =
+                                selected_objective;
+                            phase_two_trace["active_slack_after"] =
+                                slack_sum(selected_state.p_delta);
+                            phase_two_trace["reactive_slack_after"] =
+                                slack_sum(selected_state.q_delta);
+                            phase_two_trace["validation"] =
+                                selected_validation.to_json();
+                            output.economic_balance_polish_trace.push_back(
+                                std::move(phase_two_trace));
+                            if (!selected) {
+                                break;
+                            }
+                            polished_state = std::move(selected_state);
+                            polished_objective = selected_objective;
+                            polished_validation = selected_validation;
+                        }
+                        output.economic_balance_polish_objective_after =
+                            polished_objective;
+                        output.economic_balance_polish_active_slack_after =
+                            slack_sum(polished_state.p_delta);
+                        output.economic_balance_polish_reactive_slack_after =
+                            slack_sum(polished_state.q_delta);
+                        output.economic_balance_polish_validation =
+                            polished_validation;
+                        if (polished_objective > predictor_objective + 1e-9 &&
+                            polished_validation.max_residual <=
+                                options_.validation_tolerance) {
+                            output.economic_balance_polish_selected = true;
+                            predictor_state = std::move(polished_state);
+                            predictor_objective = polished_objective;
+                            predictor_validation = polished_validation;
+                        }
+                    }
                     output.converged = true;
                     output.feasible = true;
                     output.fixed_jacobian_predictor_selected = true;

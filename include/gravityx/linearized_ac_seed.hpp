@@ -27,6 +27,8 @@ struct LinearizedAcSeedResult {
     bool primal_basis_attempted{};
     bool primal_basis_accepted{};
     int primal_basis_status{};
+    bool presolve_enabled{true};
+    double primal_simplex_bound_perturbation_multiplier{-1.0};
     int simplex_strategy{};
     double maximum_column_scale{1.0};
     double maximum_row_scale{1.0};

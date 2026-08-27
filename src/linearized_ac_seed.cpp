@@ -333,6 +333,9 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"primal_basis_attempted", primal_basis_attempted},
         {"primal_basis_accepted", primal_basis_accepted},
         {"primal_basis_status", primal_basis_status},
+        {"presolve_enabled", presolve_enabled},
+        {"primal_simplex_bound_perturbation_multiplier",
+         primal_simplex_bound_perturbation_multiplier},
         {"simplex_strategy", simplex_strategy},
         {"maximum_column_scale", maximum_column_scale},
         {"maximum_row_scale", maximum_row_scale},
@@ -428,16 +431,23 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         reference.demand_factor.size() != data.loads.size()) {
         throw std::runtime_error("linearized AC seed received invalid dimensions");
     }
+    if (economic_objective &&
+        (reference.pf.size() != data.branches.size() ||
+         reference.qf.size() != data.branches.size() ||
+         reference.pt.size() != data.branches.size() ||
+         reference.qt.size() != data.branches.size())) {
+        throw std::runtime_error(
+            "linearized economic seed requires rebuilt branch-flow state");
+    }
     if (!(balance_slack_limit > 0.0 && balance_slack_limit < 0.5)) {
         throw std::runtime_error("linearized AC balance slack must be in (0, 0.5)");
     }
     if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
         throw std::runtime_error("linearized AC time limit must be positive");
     }
-    if (economic_objective &&
-        (feasibility_only || contingency.has_value())) {
+    if (economic_objective && feasibility_only) {
         throw std::runtime_error(
-            "linearized economic objective requires a base fixed-commitment model");
+            "linearized economic objective is incompatible with feasibility-only mode");
     }
     // A caller may omit all but a selected set of branch-security rows for
     // either a base or contingency Phase-I model.  Such a reduced model is
@@ -869,34 +879,49 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         append(active, vm_offset + bus, 2.0 * gs * linearization_vm[bus]);
         append(reactive, vm_offset + bus, -2.0 * bs * linearization_vm[bus]);
         if (compact_economic_objective) {
-            const auto reference_column_value = [&] (HighsInt column) {
-                if (column >= vm_offset && column < va_offset) {
-                    return linearization_vm[column - vm_offset];
+            // Compute the affine row's reference residual from the canonical
+            // rebuilt physical flows.  Reconstructing it as
+            // constant + J*x suffers catastrophic cancellation on the 19k
+            // near-zero-impedance circuits: terms around 1e5 previously left
+            // a false residual above the exact 0.5 source slack bound even
+            // though the independently verified residual was about 1e-5.
+            double active_reference_residual = 0.0;
+            double reactive_reference_residual = 0.0;
+            for (int branch_index : data.buses[bus].branches_from) {
+                if (branch_index == outaged_branch ||
+                    data.branches[branch_index].status == 0) {
+                    continue;
                 }
-                if (column >= va_offset && column < pg_offset) {
-                    return reference.va[column - va_offset];
-                }
-                if (column >= pg_offset && column < qg_offset) {
-                    return reference.pg[column - pg_offset];
-                }
-                if (column >= qg_offset && column < demand_offset) {
-                    return reference.qg[column - qg_offset];
-                }
-                if (column >= demand_offset && column < p_pos_offset) {
-                    return reference.demand_factor[column - demand_offset];
-                }
-                throw std::runtime_error(
-                    "unexpected compact economic balance column");
-            };
-            double active_reference_residual = active_constant;
-            double reactive_reference_residual = reactive_constant;
-            for (const auto& [column, coefficient] : active.entries) {
-                active_reference_residual +=
-                    coefficient * reference_column_value(column);
+                active_reference_residual += reference.pf[branch_index];
+                reactive_reference_residual += reference.qf[branch_index];
             }
-            for (const auto& [column, coefficient] : reactive.entries) {
+            for (int branch_index : data.buses[bus].branches_to) {
+                if (branch_index == outaged_branch ||
+                    data.branches[branch_index].status == 0) {
+                    continue;
+                }
+                active_reference_residual += reference.pt[branch_index];
+                reactive_reference_residual += reference.qt[branch_index];
+            }
+            for (int generator : data.buses[bus].generators) {
+                active_reference_residual -= reference.pg[generator];
+                reactive_reference_residual -= reference.qg[generator];
+            }
+            for (int load : data.buses[bus].loads) {
+                active_reference_residual +=
+                    data.loads[load].pd_nominal *
+                    reference.demand_factor[load];
                 reactive_reference_residual +=
-                    coefficient * reference_column_value(column);
+                    data.loads[load].qd_nominal *
+                    reference.demand_factor[load];
+            }
+            for (int shunt : data.buses[bus].shunts) {
+                active_reference_residual +=
+                    data.shunts[shunt].gs * linearization_vm[bus] *
+                    linearization_vm[bus];
+                reactive_reference_residual -=
+                    effective_shunt_susceptance(data, reference, shunt) *
+                    linearization_vm[bus] * linearization_vm[bus];
             }
             const auto down_column = [&] (HighsInt column) -> HighsInt {
                 if (column >= vm_offset && column < va_offset) {
@@ -1453,11 +1478,27 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     highs.setOptionValue(
         "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
     highs.setOptionValue("threads", 1);
-    highs.setOptionValue("presolve", "on");
+    // The compact economic model has an exact incumbent primal and an
+    // explicit diagonal balance-slack basis.  Preserve that basis in the
+    // original column space: presolve otherwise remaps or discards its basic
+    // elastic columns before the deliberately short resident simplex solve.
+    output.presolve_enabled = !compact_economic_objective;
+    highs.setOptionValue(
+        "presolve", output.presolve_enabled ? "on" : "off");
     highs.setOptionValue("small_matrix_value", small_matrix_value);
     highs.setOptionValue("solver", solver);
     if (solver == "simplex" && (feasibility_only || economic_objective)) {
         highs.setOptionValue("simplex_strategy", simplex_strategy);
+        if (compact_economic_objective) {
+            // A time-limited primal-simplex return must remain within the
+            // exact source bounds.  Bound perturbation had produced terminal
+            // movement columns outside those bounds even though the live log
+            // reported a feasible iterate.  Disabling it changes no model
+            // bound or acceptance tolerance.
+            output.primal_simplex_bound_perturbation_multiplier = 0.0;
+            highs.setOptionValue(
+                "primal_simplex_bound_perturbation_multiplier", 0.0);
+        }
     }
     highs.setOptionValue("run_crossover", "off");
     highs.setOptionValue("time_limit", time_limit_seconds);

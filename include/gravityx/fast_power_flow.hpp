@@ -14,6 +14,9 @@ namespace gravityx {
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool fixed_jacobian_screen_only{false};
+    bool minimize_active_balance_slack{false};
+    bool minimize_reactive_balance_slack{false};
+    double balance_cleanup_fraction{1.0};
     bool capture_diagnostics{false};
     int max_newton_iterations{50};
     int max_active_redispatch_passes{20};
@@ -28,6 +31,11 @@ struct FastPowerFlowResult {
     bool direct_candidate_attempted{};
     bool direct_candidate_selected{};
     ValidationReport direct_candidate_validation;
+    bool local_balance_candidate_attempted{};
+    bool local_balance_candidate_selected{};
+    int local_balance_backtracking_attempts{};
+    double local_balance_selected_step{};
+    ValidationReport local_balance_candidate_validation;
     bool fixed_jacobian_predictor_attempted{};
     bool fixed_jacobian_predictor_selected{};
     int fixed_jacobian_predictor_iterations{};
@@ -41,11 +49,17 @@ struct FastPowerFlowResult {
     bool active_only_newton_converged{};
     int active_only_newton_iterations{};
     ValidationReport active_only_newton_validation;
+    int active_only_backtracking_attempts{};
+    double active_only_selected_step{};
+    ValidationReport active_only_backtracking_validation;
     bool reactive_only_newton_attempted{};
     bool reactive_only_newton_selected{};
     bool reactive_only_newton_converged{};
     int reactive_only_newton_iterations{};
     ValidationReport reactive_only_newton_validation;
+    int reactive_only_backtracking_attempts{};
+    double reactive_only_selected_step{};
+    nlohmann::json reactive_only_trace = nlohmann::json::array();
     bool distributed_balance_polish_attempted{};
     bool distributed_balance_polish_selected{};
     int distributed_balance_polish_iterations{};

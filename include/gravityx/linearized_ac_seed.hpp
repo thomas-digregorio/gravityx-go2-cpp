@@ -14,6 +14,8 @@ namespace gravityx {
 struct LinearizedAcSeedResult {
     bool success{};
     double wall_seconds{};
+    bool economic_objective{};
+    bool compact_economic_objective{};
     bool projected_balance_slack{};
     bool branch_security_rows_omitted{};
     int branch_security_subset_count{};
@@ -27,6 +29,8 @@ struct LinearizedAcSeedResult {
     int primal_basis_status{};
     int simplex_strategy{};
     double maximum_column_scale{1.0};
+    double maximum_row_scale{1.0};
+    double objective_scale{1.0};
     double voltage_trust_radius{};
     double angle_trust_radius{};
     int projected_reference_voltage_count{};
@@ -36,6 +40,17 @@ struct LinearizedAcSeedResult {
     bool solution_value_valid{};
     bool info_valid{};
     bool accepted_feasible_nonoptimal_phase_one{};
+    bool accepted_feasible_nonoptimal_economic{};
+    bool accepted_approximate_economic_direction{};
+    int resident_segment_count{};
+    int feasible_segment_snapshot_count{};
+    bool recovered_feasible_segment_snapshot{};
+    bool canonicalized_segment_snapshot{};
+    double canonicalized_snapshot_max_primal_infeasibility{};
+    double canonicalized_snapshot_objective{};
+    int terminal_run_status{-99};
+    int terminal_model_status{-99};
+    nlohmann::json resident_segments = nlohmann::json::array();
     double time_limit_seconds{};
     double ipm_optimality_tolerance{};
     int row_count{};
@@ -79,6 +94,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     const std::vector<int>& branch_security_subset = {},
     bool force_projected_balance_phase_one = false,
     double voltage_trust_radius_override = -1.0,
-    double angle_trust_radius_override = -1.0);
+    double angle_trust_radius_override = -1.0,
+    bool economic_objective = false);
 
 }  // namespace gravityx

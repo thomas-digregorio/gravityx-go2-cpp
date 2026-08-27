@@ -47,6 +47,34 @@ struct IbrResult {
     nlohmann::json to_json(bool include_state = false) const;
 };
 
+struct SparseEconomicRefinementOptions {
+    double time_limit_seconds{60.0};
+    double validation_tolerance{1e-5};
+    double objective_tolerance{1e-9};
+    int maximum_rounds{24};
+    int maximum_linear_economic_rounds{1};
+    double linear_economic_time_limit_seconds{60.0};
+    double linear_economic_voltage_trust_radius{0.02};
+    double linear_economic_angle_trust_radius{0.05};
+    int voltage_coordinate_bus_count{64};
+    int maximum_voltage_coordinate_passes{8};
+};
+
+struct SparseEconomicRefinementResult {
+    bool incumbent_verified{};
+    bool attempted{};
+    bool improved{};
+    bool time_limit_reached{};
+    double wall_seconds{};
+    double incumbent_objective{};
+    double selected_objective{};
+    SolveResult selected;
+    ValidationReport selected_validation;
+    nlohmann::json rounds = nlohmann::json::array();
+
+    nlohmann::json to_json(bool include_state = false) const;
+};
+
 bool validated_candidate_is_feasible(
     const SolveResult& result,
     const ValidationReport& validation,
@@ -59,6 +87,12 @@ bool verified_economic_candidate_improves_incumbent(
     const ValidationReport& candidate_validation,
     double validation_tolerance,
     double objective_tolerance = 1e-9);
+
+SparseEconomicRefinementResult refine_fixed_commitment_sparse(
+    const CaseData& data,
+    const std::vector<int>& commitment,
+    const SolveResult& incumbent,
+    const SparseEconomicRefinementOptions& options = {});
 
 IbrResult run_iterative_batch_rounding(const CaseData& data, const IbrOptions& options = {});
 

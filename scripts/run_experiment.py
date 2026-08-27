@@ -2798,6 +2798,12 @@ def main() -> int:
     parser.add_argument(
         "--base-economic-refinement-seconds", type=float, default=0.0
     )
+    parser.add_argument(
+        "--base-sparse-economic-refinement-seconds", type=float, default=0.0
+    )
+    parser.add_argument(
+        "--base-sparse-ac-economic-refinement-seconds", type=float, default=0.0
+    )
     parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
     parser.add_argument(
@@ -2889,6 +2895,20 @@ def main() -> int:
             "--base-economic-refinement-seconds requires "
             "--validated-source-base"
         )
+    for option, value in (
+        (
+            "--base-sparse-economic-refinement-seconds",
+            args.base_sparse_economic_refinement_seconds,
+        ),
+        (
+            "--base-sparse-ac-economic-refinement-seconds",
+            args.base_sparse_ac_economic_refinement_seconds,
+        ),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            parser.error(f"{option} must be finite and nonnegative")
+        if value > 0.0 and not args.validated_source_base:
+            parser.error(f"{option} requires --validated-source-base")
     if (args.linearized_contingency_only and
             not args.linearized_contingency_fallback):
         parser.error(
@@ -3138,6 +3158,12 @@ def main() -> int:
         "base_economic_refinement_seconds": (
             args.base_economic_refinement_seconds
         ),
+        "base_sparse_economic_refinement_seconds": (
+            args.base_sparse_economic_refinement_seconds
+        ),
+        "base_sparse_ac_economic_refinement_seconds": (
+            args.base_sparse_ac_economic_refinement_seconds
+        ),
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (
@@ -3247,6 +3273,16 @@ def main() -> int:
                 base_arguments.append(
                     "economic-refinement-seconds="
                     f"{args.base_economic_refinement_seconds:.17g}"
+                )
+            if args.base_sparse_economic_refinement_seconds > 0.0:
+                base_arguments.append(
+                    "sparse-economic-refinement-seconds="
+                    f"{args.base_sparse_economic_refinement_seconds:.17g}"
+                )
+            if args.base_sparse_ac_economic_refinement_seconds > 0.0:
+                base_arguments.append(
+                    "sparse-ac-economic-refinement-seconds="
+                    f"{args.base_sparse_ac_economic_refinement_seconds:.17g}"
                 )
         else:
             base_arguments = [
@@ -4581,8 +4617,17 @@ def main() -> int:
     )
     summary = {
         "method": (
-            "C++ source commitment with HiGHS sequential-linearized AC base, "
-            "parallel sparse-Newton screening, and isolated resident Ipopt fallback"
+            (
+                "C++ source commitment with verified sparse HiGHS "
+                "preconditioning and direct sparse Ipopt fixed-commitment AC "
+                "base economics, parallel sparse-Newton screening, and "
+                "isolated resident Ipopt fallback"
+                if args.base_sparse_ac_economic_refinement_seconds > 0.0
+                else
+                "C++ source commitment with HiGHS sequential-linearized AC "
+                "base, parallel sparse-Newton screening, and isolated resident "
+                "Ipopt fallback"
+            )
             if args.validated_source_base and args.two_stage_contingency_screen
             else (
             "Gravity C++ source-status AC base plus validated sparse-Newton contingency screen"
@@ -4623,6 +4668,12 @@ def main() -> int:
         "validated_source_base": args.validated_source_base,
         "base_economic_refinement_seconds": (
             args.base_economic_refinement_seconds
+        ),
+        "base_sparse_economic_refinement_seconds": (
+            args.base_sparse_economic_refinement_seconds
+        ),
+        "base_sparse_ac_economic_refinement_seconds": (
+            args.base_sparse_ac_economic_refinement_seconds
         ),
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,

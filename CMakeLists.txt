@@ -43,6 +43,7 @@ add_executable(gravityx_go2
     src/active_feasibility_repair.cpp
     src/fast_power_flow.cpp
     src/linearized_ac_seed.cpp
+    src/sparse_ac_economic.cpp
     src/validation.cpp
     src/state_io.cpp
     src/solution_writer.cpp

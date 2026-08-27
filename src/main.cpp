@@ -5,6 +5,7 @@
 #include "gravityx/fast_power_flow.hpp"
 #include "gravityx/linearized_ac_seed.hpp"
 #include "gravityx/solution_writer.hpp"
+#include "gravityx/sparse_ac_economic.hpp"
 #include "gravityx/state_io.hpp"
 #include "gravityx/validation.hpp"
 
@@ -853,6 +854,26 @@ int run_parallel_circuit_regression() {
             "validated source-base regression failed with residual " +
             std::to_string(source_base.validation.max_residual));
     }
+    gravityx::SparseAcEconomicOptions sparse_ac_options;
+    sparse_ac_options.time_limit_seconds = 2.0;
+    sparse_ac_options.tolerance = 1e-8;
+    sparse_ac_options.acceptable_tolerance = 1e-5;
+    const auto sparse_ac_economic =
+        gravityx::solve_sparse_fixed_commitment_ac_economic(
+            data, {1}, source_base.solve, sparse_ac_options);
+    if (!sparse_ac_economic.solver_initialized ||
+        !sparse_ac_economic.candidate_returned ||
+        sparse_ac_economic.intermediate_callbacks <= 0 ||
+        sparse_ac_economic.intermediate_iterates_retrieved <= 0 ||
+        sparse_ac_economic.intermediate_capture_failures != 0 ||
+        sparse_ac_economic.initial_constraint_violation > 1e-7 ||
+        sparse_ac_economic.selected_validation.max_residual > 1e-5 ||
+        sparse_ac_economic.selected.objective + 1e-9 <
+            source_base.solve.objective) {
+        throw std::runtime_error(
+            "direct sparse AC economic regression failed: " +
+            sparse_ac_economic.to_json(false).dump());
+    }
     auto inactive_branch_data = data;
     inactive_branch_data.branches[0].status = 0;
     // Deliberately make the inactive circuit electrically extreme.  Every
@@ -926,6 +947,108 @@ int run_parallel_circuit_regression() {
                 "lightweight linearized AC seed left its trust region");
         }
     }
+    const auto economic_linear_seed = gravityx::solve_linearized_ac_seed(
+        data, source_base.solve.state, {1}, 0.499999, std::nullopt, false, true,
+        10.0, false, false, {}, false,
+        kTestVoltageTrustRadius, kTestAngleTrustRadius, true);
+    if (!economic_linear_seed.success ||
+        !economic_linear_seed.economic_objective ||
+        !economic_linear_seed.primal_start_attempted ||
+        !economic_linear_seed.primal_start_accepted ||
+        economic_linear_seed.feasibility_only ||
+        economic_linear_seed.state.pg.size() != data.generators.size() ||
+        economic_linear_seed.state.demand_factor.size() != data.loads.size() ||
+        economic_linear_seed.state.sm_slack.size() != data.branches.size() ||
+        !std::isfinite(economic_linear_seed.objective)) {
+        throw std::runtime_error(
+            "linearized economic objective regression failed: " +
+            economic_linear_seed.to_json(false).dump());
+    }
+    const auto compact_economic_linear_seed =
+        gravityx::solve_linearized_ac_seed(
+            data, source_base.solve.state, {1}, 0.499999, std::nullopt,
+            false, true, 10.0, true, false, {}, false,
+            kTestVoltageTrustRadius, kTestAngleTrustRadius, true);
+    if (!compact_economic_linear_seed.success ||
+        !compact_economic_linear_seed.compact_economic_objective ||
+        !compact_economic_linear_seed.primal_start_accepted ||
+        !compact_economic_linear_seed.primal_basis_attempted ||
+        !compact_economic_linear_seed.primal_basis_accepted ||
+        compact_economic_linear_seed.resident_segment_count < 1 ||
+        compact_economic_linear_seed.feasible_segment_snapshot_count < 1 ||
+        compact_economic_linear_seed.branch_security_rows_omitted == false ||
+        compact_economic_linear_seed.state.pg.size() !=
+            data.generators.size()) {
+        throw std::runtime_error(
+            "compact linearized economic basis regression failed: " +
+            compact_economic_linear_seed.to_json(false).dump());
+    }
+    // A switched shunt's live setting can differ from its immutable source
+    // starting value.  The compact economic LP must linearize the exact live
+    // state; otherwise its explicit incumbent basis contains a fictitious Q
+    // mismatch even though the nonlinear state is balanced.
+    auto switched_shunt_data = data;
+    gravityx::Shunt switched_shunt;
+    switched_shunt.source_key = "1";
+    switched_shunt.index = 1;
+    switched_shunt.bus = 0;
+    switched_shunt.bs = 0.02;
+    switched_shunt.dispatchable = true;
+    switched_shunt.steps = {1};
+    switched_shunt.block_maximum_steps = {4};
+    switched_shunt.block_susceptance = {0.02};
+    switched_shunt_data.shunts.push_back(switched_shunt);
+    switched_shunt_data.buses[0].shunts.push_back(0);
+    auto switched_shunt_reference = source_base.solve.state;
+    switched_shunt_reference.shunt_steps = {{4}};
+    switched_shunt_reference.shunt_bs = {0.08};
+    switched_shunt_reference.qg[0] -=
+        switched_shunt_reference.shunt_bs[0] *
+        switched_shunt_reference.vm[0] * switched_shunt_reference.vm[0];
+    gravityx::rebuild_base_state_derived_fields(
+        switched_shunt_data, {1}, switched_shunt_reference);
+    const auto switched_shunt_validation = gravityx::validate_state(
+        switched_shunt_data, gravityx::ModelMode::BaseSoft,
+        switched_shunt_reference, {1});
+    if (switched_shunt_validation.max_residual > 1e-7) {
+        throw std::runtime_error(
+            "switched-shunt economic fixture is not exactly balanced: " +
+            switched_shunt_validation.to_json().dump());
+    }
+    switched_shunt_data.buses[0].vmin = switched_shunt_reference.vm[0];
+    switched_shunt_data.buses[0].vmax = switched_shunt_reference.vm[0];
+    switched_shunt_data.buses[1].vmin = switched_shunt_reference.vm[1];
+    switched_shunt_data.buses[1].vmax = switched_shunt_reference.vm[1];
+    switched_shunt_data.generators[0].pmin =
+        switched_shunt_reference.pg[0];
+    switched_shunt_data.generators[0].pmax =
+        switched_shunt_reference.pg[0];
+    switched_shunt_data.generators[0].qmin =
+        switched_shunt_reference.qg[0];
+    switched_shunt_data.generators[0].qmax =
+        switched_shunt_reference.qg[0];
+    const auto switched_shunt_linear_seed =
+        gravityx::solve_linearized_ac_seed(
+            switched_shunt_data, switched_shunt_reference, {1}, 0.499999,
+            std::nullopt, false, true, 10.0, true, false, {}, false,
+            1e-10, 1e-10, true);
+    double expected_switched_shunt_balance_slack = 0.0;
+    for (double value : switched_shunt_reference.p_delta) {
+        expected_switched_shunt_balance_slack += value;
+    }
+    for (double value : switched_shunt_reference.q_delta) {
+        expected_switched_shunt_balance_slack += value;
+    }
+    if (!switched_shunt_linear_seed.success ||
+        std::abs(switched_shunt_linear_seed.total_balance_slack -
+                 expected_switched_shunt_balance_slack) > 2e-6) {
+        throw std::runtime_error(
+            "linearized economic seed did not preserve the live switched-"
+            "shunt balance (expected total " +
+            std::to_string(expected_switched_shunt_balance_slack) +
+            "): " +
+            switched_shunt_linear_seed.to_json(false).dump());
+    }
     auto outside_voltage_reference = source_base.solve.state;
     outside_voltage_reference.vm[0] = data.buses[0].vmax + 0.2;
     const auto projected_voltage_seed = gravityx::solve_linearized_ac_seed(
@@ -965,6 +1088,53 @@ int run_parallel_circuit_regression() {
     if ((solve.status != 0 && solve.status != 1) || !std::isfinite(solve.objective) ||
         validation.max_residual > 1e-5) {
         throw std::runtime_error("parallel-circuit symbolic-DAG regression failed");
+    }
+    auto slack_incumbent = solve;
+    slack_incumbent.status = 0;
+    slack_incumbent.state.pg[0] -= 0.05;
+    slack_incumbent.objective = gravityx::rebuild_base_state_derived_fields(
+        data, {1}, slack_incumbent.state);
+    const auto slack_incumbent_validation = gravityx::validate_state(
+        data, gravityx::ModelMode::BaseSoft,
+        slack_incumbent.state, {1});
+    if (slack_incumbent_validation.max_residual > 1e-5) {
+        throw std::runtime_error(
+            "sparse economic refinement fixture incumbent is invalid: " +
+            std::to_string(slack_incumbent_validation.max_residual) +
+            " " + slack_incumbent_validation.worst_category +
+            " " + slack_incumbent_validation.worst_identity);
+    }
+    const double incumbent_balance_slack = std::accumulate(
+        slack_incumbent.state.p_delta.begin(),
+        slack_incumbent.state.p_delta.end(), 0.0) +
+        std::accumulate(
+            slack_incumbent.state.q_delta.begin(),
+            slack_incumbent.state.q_delta.end(), 0.0);
+    gravityx::SparseEconomicRefinementOptions sparse_options;
+    sparse_options.time_limit_seconds = 10.0;
+    sparse_options.maximum_rounds = 2;
+    const auto sparse_refinement =
+        gravityx::refine_fixed_commitment_sparse(
+            data, {1}, slack_incumbent, sparse_options);
+    const double selected_balance_slack = std::accumulate(
+        sparse_refinement.selected.state.p_delta.begin(),
+        sparse_refinement.selected.state.p_delta.end(), 0.0) +
+        std::accumulate(
+            sparse_refinement.selected.state.q_delta.begin(),
+            sparse_refinement.selected.state.q_delta.end(), 0.0);
+    if (!sparse_refinement.incumbent_verified ||
+        !sparse_refinement.attempted ||
+        sparse_refinement.selected_validation.max_residual > 1e-5 ||
+        sparse_refinement.selected_objective + 1e-9 <
+            sparse_refinement.incumbent_objective ||
+        selected_balance_slack > incumbent_balance_slack + 1e-9) {
+        throw std::runtime_error(
+            "sparse fixed-commitment economic refinement regression failed: " +
+            sparse_refinement.to_json(false).dump() +
+            " incumbent_balance_slack=" +
+            std::to_string(incumbent_balance_slack) +
+            " selected_balance_slack=" +
+            std::to_string(selected_balance_slack));
     }
     {
         auto official_soft_limit_data = data;
@@ -1606,7 +1776,9 @@ int run_validated_source_base_json(
     const std::string& output_path,
     bool allow_exact_fallback = true,
     bool allow_large_base_newton_restart = true,
-    double economic_refinement_seconds = 0.0) {
+    double economic_refinement_seconds = 0.0,
+    double sparse_economic_refinement_seconds = 0.0,
+    double sparse_ac_economic_refinement_seconds = 0.0) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto command_start = std::chrono::steady_clock::now();
@@ -1653,6 +1825,8 @@ int run_validated_source_base_json(
     nlohmann::json linearized_repair_json = nlohmann::json::array();
     nlohmann::json exact_repair_json = nullptr;
     nlohmann::json economic_refinement_json = nullptr;
+    nlohmann::json sparse_economic_refinement_json = nullptr;
+    nlohmann::json sparse_ac_economic_refinement_json = nullptr;
     bool base_optimization_performed = false;
     std::string base_method = "independently_validated_source_operating_point";
     if (!success) {
@@ -2345,6 +2519,27 @@ int run_validated_source_base_json(
             {"wall_seconds", exact_total_seconds},
         });
     }
+    if (success) {
+        const auto canonical_start = std::chrono::steady_clock::now();
+        selected_solve.objective =
+            gravityx::rebuild_base_state_derived_fields(
+                data, commitment, selected_solve.state);
+        selected_validation = gravityx::validate_state(
+            data, gravityx::ModelMode::BaseSoft,
+            selected_solve.state, commitment);
+        const double canonical_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - canonical_start).count();
+        wall_seconds += canonical_seconds;
+        success = selected_validation.max_residual <= 1e-5;
+        log_base_phase("canonical_verified_incumbent", {
+            {"success", success},
+            {"objective", selected_solve.objective},
+            {"max_residual", selected_validation.max_residual},
+            {"worst_category", selected_validation.worst_category},
+            {"worst_identity", selected_validation.worst_identity},
+            {"wall_seconds", canonical_seconds},
+        });
+    }
     if (success && economic_refinement_seconds > 0.0) {
         const auto incumbent_solve = selected_solve;
         const auto incumbent_validation = selected_validation;
@@ -2405,6 +2600,105 @@ int run_validated_source_base_json(
         log_base_phase(
             "economic_refinement_complete", economic_refinement_json);
     }
+    if (success && sparse_economic_refinement_seconds > 0.0) {
+        const auto refinement_start = std::chrono::steady_clock::now();
+        nlohmann::json attempt = {
+            {"requested_total_seconds", sparse_economic_refinement_seconds},
+            {"incumbent_objective", selected_solve.objective},
+            {"incumbent_validation", selected_validation.to_json()},
+            {"accepted", false},
+        };
+        log_base_phase("sparse_economic_refinement_start", attempt);
+        try {
+            gravityx::SparseEconomicRefinementOptions options;
+            options.time_limit_seconds = sparse_economic_refinement_seconds;
+            options.linear_economic_time_limit_seconds =
+                sparse_economic_refinement_seconds;
+            const auto refinement =
+                gravityx::refine_fixed_commitment_sparse(
+                    data, commitment, selected_solve, options);
+            attempt = refinement.to_json(false);
+            attempt["requested_total_seconds"] =
+                sparse_economic_refinement_seconds;
+            attempt["accepted"] = refinement.improved;
+            base_optimization_performed =
+                base_optimization_performed || refinement.attempted;
+            if (refinement.incumbent_verified) {
+                selected_solve = refinement.selected;
+                selected_validation = refinement.selected_validation;
+                if (refinement.improved) {
+                    base_method =
+                        "highs_sparse_balance_economic_refinement";
+                }
+            }
+        } catch (const std::exception& error) {
+            attempt["status"] =
+                "exception_preserved_verified_incumbent";
+            attempt["error"] = error.what();
+        }
+        const double total_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - refinement_start).count();
+        attempt["total_wall_seconds"] = total_seconds;
+        attempt["selected_objective"] = selected_solve.objective;
+        sparse_economic_refinement_json = std::move(attempt);
+        wall_seconds += total_seconds;
+        log_base_phase("sparse_economic_refinement_complete", {
+            {"accepted", sparse_economic_refinement_json.value(
+                "accepted", false)},
+            {"attempted", sparse_economic_refinement_json.value(
+                "attempted", false)},
+            {"time_limit_reached", sparse_economic_refinement_json.value(
+                "time_limit_reached", false)},
+            {"incumbent_objective", sparse_economic_refinement_json.value(
+                "incumbent_objective", selected_solve.objective)},
+            {"selected_objective", selected_solve.objective},
+            {"max_residual", selected_validation.max_residual},
+            {"wall_seconds", total_seconds},
+        });
+    }
+    if (success && sparse_ac_economic_refinement_seconds > 0.0) {
+        const auto refinement_start = std::chrono::steady_clock::now();
+        nlohmann::json attempt = {
+            {"requested_total_seconds",
+             sparse_ac_economic_refinement_seconds},
+            {"incumbent_objective", selected_solve.objective},
+            {"incumbent_validation", selected_validation.to_json()},
+            {"accepted", false},
+        };
+        log_base_phase("sparse_ac_economic_refinement_start", attempt);
+        try {
+            gravityx::SparseAcEconomicOptions options;
+            options.time_limit_seconds =
+                sparse_ac_economic_refinement_seconds;
+            const auto refinement =
+                gravityx::solve_sparse_fixed_commitment_ac_economic(
+                    data, commitment, selected_solve, options);
+            attempt = refinement.to_json(false);
+            attempt["requested_total_seconds"] =
+                sparse_ac_economic_refinement_seconds;
+            attempt["accepted"] = refinement.improved;
+            base_optimization_performed = true;
+            selected_solve = refinement.selected;
+            selected_validation = refinement.selected_validation;
+            if (refinement.improved) {
+                base_method =
+                    "direct_sparse_ipopt_fixed_commitment_economic";
+            }
+        } catch (const std::exception& error) {
+            attempt["status"] =
+                "exception_preserved_verified_incumbent";
+            attempt["error"] = error.what();
+        }
+        const double total_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - refinement_start).count();
+        attempt["total_wall_seconds"] = total_seconds;
+        attempt["selected_objective"] = selected_solve.objective;
+        sparse_ac_economic_refinement_json = std::move(attempt);
+        wall_seconds += total_seconds;
+        log_base_phase(
+            "sparse_ac_economic_refinement_complete",
+            sparse_ac_economic_refinement_json);
+    }
     gravityx::IbrResult result;
     result.success = success;
     result.wall_seconds = wall_seconds;
@@ -2421,6 +2715,10 @@ int run_validated_source_base_json(
     output["linearized_repair"] = linearized_repair_json;
     output["exact_repair"] = exact_repair_json;
     output["economic_refinement"] = economic_refinement_json;
+    output["sparse_economic_refinement"] =
+        sparse_economic_refinement_json;
+    output["sparse_ac_economic_refinement"] =
+        sparse_ac_economic_refinement_json;
     write_json_file(output_path, output);
     std::cout << nlohmann::json({
         {"output", output_path},
@@ -2461,6 +2759,125 @@ BasePoint load_base_point(const std::string& base_result_path) {
         base_json.at("commitment").get<std::vector<int>>(),
         gravityx::ac_state_from_json(base_json.at("selected_state")),
     };
+}
+
+int run_sparse_economic_refinement_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "sparse economic refinement time limit must be finite and positive");
+    }
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    const auto base = load_base_point(base_result_path);
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    gravityx::SparseEconomicRefinementOptions options;
+    options.time_limit_seconds = time_limit_seconds;
+    const auto refinement = gravityx::refine_fixed_commitment_sparse(
+        data, base.commitment, incumbent, options);
+
+    auto output = input_json;
+    output["success"] = refinement.incumbent_verified;
+    output["base_optimization_performed"] = refinement.attempted;
+    output["economic_refinement"] = refinement.to_json(false);
+    output["base"] = gravityx::solve_result_to_json(
+        refinement.selected, true);
+    output["base_validation"] =
+        refinement.selected_validation.to_json();
+    output["selected_state"] =
+        gravityx::ac_state_to_json(refinement.selected.state);
+    output["wall_seconds"] =
+        input_json.value("wall_seconds", 0.0) + refinement.wall_seconds;
+    if (refinement.improved) {
+        output["base_method"] =
+            "highs_sparse_balance_economic_refinement";
+    }
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", refinement.incumbent_verified},
+        {"attempted", refinement.attempted},
+        {"improved", refinement.improved},
+        {"time_limit_reached", refinement.time_limit_reached},
+        {"incumbent_objective", refinement.incumbent_objective},
+        {"selected_objective", refinement.selected_objective},
+        {"wall_seconds", refinement.wall_seconds},
+        {"max_residual", refinement.selected_validation.max_residual},
+    }).dump(2) << '\n';
+    return refinement.incumbent_verified ? 0 : 1;
+}
+
+int run_sparse_ac_economic_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds,
+    int print_level) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    const auto base = load_base_point(base_result_path);
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    gravityx::SparseAcEconomicOptions options;
+    options.time_limit_seconds = time_limit_seconds;
+    options.print_level = print_level;
+    const auto refinement =
+        gravityx::solve_sparse_fixed_commitment_ac_economic(
+            data, base.commitment, incumbent, options);
+
+    auto output = input_json;
+    output["sparse_ac_economic"] = refinement.to_json(false);
+    output["base_optimization_performed"] = refinement.attempted;
+    output["base"] = gravityx::solve_result_to_json(
+        refinement.selected, true);
+    output["base_validation"] =
+        refinement.selected_validation.to_json();
+    output["selected_state"] =
+        gravityx::ac_state_to_json(refinement.selected.state);
+    output["wall_seconds"] =
+        input_json.value("wall_seconds", 0.0) + refinement.wall_seconds;
+    if (refinement.improved) {
+        output["base_method"] =
+            "direct_sparse_ipopt_fixed_commitment_economic";
+    }
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"solver_initialized", refinement.solver_initialized},
+        {"candidate_returned", refinement.candidate_returned},
+        {"candidate_verified", refinement.candidate_verified},
+        {"best_intermediate_found", refinement.best_intermediate_found},
+        {"improved", refinement.improved},
+        {"status", refinement.status},
+        {"iterations", refinement.iterations},
+        {"intermediate_callbacks", refinement.intermediate_callbacks},
+        {"intermediate_verified_candidates",
+         refinement.intermediate_verified_candidates},
+        {"best_intermediate_iteration",
+         refinement.best_intermediate_iteration},
+        {"selected_source", refinement.selected_source},
+        {"incumbent_objective", refinement.incumbent_objective},
+        {"selected_objective", refinement.selected.objective},
+        {"initial_constraint_violation",
+         refinement.initial_constraint_violation},
+        {"candidate_constraint_violation",
+         refinement.candidate_constraint_violation},
+        {"max_residual", refinement.selected_validation.max_residual},
+        {"wall_seconds", refinement.wall_seconds},
+    }).dump(2) << '\n';
+    return refinement.selected_validation.max_residual <= 1e-5 ? 0 : 1;
 }
 
 bool solve_loaded_contingency(
@@ -4124,11 +4541,13 @@ int main(int argc, char** argv) {
             }
             return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
-        if ((argc >= 4 && argc <= 7) &&
+        if ((argc >= 4 && argc <= 9) &&
             std::string(argv[1]) == "validated-source-base-json") {
             bool allow_exact_fallback = true;
             bool allow_large_base_newton_restart = true;
             double economic_refinement_seconds = 0.0;
+            double sparse_economic_refinement_seconds = 0.0;
+            double sparse_ac_economic_refinement_seconds = 0.0;
             for (int i = 4; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "fast-only") {
@@ -4146,6 +4565,27 @@ int main(int argc, char** argv) {
                         throw std::runtime_error(
                             "economic refinement seconds must be finite and positive");
                     }
+                } else if (option.rfind(
+                               "sparse-economic-refinement-seconds=", 0) == 0) {
+                    sparse_economic_refinement_seconds = std::stod(
+                        option.substr(std::string(
+                            "sparse-economic-refinement-seconds=").size()));
+                    if (!std::isfinite(sparse_economic_refinement_seconds) ||
+                        sparse_economic_refinement_seconds <= 0.0) {
+                        throw std::runtime_error(
+                            "sparse economic refinement seconds must be finite and positive");
+                    }
+                } else if (option.rfind(
+                               "sparse-ac-economic-refinement-seconds=", 0) == 0) {
+                    sparse_ac_economic_refinement_seconds = std::stod(
+                        option.substr(std::string(
+                            "sparse-ac-economic-refinement-seconds=").size()));
+                    if (!std::isfinite(
+                            sparse_ac_economic_refinement_seconds) ||
+                        sparse_ac_economic_refinement_seconds <= 0.0) {
+                        throw std::runtime_error(
+                            "sparse AC economic refinement seconds must be finite and positive");
+                    }
                 } else {
                     throw std::runtime_error(
                         "unknown validated-source-base-json option: " + option);
@@ -4154,11 +4594,24 @@ int main(int argc, char** argv) {
             return run_validated_source_base_json(
                 argv[2], argv[3], allow_exact_fallback,
                 allow_large_base_newton_restart,
-                economic_refinement_seconds);
+                economic_refinement_seconds,
+                sparse_economic_refinement_seconds,
+                sparse_ac_economic_refinement_seconds);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
             return solve_contingency(argv[2], argv[3], argv[4], argv[5], print_level);
+        }
+        if (argc == 6 &&
+            std::string(argv[1]) == "sparse-economic-refine-base-json") {
+            return run_sparse_economic_refinement_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]));
+        }
+        if ((argc == 6 || argc == 7) &&
+            std::string(argv[1]) == "sparse-ac-economic-base-json") {
+            const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
+            return run_sparse_ac_economic_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]), print_level);
         }
         if (argc == 5 && std::string(argv[1]) == "screen-all-contingencies") {
             return screen_all_contingencies(argv[2], argv[3], argv[4]);
@@ -4215,7 +4668,9 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 solve-relax CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr CASE.json [print-level]\n"
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
-                  << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only] [robust-contingency-seed] [economic-refinement-seconds=N]\n"
+                  << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only] [robust-contingency-seed] [economic-refinement-seconds=N] [sparse-economic-refinement-seconds=N] [sparse-ac-economic-refinement-seconds=N]\n"
+                  << "  gravityx_go2 sparse-economic-refine-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
+                  << "  gravityx_go2 sparse-ac-economic-base-json CASE.json BASE.json OUTPUT.json SECONDS [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 screen-all-contingencies CASE.json BASE.json OUTPUT.json\n"
                   << "  gravityx_go2 solve-contingency-batch CASE.json BASE.json MANIFEST.json [print-level]\n"

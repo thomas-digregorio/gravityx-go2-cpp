@@ -1,3 +1,6 @@
+#include <highs/Highs.h>
+#include <Eigen/SparseLU>
+
 #include "gravityx/algorithm.hpp"
 #include "gravityx/fast_power_flow.hpp"
 #include "gravityx/linearized_ac_seed.hpp"
@@ -7,9 +10,11 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 
 namespace gravityx {
 namespace {
@@ -54,6 +59,1413 @@ bool verified_economic_candidate_improves_incumbent(
         validated_candidate_is_feasible(
             candidate, candidate_validation, validation_tolerance) &&
         candidate.objective > incumbent.objective + objective_tolerance;
+}
+
+double base_commitment_transition_cost(
+    const CaseData& data,
+    const std::vector<int>& commitment) {
+    if (commitment.size() != data.generators.size()) {
+        throw std::runtime_error(
+            "base commitment transition-cost size mismatch");
+    }
+    double cost = 0.0;
+    for (int generator = 0;
+         generator < static_cast<int>(data.generators.size());
+         ++generator) {
+        if (commitment[generator] != 0 && commitment[generator] != 1) {
+            throw std::runtime_error(
+                "base commitment transition-cost status is not binary");
+        }
+        const auto& source = data.generators[generator];
+        if (commitment[generator] > source.status_prev) {
+            cost += source.sucost;
+        } else if (commitment[generator] < source.status_prev) {
+            cost += source.sdcost;
+        }
+    }
+    return cost;
+}
+
+nlohmann::json BusInjectionCommitmentResult::to_json(
+    bool include_state) const {
+    return {
+        {"attempted", attempted},
+        {"solver_feasible", solver_feasible},
+        {"candidate_verified", candidate_verified},
+        {"improved", improved},
+        {"wall_seconds", wall_seconds},
+        {"incumbent_objective", incumbent_objective},
+        {"candidate_objective", candidate_objective},
+        {"incumbent_transition_cost", incumbent_transition_cost},
+        {"candidate_transition_cost", candidate_transition_cost},
+        {"incumbent_official_proxy", incumbent_official_proxy},
+        {"candidate_official_proxy", candidate_official_proxy},
+        {"maximum_bus_active_injection_change",
+         maximum_bus_active_injection_change},
+        {"maximum_bus_reactive_injection_change",
+         maximum_bus_reactive_injection_change},
+        {"online_before", online_before},
+        {"online_after", online_after},
+        {"shutdown_count", shutdown_count},
+        {"row_count", row_count},
+        {"column_count", column_count},
+        {"nonzero_count", nonzero_count},
+        {"run_status", run_status},
+        {"model_status", model_status},
+        {"primal_solution_status", primal_solution_status},
+        {"mip_node_count", mip_node_count},
+        {"mip_gap", mip_gap},
+        {"mip_dual_bound", mip_dual_bound},
+        {"status", status},
+        {"commitment", commitment},
+        {"selected", solve_result_to_json(selected, include_state)},
+        {"selected_validation", selected_validation.to_json()},
+    };
+}
+
+BusInjectionCommitmentResult refine_commitment_preserving_bus_injections(
+    const CaseData& data,
+    const std::vector<int>& incumbent_commitment,
+    const SolveResult& incumbent,
+    const BusInjectionCommitmentOptions& options) {
+    const auto wall_start = std::chrono::steady_clock::now();
+    BusInjectionCommitmentResult output;
+    output.attempted = true;
+    output.commitment = incumbent_commitment;
+    output.selected = incumbent;
+    if (incumbent_commitment.size() != data.generators.size() ||
+        incumbent.state.pg.size() != data.generators.size() ||
+        incumbent.state.qg.size() != data.generators.size() ||
+        !std::isfinite(options.time_limit_seconds) ||
+        options.time_limit_seconds <= 0.0 ||
+        !std::isfinite(options.mip_relative_gap) ||
+        options.mip_relative_gap < 0.0 ||
+        !std::isfinite(options.validation_tolerance) ||
+        options.validation_tolerance < 0.0 ||
+        !std::isfinite(options.objective_tolerance) ||
+        options.objective_tolerance < 0.0) {
+        output.status = "invalid_input";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
+    output.selected.objective = rebuild_base_state_derived_fields(
+        data, incumbent_commitment, output.selected.state);
+    output.selected_validation = validate_state(
+        data, ModelMode::BaseSoft, output.selected.state,
+        incumbent_commitment);
+    output.incumbent_objective = output.selected.objective;
+    output.candidate_objective = output.incumbent_objective;
+    output.incumbent_transition_cost = base_commitment_transition_cost(
+        data, incumbent_commitment);
+    output.candidate_transition_cost = output.incumbent_transition_cost;
+    output.incumbent_official_proxy = output.incumbent_objective -
+        output.incumbent_transition_cost;
+    output.candidate_official_proxy = output.incumbent_official_proxy;
+    output.online_before = static_cast<int>(std::count(
+        incumbent_commitment.begin(), incumbent_commitment.end(), 1));
+    output.online_after = output.online_before;
+    if (!validated_candidate_is_feasible(
+            output.selected, output.selected_validation,
+            options.validation_tolerance)) {
+        output.status = "incumbent_not_verified";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
+    struct SparseRow {
+        double lower{-kHighsInf};
+        double upper{kHighsInf};
+        std::vector<std::pair<HighsInt, double>> entries;
+    };
+    const int ng = static_cast<int>(data.generators.size());
+    const int nb = static_cast<int>(data.buses.size());
+    const int u_offset = 0;
+    const int q_offset = ng;
+    const int headroom_offset = 2 * ng;
+    int next_column = 3 * ng;
+    std::vector<int> lambda_offset(static_cast<std::size_t>(ng), 0);
+    std::vector<std::vector<PwlPoint>> points(static_cast<std::size_t>(ng));
+    std::vector<double> p_lower(static_cast<std::size_t>(ng), 0.0);
+    std::vector<double> p_upper(static_cast<std::size_t>(ng), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        const auto& source = data.generators[generator];
+        const double previous = source.status_prev == 0
+            ? source.pmin : source.pg_prev;
+        p_lower[generator] = std::max(
+            source.pmin, previous - data.delta_r * source.prdmax);
+        p_upper[generator] = std::min(
+            source.pmax, previous + data.delta_r * source.prumax);
+        if (p_lower[generator] > p_upper[generator] + 1e-12) {
+            output.status = "empty_generator_interval";
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            return output;
+        }
+        points[generator] = active_pwl_points(
+            source.cost, source.ncost,
+            p_lower[generator], p_upper[generator]);
+        lambda_offset[generator] = next_column;
+        next_column += static_cast<int>(points[generator].size());
+    }
+    const int column_count = next_column;
+    output.column_count = column_count;
+    std::vector<double> lower(
+        static_cast<std::size_t>(column_count), 0.0);
+    std::vector<double> upper(
+        static_cast<std::size_t>(column_count), 1.0);
+    std::vector<double> cost(
+        static_cast<std::size_t>(column_count), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        const auto& source = data.generators[generator];
+        const bool can_start = source.status_prev == 0 && source.suqual == 1;
+        const bool can_stop = source.status_prev == 1 && source.sdqual == 1;
+        if ((source.status_prev == 0 && !can_start) ||
+            (source.status_prev == 1 && !can_stop)) {
+            lower[u_offset + generator] = source.status_prev;
+            upper[u_offset + generator] = source.status_prev;
+        }
+        lower[q_offset + generator] = std::min(0.0, source.qmin);
+        upper[q_offset + generator] = std::max(0.0, source.qmax);
+        lower[headroom_offset + generator] = 0.0;
+        upper[headroom_offset + generator] = std::max(
+            0.0, data.delta_r_ctg * source.prumaxctg);
+        cost[u_offset + generator] = data.delta * source.oncost +
+            (source.status_prev == 0 ? source.sucost : -source.sdcost);
+        for (int point = 0;
+             point < static_cast<int>(points[generator].size());
+             ++point) {
+            cost[lambda_offset[generator] + point] =
+                data.delta * points[generator][point].cost;
+        }
+    }
+
+    std::vector<SparseRow> rows;
+    rows.reserve(static_cast<std::size_t>(5 * ng + 3 * nb));
+    const auto append = [](SparseRow& row, int column, double coefficient) {
+        if (std::abs(coefficient) > 1e-14) {
+            row.entries.emplace_back(column, coefficient);
+        }
+    };
+    const auto append_pg = [&](SparseRow& row, int generator,
+                               double multiplier = 1.0) {
+        for (int point = 0;
+             point < static_cast<int>(points[generator].size());
+             ++point) {
+            append(
+                row, lambda_offset[generator] + point,
+                multiplier * points[generator][point].mw);
+        }
+    };
+    for (int generator = 0; generator < ng; ++generator) {
+        const auto& source = data.generators[generator];
+        SparseRow lambda_sum;
+        lambda_sum.lower = 0.0;
+        lambda_sum.upper = 0.0;
+        append(lambda_sum, u_offset + generator, -1.0);
+        for (int point = 0;
+             point < static_cast<int>(points[generator].size());
+             ++point) {
+            append(lambda_sum, lambda_offset[generator] + point, 1.0);
+        }
+        rows.push_back(std::move(lambda_sum));
+
+        SparseRow pg_min;
+        pg_min.lower = 0.0;
+        append_pg(pg_min, generator);
+        append(pg_min, u_offset + generator, -p_lower[generator]);
+        rows.push_back(std::move(pg_min));
+        SparseRow pg_max;
+        pg_max.upper = 0.0;
+        append_pg(pg_max, generator);
+        append(pg_max, u_offset + generator, -p_upper[generator]);
+        rows.push_back(std::move(pg_max));
+
+        SparseRow q_min;
+        q_min.lower = 0.0;
+        append(q_min, q_offset + generator, 1.0);
+        append(q_min, u_offset + generator, -source.qmin);
+        rows.push_back(std::move(q_min));
+        SparseRow q_max;
+        q_max.upper = 0.0;
+        append(q_max, q_offset + generator, 1.0);
+        append(q_max, u_offset + generator, -source.qmax);
+        rows.push_back(std::move(q_max));
+
+        SparseRow physical_headroom;
+        physical_headroom.upper = 0.0;
+        append(
+            physical_headroom, headroom_offset + generator, 1.0);
+        append_pg(physical_headroom, generator);
+        append(
+            physical_headroom, u_offset + generator, -source.pmax);
+        rows.push_back(std::move(physical_headroom));
+        SparseRow ramp_headroom;
+        ramp_headroom.upper = 0.0;
+        append(ramp_headroom, headroom_offset + generator, 1.0);
+        append(
+            ramp_headroom, u_offset + generator,
+            -std::max(0.0, data.delta_r_ctg * source.prumaxctg));
+        rows.push_back(std::move(ramp_headroom));
+    }
+
+    std::vector<double> target_p(static_cast<std::size_t>(nb), 0.0);
+    std::vector<double> target_q(static_cast<std::size_t>(nb), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        const int bus = data.generators[generator].bus;
+        target_p[bus] += incumbent.state.pg[generator];
+        target_q[bus] += incumbent.state.qg[generator];
+    }
+    for (int bus = 0; bus < nb; ++bus) {
+        if (data.buses[bus].generators.empty()) {
+            continue;
+        }
+        SparseRow active_total;
+        active_total.lower = target_p[bus];
+        active_total.upper = target_p[bus];
+        SparseRow reactive_total;
+        reactive_total.lower = target_q[bus];
+        reactive_total.upper = target_q[bus];
+        SparseRow online_count;
+        online_count.lower = 1.0;
+        bool has_available_generator = false;
+        for (int generator : data.buses[bus].generators) {
+            append_pg(active_total, generator);
+            append(reactive_total, q_offset + generator, 1.0);
+            append(online_count, u_offset + generator, 1.0);
+            has_available_generator = has_available_generator ||
+                upper[u_offset + generator] >= 1.0 - 1e-12;
+        }
+        rows.push_back(std::move(active_total));
+        rows.push_back(std::move(reactive_total));
+        if (has_available_generator) {
+            rows.push_back(std::move(online_count));
+        }
+    }
+
+    if (options.enforce_generator_contingency_headroom) {
+        std::vector<unsigned char> added(
+            static_cast<std::size_t>(ng), 0);
+        for (const auto& contingency : data.contingencies) {
+            if (contingency.type != ContingencyType::Generator ||
+                contingency.component < 0 || contingency.component >= ng ||
+                added[contingency.component]) {
+                continue;
+            }
+            const int outaged = contingency.component;
+            added[outaged] = 1;
+            SparseRow reserve;
+            reserve.lower = 0.0;
+            for (int generator = 0; generator < ng; ++generator) {
+                if (generator != outaged) {
+                    append(
+                        reserve, headroom_offset + generator, 1.0);
+                }
+            }
+            append_pg(reserve, outaged, -1.0);
+            rows.push_back(std::move(reserve));
+
+            double original_maximum_active = 0.0;
+            double original_maximum_reactive = 0.0;
+            const int bus = data.generators[outaged].bus;
+            for (int generator : data.buses[bus].generators) {
+                if (incumbent_commitment[generator] == 0) {
+                    continue;
+                }
+                original_maximum_active = std::max(
+                    original_maximum_active,
+                    std::abs(incumbent.state.pg[generator]));
+                original_maximum_reactive = std::max(
+                    original_maximum_reactive,
+                    std::abs(incumbent.state.qg[generator]));
+            }
+            SparseRow active_loss_cap;
+            active_loss_cap.lower = -original_maximum_active;
+            active_loss_cap.upper = original_maximum_active;
+            append_pg(active_loss_cap, outaged);
+            rows.push_back(std::move(active_loss_cap));
+            SparseRow reactive_loss_cap;
+            reactive_loss_cap.lower = -original_maximum_reactive;
+            reactive_loss_cap.upper = original_maximum_reactive;
+            append(reactive_loss_cap, q_offset + outaged, 1.0);
+            rows.push_back(std::move(reactive_loss_cap));
+        }
+    }
+
+    std::vector<double> row_lower;
+    std::vector<double> row_upper;
+    std::vector<HighsInt> starts;
+    std::vector<HighsInt> indices;
+    std::vector<double> values;
+    row_lower.reserve(rows.size());
+    row_upper.reserve(rows.size());
+    starts.reserve(rows.size() + 1);
+    starts.push_back(0);
+    for (const auto& row : rows) {
+        row_lower.push_back(row.lower);
+        row_upper.push_back(row.upper);
+        for (const auto& [column, coefficient] : row.entries) {
+            indices.push_back(column);
+            values.push_back(coefficient);
+        }
+        starts.push_back(static_cast<HighsInt>(indices.size()));
+    }
+    output.row_count = static_cast<int>(rows.size());
+    output.nonzero_count = static_cast<int>(indices.size());
+
+    Highs highs;
+    const char* highs_log = std::getenv("GRAVITYX_HIGHS_LOG");
+    highs.setOptionValue(
+        "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
+    highs.setOptionValue("threads", 1);
+    highs.setOptionValue("presolve", "on");
+    highs.setOptionValue("time_limit", options.time_limit_seconds);
+    highs.setOptionValue("mip_rel_gap", options.mip_relative_gap);
+    highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
+    highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
+    const bool model_loaded =
+        highs.addVars(column_count, lower.data(), upper.data()) ==
+            HighsStatus::kOk &&
+        highs.changeColsCost(0, column_count - 1, cost.data()) ==
+            HighsStatus::kOk &&
+        highs.addRows(
+            static_cast<HighsInt>(rows.size()), row_lower.data(),
+            row_upper.data(), static_cast<HighsInt>(indices.size()),
+            starts.data(), indices.data(), values.data()) ==
+            HighsStatus::kOk;
+    if (!model_loaded) {
+        output.status = "model_construction_failed";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+    std::vector<HighsInt> integer_columns(static_cast<std::size_t>(ng));
+    std::iota(integer_columns.begin(), integer_columns.end(), HighsInt{0});
+    std::vector<HighsVarType> integer_types(
+        static_cast<std::size_t>(ng), HighsVarType::kInteger);
+    if (highs.changeColsIntegrality(
+            ng, integer_columns.data(), integer_types.data()) !=
+        HighsStatus::kOk) {
+        output.status = "integrality_construction_failed";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
+    const HighsStatus run_status = highs.run();
+    const HighsModelStatus model_status = highs.getModelStatus();
+    const auto& solution = highs.getSolution();
+    const auto& info = highs.getInfo();
+    output.run_status = static_cast<int>(run_status);
+    output.model_status = static_cast<int>(model_status);
+    output.primal_solution_status =
+        static_cast<int>(info.primal_solution_status);
+    output.mip_node_count = static_cast<int>(info.mip_node_count);
+    output.mip_gap = info.mip_gap;
+    output.mip_dual_bound = info.mip_dual_bound;
+    output.status = highs.modelStatusToString(model_status);
+    output.solver_feasible = solution.value_valid &&
+        solution.col_value.size() == static_cast<std::size_t>(column_count);
+    if (!output.solver_feasible) {
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
+    std::vector<int> candidate_commitment(static_cast<std::size_t>(ng), 0);
+    AcState candidate_state = output.selected.state;
+    candidate_state.commitment.assign(static_cast<std::size_t>(ng), 0.0);
+    candidate_state.startup.assign(static_cast<std::size_t>(ng), 0.0);
+    candidate_state.shutdown.assign(static_cast<std::size_t>(ng), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        const double relaxed_status = solution.col_value[u_offset + generator];
+        if (std::abs(relaxed_status - std::round(relaxed_status)) > 1e-6) {
+            output.solver_feasible = false;
+            output.status = "nonintegral_incumbent";
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            return output;
+        }
+        candidate_commitment[generator] =
+            static_cast<int>(std::round(relaxed_status));
+        candidate_state.commitment[generator] =
+            static_cast<double>(candidate_commitment[generator]);
+        candidate_state.startup[generator] = std::max(
+            0, candidate_commitment[generator] -
+                data.generators[generator].status_prev);
+        candidate_state.shutdown[generator] = std::max(
+            0, data.generators[generator].status_prev -
+                candidate_commitment[generator]);
+        double pg = 0.0;
+        for (int point = 0;
+             point < static_cast<int>(points[generator].size());
+             ++point) {
+            pg += points[generator][point].mw *
+                solution.col_value[lambda_offset[generator] + point];
+        }
+        candidate_state.pg[generator] = pg;
+        candidate_state.qg[generator] =
+            solution.col_value[q_offset + generator];
+    }
+    SolveResult candidate;
+    candidate.status = 0;
+    candidate.state = std::move(candidate_state);
+    candidate.objective = rebuild_base_state_derived_fields(
+        data, candidate_commitment, candidate.state);
+    const auto candidate_validation = validate_state(
+        data, ModelMode::BaseSoft, candidate.state,
+        candidate_commitment);
+    output.candidate_verified = validated_candidate_is_feasible(
+        candidate, candidate_validation, options.validation_tolerance);
+    output.candidate_objective = candidate.objective;
+    output.candidate_transition_cost = base_commitment_transition_cost(
+        data, candidate_commitment);
+    output.candidate_official_proxy = output.candidate_objective -
+        output.candidate_transition_cost;
+    output.online_after = static_cast<int>(std::count(
+        candidate_commitment.begin(), candidate_commitment.end(), 1));
+    output.shutdown_count = 0;
+    for (int generator = 0; generator < ng; ++generator) {
+        output.shutdown_count +=
+            incumbent_commitment[generator] == 1 &&
+            candidate_commitment[generator] == 0;
+    }
+    for (int bus = 0; bus < nb; ++bus) {
+        double candidate_p = 0.0;
+        double candidate_q = 0.0;
+        for (int generator : data.buses[bus].generators) {
+            candidate_p += candidate.state.pg[generator];
+            candidate_q += candidate.state.qg[generator];
+        }
+        output.maximum_bus_active_injection_change = std::max(
+            output.maximum_bus_active_injection_change,
+            std::abs(candidate_p - target_p[bus]));
+        output.maximum_bus_reactive_injection_change = std::max(
+            output.maximum_bus_reactive_injection_change,
+            std::abs(candidate_q - target_q[bus]));
+    }
+    output.improved = output.candidate_verified &&
+        output.candidate_official_proxy >
+            output.incumbent_official_proxy + options.objective_tolerance;
+    if (output.improved) {
+        output.commitment = std::move(candidate_commitment);
+        output.selected = std::move(candidate);
+        output.selected_validation = candidate_validation;
+    }
+    output.wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    output.selected.wall_seconds = output.wall_seconds;
+    return output;
+}
+
+nlohmann::json ComponentEconomicDispatchResult::to_json(
+    bool include_state) const {
+    return {
+        {"incumbent_verified", incumbent_verified},
+        {"attempted", attempted},
+        {"solver_feasible", solver_feasible},
+        {"solver_optimal", solver_optimal},
+        {"improved", improved},
+        {"time_limit_reached", time_limit_reached},
+        {"primal_start_attempted", primal_start_attempted},
+        {"primal_start_accepted", primal_start_accepted},
+        {"wall_seconds", wall_seconds},
+        {"solver_wall_seconds", solver_wall_seconds},
+        {"incumbent_objective", incumbent_objective},
+        {"relaxed_market_surplus", relaxed_market_surplus},
+        {"selected_objective", selected_objective},
+        {"selected_fraction", selected_fraction},
+        {"component_count", component_count},
+        {"rounds_completed", rounds_completed},
+        {"row_count", row_count},
+        {"column_count", column_count},
+        {"nonzero_count", nonzero_count},
+        {"run_status", run_status},
+        {"model_status", model_status},
+        {"primal_solution_status", primal_solution_status},
+        {"primal_start_status", primal_start_status},
+        {"simplex_iterations", simplex_iterations},
+        {"ipm_iterations", ipm_iterations},
+        {"status", status},
+        {"trials", trials},
+        {"selected", solve_result_to_json(selected, include_state)},
+        {"selected_validation", selected_validation.to_json()},
+    };
+}
+
+ComponentEconomicDispatchResult refine_fixed_commitment_component_economic(
+    const CaseData& data,
+    const std::vector<int>& commitment,
+    const SolveResult& incumbent,
+    const ComponentEconomicDispatchOptions& options) {
+    const auto wall_start = std::chrono::steady_clock::now();
+    ComponentEconomicDispatchResult output;
+    output.selected = incumbent;
+    if (commitment.size() != data.generators.size() ||
+        incumbent.state.pg.size() != data.generators.size() ||
+        incumbent.state.qg.size() != data.generators.size() ||
+        incumbent.state.demand_factor.size() != data.loads.size() ||
+        incumbent.state.vm.size() != data.buses.size() ||
+        incumbent.state.va.size() != data.buses.size() ||
+        !std::isfinite(options.time_limit_seconds) ||
+        options.time_limit_seconds <= 0.0 ||
+        !std::isfinite(options.validation_tolerance) ||
+        options.validation_tolerance < 0.0 ||
+        !std::isfinite(options.objective_tolerance) ||
+        options.objective_tolerance < 0.0 ||
+        options.maximum_rounds <= 0 ||
+        options.maximum_candidate_trials <= 0) {
+        output.status = "invalid_input";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+    for (int value : commitment) {
+        if (value != 0 && value != 1) {
+            output.status = "nonbinary_commitment";
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            return output;
+        }
+    }
+
+    output.selected.status = 0;
+    output.selected.objective = rebuild_base_state_derived_fields(
+        data, commitment, output.selected.state);
+    output.selected_validation = validate_state(
+        data, ModelMode::BaseSoft, output.selected.state, commitment);
+    output.incumbent_objective = output.selected.objective;
+    output.selected_objective = output.selected.objective;
+    output.incumbent_verified = validated_candidate_is_feasible(
+        output.selected, output.selected_validation,
+        options.validation_tolerance);
+    if (!output.incumbent_verified) {
+        output.status = "incumbent_not_verified";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+    output.attempted = true;
+
+    const int nb = static_cast<int>(data.buses.size());
+    const int ng = static_cast<int>(data.generators.size());
+    const int nd = static_cast<int>(data.loads.size());
+
+    // Deterministic disjoint-set construction of the in-service connected
+    // components.  Each component retains the incumbent's net real-power
+    // injection, which in turn retains its aggregate AC loss/shunt burden.
+    std::vector<int> parent(static_cast<std::size_t>(nb));
+    std::iota(parent.begin(), parent.end(), 0);
+    const auto find_root = [&](int start) {
+        int root = start;
+        while (parent[root] != root) {
+            root = parent[root];
+        }
+        int node = start;
+        while (parent[node] != node) {
+            const int next = parent[node];
+            parent[node] = root;
+            node = next;
+        }
+        return root;
+    };
+    for (const auto& branch : data.branches) {
+        if (!branch.present || branch.status == 0 ||
+            branch.from < 0 || branch.from >= nb ||
+            branch.to < 0 || branch.to >= nb) {
+            continue;
+        }
+        const int left = find_root(branch.from);
+        const int right = find_root(branch.to);
+        if (left != right) {
+            parent[std::max(left, right)] = std::min(left, right);
+        }
+    }
+    std::vector<int> component_of_bus(static_cast<std::size_t>(nb), -1);
+    std::vector<int> root_to_component(static_cast<std::size_t>(nb), -1);
+    std::vector<int> component_reference;
+    for (int bus = 0; bus < nb; ++bus) {
+        const int root = find_root(bus);
+        if (root_to_component[root] < 0) {
+            root_to_component[root] = output.component_count++;
+            component_reference.push_back(bus);
+        }
+        component_of_bus[bus] = root_to_component[root];
+    }
+
+    std::vector<std::vector<PwlPoint>> generator_points(
+        static_cast<std::size_t>(ng));
+    std::vector<std::vector<PwlPoint>> load_points(
+        static_cast<std::size_t>(nd));
+    std::vector<int> generator_offset(static_cast<std::size_t>(ng), -1);
+    std::vector<int> load_offset(static_cast<std::size_t>(nd), -1);
+    std::vector<double> generator_lower(static_cast<std::size_t>(ng), 0.0);
+    std::vector<double> generator_upper(static_cast<std::size_t>(ng), 0.0);
+    std::vector<double> load_mw_lower(static_cast<std::size_t>(nd), 0.0);
+    std::vector<double> load_mw_upper(static_cast<std::size_t>(nd), 0.0);
+    int next_column = 0;
+    for (int generator = 0; generator < ng; ++generator) {
+        if (commitment[generator] == 0) {
+            continue;
+        }
+        const auto& source = data.generators[generator];
+        const double previous = source.status_prev == 0
+            ? source.pmin : source.pg_prev;
+        generator_lower[generator] = std::max(
+            source.pmin, previous - data.delta_r * source.prdmax);
+        generator_upper[generator] = std::min(
+            source.pmax, previous + data.delta_r * source.prumax);
+        if (generator_lower[generator] >
+                generator_upper[generator] + 1e-12) {
+            output.status = "empty_generator_interval";
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            return output;
+        }
+        generator_points[generator] = active_pwl_points(
+            source.cost, source.ncost,
+            generator_lower[generator], generator_upper[generator]);
+        generator_offset[generator] = next_column;
+        next_column += static_cast<int>(generator_points[generator].size());
+    }
+    for (int load = 0; load < nd; ++load) {
+        const auto& source = data.loads[load];
+        double factor_lower = source.tmin;
+        double factor_upper = source.tmax;
+        if (std::abs(source.pd_nominal) > 1e-12) {
+            factor_lower = std::max(
+                factor_lower,
+                (source.pd_prev - source.prdmax * data.delta_r) /
+                    source.pd_nominal);
+            factor_upper = std::min(
+                factor_upper,
+                (source.pd_prev + source.prumax * data.delta_r) /
+                    source.pd_nominal);
+        }
+        if (factor_lower > factor_upper + 1e-12) {
+            output.status = "empty_load_interval";
+            output.wall_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            return output;
+        }
+        load_mw_lower[load] = source.pd_nominal * factor_lower;
+        load_mw_upper[load] = source.pd_nominal * factor_upper;
+        if (load_mw_lower[load] > load_mw_upper[load]) {
+            std::swap(load_mw_lower[load], load_mw_upper[load]);
+        }
+        load_points[load] = active_pwl_points(
+            source.cost, source.ncost, source.pd_min, source.pd_max);
+        load_offset[load] = next_column;
+        next_column += static_cast<int>(load_points[load].size());
+    }
+    output.column_count = next_column;
+    if (next_column <= 0) {
+        output.status = "empty_relaxation";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
+    struct SparseRow {
+        double lower{-kHighsInf};
+        double upper{kHighsInf};
+        std::vector<std::pair<HighsInt, double>> entries;
+    };
+    std::vector<SparseRow> rows;
+    rows.reserve(static_cast<std::size_t>(2 * (ng + nd) +
+        output.component_count));
+    const auto append = [](SparseRow& row, int column, double coefficient) {
+        if (std::abs(coefficient) > 1e-14) {
+            row.entries.emplace_back(column, coefficient);
+        }
+    };
+    const auto append_points = [&](SparseRow& row, int offset,
+                                   const std::vector<PwlPoint>& points,
+                                   double multiplier = 1.0) {
+        for (int point = 0; point < static_cast<int>(points.size()); ++point) {
+            append(row, offset + point, multiplier * points[point].mw);
+        }
+    };
+
+    std::vector<double> lower(
+        static_cast<std::size_t>(next_column), 0.0);
+    std::vector<double> upper(
+        static_cast<std::size_t>(next_column), 1.0);
+    std::vector<double> cost(
+        static_cast<std::size_t>(next_column), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        if (generator_offset[generator] < 0) {
+            continue;
+        }
+        SparseRow lambda_sum;
+        lambda_sum.lower = 1.0;
+        lambda_sum.upper = 1.0;
+        for (int point = 0;
+             point < static_cast<int>(generator_points[generator].size());
+             ++point) {
+            const int column = generator_offset[generator] + point;
+            append(lambda_sum, column, 1.0);
+            cost[column] = data.delta *
+                generator_points[generator][point].cost;
+        }
+        rows.push_back(std::move(lambda_sum));
+        SparseRow power_bounds;
+        power_bounds.lower = generator_lower[generator];
+        power_bounds.upper = generator_upper[generator];
+        append_points(
+            power_bounds, generator_offset[generator],
+            generator_points[generator]);
+        rows.push_back(std::move(power_bounds));
+    }
+    for (int load = 0; load < nd; ++load) {
+        SparseRow lambda_sum;
+        lambda_sum.lower = 1.0;
+        lambda_sum.upper = 1.0;
+        for (int point = 0;
+             point < static_cast<int>(load_points[load].size());
+             ++point) {
+            const int column = load_offset[load] + point;
+            append(lambda_sum, column, 1.0);
+            cost[column] = -data.delta * load_points[load][point].cost;
+        }
+        rows.push_back(std::move(lambda_sum));
+        SparseRow power_bounds;
+        power_bounds.lower = load_mw_lower[load];
+        power_bounds.upper = load_mw_upper[load];
+        append_points(power_bounds, load_offset[load], load_points[load]);
+        rows.push_back(std::move(power_bounds));
+    }
+
+    std::vector<SparseRow> component_rows(
+        static_cast<std::size_t>(output.component_count));
+    std::vector<double> component_target(
+        static_cast<std::size_t>(output.component_count), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        const int component = component_of_bus[data.generators[generator].bus];
+        component_target[component] += incumbent.state.pg[generator];
+        if (generator_offset[generator] >= 0) {
+            append_points(
+                component_rows[component], generator_offset[generator],
+                generator_points[generator], 1.0);
+        }
+    }
+    for (int load = 0; load < nd; ++load) {
+        const int component = component_of_bus[data.loads[load].bus];
+        component_target[component] -= data.loads[load].pd_nominal *
+            incumbent.state.demand_factor[load];
+        append_points(
+            component_rows[component], load_offset[load],
+            load_points[load], -1.0);
+    }
+    for (int component = 0;
+         component < output.component_count; ++component) {
+        component_rows[component].lower = component_target[component];
+        component_rows[component].upper = component_target[component];
+        rows.push_back(std::move(component_rows[component]));
+    }
+
+    std::vector<double> row_lower;
+    std::vector<double> row_upper;
+    std::vector<HighsInt> starts;
+    std::vector<HighsInt> indices;
+    std::vector<double> values;
+    row_lower.reserve(rows.size());
+    row_upper.reserve(rows.size());
+    starts.reserve(rows.size() + 1);
+    starts.push_back(0);
+    for (const auto& row : rows) {
+        row_lower.push_back(row.lower);
+        row_upper.push_back(row.upper);
+        for (const auto& [column, coefficient] : row.entries) {
+            indices.push_back(column);
+            values.push_back(coefficient);
+        }
+        starts.push_back(static_cast<HighsInt>(indices.size()));
+    }
+    output.row_count = static_cast<int>(rows.size());
+    output.nonzero_count = static_cast<int>(indices.size());
+
+    Highs highs;
+    const char* highs_log = std::getenv("GRAVITYX_HIGHS_LOG");
+    highs.setOptionValue(
+        "output_flag", highs_log != nullptr && std::string(highs_log) != "0");
+    highs.setOptionValue("threads", 1);
+    highs.setOptionValue("presolve", "on");
+    highs.setOptionValue("solver", "simplex");
+    highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
+    highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
+    const double elapsed_before_solver = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    const double solver_limit = std::max(
+        0.05, std::min(
+            0.6 * options.time_limit_seconds,
+            options.time_limit_seconds - elapsed_before_solver - 0.05));
+    highs.setOptionValue("time_limit", solver_limit);
+    const bool model_loaded =
+        highs.addVars(next_column, lower.data(), upper.data()) ==
+            HighsStatus::kOk &&
+        highs.changeColsCost(0, next_column - 1, cost.data()) ==
+            HighsStatus::kOk &&
+        highs.addRows(
+            static_cast<HighsInt>(rows.size()), row_lower.data(),
+            row_upper.data(), static_cast<HighsInt>(indices.size()),
+            starts.data(), indices.data(), values.data()) ==
+            HighsStatus::kOk;
+    if (!model_loaded) {
+        output.status = "model_construction_failed";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
+
+    const auto interpolation = [](const std::vector<PwlPoint>& points,
+                                  double target) {
+        std::vector<double> weights(points.size(), 0.0);
+        if (target <= points.front().mw) {
+            weights.front() = 1.0;
+            return weights;
+        }
+        if (target >= points.back().mw) {
+            weights.back() = 1.0;
+            return weights;
+        }
+        for (int point = 0;
+             point + 1 < static_cast<int>(points.size()); ++point) {
+            if (target > points[point + 1].mw) {
+                continue;
+            }
+            const double width = points[point + 1].mw - points[point].mw;
+            if (std::abs(width) <= 1e-14) {
+                weights[point] = 1.0;
+            } else {
+                const double right = (target - points[point].mw) / width;
+                weights[point] = 1.0 - right;
+                weights[point + 1] = right;
+            }
+            return weights;
+        }
+        weights.back() = 1.0;
+        return weights;
+    };
+    std::vector<double> primal_start(
+        static_cast<std::size_t>(next_column), 0.0);
+    for (int generator = 0; generator < ng; ++generator) {
+        if (generator_offset[generator] < 0) {
+            continue;
+        }
+        const auto weights = interpolation(
+            generator_points[generator], incumbent.state.pg[generator]);
+        std::copy(
+            weights.begin(), weights.end(),
+            primal_start.begin() + generator_offset[generator]);
+    }
+    for (int load = 0; load < nd; ++load) {
+        const auto weights = interpolation(
+            load_points[load], data.loads[load].pd_nominal *
+                incumbent.state.demand_factor[load]);
+        std::copy(
+            weights.begin(), weights.end(),
+            primal_start.begin() + load_offset[load]);
+    }
+    std::vector<HighsInt> start_indices(
+        static_cast<std::size_t>(next_column));
+    std::iota(start_indices.begin(), start_indices.end(), HighsInt{0});
+    output.primal_start_attempted = true;
+    const HighsStatus start_status = highs.setSolution(
+        next_column, start_indices.data(), primal_start.data());
+    output.primal_start_status = static_cast<int>(start_status);
+    output.primal_start_accepted = start_status == HighsStatus::kOk;
+
+    double on_cost = 0.0;
+    for (int generator = 0; generator < ng; ++generator) {
+        if (commitment[generator] != 0) {
+            on_cost += data.delta * data.generators[generator].oncost;
+        }
+    }
+    const int component_row_offset =
+        static_cast<int>(rows.size()) - output.component_count;
+    bool every_solve_optimal = true;
+    for (int round = 1; round <= options.maximum_rounds; ++round) {
+        const double elapsed_before_round = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        const double remaining_before_round =
+            options.time_limit_seconds - elapsed_before_round;
+        if (remaining_before_round <= 0.02) {
+            output.time_limit_reached = true;
+            break;
+        }
+
+        const SolveResult round_incumbent = output.selected;
+        std::fill(component_target.begin(), component_target.end(), 0.0);
+        for (int generator = 0; generator < ng; ++generator) {
+            const int component =
+                component_of_bus[data.generators[generator].bus];
+            component_target[component] +=
+                round_incumbent.state.pg[generator];
+        }
+        for (int load = 0; load < nd; ++load) {
+            const int component = component_of_bus[data.loads[load].bus];
+            component_target[component] -= data.loads[load].pd_nominal *
+                round_incumbent.state.demand_factor[load];
+        }
+        bool bounds_updated = true;
+        for (int component = 0;
+             component < output.component_count; ++component) {
+            bounds_updated = bounds_updated &&
+                highs.changeRowBounds(
+                    component_row_offset + component,
+                    component_target[component],
+                    component_target[component]) == HighsStatus::kOk;
+        }
+        if (!bounds_updated) {
+            output.status = "component_balance_update_failed";
+            break;
+        }
+        highs.setOptionValue(
+            "time_limit", std::max(
+                0.01, std::min(
+                    0.5 * remaining_before_round,
+                    remaining_before_round - 0.01)));
+
+        const auto solver_start = std::chrono::steady_clock::now();
+        const HighsStatus run_status = highs.run();
+        output.solver_wall_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - solver_start).count();
+        const HighsModelStatus model_status = highs.getModelStatus();
+        const auto& solution = highs.getSolution();
+        const auto& info = highs.getInfo();
+        output.run_status = static_cast<int>(run_status);
+        output.model_status = static_cast<int>(model_status);
+        output.primal_solution_status =
+            static_cast<int>(info.primal_solution_status);
+        output.simplex_iterations +=
+            static_cast<int>(info.simplex_iteration_count);
+        output.ipm_iterations += static_cast<int>(info.ipm_iteration_count);
+        output.status = highs.modelStatusToString(model_status);
+        every_solve_optimal = every_solve_optimal &&
+            model_status == HighsModelStatus::kOptimal;
+        output.solver_optimal = every_solve_optimal;
+        output.time_limit_reached = output.time_limit_reached ||
+            model_status == HighsModelStatus::kTimeLimit;
+        const bool round_solver_feasible = solution.value_valid &&
+            solution.col_value.size() ==
+                static_cast<std::size_t>(next_column);
+        output.solver_feasible = output.solver_feasible ||
+            round_solver_feasible;
+        if (std::isfinite(info.objective_function_value)) {
+            output.relaxed_market_surplus =
+                -info.objective_function_value - on_cost;
+        }
+        if (!round_solver_feasible) {
+            break;
+        }
+        ++output.rounds_completed;
+
+        std::vector<double> target_pg(static_cast<std::size_t>(ng), 0.0);
+        std::vector<double> target_demand(static_cast<std::size_t>(nd), 0.0);
+        for (int generator = 0; generator < ng; ++generator) {
+            if (generator_offset[generator] < 0) {
+                continue;
+            }
+            for (int point = 0;
+                 point < static_cast<int>(generator_points[generator].size());
+                 ++point) {
+                target_pg[generator] +=
+                    generator_points[generator][point].mw *
+                    solution.col_value[
+                        generator_offset[generator] + point];
+            }
+        }
+        for (int load = 0; load < nd; ++load) {
+            double mw = 0.0;
+            for (int point = 0;
+                 point < static_cast<int>(load_points[load].size());
+                 ++point) {
+                mw += load_points[load][point].mw *
+                    solution.col_value[load_offset[load] + point];
+            }
+            target_demand[load] =
+                std::abs(data.loads[load].pd_nominal) > 1e-12
+                ? mw / data.loads[load].pd_nominal
+                : round_incumbent.state.demand_factor[load];
+        }
+
+        // The component relaxation changes injections at thousands of buses.
+        // Starting nonlinear repair from the incumbent angles makes those
+        // changes look like enormous local imbalances, which previously
+        // triggered defensive load/generator projection and discarded most
+        // of the economic gain.  Solve the reduced active-angle Newton system
+        // once, with one reference angle removed per connected component, so
+        // each line-search proposal begins near its own power-flow manifold.
+        const auto angle_predictor_start = std::chrono::steady_clock::now();
+        std::vector<unsigned char> is_reference(
+            static_cast<std::size_t>(nb), 0);
+        for (int bus : component_reference) {
+            is_reference[bus] = 1;
+        }
+        std::vector<int> reduced_index(static_cast<std::size_t>(nb), -1);
+        int reduced_count = 0;
+        for (int bus = 0; bus < nb; ++bus) {
+            if (is_reference[bus] == 0) {
+                reduced_index[bus] = reduced_count++;
+            }
+        }
+        using SparseMatrix = Eigen::SparseMatrix<
+            double, Eigen::ColMajor, int>;
+        std::vector<Eigen::Triplet<double, int>> triplets;
+        triplets.reserve(4 * data.branches.size());
+        const auto add_angle_entry = [&](int row_bus, int column_bus,
+                                         double coefficient) {
+            if (reduced_index[row_bus] >= 0 &&
+                reduced_index[column_bus] >= 0 &&
+                std::isfinite(coefficient) &&
+                std::abs(coefficient) > 1e-14) {
+                triplets.emplace_back(
+                    reduced_index[row_bus],
+                    reduced_index[column_bus], coefficient);
+            }
+        };
+        for (const auto& branch : data.branches) {
+            if (!branch.present || branch.status == 0) {
+                continue;
+            }
+            double from_cross_cos = branch.flow_from_cross_cos;
+            double from_cross_sin = branch.flow_from_cross_sin;
+            double to_cross_cos = branch.flow_to_cross_cos;
+            double to_cross_sin = branch.flow_to_cross_sin;
+            if (!branch.flow_coefficients_valid) {
+                const double denominator =
+                    branch.r * branch.r + branch.x * branch.x;
+                const double g = denominator > 1e-20
+                    ? branch.r / denominator : 0.0;
+                const double b = denominator > 1e-20
+                    ? -branch.x / denominator : 0.0;
+                // MATPOWER encodes a zero tap ratio as the nominal 1.0 ratio.
+                // Parsed production cases normally carry precomputed flow
+                // coefficients, but keep the fallback numerically safe and
+                // semantically identical for tiny fixtures.
+                const double effective_tap =
+                    std::abs(branch.tap) > 1e-12 ? branch.tap : 1.0;
+                const double tap_squared = effective_tap * effective_tap;
+                const double tap_real =
+                    effective_tap * std::cos(branch.shift);
+                const double tap_imag =
+                    effective_tap * std::sin(branch.shift);
+                from_cross_cos =
+                    (-g * tap_real + b * tap_imag) / tap_squared;
+                from_cross_sin =
+                    (-b * tap_real - g * tap_imag) / tap_squared;
+                to_cross_cos =
+                    (-g * tap_real - b * tap_imag) / tap_squared;
+                to_cross_sin =
+                    (-b * tap_real + g * tap_imag) / tap_squared;
+            }
+            const int from = branch.from;
+            const int to = branch.to;
+            const double angle =
+                round_incumbent.state.va[from] -
+                round_incumbent.state.va[to];
+            const double voltage_product =
+                round_incumbent.state.vm[from] *
+                round_incumbent.state.vm[to];
+            const double derivative_from = voltage_product *
+                (-from_cross_cos * std::sin(angle) +
+                 from_cross_sin * std::cos(angle));
+            const double derivative_to = voltage_product *
+                (-to_cross_cos * std::sin(angle) -
+                 to_cross_sin * std::cos(angle));
+            add_angle_entry(from, from, derivative_from);
+            add_angle_entry(from, to, -derivative_from);
+            add_angle_entry(to, from, derivative_to);
+            add_angle_entry(to, to, -derivative_to);
+        }
+        SparseMatrix active_angle_jacobian(reduced_count, reduced_count);
+        active_angle_jacobian.setFromTriplets(
+            triplets.begin(), triplets.end());
+        active_angle_jacobian.makeCompressed();
+        Eigen::VectorXd injection_change = Eigen::VectorXd::Zero(
+            reduced_count);
+        for (int generator = 0; generator < ng; ++generator) {
+            const int bus = data.generators[generator].bus;
+            if (reduced_index[bus] >= 0) {
+                injection_change[reduced_index[bus]] +=
+                    target_pg[generator] -
+                    round_incumbent.state.pg[generator];
+            }
+        }
+        for (int load = 0; load < nd; ++load) {
+            const int bus = data.loads[load].bus;
+            if (reduced_index[bus] >= 0) {
+                injection_change[reduced_index[bus]] -=
+                    data.loads[load].pd_nominal *
+                    (target_demand[load] -
+                     round_incumbent.state.demand_factor[load]);
+            }
+        }
+        std::vector<double> angle_correction(
+            static_cast<std::size_t>(nb), 0.0);
+        // A network made entirely of one-bus components has no free angle
+        // variables.  Its zero correction is already the exact predictor.
+        bool angle_predictor_success = reduced_count == 0;
+        double maximum_angle_correction = 0.0;
+        if (reduced_count > 0) {
+            Eigen::SparseLU<
+                SparseMatrix, Eigen::COLAMDOrdering<int>> angle_factorization;
+            angle_factorization.analyzePattern(active_angle_jacobian);
+            angle_factorization.factorize(active_angle_jacobian);
+            angle_predictor_success =
+                angle_factorization.info() == Eigen::Success;
+            if (!angle_predictor_success) {
+                // Retain the incumbent-angle fallback.  The candidate still
+                // passes through nonlinear repair and the independent
+                // validator before it can be accepted.
+            } else {
+            const Eigen::VectorXd reduced_angle =
+                angle_factorization.solve(injection_change);
+            angle_predictor_success =
+                angle_factorization.info() == Eigen::Success &&
+                reduced_angle.allFinite();
+            if (angle_predictor_success) {
+                for (int bus = 0; bus < nb; ++bus) {
+                    if (reduced_index[bus] < 0) {
+                        continue;
+                    }
+                    angle_correction[bus] =
+                        reduced_angle[reduced_index[bus]];
+                    maximum_angle_correction = std::max(
+                        maximum_angle_correction,
+                        std::abs(angle_correction[bus]));
+                }
+            }
+            }
+        }
+        const double angle_predictor_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() -
+                angle_predictor_start).count();
+
+        // The component LP omits network limits, so its full injection move
+        // can be far outside the AC-feasible neighborhood.  Start the
+        // deterministic backtracking at a small-angle trust boundary rather
+        // than spending most of the budget on predictably overlarge trials.
+        // Powers of two preserve deterministic trial identities.
+        constexpr double kMaximumPredictedAngleStep = 0.01;
+        double initial_fraction = 1.0;
+        if (angle_predictor_success &&
+            maximum_angle_correction > kMaximumPredictedAngleStep) {
+            while (initial_fraction * maximum_angle_correction >
+                       kMaximumPredictedAngleStep &&
+                   initial_fraction > std::ldexp(
+                       1.0, 1 - options.maximum_candidate_trials)) {
+                initial_fraction *= 0.5;
+            }
+        }
+
+        bool round_improved = false;
+        for (int trial_index = 0;
+             trial_index < options.maximum_candidate_trials; ++trial_index) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wall_start).count();
+            if (elapsed >= options.time_limit_seconds - 0.01) {
+                output.time_limit_reached = true;
+                break;
+            }
+            const double fraction =
+                initial_fraction * std::ldexp(1.0, -trial_index);
+            SolveResult proposal;
+            proposal.status = 0;
+            proposal.state = round_incumbent.state;
+            for (int generator = 0; generator < ng; ++generator) {
+                proposal.state.pg[generator] =
+                    round_incumbent.state.pg[generator] + fraction *
+                    (target_pg[generator] -
+                     round_incumbent.state.pg[generator]);
+            }
+            for (int load = 0; load < nd; ++load) {
+                proposal.state.demand_factor[load] =
+                    round_incumbent.state.demand_factor[load] + fraction *
+                    (target_demand[load] -
+                     round_incumbent.state.demand_factor[load]);
+            }
+            if (angle_predictor_success) {
+                for (int bus = 0; bus < nb; ++bus) {
+                    proposal.state.va[bus] +=
+                        fraction * angle_correction[bus];
+                }
+            }
+            proposal.objective = rebuild_base_state_derived_fields(
+                data, commitment, proposal.state);
+            auto proposal_validation = validate_state(
+                data, ModelMode::BaseSoft, proposal.state, commitment);
+            const double raw_proposal_objective = proposal.objective;
+            const auto raw_proposal_validation = proposal_validation;
+            const double raw_active_balance_slack = std::accumulate(
+                proposal.state.p_delta.begin(),
+                proposal.state.p_delta.end(), 0.0);
+            const double raw_reactive_balance_slack = std::accumulate(
+                proposal.state.q_delta.begin(),
+                proposal.state.q_delta.end(), 0.0);
+            const double raw_thermal_slack = std::accumulate(
+                proposal.state.sm_slack.begin(),
+                proposal.state.sm_slack.end(), 0.0);
+            const double raw_penalty = data.delta *
+                (data.p_delta_cost_approx * raw_active_balance_slack +
+                 data.q_delta_cost_approx * raw_reactive_balance_slack +
+                 data.sm_cost_approx * raw_thermal_slack);
+            const double raw_market_surplus_without_penalty =
+                raw_proposal_objective + raw_penalty;
+            const auto proposed_pg = proposal.state.pg;
+            const auto proposed_demand = proposal.state.demand_factor;
+            bool nonlinear_repair_attempted = false;
+            double nonlinear_repair_seconds = 0.0;
+            bool nonlinear_repair_feasible = false;
+            bool nonlinear_repair_converged = false;
+            bool nonlinear_repair_newton_selected = false;
+            int nonlinear_repair_newton_iterations = 0;
+            int nonlinear_repair_active_passes = 0;
+            int nonlinear_repair_reactive_passes = 0;
+            std::string nonlinear_repair_failure_reason;
+            if (raw_active_balance_slack + raw_reactive_balance_slack > 1e-8 ||
+                !validated_candidate_is_feasible(
+                    proposal, proposal_validation,
+                    options.validation_tolerance)) {
+                nonlinear_repair_attempted = true;
+                FastPowerFlowOptions fast_options;
+                // The component LP has already selected the economic P/load
+                // target.  Ordinary AC Newton should route those injections
+                // first; the balance-minimization path locally rewrites the
+                // target before attempting the power flow and was observed to
+                // discard nearly all of the relaxation gain.
+                fast_options.minimize_active_balance_slack = true;
+                fast_options.minimize_reactive_balance_slack = true;
+                fast_options.skip_balance_cleanup_prepasses = true;
+                fast_options.max_newton_iterations = 30;
+                fast_options.max_active_redispatch_passes = 12;
+                fast_options.max_reactive_limit_passes = 8;
+                FastContingencyPowerFlow repair(
+                    data, proposal.state, commitment, fast_options);
+                auto repaired = repair.solve_base();
+                nonlinear_repair_seconds = repaired.wall_seconds;
+                nonlinear_repair_feasible = repaired.feasible;
+                nonlinear_repair_converged = repaired.converged;
+                nonlinear_repair_newton_selected =
+                    repaired.newton_candidate_selected;
+                nonlinear_repair_newton_iterations =
+                    repaired.newton_iterations;
+                nonlinear_repair_active_passes =
+                    repaired.active_redispatch_passes;
+                nonlinear_repair_reactive_passes =
+                    repaired.reactive_limit_passes;
+                nonlinear_repair_failure_reason = repaired.failure_reason;
+                repaired.solve.objective = rebuild_base_state_derived_fields(
+                    data, commitment, repaired.solve.state);
+                repaired.validation = validate_state(
+                    data, ModelMode::BaseSoft,
+                    repaired.solve.state, commitment);
+                proposal = std::move(repaired.solve);
+                proposal_validation = repaired.validation;
+            }
+            const double candidate_active_balance_slack = std::accumulate(
+                proposal.state.p_delta.begin(),
+                proposal.state.p_delta.end(), 0.0);
+            const double candidate_reactive_balance_slack = std::accumulate(
+                proposal.state.q_delta.begin(),
+                proposal.state.q_delta.end(), 0.0);
+            const double candidate_thermal_slack = std::accumulate(
+                proposal.state.sm_slack.begin(),
+                proposal.state.sm_slack.end(), 0.0);
+            const double candidate_penalty = data.delta *
+                (data.p_delta_cost_approx * candidate_active_balance_slack +
+                 data.q_delta_cost_approx * candidate_reactive_balance_slack +
+                 data.sm_cost_approx * candidate_thermal_slack);
+            double generator_movement_from_proposal = 0.0;
+            for (int generator = 0; generator < ng; ++generator) {
+                generator_movement_from_proposal += std::abs(
+                    proposal.state.pg[generator] - proposed_pg[generator]);
+            }
+            double load_movement_from_proposal = 0.0;
+            for (int load = 0; load < nd; ++load) {
+                load_movement_from_proposal += std::abs(
+                    data.loads[load].pd_nominal *
+                    (proposal.state.demand_factor[load] -
+                     proposed_demand[load]));
+            }
+            const bool accepted =
+                verified_economic_candidate_improves_incumbent(
+                    output.selected, output.selected_validation,
+                    proposal, proposal_validation,
+                    options.validation_tolerance,
+                    options.objective_tolerance);
+            output.trials.push_back({
+                {"round", round},
+                {"trial", trial_index + 1},
+                {"fraction", fraction},
+                {"angle_predictor_success", angle_predictor_success},
+                {"angle_predictor_seconds", angle_predictor_seconds},
+                {"maximum_full_angle_correction",
+                 maximum_angle_correction},
+                {"initial_candidate_fraction", initial_fraction},
+                {"raw_objective", raw_proposal_objective},
+                {"raw_validation", raw_proposal_validation.to_json()},
+                {"raw_active_balance_slack", raw_active_balance_slack},
+                {"raw_reactive_balance_slack", raw_reactive_balance_slack},
+                {"raw_thermal_slack", raw_thermal_slack},
+                {"raw_penalty", raw_penalty},
+                {"raw_market_surplus_without_penalty",
+                 raw_market_surplus_without_penalty},
+                {"nonlinear_repair_attempted", nonlinear_repair_attempted},
+                {"nonlinear_repair_seconds", nonlinear_repair_seconds},
+                {"nonlinear_repair_feasible", nonlinear_repair_feasible},
+                {"nonlinear_repair_converged", nonlinear_repair_converged},
+                {"nonlinear_repair_newton_selected",
+                 nonlinear_repair_newton_selected},
+                {"nonlinear_repair_newton_iterations",
+                 nonlinear_repair_newton_iterations},
+                {"nonlinear_repair_active_passes",
+                 nonlinear_repair_active_passes},
+                {"nonlinear_repair_reactive_passes",
+                 nonlinear_repair_reactive_passes},
+                {"nonlinear_repair_failure_reason",
+                 nonlinear_repair_failure_reason},
+                {"candidate_objective", proposal.objective},
+                {"candidate_penalty", candidate_penalty},
+                {"candidate_market_surplus_without_penalty",
+                 proposal.objective + candidate_penalty},
+                {"generator_movement_from_proposal",
+                 generator_movement_from_proposal},
+                {"load_movement_from_proposal",
+                 load_movement_from_proposal},
+                {"candidate_validation", proposal_validation.to_json()},
+                {"accepted", accepted},
+            });
+            if (accepted) {
+                output.selected = std::move(proposal);
+                output.selected_validation = proposal_validation;
+                output.selected_objective = output.selected.objective;
+                output.selected_fraction = fraction;
+                output.improved = true;
+                round_improved = true;
+                // This is the largest trusted fraction that passed every
+                // acceptance gate.  Recompute the relaxation from the new
+                // verified point rather than testing smaller points along the
+                // now-stale direction.
+                break;
+            }
+        }
+        if (output.time_limit_reached || !round_improved) {
+            break;
+        }
+    }
+
+    output.wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    output.time_limit_reached = output.time_limit_reached ||
+        output.wall_seconds >= options.time_limit_seconds;
+    output.selected.wall_seconds = output.wall_seconds;
+    output.selected_objective = output.selected.objective;
+    return output;
 }
 
 nlohmann::json SparseEconomicRefinementResult::to_json(

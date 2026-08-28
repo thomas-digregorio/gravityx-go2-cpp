@@ -597,6 +597,173 @@ int run_component_tests() {
             "component test failed: nonfinite candidate was accepted");
     }
 
+    // A commitment refinement that fixes the aggregate P/Q injection at each
+    // bus must leave the AC network point unchanged.  This tiny fixture also
+    // checks exact conditional PMIN/PMAX, source transition costs, and that a
+    // verified economic candidate is selected only after nonlinear validation.
+    gravityx::CaseData commitment_case;
+    commitment_case.name = "bus-injection-commitment-fixture";
+    commitment_case.base_mva = 100.0;
+    commitment_case.delta = 1.0;
+    commitment_case.delta_r = 1.0;
+    commitment_case.delta_ctg = 1.0;
+    commitment_case.delta_r_ctg = 1.0;
+    commitment_case.sm_vio_limit = 0.0;
+    commitment_case.sm_cost_approx = 1e6;
+    commitment_case.p_delta_cost_approx = 1e6;
+    commitment_case.q_delta_cost_approx = 1e6;
+    commitment_case.buses.resize(1);
+    commitment_case.buses[0].source_key = "1";
+    commitment_case.buses[0].index = 0;
+    commitment_case.buses[0].bus_i = 1;
+    commitment_case.buses[0].type = 3;
+    commitment_case.buses[0].vmin = 0.9;
+    commitment_case.buses[0].vmax = 1.1;
+    commitment_case.buses[0].generators = {0, 1};
+    commitment_case.buses[0].loads = {0};
+    commitment_case.bus_position.emplace(1, 0);
+    commitment_case.generators.resize(2);
+    for (int generator = 0; generator < 2; ++generator) {
+        auto& source_generator = commitment_case.generators[generator];
+        source_generator.source_key = "1:G" + std::to_string(generator + 1);
+        source_generator.index = generator;
+        source_generator.bus = 0;
+        source_generator.status_prev = 1;
+        source_generator.suqual = 1;
+        source_generator.sdqual = 1;
+        source_generator.pg_start = 0.5;
+        source_generator.pg_prev = 0.5;
+        source_generator.pmin = 0.0;
+        source_generator.pmax = 1.0;
+        source_generator.qmin = -1.0;
+        source_generator.qmax = 1.0;
+        source_generator.prumax = 10.0;
+        source_generator.prdmax = 10.0;
+        source_generator.prumaxctg = 10.0;
+        source_generator.prdmaxctg = 10.0;
+        source_generator.oncost = 10.0;
+        source_generator.sucost = 2.0;
+        source_generator.sdcost = 1.0;
+        source_generator.ncost = 2;
+        source_generator.cost = generator == 0
+            ? std::vector<double>{0.0, 0.0, 1.0, 100.0}
+            : std::vector<double>{0.0, 0.0, 1.0, 1.0};
+    }
+    commitment_case.loads.resize(1);
+    auto& commitment_load = commitment_case.loads[0];
+    commitment_load.source_key = "1:L1";
+    commitment_load.index = 0;
+    commitment_load.bus = 0;
+    commitment_load.pd_nominal = 1.0;
+    commitment_load.qd_nominal = 0.0;
+    commitment_load.pd_prev = 1.0;
+    commitment_load.pd_min = 0.0;
+    commitment_load.pd_max = 1.0;
+    commitment_load.tmin = 1.0;
+    commitment_load.tmax = 1.0;
+    commitment_load.prumax = 0.0;
+    commitment_load.prdmax = 0.0;
+    commitment_load.prumaxctg = 0.0;
+    commitment_load.prdmaxctg = 0.0;
+    commitment_load.ncost = 2;
+    commitment_load.cost = {0.0, 0.0, 1.0, 200.0};
+
+    gravityx::SolveResult commitment_incumbent;
+    commitment_incumbent.status = 0;
+    commitment_incumbent.state.vm = {1.0};
+    commitment_incumbent.state.va = {0.0};
+    commitment_incumbent.state.pg = {0.5, 0.5};
+    commitment_incumbent.state.qg = {0.0, 0.0};
+    commitment_incumbent.state.demand_factor = {1.0};
+    const std::vector<int> commitment_before{1, 1};
+    commitment_incumbent.objective =
+        gravityx::rebuild_base_state_derived_fields(
+            commitment_case, commitment_before,
+            commitment_incumbent.state);
+    const auto commitment_incumbent_validation = gravityx::validate_state(
+        commitment_case, gravityx::ModelMode::BaseSoft,
+        commitment_incumbent.state, commitment_before);
+    if (commitment_incumbent_validation.max_residual > 1e-10) {
+        throw std::runtime_error(
+            "component test failed: commitment fixture incumbent invalid");
+    }
+    gravityx::BusInjectionCommitmentOptions commitment_options;
+    commitment_options.time_limit_seconds = 5.0;
+    commitment_options.enforce_generator_contingency_headroom = false;
+    const auto commitment_refinement =
+        gravityx::refine_commitment_preserving_bus_injections(
+            commitment_case, commitment_before,
+            commitment_incumbent, commitment_options);
+    if (!commitment_refinement.solver_feasible ||
+        !commitment_refinement.candidate_verified ||
+        !commitment_refinement.improved ||
+        commitment_refinement.commitment != std::vector<int>({0, 1}) ||
+        commitment_refinement.online_before != 2 ||
+        commitment_refinement.online_after != 1 ||
+        commitment_refinement.shutdown_count != 1 ||
+        commitment_refinement.maximum_bus_active_injection_change > 1e-8 ||
+        commitment_refinement.maximum_bus_reactive_injection_change > 1e-8 ||
+        commitment_refinement.selected_validation.max_residual > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: bus-injection commitment refinement");
+    }
+    require_near(
+        gravityx::base_commitment_transition_cost(
+            commitment_case, commitment_refinement.commitment),
+        1.0, 1e-12, "commitment shutdown cost");
+
+    gravityx::ComponentEconomicDispatchOptions component_dispatch_options;
+    component_dispatch_options.time_limit_seconds = 5.0;
+    component_dispatch_options.maximum_candidate_trials = 4;
+    const auto component_dispatch =
+        gravityx::refine_fixed_commitment_component_economic(
+            commitment_case, commitment_before,
+            commitment_incumbent, component_dispatch_options);
+    if (!component_dispatch.incumbent_verified ||
+        !component_dispatch.solver_feasible ||
+        !component_dispatch.solver_optimal ||
+        !component_dispatch.primal_start_attempted ||
+        !component_dispatch.primal_start_accepted ||
+        !component_dispatch.improved ||
+        component_dispatch.component_count != 1 ||
+        component_dispatch.selected_validation.max_residual > 1e-8 ||
+        component_dispatch.selected.state.pg.size() != 2 ||
+        component_dispatch.selected.state.demand_factor.size() != 1 ||
+        component_dispatch.selected.state.pg[0] > 1e-8 ||
+        std::abs(component_dispatch.selected.state.pg[1] - 1.0) > 1e-8 ||
+        std::abs(
+            component_dispatch.selected.state.demand_factor[0] - 1.0) >
+            1e-8 ||
+        component_dispatch.selected.objective <=
+            commitment_incumbent.objective + 1e-8) {
+        throw std::runtime_error(
+            "component test failed: component economic dispatch refinement: " +
+            component_dispatch.to_json(false).dump());
+    }
+    gravityx::ActiveNetworkEconomicDispatchOptions active_dispatch_options;
+    active_dispatch_options.time_limit_seconds = 5.0;
+    active_dispatch_options.maximum_rounds = 3;
+    active_dispatch_options.maximum_candidate_trials = 4;
+    const auto active_dispatch =
+        gravityx::refine_fixed_commitment_active_network_economic(
+            commitment_case, commitment_before,
+            commitment_incumbent, active_dispatch_options);
+    if (!active_dispatch.incumbent_verified ||
+        !active_dispatch.solver_feasible ||
+        !active_dispatch.all_solver_rounds_optimal ||
+        !active_dispatch.improved ||
+        active_dispatch.component_count != 1 ||
+        active_dispatch.selected_validation.max_residual > 1e-8 ||
+        active_dispatch.selected.state.pg.size() != 2 ||
+        active_dispatch.selected.state.pg[0] > 1e-8 ||
+        std::abs(active_dispatch.selected.state.pg[1] - 1.0) > 1e-8 ||
+        active_dispatch.selected.objective <=
+            commitment_incumbent.objective + 1e-8) {
+        throw std::runtime_error(
+            "component test failed: active-network economic dispatch: " +
+            active_dispatch.to_json(false).dump());
+    }
+
     gravityx::CaseData passive_pocket_case;
     passive_pocket_case.buses.resize(4);
     passive_pocket_case.generators.resize(1);
@@ -2841,6 +3008,202 @@ int run_sparse_economic_refinement_json(
     return refinement.incumbent_verified ? 0 : 1;
 }
 
+int run_bus_injection_commitment_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "bus-injection commitment time limit must be finite and positive");
+    }
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    const auto base = load_base_point(base_result_path);
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    gravityx::BusInjectionCommitmentOptions options;
+    options.time_limit_seconds = time_limit_seconds;
+    const auto refinement =
+        gravityx::refine_commitment_preserving_bus_injections(
+            data, base.commitment, incumbent, options);
+    const bool selected_verified = gravityx::validated_candidate_is_feasible(
+        refinement.selected, refinement.selected_validation,
+        options.validation_tolerance);
+
+    auto output = input_json;
+    output["success"] = selected_verified;
+    output["bus_injection_commitment_refinement"] =
+        refinement.to_json(false);
+    output["commitment"] = refinement.commitment;
+    output["base"] = gravityx::solve_result_to_json(
+        refinement.selected, true);
+    output["base_validation"] =
+        refinement.selected_validation.to_json();
+    output["selected_state"] =
+        gravityx::ac_state_to_json(refinement.selected.state);
+    output["wall_seconds"] =
+        input_json.value("wall_seconds", 0.0) + refinement.wall_seconds;
+    if (refinement.improved) {
+        output["base_method"] =
+            "verified_bus_injection_commitment_milp";
+    }
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", selected_verified},
+        {"solver_feasible", refinement.solver_feasible},
+        {"candidate_verified", refinement.candidate_verified},
+        {"improved", refinement.improved},
+        {"incumbent_official_proxy", refinement.incumbent_official_proxy},
+        {"candidate_official_proxy", refinement.candidate_official_proxy},
+        {"online_before", refinement.online_before},
+        {"online_after", refinement.online_after},
+        {"shutdown_count", refinement.shutdown_count},
+        {"mip_gap", refinement.mip_gap},
+        {"wall_seconds", refinement.wall_seconds},
+        {"max_residual", refinement.selected_validation.max_residual},
+        {"max_bus_p_change",
+         refinement.maximum_bus_active_injection_change},
+        {"max_bus_q_change",
+         refinement.maximum_bus_reactive_injection_change},
+    }).dump(2) << '\n';
+    return selected_verified ? 0 : 1;
+}
+
+int run_component_economic_dispatch_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "component economic dispatch time limit must be finite and positive");
+    }
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    const auto base = load_base_point(base_result_path);
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    gravityx::ComponentEconomicDispatchOptions options;
+    options.time_limit_seconds = time_limit_seconds;
+    const auto refinement =
+        gravityx::refine_fixed_commitment_component_economic(
+            data, base.commitment, incumbent, options);
+
+    auto output = input_json;
+    output["success"] = refinement.incumbent_verified;
+    output["component_economic_dispatch"] = refinement.to_json(false);
+    output["base_optimization_performed"] = refinement.attempted;
+    output["base"] = gravityx::solve_result_to_json(
+        refinement.selected, true);
+    output["base_validation"] =
+        refinement.selected_validation.to_json();
+    output["selected_state"] =
+        gravityx::ac_state_to_json(refinement.selected.state);
+    output["wall_seconds"] =
+        input_json.value("wall_seconds", 0.0) + refinement.wall_seconds;
+    if (refinement.improved) {
+        output["base_method"] =
+            "verified_component_economic_dispatch_relaxation";
+    }
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", refinement.incumbent_verified},
+        {"solver_feasible", refinement.solver_feasible},
+        {"solver_optimal", refinement.solver_optimal},
+        {"improved", refinement.improved},
+        {"incumbent_objective", refinement.incumbent_objective},
+        {"relaxed_market_surplus", refinement.relaxed_market_surplus},
+        {"selected_objective", refinement.selected_objective},
+        {"selected_fraction", refinement.selected_fraction},
+        {"component_count", refinement.component_count},
+        {"rounds_completed", refinement.rounds_completed},
+        {"row_count", refinement.row_count},
+        {"column_count", refinement.column_count},
+        {"simplex_iterations", refinement.simplex_iterations},
+        {"solver_wall_seconds", refinement.solver_wall_seconds},
+        {"wall_seconds", refinement.wall_seconds},
+        {"max_residual", refinement.selected_validation.max_residual},
+        {"status", refinement.status},
+    }).dump(2) << '\n';
+    return refinement.incumbent_verified ? 0 : 1;
+}
+
+int run_active_network_economic_dispatch_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "active-network economic dispatch time limit must be finite and positive");
+    }
+    const auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    const auto base = load_base_point(base_result_path);
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    gravityx::ActiveNetworkEconomicDispatchOptions options;
+    options.time_limit_seconds = time_limit_seconds;
+    const auto refinement =
+        gravityx::refine_fixed_commitment_active_network_economic(
+            data, base.commitment, incumbent, options);
+
+    auto output = input_json;
+    output["success"] = refinement.incumbent_verified;
+    output["active_network_economic_dispatch"] =
+        refinement.to_json(false);
+    output["base_optimization_performed"] = refinement.attempted;
+    output["base"] = gravityx::solve_result_to_json(
+        refinement.selected, true);
+    output["base_validation"] =
+        refinement.selected_validation.to_json();
+    output["selected_state"] =
+        gravityx::ac_state_to_json(refinement.selected.state);
+    output["wall_seconds"] =
+        input_json.value("wall_seconds", 0.0) + refinement.wall_seconds;
+    if (refinement.improved) {
+        output["base_method"] =
+            "verified_active_network_economic_dispatch";
+    }
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", refinement.incumbent_verified},
+        {"solver_feasible", refinement.solver_feasible},
+        {"all_solver_rounds_optimal",
+         refinement.all_solver_rounds_optimal},
+        {"improved", refinement.improved},
+        {"incumbent_objective", refinement.incumbent_objective},
+        {"selected_objective", refinement.selected_objective},
+        {"selected_fraction", refinement.selected_fraction},
+        {"rounds_completed", refinement.rounds_completed},
+        {"row_count", refinement.row_count},
+        {"column_count", refinement.column_count},
+        {"thermal_row_count", refinement.thermal_row_count},
+        {"simplex_iterations", refinement.simplex_iterations},
+        {"solver_wall_seconds", refinement.solver_wall_seconds},
+        {"wall_seconds", refinement.wall_seconds},
+        {"max_residual", refinement.selected_validation.max_residual},
+        {"status", refinement.status},
+    }).dump(2) << '\n';
+    return refinement.incumbent_verified ? 0 : 1;
+}
+
 int run_sparse_ac_economic_json(
     const std::string& case_path,
     const std::string& base_result_path,
@@ -4275,11 +4638,25 @@ int run_contingency_worker(
         fast_options.economic_balance_polish =
             economic_contingency_polish;
         if (economic_contingency_polish && data.buses.size() >= 16000) {
-            // Spend the bounded Phase-I/Phase-II work on the economically
-            // dominant 19k tail.  The threshold is evaluated only after a
-            // secure predictor exists; all other contingencies retain that
-            // independently verified incumbent unchanged.
-            fast_options.economic_balance_polish_objective_threshold = -2e6;
+            // Give every independently secure predictor the inexpensive
+            // cached-Jacobian and local-injection cleanup.  Spend one short
+            // Phase-I LP only on the remaining low-objective tail; Phase II
+            // stays disabled until Phase I's measured yield and cost justify
+            // it.
+            fast_options.economic_balance_polish_objective_threshold =
+                std::numeric_limits<double>::infinity();
+            fast_options.economic_linearized_objective_threshold = 1e5;
+            fast_options.max_economic_linearized_polish_rounds = 1;
+            fast_options.economic_linearized_polish_seconds = 2.0;
+            fast_options.max_economic_linearized_phase_two_rounds = 0;
+            fast_options.economic_balance_polish_wall_seconds = 4.0;
+            fast_options.max_economic_reactive_zero_balance_rounds = 8;
+            fast_options.economic_reactive_zero_balance_objective_threshold =
+                1.8e5;
+            fast_options.economic_reactive_zero_balance_trigger_slack = 0.25;
+            fast_options.economic_exact_newton_rescue = true;
+            fast_options.economic_exact_newton_objective_threshold = 1.8e5;
+            fast_options.economic_exact_newton_max_iterations = 15;
         }
         const char* fast_diagnostics =
             std::getenv("GRAVITYX_FAST_PF_DIAGNOSTICS");
@@ -4654,6 +5031,21 @@ int main(int argc, char** argv) {
             return run_sparse_economic_refinement_json(
                 argv[2], argv[3], argv[4], std::stod(argv[5]));
         }
+        if (argc == 6 &&
+            std::string(argv[1]) == "bus-injection-commitment-base-json") {
+            return run_bus_injection_commitment_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]));
+        }
+        if (argc == 6 &&
+            std::string(argv[1]) == "component-economic-dispatch-base-json") {
+            return run_component_economic_dispatch_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]));
+        }
+        if (argc == 6 &&
+            std::string(argv[1]) == "active-network-economic-base-json") {
+            return run_active_network_economic_dispatch_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]));
+        }
         if ((argc == 6 || argc == 7) &&
             std::string(argv[1]) == "sparse-ac-economic-base-json") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
@@ -4721,6 +5113,9 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 run-ibr-json CASE.json OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 validated-source-base-json CASE.json OUTPUT.json [fast-only] [robust-contingency-seed] [economic-refinement-seconds=N] [sparse-economic-refinement-seconds=N] [sparse-ac-economic-refinement-seconds=N]\n"
                   << "  gravityx_go2 sparse-economic-refine-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
+                  << "  gravityx_go2 bus-injection-commitment-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
+                  << "  gravityx_go2 component-economic-dispatch-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
+                  << "  gravityx_go2 active-network-economic-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
                   << "  gravityx_go2 sparse-ac-economic-base-json CASE.json BASE.json OUTPUT.json SECONDS [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 screen-all-contingencies CASE.json BASE.json OUTPUT.json\n"

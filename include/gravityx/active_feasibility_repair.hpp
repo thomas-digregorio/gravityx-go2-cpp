@@ -44,6 +44,7 @@ struct ActiveFeasibilityRepairResult {
     double maximum_linearized_violation{};
     double maximum_column_violation{};
     bool finite_solution_values{};
+    bool independently_feasible_terminal_solution{};
     bool canonicalized_terminal_solution{};
     double maximum_angle_change{};
     double maximum_voltage_change{};

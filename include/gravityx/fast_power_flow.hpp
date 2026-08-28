@@ -18,6 +18,11 @@ struct FastPowerFlowOptions {
     bool economic_balance_polish{false};
     bool minimize_active_balance_slack{false};
     bool minimize_reactive_balance_slack{false};
+    // Route a supplied economic injection target directly through the full AC
+    // Newton equations.  The zero-slack target remains active, but the legacy
+    // local/active/reactive cleanup prepasses are skipped so they cannot
+    // rewrite the supplied generation and load direction first.
+    bool skip_balance_cleanup_prepasses{false};
     double balance_cleanup_fraction{1.0};
     bool capture_diagnostics{false};
     int max_economic_balance_polish_iterations{4};
@@ -26,6 +31,17 @@ struct FastPowerFlowOptions {
     double economic_linearized_trigger_slack{0.05};
     double economic_balance_polish_objective_threshold{
         std::numeric_limits<double>::infinity()};
+    double economic_linearized_objective_threshold{
+        std::numeric_limits<double>::infinity()};
+    double economic_balance_polish_wall_seconds{
+        std::numeric_limits<double>::infinity()};
+    int max_economic_reactive_zero_balance_rounds{0};
+    double economic_reactive_zero_balance_objective_threshold{
+        std::numeric_limits<double>::infinity()};
+    double economic_reactive_zero_balance_trigger_slack{0.0};
+    bool economic_exact_newton_rescue{false};
+    double economic_exact_newton_objective_threshold{-5e5};
+    int economic_exact_newton_max_iterations{4};
     int max_economic_linearized_phase_two_rounds{1};
     double economic_linearized_phase_two_seconds{0.75};
     int max_newton_iterations{50};
@@ -55,6 +71,18 @@ struct FastPowerFlowResult {
     bool economic_balance_polish_attempted{};
     bool economic_balance_polish_threshold_passed{};
     double economic_balance_polish_objective_threshold{};
+    double economic_linearized_objective_threshold{};
+    bool economic_balance_polish_time_limit_reached{};
+    double economic_balance_polish_wall_seconds{};
+    bool economic_exact_newton_attempted{};
+    bool economic_exact_newton_converged{};
+    bool economic_exact_newton_selected{};
+    int economic_exact_newton_iterations{};
+    int economic_exact_newton_q_limit_switches{};
+    double economic_exact_newton_wall_seconds{};
+    double economic_exact_newton_objective{};
+    std::string economic_exact_newton_failure_reason;
+    ValidationReport economic_exact_newton_validation;
     bool economic_balance_polish_selected{};
     int economic_balance_polish_iterations{};
     int economic_balance_polish_backtracking_attempts{};

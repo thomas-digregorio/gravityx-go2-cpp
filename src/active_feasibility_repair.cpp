@@ -263,6 +263,8 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"maximum_linearized_violation", maximum_linearized_violation},
         {"maximum_column_violation", maximum_column_violation},
         {"finite_solution_values", finite_solution_values},
+        {"independently_feasible_terminal_solution",
+         independently_feasible_terminal_solution},
         {"canonicalized_terminal_solution",
          canonicalized_terminal_solution},
         {"maximum_angle_change", maximum_angle_change},
@@ -1039,7 +1041,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             // hard safety cap.
             highs.setOptionValue(
                 "primal_simplex_bound_perturbation_multiplier", 0.0);
-            output.simplex_iteration_limit = 1000;
+            output.simplex_iteration_limit = 5000;
             highs.setOptionValue(
                 "simplex_iteration_limit", output.simplex_iteration_limit);
         }
@@ -1172,17 +1174,42 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             }
         }
         if (output.finite_solution_values && minimize_balance_slack) {
+            double original_maximum_column_violation = 0.0;
+            for (HighsInt column = 0; column < column_count; ++column) {
+                const double value = candidate_values[column];
+                original_maximum_column_violation = std::max(
+                    original_maximum_column_violation,
+                    std::max(
+                        std::max(0.0, lower[column] - value),
+                        std::max(0.0, value - upper[column])));
+            }
+            double original_maximum_row_violation = 0.0;
+            for (const auto& row : rows) {
+                original_maximum_row_violation = std::max(
+                    original_maximum_row_violation,
+                    row_violation(row, candidate_values));
+            }
+            output.independently_feasible_terminal_solution =
+                original_maximum_column_violation <= 1e-7 &&
+                original_maximum_row_violation <= 1e-7;
+
             // HiGHS can return a time- or iteration-limited primal-simplex
             // point before it has removed tiny bound perturbations.  Project
             // only onto the original column bounds, then recompute the
             // dedicated balance slacks exactly.  The complete row/column audit
             // below must still pass at 1e-7 before this point is exposed to the
             // nonlinear validator.
-            for (HighsInt column = 0; column < column_count; ++column) {
-                candidate_values[column] = std::clamp(
-                    candidate_values[column], lower[column], upper[column]);
+            // If the original terminal vector already passes that independent
+            // audit, preserve it exactly.  Re-canonicalizing a feasible vector
+            // can introduce a false rejection after a time-limited solve.
+            bool canonicalized = false;
+            if (!output.independently_feasible_terminal_solution) {
+                for (HighsInt column = 0; column < column_count; ++column) {
+                    candidate_values[column] = std::clamp(
+                        candidate_values[column], lower[column], upper[column]);
+                }
+                canonicalized = true;
             }
-            bool canonicalized = true;
             const auto canonicalize_balance = [&] (
                 int row_index, int positive_column, int negative_column) {
                 candidate_values[positive_column] = 0.0;
@@ -1226,15 +1253,17 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
                 }
                 return true;
             };
-            for (int bus = 0; canonicalized && bus < nb; ++bus) {
-                const int active_row = include_reactive ? 2 * bus : bus;
-                canonicalized = canonicalize_balance(
-                    active_row, p_positive_offset + bus,
-                    p_negative_offset + bus);
-                if (canonicalized && include_reactive) {
+            if (!output.independently_feasible_terminal_solution) {
+                for (int bus = 0; canonicalized && bus < nb; ++bus) {
+                    const int active_row = include_reactive ? 2 * bus : bus;
                     canonicalized = canonicalize_balance(
-                        active_row + 1, q_positive_offset + bus,
-                        q_negative_offset + bus);
+                        active_row, p_positive_offset + bus,
+                        p_negative_offset + bus);
+                    if (canonicalized && include_reactive) {
+                        canonicalized = canonicalize_balance(
+                            active_row + 1, q_positive_offset + bus,
+                            q_negative_offset + bus);
+                    }
                 }
             }
             output.canonicalized_terminal_solution = canonicalized;
@@ -1263,7 +1292,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     }
     const bool candidate_usable = shape_valid &&
         (!minimize_balance_slack ||
-         output.canonicalized_terminal_solution);
+         output.canonicalized_terminal_solution ||
+         output.independently_feasible_terminal_solution);
     const bool optimal = run_status != HighsStatus::kError &&
         model_status == HighsModelStatus::kOptimal && candidate_usable;
     const bool feasible_nonoptimal = run_status != HighsStatus::kError &&

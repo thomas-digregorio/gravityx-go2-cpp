@@ -1015,6 +1015,49 @@ void normalize_source_reference_angles(
 
 }  // namespace
 
+namespace {
+
+AcState interpolate_corrective_candidate(
+    const AcState& from,
+    const AcState& to,
+    double step) {
+    if (!std::isfinite(step) || step < 0.0 || step > 1.0) {
+        throw std::runtime_error(
+            "corrective candidate interpolation step is outside [0, 1]");
+    }
+    AcState candidate = from;
+    const auto blend = [step](
+        const std::vector<double>& left,
+        const std::vector<double>& right,
+        std::vector<double>& target,
+        const char* identity) {
+        if (left.size() != right.size()) {
+            throw std::runtime_error(
+                std::string("corrective candidate dimension mismatch: ") +
+                identity);
+        }
+        target.resize(left.size());
+        for (std::size_t i = 0; i < left.size(); ++i) {
+            target[i] = left[i] + step * (right[i] - left[i]);
+        }
+    };
+    blend(from.vm, to.vm, candidate.vm, "vm");
+    blend(from.va, to.va, candidate.va, "va");
+    blend(from.pg, to.pg, candidate.pg, "pg");
+    blend(from.qg, to.qg, candidate.qg, "qg");
+    blend(
+        from.demand_factor, to.demand_factor,
+        candidate.demand_factor, "demand_factor");
+    // Switched-shunt controls are discrete.  The AC equations for `to` were
+    // built with this exact shunt state, so interpolation must transfer it as
+    // a unit instead of retaining an unrelated state from `from`.
+    candidate.shunt_bs = to.shunt_bs;
+    candidate.shunt_steps = to.shunt_steps;
+    return candidate;
+}
+
+}  // namespace
+
 void run_fast_power_flow_topology_cache_regression() {
     CaseData data;
     data.buses.resize(3);
@@ -1057,6 +1100,36 @@ void run_fast_power_flow_topology_cache_regression() {
         std::abs(angles[2]) > 1e-12) {
         throw std::runtime_error(
             "fast power-flow topology cache normalized the wrong island");
+    }
+
+    AcState interpolation_from;
+    interpolation_from.vm = {1.0, 2.0};
+    interpolation_from.va = {0.0, 0.2};
+    interpolation_from.pg = {1.0};
+    interpolation_from.qg = {2.0};
+    interpolation_from.demand_factor = {0.8};
+    interpolation_from.shunt_bs = {0.1};
+    interpolation_from.shunt_steps = {{1, 0}};
+    AcState interpolation_to = interpolation_from;
+    interpolation_to.vm = {1.4, 2.4};
+    interpolation_to.va = {0.4, 0.6};
+    interpolation_to.pg = {3.0};
+    interpolation_to.qg = {4.0};
+    interpolation_to.demand_factor = {1.0};
+    interpolation_to.shunt_bs = {0.3};
+    interpolation_to.shunt_steps = {{0, 1}};
+    const auto interpolation = interpolate_corrective_candidate(
+        interpolation_from, interpolation_to, 0.25);
+    if (std::abs(interpolation.vm[0] - 1.1) > 1e-12 ||
+        std::abs(interpolation.va[1] - 0.3) > 1e-12 ||
+        std::abs(interpolation.pg[0] - 1.5) > 1e-12 ||
+        std::abs(interpolation.qg[0] - 2.5) > 1e-12 ||
+        std::abs(interpolation.demand_factor[0] - 0.85) > 1e-12 ||
+        interpolation.shunt_bs != interpolation_to.shunt_bs ||
+        interpolation.shunt_steps != interpolation_to.shunt_steps) {
+        throw std::runtime_error(
+            "corrective candidate interpolation dropped a continuous or "
+            "discrete control");
     }
 }
 
@@ -3287,6 +3360,15 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             predictor_state.pg = pg;
             predictor_state.qg = qg;
             predictor_state.demand_factor = predictor_demand_factor;
+            // Preserve the economically preferred contingency controls before
+            // the feasibility predictor starts making local bus-by-bus
+            // corrections.  Those local corrections are excellent at finding
+            // a secure point, but they can move generation and load far away
+            // from the verified base dispatch.  The refreshed-Jacobian Newton
+            // rescue below should solve the AC equations for this preferred
+            // control target, using the secure predictor only as its voltage
+            // initialization.
+            const AcState economic_target_state = predictor_state;
             ValidationReport predictor_validation =
                 output.direct_candidate_validation;
             std::unique_ptr<FixedJacobianPredictorCache>
@@ -4756,8 +4838,19 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             output.economic_exact_newton_attempted = true;
                             const auto exact_newton_start =
                                 std::chrono::steady_clock::now();
+                            // Generator outages need the feasibility-polished
+                            // controls: their component redispatch can land on
+                            // several simultaneous corrective limits, and the
+                            // existing route is already robust there.  A branch
+                            // outage leaves every generator available, so use
+                            // the preserved economic target and retain the
+                            // secure predictor only as the voltage start.
+                            const AcState& exact_control_reference =
+                                outaged_branch >= 0
+                                ? economic_target_state : polished_state;
                             const YRows exact_ybus = build_ybus(
-                                data_, outaged_branch, &polished_state);
+                                data_, outaged_branch,
+                                &exact_control_reference);
                             std::vector<double> exact_p_spec(nb, 0.0);
                             std::vector<double> exact_q_spec(nb, 0.0);
                             std::vector<double> exact_load_p(nb, 0.0);
@@ -4770,9 +4863,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 const int bus =
                                     data_.generators[generator].bus;
                                 exact_p_spec[bus] +=
-                                    polished_state.pg[generator];
+                                    exact_control_reference.pg[generator];
                                 exact_q_spec[bus] +=
-                                    polished_state.qg[generator];
+                                    exact_control_reference.qg[generator];
                             }
                             for (int load = 0;
                                  load < static_cast<int>(data_.loads.size());
@@ -4780,10 +4873,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 const int bus = data_.loads[load].bus;
                                 const double load_p =
                                     data_.loads[load].pd_nominal *
-                                    polished_state.demand_factor[load];
+                                    exact_control_reference.demand_factor[load];
                                 const double load_q =
                                     data_.loads[load].qd_nominal *
-                                    polished_state.demand_factor[load];
+                                    exact_control_reference.demand_factor[load];
                                 exact_load_p[bus] += load_p;
                                 exact_load_q[bus] += load_q;
                                 exact_p_spec[bus] -= load_p;
@@ -4813,10 +4906,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     active_slack_weights[bus] += upward
                                         ? std::max(
                                               0.0, p_upper[generator] -
-                                                  polished_state.pg[generator])
+                                                  exact_control_reference.pg[generator])
                                         : std::max(
                                               0.0,
-                                              polished_state.pg[generator] -
+                                              exact_control_reference.pg[generator] -
                                                   p_lower[generator]);
                                 }
                             }
@@ -4912,7 +5005,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     "exact Newton reactive active-set limit";
                             }
                             if (exact_active_set_complete) {
-                                AcState exact_state = polished_state;
+                                AcState exact_state = exact_control_reference;
                                 exact_state.vm = std::move(exact_vm);
                                 exact_state.va = std::move(exact_va);
                                 network_injections(
@@ -4929,7 +5022,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         exact_load_p[bus];
                                     if (!allocate_total(
                                             active_at_bus[bus], p_lower,
-                                            p_upper, polished_state.pg,
+                                            p_upper, exact_control_reference.pg,
                                             required_p, exact_state.pg)) {
                                         double total_lower = 0.0;
                                         double total_upper = 0.0;
@@ -4955,7 +5048,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         exact_load_q[bus];
                                     if (!allocate_total(
                                             active_at_bus[bus], q_lower,
-                                            q_upper, polished_state.qg,
+                                            q_upper, exact_control_reference.qg,
                                             required_q, exact_state.qg)) {
                                         double total_lower = 0.0;
                                         double total_upper = 0.0;
@@ -4988,24 +5081,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             0.001953125};
                                     for (double step :
                                          exact_line_search_steps) {
-                                        AcState candidate = polished_state;
-                                        for (int bus = 0; bus < nb; ++bus) {
-                                            candidate.vm[bus] += step *
-                                                (exact_state.vm[bus] -
-                                                 polished_state.vm[bus]);
-                                            candidate.va[bus] += step *
-                                                (exact_state.va[bus] -
-                                                 polished_state.va[bus]);
-                                        }
-                                        for (int generator = 0;
-                                             generator < ng; ++generator) {
-                                            candidate.pg[generator] += step *
-                                                (exact_state.pg[generator] -
-                                                 polished_state.pg[generator]);
-                                            candidate.qg[generator] += step *
-                                                (exact_state.qg[generator] -
-                                                 polished_state.qg[generator]);
-                                        }
+                                        AcState candidate =
+                                            interpolate_corrective_candidate(
+                                                polished_state, exact_state,
+                                                step);
                                         normalize_source_reference_angles(
                                             data_, components, candidate.va);
                                         const double candidate_objective =
@@ -5093,45 +5172,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                                 for (double step :
                                                      repair_line_search_steps) {
                                                     AcState candidate =
-                                                        polished_state;
-                                                    const auto blend = [step](
-                                                        const std::vector<double>&
-                                                            from,
-                                                        const std::vector<double>&
-                                                            to,
-                                                        std::vector<double>&
-                                                            target) {
-                                                        target.resize(from.size());
-                                                        for (std::size_t i = 0;
-                                                             i < from.size(); ++i) {
-                                                            target[i] = from[i] +
-                                                                step *
-                                                                    (to[i] -
-                                                                     from[i]);
-                                                        }
-                                                    };
-                                                    blend(
-                                                        polished_state.vm,
-                                                        repair.state.vm,
-                                                        candidate.vm);
-                                                    blend(
-                                                        polished_state.va,
-                                                        repair.state.va,
-                                                        candidate.va);
-                                                    blend(
-                                                        polished_state.pg,
-                                                        repair.state.pg,
-                                                        candidate.pg);
-                                                    blend(
-                                                        polished_state.qg,
-                                                        repair.state.qg,
-                                                        candidate.qg);
-                                                    blend(
-                                                        polished_state
-                                                            .demand_factor,
-                                                        repair.state
-                                                            .demand_factor,
-                                                        candidate.demand_factor);
+                                                        interpolate_corrective_candidate(
+                                                            polished_state,
+                                                            repair.state,
+                                                            step);
                                                     normalize_source_reference_angles(
                                                         data_, components,
                                                         candidate.va);
@@ -5298,7 +5342,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                                              .rfind("branch:", 0) ==
                                                          0);
                                                 continue_sequential_repair =
-                                                    outaged_generator >= 0 &&
                                                     full_objective >
                                                         polished_objective + 1e-9 &&
                                                     full_validation.max_residual >

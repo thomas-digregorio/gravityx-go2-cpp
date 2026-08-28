@@ -120,3 +120,42 @@ and to gate the path to the generator-outage tail before a full scenario run.
 The component test suite passes 4/4. No official scenario-095 rerun has been
 performed at this checkpoint. A broader representative calibration is still
 required before spending the one permitted cold full-scenario run.
+
+## Economic-target branch Newton and complete state transfer
+
+The fixed-Jacobian feasibility predictor can alter generation, load, and
+switched-shunt controls substantially before it reaches a secure state.  The
+refreshed-Jacobian Newton rescue previously solved the AC equations for those
+already-distorted controls.  The retained branch-outage correction now:
+
+1. preserves the economically preferred post-outage controls before the local
+   feasibility projections;
+2. uses the secure predictor voltages only as the Newton initialization;
+3. transfers load factors and the exact discrete switched-shunt state into the
+   Newton and repair candidates; and
+4. permits the existing monotone sequential security repair for branch as well
+   as generator outages.
+
+Generator outages retain their previously verified feasibility-polished Newton
+reference.  An initial diagnostic showed that replacing it could miss an exact
+corrective generator bound by approximately `0.001 p.u.`; that path was rejected
+before retention.
+
+The final six-label diagnostic evaluated each label once.  Every point remained
+secure under the unchanged complete nonlinear validator.
+
+| Label | Type | Prior objective | Retained objective | Change | Residual | Time (s) |
+|---|---|---:|---:|---:|---:|---:|
+| CTG_000353 | generator | -15107.286 | -15107.286 | 0.000 | 2.50e-10 | 5.861 |
+| CTG_000111 | generator | 212203.094 | 212203.094 | 0.000 | 9.25e-16 | 2.133 |
+| CTG_000545 | branch | -1263951.215 | -14624.067 | +1249327.148 | 1.31e-10 | 6.232 |
+| CTG_001538 | branch | -94528.054 | 199370.469 | +293898.523 | 3.02e-8 | 3.503 |
+| CTG_002190 | branch | 211729.810 | 211680.760 | -49.050 | 1.19e-15 | 2.581 |
+| CTG_002330 | branch | -5552.737 | 193947.903 | +199500.640 | 4.71e-7 | 4.799 |
+
+The tiny `CTG_002190` variation is a `0.023%` bounded-path difference.  Within
+every run, candidate replacement remains strictly objective-monotone.  A new
+component regression verifies that all continuous controls are interpolated
+and that the target switched-shunt state is transferred atomically; 4/4 tests
+pass after this correction.  These results remain targeted diagnostics, not an
+official scenario score.

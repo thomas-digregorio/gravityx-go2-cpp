@@ -16,6 +16,15 @@ struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool fixed_jacobian_screen_only{false};
     bool economic_balance_polish{false};
+    // Build an exact separable PWL market-surplus target while preserving the
+    // original net active injection at every bus.  This changes only the
+    // candidate direction: the complete source AC model and independent
+    // validator remain the acceptance gate.
+    bool economic_merit_dispatch{false};
+    int economic_merit_cluster_max_buses{1};
+    bool economic_merit_allow_load_movement{false};
+    bool economic_merit_retry_from_fallback{false};
+    double economic_merit_fallback_objective_threshold{2e5};
     bool minimize_active_balance_slack{false};
     bool minimize_reactive_balance_slack{false};
     // Route a supplied economic injection target directly through the full AC
@@ -69,6 +78,20 @@ struct FastPowerFlowResult {
     ValidationReport fixed_jacobian_predictor_validation;
     nlohmann::json fixed_jacobian_predictor_trace = nlohmann::json::array();
     bool economic_balance_polish_attempted{};
+    bool economic_merit_dispatch_attempted{};
+    bool economic_merit_dispatch_cache_hit{};
+    bool economic_merit_dispatch_feasible{};
+    bool economic_merit_dispatch_applied{};
+    double economic_merit_dispatch_surplus_gain{};
+    double economic_merit_dispatch_generation_movement{};
+    double economic_merit_dispatch_load_movement{};
+    int economic_merit_dispatch_component_count{};
+    bool economic_merit_fallback_attempted{};
+    bool economic_merit_fallback_selected{};
+    double economic_merit_candidate_objective{};
+    bool economic_merit_anchored_retry_attempted{};
+    bool economic_merit_anchored_retry_selected{};
+    double economic_merit_anchored_retry_objective{};
     bool economic_balance_polish_threshold_passed{};
     double economic_balance_polish_objective_threshold{};
     double economic_linearized_objective_threshold{};
@@ -193,11 +216,19 @@ private:
     std::vector<unsigned char> bridge_branch_;
     struct FixedJacobianPredictorCache;
     mutable std::unique_ptr<FixedJacobianPredictorCache> predictor_cache_;
+    struct EconomicMeritTargetCache;
+    mutable std::unique_ptr<EconomicMeritTargetCache>
+        economic_merit_target_cache_;
+    mutable std::unique_ptr<FastContingencyPowerFlow>
+        economic_merit_fallback_;
 
     FastPowerFlowResult solve_impl(
         const Contingency* contingency,
         const AcState* initial_state = nullptr,
         bool supplied_candidate_direct_only = false) const;
+    FastPowerFlowResult solve_with_merit_fallback(
+        const Contingency& contingency,
+        const AcState* initial_state = nullptr) const;
 };
 
 }  // namespace gravityx

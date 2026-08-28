@@ -730,6 +730,403 @@ void append_weights(
     destination.insert(destination.end(), weights.begin(), weights.end());
 }
 
+double pwl_value_at(
+    const std::vector<PwlPoint>& points,
+    double target) {
+    const auto weights = interpolation_weights(points, target);
+    double value = 0.0;
+    for (std::size_t point = 0; point < points.size(); ++point) {
+        value += weights[point] * points[point].cost;
+    }
+    return value;
+}
+
+struct EconomicMeritTarget {
+    bool feasible{};
+    bool curve_order_valid{true};
+    std::vector<double> pg;
+    std::vector<double> load_power;
+    double initial_market_surplus{};
+    double target_market_surplus{};
+    double generation_movement{};
+    double load_movement{};
+    int component_count{};
+};
+
+// Solve the network-free portion of the corrective PWL economics exactly.
+// For convex generator costs and concave load benefits, the component problem
+//
+//   max  benefit(D) - cost(G)       subject to G - D = fixed net injection
+//
+// is a one-dimensional convex resource-allocation problem.  Starting from the
+// minimum feasible demand, generator segments are consumed from cheapest to
+// dearest and load segments from highest to lowest benefit.  Paired increments
+// continue while marginal benefit exceeds marginal cost.  The resulting
+// controls are only a target; nonlinear AC repair and the complete validator
+// decide whether any part of it may be accepted.
+EconomicMeritTarget build_component_economic_merit_target(
+    const CaseData& data,
+    const std::vector<std::vector<int>>& components,
+    const std::vector<bool>& active,
+    const std::vector<double>& generator_lower,
+    const std::vector<double>& generator_upper,
+    const std::vector<double>& load_lower,
+    const std::vector<double>& load_upper,
+    const std::vector<double>& reference_pg,
+    const std::vector<double>& reference_load_power) {
+    EconomicMeritTarget output;
+    const int nb = static_cast<int>(data.buses.size());
+    const int ng = static_cast<int>(data.generators.size());
+    const int nd = static_cast<int>(data.loads.size());
+    if (active.size() != data.generators.size() ||
+        generator_lower.size() != data.generators.size() ||
+        generator_upper.size() != data.generators.size() ||
+        load_lower.size() != data.loads.size() ||
+        load_upper.size() != data.loads.size() ||
+        reference_pg.size() != data.generators.size() ||
+        reference_load_power.size() != data.loads.size()) {
+        return output;
+    }
+
+    std::vector<int> component_of_bus(static_cast<std::size_t>(nb), -1);
+    for (int component = 0;
+         component < static_cast<int>(components.size()); ++component) {
+        for (int bus : components[component]) {
+            if (bus < 0 || bus >= nb || component_of_bus[bus] >= 0) {
+                return output;
+            }
+            component_of_bus[bus] = component;
+        }
+    }
+    if (std::any_of(
+            component_of_bus.begin(), component_of_bus.end(),
+            [](int component) { return component < 0; })) {
+        return output;
+    }
+
+    output.pg.assign(data.generators.size(), 0.0);
+    output.load_power = reference_load_power;
+
+    struct Segment {
+        int device{-1};
+        int ordinal{};
+        double remaining{};
+        double slope{};
+    };
+    const auto append_segments = [&output](
+        const std::vector<PwlPoint>& points,
+        int device,
+        double lower,
+        double upper,
+        bool convex,
+        std::vector<Segment>& segments) {
+        if (!std::isfinite(lower) || !std::isfinite(upper) ||
+            lower > upper + 1e-10 || points.size() < 2) {
+            output.curve_order_valid = false;
+            return;
+        }
+        double covered = 0.0;
+        double prior_slope = convex
+            ? -std::numeric_limits<double>::infinity()
+            : std::numeric_limits<double>::infinity();
+        int ordinal = 0;
+        for (std::size_t point = 1; point < points.size(); ++point) {
+            const double x0 = points[point - 1].mw;
+            const double x1 = points[point].mw;
+            const double width = x1 - x0;
+            if (!std::isfinite(width) || width <= 1e-14) {
+                output.curve_order_valid = false;
+                return;
+            }
+            const double slope =
+                (points[point].cost - points[point - 1].cost) / width;
+            if (!std::isfinite(slope) ||
+                (convex && slope + 1e-8 < prior_slope) ||
+                (!convex && slope > prior_slope + 1e-8)) {
+                output.curve_order_valid = false;
+                return;
+            }
+            prior_slope = slope;
+            const double left = std::max(lower, x0);
+            const double right = std::min(upper, x1);
+            if (right > left + 1e-14) {
+                segments.push_back({device, ordinal++, right - left, slope});
+                covered += right - left;
+            }
+        }
+        if (std::abs(covered - (upper - lower)) >
+            1e-7 * std::max(1.0, std::abs(upper - lower))) {
+            output.curve_order_valid = false;
+        }
+    };
+
+    std::vector<std::vector<int>> generators_by_component(components.size());
+    std::vector<std::vector<int>> loads_by_component(components.size());
+    for (int generator = 0; generator < ng; ++generator) {
+        if (!active[generator]) {
+            continue;
+        }
+        const int component =
+            component_of_bus[data.generators[generator].bus];
+        generators_by_component[component].push_back(generator);
+    }
+    for (int load = 0; load < nd; ++load) {
+        const int component = component_of_bus[data.loads[load].bus];
+        loads_by_component[component].push_back(load);
+    }
+
+    for (int component = 0;
+         component < static_cast<int>(components.size()); ++component) {
+        std::vector<Segment> supply;
+        std::vector<Segment> demand;
+        double generation_lower_total = 0.0;
+        double generation_upper_total = 0.0;
+        double load_lower_total = 0.0;
+        double load_upper_total = 0.0;
+        double reference_net_injection = 0.0;
+
+        for (int generator : generators_by_component[component]) {
+            const double lower = generator_lower[generator];
+            const double upper = generator_upper[generator];
+            if (lower > upper + 1e-10) {
+                return output;
+            }
+            output.pg[generator] = lower;
+            generation_lower_total += lower;
+            generation_upper_total += upper;
+            reference_net_injection += reference_pg[generator];
+            const auto& source = data.generators[generator];
+            append_segments(
+                active_pwl_points(
+                    source.cost, source.ncost, lower, upper),
+                generator, lower, upper, true, supply);
+        }
+        for (int load : loads_by_component[component]) {
+            const double lower = load_lower[load];
+            const double upper = load_upper[load];
+            if (lower > upper + 1e-10) {
+                return output;
+            }
+            output.load_power[load] = lower;
+            load_lower_total += lower;
+            load_upper_total += upper;
+            reference_net_injection -= reference_load_power[load];
+            const auto& source = data.loads[load];
+            append_segments(
+                active_pwl_points(
+                    source.cost, source.ncost,
+                    source.pd_min, source.pd_max),
+                load, lower, upper, false, demand);
+        }
+        if (!output.curve_order_valid) {
+            return output;
+        }
+
+        const double feasible_load_lower = std::max(
+            load_lower_total,
+            generation_lower_total - reference_net_injection);
+        const double feasible_load_upper = std::min(
+            load_upper_total,
+            generation_upper_total - reference_net_injection);
+        if (feasible_load_lower > feasible_load_upper + 1e-7) {
+            return output;
+        }
+        const double selected_load_total = std::clamp(
+            feasible_load_lower, load_lower_total, load_upper_total);
+        const double selected_generation_total =
+            selected_load_total + reference_net_injection;
+
+        std::stable_sort(
+            supply.begin(), supply.end(),
+            [](const Segment& left, const Segment& right) {
+                if (std::abs(left.slope - right.slope) > 1e-12) {
+                    return left.slope < right.slope;
+                }
+                if (left.device != right.device) {
+                    return left.device < right.device;
+                }
+                return left.ordinal < right.ordinal;
+            });
+        std::stable_sort(
+            demand.begin(), demand.end(),
+            [](const Segment& left, const Segment& right) {
+                if (std::abs(left.slope - right.slope) > 1e-12) {
+                    return left.slope > right.slope;
+                }
+                if (left.device != right.device) {
+                    return left.device < right.device;
+                }
+                return left.ordinal < right.ordinal;
+            });
+
+        const auto consume = [](std::vector<Segment>& segments,
+                                double amount,
+                                std::vector<double>& values) {
+            for (auto& segment : segments) {
+                if (amount <= 1e-10) {
+                    break;
+                }
+                const double used = std::min(amount, segment.remaining);
+                values[segment.device] += used;
+                segment.remaining -= used;
+                amount -= used;
+            }
+            return amount <= 1e-7;
+        };
+        if (!consume(
+                supply,
+                selected_generation_total - generation_lower_total,
+                output.pg) ||
+            !consume(
+                demand,
+                selected_load_total - load_lower_total,
+                output.load_power)) {
+            return output;
+        }
+
+        std::size_t supply_position = 0;
+        std::size_t demand_position = 0;
+        while (true) {
+            while (supply_position < supply.size() &&
+                   supply[supply_position].remaining <= 1e-12) {
+                ++supply_position;
+            }
+            while (demand_position < demand.size() &&
+                   demand[demand_position].remaining <= 1e-12) {
+                ++demand_position;
+            }
+            if (supply_position >= supply.size() ||
+                demand_position >= demand.size() ||
+                demand[demand_position].slope <=
+                    supply[supply_position].slope + 1e-10) {
+                break;
+            }
+            const double paired = std::min(
+                supply[supply_position].remaining,
+                demand[demand_position].remaining);
+            output.pg[supply[supply_position].device] += paired;
+            output.load_power[demand[demand_position].device] += paired;
+            supply[supply_position].remaining -= paired;
+            demand[demand_position].remaining -= paired;
+        }
+
+        double selected_net = 0.0;
+        for (int generator : generators_by_component[component]) {
+            selected_net += output.pg[generator];
+        }
+        for (int load : loads_by_component[component]) {
+            selected_net -= output.load_power[load];
+        }
+        if (std::abs(selected_net - reference_net_injection) > 1e-7) {
+            return output;
+        }
+    }
+
+    for (int generator = 0; generator < ng; ++generator) {
+        if (!active[generator]) {
+            continue;
+        }
+        const auto& source = data.generators[generator];
+        const auto points = active_pwl_points(
+            source.cost, source.ncost,
+            generator_lower[generator], generator_upper[generator]);
+        output.initial_market_surplus -=
+            pwl_value_at(points, reference_pg[generator]);
+        output.target_market_surplus -=
+            pwl_value_at(points, output.pg[generator]);
+        output.generation_movement +=
+            std::abs(output.pg[generator] - reference_pg[generator]);
+    }
+    for (int load = 0; load < nd; ++load) {
+        const auto& source = data.loads[load];
+        const auto points = active_pwl_points(
+            source.cost, source.ncost,
+            source.pd_min, source.pd_max);
+        output.initial_market_surplus +=
+            pwl_value_at(points, reference_load_power[load]);
+        output.target_market_surplus +=
+            pwl_value_at(points, output.load_power[load]);
+        output.load_movement +=
+            std::abs(output.load_power[load] - reference_load_power[load]);
+    }
+    output.feasible = std::isfinite(output.initial_market_surplus) &&
+        std::isfinite(output.target_market_surplus) &&
+        output.target_market_surplus + 1e-7 >=
+            output.initial_market_surplus;
+    return output;
+}
+
+std::vector<std::vector<int>> capacity_bounded_network_clusters(
+    const CaseData& data,
+    int maximum_buses,
+    int outaged_branch = -1) {
+    const int nb = static_cast<int>(data.buses.size());
+    maximum_buses = std::clamp(maximum_buses, 1, std::max(1, nb));
+    std::vector<int> parent(static_cast<std::size_t>(nb));
+    std::vector<int> size(static_cast<std::size_t>(nb), 1);
+    std::iota(parent.begin(), parent.end(), 0);
+    const auto find_root = [&](int start) {
+        int root = start;
+        while (parent[root] != root) {
+            root = parent[root];
+        }
+        int node = start;
+        while (parent[node] != node) {
+            const int next = parent[node];
+            parent[node] = root;
+            node = next;
+        }
+        return root;
+    };
+    std::vector<int> order;
+    order.reserve(data.branches.size());
+    for (int branch = 0;
+         branch < static_cast<int>(data.branches.size()); ++branch) {
+        const auto& source = data.branches[branch];
+        if (branch != outaged_branch && source.present &&
+            source.status != 0 && source.from >= 0 && source.from < nb &&
+            source.to >= 0 && source.to < nb) {
+            order.push_back(branch);
+        }
+    }
+    std::stable_sort(
+        order.begin(), order.end(),
+        [&](int left, int right) {
+            const double left_capacity = std::max(
+                0.0, data.branches[left].rate_c);
+            const double right_capacity = std::max(
+                0.0, data.branches[right].rate_c);
+            if (std::abs(left_capacity - right_capacity) > 1e-12) {
+                return left_capacity > right_capacity;
+            }
+            return left < right;
+        });
+    for (int branch : order) {
+        int left = find_root(data.branches[branch].from);
+        int right = find_root(data.branches[branch].to);
+        if (left == right || size[left] + size[right] > maximum_buses) {
+            continue;
+        }
+        if (left > right) {
+            std::swap(left, right);
+        }
+        parent[right] = left;
+        size[left] += size[right];
+    }
+    std::vector<int> root_to_component(static_cast<std::size_t>(nb), -1);
+    std::vector<std::vector<int>> components;
+    components.reserve(static_cast<std::size_t>(nb));
+    for (int bus = 0; bus < nb; ++bus) {
+        const int root = find_root(bus);
+        if (root_to_component[root] < 0) {
+            root_to_component[root] = static_cast<int>(components.size());
+            components.emplace_back();
+        }
+        components[root_to_component[root]].push_back(bus);
+    }
+    return components;
+}
+
 void compute_branch_flows(
     const CaseData& data,
     int outaged_branch,
@@ -1131,7 +1528,93 @@ void run_fast_power_flow_topology_cache_regression() {
             "corrective candidate interpolation dropped a continuous or "
             "discrete control");
     }
+
+    data.branches[0].rate_c = 3.0;
+    data.branches[1].rate_c = 2.0;
+    data.branches[2].rate_c = 1.0;
+    const auto bounded_clusters =
+        capacity_bounded_network_clusters(data, 2);
+    if (bounded_clusters.size() != 2 ||
+        bounded_clusters[0] != std::vector<int>({0, 1}) ||
+        bounded_clusters[1] != std::vector<int>({2})) {
+        throw std::runtime_error(
+            "capacity-bounded economic clusters are not deterministic or "
+            "connected");
+    }
+    const auto singleton_clusters =
+        capacity_bounded_network_clusters(data, 1);
+    if (singleton_clusters.size() != 3) {
+        throw std::runtime_error(
+            "capacity-bounded economic clusters violated their size cap");
+    }
+
+    CaseData economic_data;
+    economic_data.buses.resize(1);
+    economic_data.generators.resize(2);
+    economic_data.generators[0].bus = 0;
+    economic_data.generators[0].ncost = 2;
+    economic_data.generators[0].cost = {0.0, 0.0, 2.0, 20.0};
+    economic_data.generators[1].bus = 0;
+    economic_data.generators[1].ncost = 2;
+    economic_data.generators[1].cost = {0.0, 0.0, 2.0, 60.0};
+    economic_data.loads.resize(1);
+    economic_data.loads[0].bus = 0;
+    economic_data.loads[0].pd_min = 0.0;
+    economic_data.loads[0].pd_max = 3.0;
+    economic_data.loads[0].ncost = 4;
+    economic_data.loads[0].cost = {
+        0.0, 0.0,
+        1.0, 100.0,
+        2.0, 150.0,
+        3.0, 160.0,
+    };
+    const auto economic_target = build_component_economic_merit_target(
+        economic_data, {{0}}, {true, true},
+        {0.0, 0.0}, {2.0, 2.0},
+        {0.0}, {3.0},
+        {1.0, 0.0}, {1.0});
+    if (!economic_target.feasible ||
+        std::abs(economic_target.pg[0] - 2.0) > 1e-12 ||
+        std::abs(economic_target.pg[1]) > 1e-12 ||
+        std::abs(economic_target.load_power[0] - 2.0) > 1e-12 ||
+        std::abs(economic_target.initial_market_surplus - 90.0) > 1e-12 ||
+        std::abs(economic_target.target_market_surplus - 130.0) > 1e-12) {
+        throw std::runtime_error(
+            "component economic merit dispatch did not match the exact "
+            "convex PWL solution");
+    }
+
+    economic_data.generators[0].ncost = 3;
+    economic_data.generators[0].cost = {
+        0.0, 0.0,
+        1.0, 20.0,
+        2.0, 30.0,
+    };
+    const auto nonconvex_target =
+        build_component_economic_merit_target(
+            economic_data, {{0}}, {true, true},
+            {0.0, 0.0}, {2.0, 2.0},
+            {0.0}, {3.0},
+            {1.0, 0.0}, {1.0});
+    if (nonconvex_target.feasible ||
+        nonconvex_target.curve_order_valid) {
+        throw std::runtime_error(
+            "component economic merit dispatch accepted a nonconvex "
+            "generator curve");
+    }
 }
+
+struct FastContingencyPowerFlow::EconomicMeritTargetCache {
+    bool initialized{};
+    bool feasible{};
+    std::vector<double> pg;
+    std::vector<double> load_power;
+    double initial_market_surplus{};
+    double target_market_surplus{};
+    double generation_movement{};
+    double load_movement{};
+    int component_count{};
+};
 
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     struct LowRankUpdate {
@@ -2420,6 +2903,34 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          fixed_jacobian_predictor_trace},
         {"economic_balance_polish_attempted",
          economic_balance_polish_attempted},
+        {"economic_merit_dispatch_attempted",
+         economic_merit_dispatch_attempted},
+        {"economic_merit_dispatch_cache_hit",
+         economic_merit_dispatch_cache_hit},
+        {"economic_merit_dispatch_feasible",
+         economic_merit_dispatch_feasible},
+        {"economic_merit_dispatch_applied",
+         economic_merit_dispatch_applied},
+        {"economic_merit_dispatch_surplus_gain",
+         economic_merit_dispatch_surplus_gain},
+        {"economic_merit_dispatch_generation_movement",
+         economic_merit_dispatch_generation_movement},
+        {"economic_merit_dispatch_load_movement",
+         economic_merit_dispatch_load_movement},
+        {"economic_merit_dispatch_component_count",
+         economic_merit_dispatch_component_count},
+        {"economic_merit_fallback_attempted",
+         economic_merit_fallback_attempted},
+        {"economic_merit_fallback_selected",
+         economic_merit_fallback_selected},
+        {"economic_merit_candidate_objective",
+         economic_merit_candidate_objective},
+        {"economic_merit_anchored_retry_attempted",
+         economic_merit_anchored_retry_attempted},
+        {"economic_merit_anchored_retry_selected",
+         economic_merit_anchored_retry_selected},
+        {"economic_merit_anchored_retry_objective",
+         economic_merit_anchored_retry_objective},
         {"economic_balance_polish_threshold_passed",
          economic_balance_polish_threshold_passed},
         {"economic_balance_polish_objective_threshold",
@@ -2867,19 +3378,116 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
         throw std::runtime_error(
             "fast power flow balance cleanup fraction must be in (0, 1]");
     }
+    if (options_.economic_merit_cluster_max_buses <= 0 ||
+        !std::isfinite(
+            options_.economic_merit_fallback_objective_threshold)) {
+        throw std::runtime_error(
+            "fast power flow economic merit options are invalid");
+    }
 }
 
 FastContingencyPowerFlow::~FastContingencyPowerFlow() = default;
 
 FastPowerFlowResult FastContingencyPowerFlow::solve(
     const Contingency& contingency) const {
-    return solve_impl(&contingency);
+    return solve_with_merit_fallback(contingency);
 }
 
 FastPowerFlowResult FastContingencyPowerFlow::solve(
     const Contingency& contingency,
     const AcState& initial_state) const {
-    return solve_impl(&contingency, &initial_state);
+    return solve_with_merit_fallback(contingency, &initial_state);
+}
+
+FastPowerFlowResult FastContingencyPowerFlow::solve_with_merit_fallback(
+    const Contingency& contingency,
+    const AcState* initial_state) const {
+    const auto wall_start = std::chrono::steady_clock::now();
+    auto candidate = solve_impl(&contingency, initial_state);
+    candidate.economic_merit_candidate_objective =
+        candidate.solve.objective;
+    const bool branch_merit_candidate =
+        options_.economic_merit_dispatch &&
+        contingency.type == ContingencyType::Branch;
+    const bool fallback_required = branch_merit_candidate &&
+        (!candidate.feasible || !std::isfinite(candidate.solve.objective) ||
+         candidate.solve.objective <
+             options_.economic_merit_fallback_objective_threshold);
+    if (!fallback_required) {
+        return candidate;
+    }
+
+    candidate.economic_merit_fallback_attempted = true;
+    if (!economic_merit_fallback_) {
+        auto fallback_options = options_;
+        fallback_options.economic_merit_dispatch = false;
+        economic_merit_fallback_ =
+            std::make_unique<FastContingencyPowerFlow>(
+                data_, base_state_, commitment_, fallback_options);
+    }
+    auto fallback = economic_merit_fallback_->solve_impl(
+        &contingency, initial_state);
+    const bool anchored_retry_attempted =
+        options_.economic_merit_retry_from_fallback &&
+        fallback.feasible && std::isfinite(fallback.solve.objective);
+    FastPowerFlowResult anchored;
+    if (anchored_retry_attempted) {
+        // The first merit attempt can spend its entire continuation path
+        // removing source-authorized overload slack. Retry from the verified
+        // legacy state so every accepted continuation step must improve an
+        // already secure, high-objective incumbent.
+        anchored = solve_impl(&contingency, &fallback.solve.state);
+        anchored.economic_merit_candidate_objective =
+            anchored.solve.objective;
+    }
+
+    const FastPowerFlowResult* selected = &candidate;
+    const auto prefer = [&](const FastPowerFlowResult& proposal) {
+        return proposal.feasible &&
+            std::isfinite(proposal.solve.objective) &&
+            (!selected->feasible ||
+             proposal.solve.objective > selected->solve.objective + 1e-9);
+    };
+    if (prefer(fallback)) {
+        selected = &fallback;
+    }
+    if (anchored_retry_attempted && prefer(anchored)) {
+        selected = &anchored;
+    }
+
+    FastPowerFlowResult output = *selected;
+    const FastPowerFlowResult& merit_diagnostics =
+        anchored_retry_attempted ? anchored : candidate;
+    output.economic_merit_dispatch_attempted =
+        merit_diagnostics.economic_merit_dispatch_attempted;
+    output.economic_merit_dispatch_cache_hit =
+        merit_diagnostics.economic_merit_dispatch_cache_hit;
+    output.economic_merit_dispatch_feasible =
+        merit_diagnostics.economic_merit_dispatch_feasible;
+    output.economic_merit_dispatch_applied =
+        merit_diagnostics.economic_merit_dispatch_applied;
+    output.economic_merit_dispatch_surplus_gain =
+        merit_diagnostics.economic_merit_dispatch_surplus_gain;
+    output.economic_merit_dispatch_generation_movement =
+        merit_diagnostics.economic_merit_dispatch_generation_movement;
+    output.economic_merit_dispatch_load_movement =
+        merit_diagnostics.economic_merit_dispatch_load_movement;
+    output.economic_merit_dispatch_component_count =
+        merit_diagnostics.economic_merit_dispatch_component_count;
+    output.economic_merit_candidate_objective =
+        candidate.solve.objective;
+    output.economic_merit_fallback_attempted = true;
+    output.economic_merit_fallback_selected = selected == &fallback;
+    output.economic_merit_anchored_retry_attempted =
+        anchored_retry_attempted;
+    output.economic_merit_anchored_retry_selected =
+        anchored_retry_attempted && selected == &anchored;
+    output.economic_merit_anchored_retry_objective =
+        anchored_retry_attempted ? anchored.solve.objective : 0.0;
+    output.wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    output.solve.wall_seconds = output.wall_seconds;
+    return output;
 }
 
 FastPowerFlowResult FastContingencyPowerFlow::screen_candidate(
@@ -3342,6 +3950,107 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
     }
 
+    std::vector<double> economic_merit_target_pg;
+    std::vector<double> economic_merit_target_demand_factor;
+    if (!base_mode && outaged_branch >= 0 &&
+        options_.economic_merit_dispatch && nb >= 16000) {
+        output.economic_merit_dispatch_attempted = true;
+        const bool reusable_branch_target = outaged_branch >= 0 &&
+            bridge_branch_[static_cast<std::size_t>(outaged_branch)] == 0;
+        EconomicMeritTarget merit_target;
+        if (reusable_branch_target && economic_merit_target_cache_ &&
+            economic_merit_target_cache_->initialized) {
+            output.economic_merit_dispatch_cache_hit = true;
+            merit_target.feasible =
+                economic_merit_target_cache_->feasible;
+            merit_target.pg = economic_merit_target_cache_->pg;
+            merit_target.load_power =
+                economic_merit_target_cache_->load_power;
+            merit_target.initial_market_surplus =
+                economic_merit_target_cache_->initial_market_surplus;
+            merit_target.target_market_surplus =
+                economic_merit_target_cache_->target_market_surplus;
+            merit_target.generation_movement =
+                economic_merit_target_cache_->generation_movement;
+            merit_target.load_movement =
+                economic_merit_target_cache_->load_movement;
+            output.economic_merit_dispatch_component_count =
+                economic_merit_target_cache_->component_count;
+        } else {
+            const auto injection_components =
+                capacity_bounded_network_clusters(
+                    data_, options_.economic_merit_cluster_max_buses,
+                    reusable_branch_target ? -1 : outaged_branch);
+            output.economic_merit_dispatch_component_count =
+                static_cast<int>(injection_components.size());
+            // Keep responsive load fixed by default: active load movement also
+            // changes reactive demand and can invalidate an otherwise useful
+            // active-power merit target. It is exposed only as an explicit
+            // diagnostic option. Cluster size therefore controls generator
+            // sharing without silently changing the source load profile.
+            const std::vector<double> fixed_load_power =
+                predictor_load_power;
+            const auto& merit_load_lower =
+                options_.economic_merit_allow_load_movement
+                ? predictor_load_power_lower : fixed_load_power;
+            const auto& merit_load_upper =
+                options_.economic_merit_allow_load_movement
+                ? predictor_load_power_upper : fixed_load_power;
+            merit_target = build_component_economic_merit_target(
+                data_, injection_components, active, p_lower, p_upper,
+                merit_load_lower, merit_load_upper,
+                pg, predictor_load_power);
+            if (reusable_branch_target) {
+                if (!economic_merit_target_cache_) {
+                    economic_merit_target_cache_ =
+                        std::make_unique<EconomicMeritTargetCache>();
+                }
+                economic_merit_target_cache_->initialized = true;
+                economic_merit_target_cache_->feasible =
+                    merit_target.feasible;
+                economic_merit_target_cache_->pg = merit_target.pg;
+                economic_merit_target_cache_->load_power =
+                    merit_target.load_power;
+                economic_merit_target_cache_->initial_market_surplus =
+                    merit_target.initial_market_surplus;
+                economic_merit_target_cache_->target_market_surplus =
+                    merit_target.target_market_surplus;
+                economic_merit_target_cache_->generation_movement =
+                    merit_target.generation_movement;
+                economic_merit_target_cache_->load_movement =
+                    merit_target.load_movement;
+                economic_merit_target_cache_->component_count =
+                    output.economic_merit_dispatch_component_count;
+            }
+        }
+        output.economic_merit_dispatch_feasible = merit_target.feasible;
+        output.economic_merit_dispatch_surplus_gain = data_.delta_ctg *
+            (merit_target.target_market_surplus -
+             merit_target.initial_market_surplus);
+        output.economic_merit_dispatch_generation_movement =
+            merit_target.generation_movement;
+        output.economic_merit_dispatch_load_movement =
+            merit_target.load_movement;
+        if (merit_target.feasible &&
+            output.economic_merit_dispatch_surplus_gain > 1e-9 &&
+            merit_target.pg.size() == data_.generators.size() &&
+            merit_target.load_power.size() == data_.loads.size()) {
+            economic_merit_target_pg = std::move(merit_target.pg);
+            economic_merit_target_demand_factor =
+                predictor_demand_factor;
+            for (int load_index = 0;
+                 load_index < static_cast<int>(data_.loads.size());
+                 ++load_index) {
+                if (std::abs(data_.loads[load_index].pd_nominal) > 1e-12) {
+                    economic_merit_target_demand_factor[load_index] =
+                        merit_target.load_power[load_index] /
+                            data_.loads[load_index].pd_nominal;
+                }
+            }
+            output.economic_merit_dispatch_applied = true;
+        }
+    }
+
     if (!base_mode && nb >= 16000) {
         output.fixed_jacobian_predictor_attempted = true;
         if (!predictor_cache_) {
@@ -3368,7 +4077,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             // rescue below should solve the AC equations for this preferred
             // control target, using the secure predictor only as its voltage
             // initialization.
-            const AcState economic_target_state = predictor_state;
+            AcState economic_target_state = predictor_state;
+            if (output.economic_merit_dispatch_applied) {
+                economic_target_state.pg = economic_merit_target_pg;
+                economic_target_state.demand_factor =
+                    economic_merit_target_demand_factor;
+            }
             ValidationReport predictor_validation =
                 output.direct_candidate_validation;
             std::unique_ptr<FixedJacobianPredictorCache>
@@ -4825,14 +5539,19 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         // generator/load/ramp limits are reconstructed below,
                         // and the complete nonlinear contingency validator is
                         // the sole acceptance gate.
+                        const bool merit_exact_newton_target =
+                            outaged_branch >= 0 &&
+                            output.economic_merit_dispatch_applied;
                         if (options_.economic_exact_newton_rescue &&
-                            (exact_newton_reactive_trigger ||
+                            (merit_exact_newton_target ||
+                             exact_newton_reactive_trigger ||
                              slack_sum(polished_state.p_delta) +
                                      slack_sum(polished_state.q_delta) >
                                  options_
                                      .economic_linearized_trigger_slack) &&
-                            polished_objective <= options_
-                                .economic_exact_newton_objective_threshold &&
+                            (merit_exact_newton_target ||
+                             polished_objective <= options_
+                                 .economic_exact_newton_objective_threshold) &&
                             options_.economic_exact_newton_max_iterations > 0 &&
                             !economic_polish_budget_exhausted()) {
                             output.economic_exact_newton_attempted = true;
@@ -9237,6 +9956,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     bool fully_solved = false;
     bool approximate_candidate = false;
     std::vector<double> p_network, q_network;
+    const auto requested_balance_cleanup_complete =
+        [&](const AcState& candidate) {
+            // Rebuilt states deliberately add a 1e-7 interior margin to
+            // every nodal slack variable.  Treat exactly that bookkeeping
+            // floor as zero; otherwise a large case can never satisfy a
+            // nominal zero-slack cleanup request.
+            const double active_cleanup_floor =
+                1e-7 * static_cast<double>(candidate.p_delta.size()) +
+                1e-8;
+            const double reactive_cleanup_floor =
+                1e-7 * static_cast<double>(candidate.q_delta.size()) +
+                1e-8;
+            const double active_slack = std::accumulate(
+                candidate.p_delta.begin(),
+                candidate.p_delta.end(), 0.0);
+            const double reactive_slack = std::accumulate(
+                candidate.q_delta.begin(),
+                candidate.q_delta.end(), 0.0);
+            return (!base_mode ||
+                    !options_.minimize_active_balance_slack ||
+                    active_slack <= active_cleanup_floor) &&
+                (!base_mode ||
+                 !options_.minimize_reactive_balance_slack ||
+                 reactive_slack <= reactive_cleanup_floor);
+        };
     for (int active_pass = 0;
          active_pass <= options_.max_active_redispatch_passes && !fully_solved;
          ++active_pass) {
@@ -9294,7 +10038,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 newton_state, newton_validation,
                 "full_newton");
             if (newton_validation.max_residual <=
-                options_.validation_tolerance) {
+                    options_.validation_tolerance &&
+                requested_balance_cleanup_complete(newton_state)) {
                 output.converged = newton.converged;
                 output.feasible = true;
                 output.newton_candidate_selected = true;

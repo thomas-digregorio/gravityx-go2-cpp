@@ -84,6 +84,37 @@ The following targeted experiments were not retained in the production path:
 - The component-only base economic direction produced too little verified gain
   for its runtime.
 
+## Sequential nonlinear security repair
+
+A later 100-label longest-first calibration reached its 180-second diagnostic
+limit after 37 labels. Thirty-four completed labels were generator outages, and
+their initial corrective states carried multi-million-dollar paid imbalance.
+This configuration was explicitly rejected for a full run: it averaged
+`4.692 s` per completed label on one resident worker and could not satisfy the
+300-second system boundary without tighter routing.
+
+Attribution on severe generator outage `CTG_000353` showed that the first full
+exact-Newton security-repair candidate improved the objective from
+`-2293035.173` to `29194.751` with exact P/Q balance, but one branch required
+overload slack `0.144758` above its source bound. The one-shot linearization
+therefore accepted only a `1/64` blend and retained most of the economic loss.
+
+The retained correction performs at most four compact sequential security
+repairs, relinearizing only while:
+
+- the full candidate has a strictly higher objective than the verified
+  incumbent;
+- the only blocker is a branch flow, angle, or branch-slack bound;
+- the complete nonlinear residual strictly decreases; and
+- the global economic-polish deadline remains.
+
+On the same `CTG_000353` point, the four sequential rounds reduced the nonlinear
+branch residual from `0.144758` to `2.50e-10`, raised the verified objective from
+`-2256039.412` to `-15107.286`, and remained within the unchanged source model.
+This is a gain of approximately `2.241 million` on that contingency. The solve
+took `6.072 s`; further work is required to remove the remaining paid P/Q slack
+and to gate the path to the generator-outage tail before a full scenario run.
+
 ## Status
 
 The component test suite passes 4/4. No official scenario-095 rerun has been

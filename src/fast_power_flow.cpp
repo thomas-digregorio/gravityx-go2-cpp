@@ -5082,6 +5082,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             const ActiveFeasibilityRepairResult&
                                                 repair,
                                             nlohmann::json& trace) {
+                                            bool first_rejection_recorded = false;
                                             if (repair.success) {
                                                 const std::array<double, 11>
                                                     repair_line_search_steps{
@@ -5149,6 +5150,24 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                                                 candidate,
                                                                 commitment_,
                                                                 direct_context);
+                                                    if (!first_rejection_recorded &&
+                                                        candidate_validation
+                                                                .max_residual >
+                                                            options_
+                                                                .validation_tolerance) {
+                                                        first_rejection_recorded =
+                                                            true;
+                                                        trace[
+                                                            "first_rejected_step"] =
+                                                            step;
+                                                        trace[
+                                                            "first_rejected_objective"] =
+                                                            candidate_objective;
+                                                        trace[
+                                                            "first_rejected_validation"] =
+                                                            candidate_validation
+                                                                .to_json();
+                                                    }
                                                     if (candidate_validation
                                                                 .max_residual <=
                                                             options_
@@ -5179,43 +5198,128 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         };
 
                                         // Preserve the fast ordinary security
-                                        // repair first. It has a much smaller
-                                        // LP than Phase I and is the reliable
-                                        // path for generator-outage cases.
-                                        const auto security_repair =
-                                            solve_linearized_active_feasibility_repair(
-                                                data_, security_reference,
-                                                commitment_, *direct_context,
-                                                0.5, 0.05,
-                                                security_repair_seconds,
-                                                // The full Newton point can
-                                                // legitimately overshoot a
-                                                // source voltage bound by more
-                                                // than the old 0.02-p.u.
-                                                // radius.  A wider *solver*
-                                                // trust region lets the LP
-                                                // move it back inside the
-                                                // unchanged source bound; the
-                                                // nonlinear validator remains
-                                                // the acceptance gate.
-                                                0.10, true, true, false,
-                                                false);
-                                        nlohmann::json security_trace = {
-                                            {"phase",
-                                             "exact_newton_security_repair"},
-                                            {"repair",
-                                             security_repair.to_json(false)},
-                                            {"selected", false},
-                                            {"selected_step", 0.0},
-                                            {"objective_before",
-                                             polished_objective},
-                                            {"projected_voltage_count",
-                                             projected_voltage_count},
-                                            {"maximum_voltage_projection",
-                                             maximum_voltage_projection},
-                                        };
-                                        try_security_repair(
-                                            security_repair, security_trace);
+                                        // repair first. If its full nonlinear
+                                        // point remains blocked only by a
+                                        // shrinking branch/angle residual,
+                                        // relinearize around that point a few
+                                        // times. This is substantially smaller
+                                        // than Phase I and retains the exact
+                                        // Newton point's zero-balance economics.
+                                        AcState security_iteration_reference =
+                                            security_reference;
+                                        double prior_full_residual =
+                                            std::numeric_limits<double>::infinity();
+                                        constexpr int
+                                            kMaximumSequentialSecurityRepairs = 4;
+                                        for (int security_round = 1;
+                                             security_round <=
+                                                 kMaximumSequentialSecurityRepairs &&
+                                             !economic_polish_budget_exhausted();
+                                             ++security_round) {
+                                            const double round_seconds =
+                                                security_round == 1
+                                                ? security_repair_seconds
+                                                : bounded_economic_solver_seconds(
+                                                      0.75);
+                                            if (round_seconds <= 1e-3) {
+                                                break;
+                                            }
+                                            const auto security_repair =
+                                                solve_linearized_active_feasibility_repair(
+                                                    data_,
+                                                    security_iteration_reference,
+                                                    commitment_, *direct_context,
+                                                    0.5, 0.05, round_seconds,
+                                                    // The full Newton point can
+                                                    // legitimately overshoot a
+                                                    // source voltage bound by
+                                                    // more than the old
+                                                    // 0.02-p.u. radius. A wider
+                                                    // solver trust region lets
+                                                    // the LP move it back inside
+                                                    // the unchanged source bound;
+                                                    // the nonlinear validator
+                                                    // remains the acceptance gate.
+                                                    0.10, true, true, false,
+                                                    false);
+                                            nlohmann::json security_trace = {
+                                                {"phase",
+                                                 security_round == 1
+                                                     ? "exact_newton_security_repair"
+                                                     : "sequential_exact_newton_security_repair"},
+                                                {"round", security_round},
+                                                {"repair",
+                                                 security_repair.to_json(false)},
+                                                {"selected", false},
+                                                {"selected_step", 0.0},
+                                                {"objective_before",
+                                                 polished_objective},
+                                                {"projected_voltage_count",
+                                                 projected_voltage_count},
+                                                {"maximum_voltage_projection",
+                                                 maximum_voltage_projection},
+                                            };
+                                            bool continue_sequential_repair =
+                                                false;
+                                            AcState next_security_reference;
+                                            if (security_repair.success) {
+                                                next_security_reference =
+                                                    security_repair.state;
+                                                normalize_source_reference_angles(
+                                                    data_, components,
+                                                    next_security_reference.va);
+                                                const double full_objective =
+                                                    rebuild_contingency_state_derived_fields(
+                                                        data_, base_state_,
+                                                        commitment_,
+                                                        *contingency,
+                                                        next_security_reference);
+                                                const auto full_validation =
+                                                    validate_state(
+                                                        data_,
+                                                        ModelMode::ContingencySoft,
+                                                        next_security_reference,
+                                                        commitment_,
+                                                        direct_context);
+                                                security_trace[
+                                                    "full_candidate_objective"] =
+                                                    full_objective;
+                                                security_trace[
+                                                    "full_candidate_validation"] =
+                                                    full_validation.to_json();
+                                                const bool security_only_block =
+                                                    full_validation.worst_category ==
+                                                        "flow_limit" ||
+                                                    full_validation.worst_category ==
+                                                        "angle_limit" ||
+                                                    (full_validation.worst_category ==
+                                                         "variable_bound" &&
+                                                     full_validation.worst_identity
+                                                             .rfind("branch:", 0) ==
+                                                         0);
+                                                continue_sequential_repair =
+                                                    outaged_generator >= 0 &&
+                                                    full_objective >
+                                                        polished_objective + 1e-9 &&
+                                                    full_validation.max_residual >
+                                                        options_
+                                                            .validation_tolerance &&
+                                                    security_only_block &&
+                                                    full_validation.max_residual +
+                                                            1e-8 <
+                                                        prior_full_residual;
+                                                prior_full_residual =
+                                                    full_validation.max_residual;
+                                            }
+                                            try_security_repair(
+                                                security_repair, security_trace);
+                                            if (!continue_sequential_repair) {
+                                                break;
+                                            }
+                                            security_iteration_reference =
+                                                std::move(
+                                                    next_security_reference);
+                                        }
 
                                         // A projected exact-Newton point is the
                                         // distinctive failure mode in which the

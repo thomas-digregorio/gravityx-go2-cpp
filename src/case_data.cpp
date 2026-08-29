@@ -66,6 +66,92 @@ int source_integer(const json& item, std::size_t position) {
 
 }  // namespace
 
+void refresh_branch_flow_coefficients(Branch& branch) {
+    const double denominator = branch.r * branch.r + branch.x * branch.x;
+    const double g = denominator > 1e-20
+        ? branch.r / denominator : 0.0;
+    const double b = denominator > 1e-20
+        ? -branch.x / denominator : 0.0;
+    if (!std::isfinite(branch.tap) || std::abs(branch.tap) <= 1e-12) {
+        throw std::runtime_error(
+            "branch has an invalid tap ratio: " + branch.source_key);
+    }
+    const double tap_squared = branch.tap * branch.tap;
+    const double tap_real = branch.tap * std::cos(branch.shift);
+    const double tap_imag = branch.tap * std::sin(branch.shift);
+    branch.flow_from_g_self = branch.transformer
+        ? g / tap_squared + branch.g_fr
+        : (g + branch.g_fr) / tap_squared;
+    branch.flow_from_b_self = branch.transformer
+        ? b / tap_squared + branch.b_fr
+        : (b + branch.b_fr) / tap_squared;
+    branch.flow_to_g_self = g + branch.g_to;
+    branch.flow_to_b_self = b + branch.b_to;
+    branch.flow_from_cross_cos =
+        (-g * tap_real + b * tap_imag) / tap_squared;
+    branch.flow_from_cross_sin =
+        (-b * tap_real - g * tap_imag) / tap_squared;
+    branch.flow_to_cross_cos =
+        (-g * tap_real - b * tap_imag) / tap_squared;
+    branch.flow_to_cross_sin =
+        (-b * tap_real + g * tap_imag) / tap_squared;
+    branch.flow_coefficients_valid = true;
+}
+
+std::pair<int, int> transformer_step_bounds(const Branch& branch) {
+    if (!branch.transformer) {
+        throw std::runtime_error(
+            "transformer step requested for a non-transformer branch: " +
+            branch.source_key);
+    }
+    const int mode = std::abs(branch.control_mode);
+    const int steps = mode == 1 ? branch.tm_steps
+        : mode == 3 ? branch.ta_steps : 0;
+    if (steps < 3 || steps % 2 == 0) {
+        throw std::runtime_error(
+            "transformer control positions must be an odd source count: " +
+            branch.source_key);
+    }
+    const int maximum_step = (steps - 1) / 2;
+    return {-maximum_step, maximum_step};
+}
+
+double transformer_step_value(const Branch& branch, int step) {
+    const auto [lower_step, upper_step] = transformer_step_bounds(branch);
+    if (step < lower_step || step > upper_step) {
+        throw std::runtime_error(
+            "transformer step is outside the source range: " +
+            branch.source_key);
+    }
+    const int mode = std::abs(branch.control_mode);
+    const int steps = mode == 1 ? branch.tm_steps : branch.ta_steps;
+    const double minimum = mode == 1 ? branch.tm_min : branch.ta_min;
+    const double maximum = mode == 1 ? branch.tm_max : branch.ta_max;
+    if (!std::isfinite(minimum) || !std::isfinite(maximum) ||
+        maximum < minimum) {
+        throw std::runtime_error(
+            "transformer has an invalid source control range: " +
+            branch.source_key);
+    }
+    const double increment = (maximum - minimum) /
+        static_cast<double>(steps - 1);
+    const double midpoint = 0.5 * (minimum + maximum);
+    return midpoint + increment * static_cast<double>(step);
+}
+
+void set_transformer_step(Branch& branch, int step) {
+    const double value = transformer_step_value(branch, step);
+    const int mode = std::abs(branch.control_mode);
+    if (mode == 1) {
+        branch.tap = value;
+        branch.tm_step = step;
+    } else {
+        branch.shift = value;
+        branch.ta_step = step;
+    }
+    refresh_branch_flow_coefficients(branch);
+}
+
 CaseData CaseData::load(const std::string& path) {
     std::ifstream stream(path);
     if (!stream) {
@@ -221,31 +307,6 @@ CaseData CaseData::load(const std::string& path) {
         branch.b_to = item.at("b_to").get<double>();
         branch.tap = item.at("tap").get<double>();
         branch.shift = item.at("shift").get<double>();
-        const double denominator = branch.r * branch.r + branch.x * branch.x;
-        const double g = denominator > 1e-20
-            ? branch.r / denominator : 0.0;
-        const double b = denominator > 1e-20
-            ? -branch.x / denominator : 0.0;
-        const double tap_squared = branch.tap * branch.tap;
-        const double tap_real = branch.tap * std::cos(branch.shift);
-        const double tap_imag = branch.tap * std::sin(branch.shift);
-        branch.flow_from_g_self = branch.transformer
-            ? g / tap_squared + branch.g_fr
-            : (g + branch.g_fr) / tap_squared;
-        branch.flow_from_b_self = branch.transformer
-            ? b / tap_squared + branch.b_fr
-            : (b + branch.b_fr) / tap_squared;
-        branch.flow_to_g_self = g + branch.g_to;
-        branch.flow_to_b_self = b + branch.b_to;
-        branch.flow_from_cross_cos =
-            (-g * tap_real + b * tap_imag) / tap_squared;
-        branch.flow_from_cross_sin =
-            (-b * tap_real - g * tap_imag) / tap_squared;
-        branch.flow_to_cross_cos =
-            (-g * tap_real - b * tap_imag) / tap_squared;
-        branch.flow_to_cross_sin =
-            (-b * tap_real + g * tap_imag) / tap_squared;
-        branch.flow_coefficients_valid = true;
         branch.angmin = item.at("angmin").get<double>();
         branch.angmax = item.at("angmax").get<double>();
         branch.rate_a = item.at("rate_a").get<double>();
@@ -257,8 +318,15 @@ CaseData CaseData::load(const std::string& path) {
         branch.source_id = source_identifier(
             item, branch.transformer ? 4 : 3);
         branch.control_mode = item.value("control_mode", 0);
+        branch.tm_min = item.value("tm_min", branch.tap);
+        branch.tm_max = item.value("tm_max", branch.tap);
+        branch.tm_steps = item.value("tm_steps", 1);
         branch.tm_step = item.value("tm_step", 0);
+        branch.ta_min = item.value("ta_min", branch.shift);
+        branch.ta_max = item.value("ta_max", branch.shift);
+        branch.ta_steps = item.value("ta_steps", 1);
         branch.ta_step = item.value("ta_step", 0);
+        refresh_branch_flow_coefficients(branch);
         return branch;
     });
 

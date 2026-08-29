@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -136,7 +137,13 @@ struct Branch {
     int source_to{};
     std::string source_id;
     int control_mode{};
+    double tm_min{};
+    double tm_max{};
+    int tm_steps{1};
     int tm_step{};
+    double ta_min{};
+    double ta_max{};
+    int ta_steps{1};
     int ta_step{};
 };
 
@@ -192,5 +199,15 @@ double branch_terminal_component_bound(
     const Branch& branch,
     double rating,
     bool from_terminal);
+
+// GO Challenge 2 controllable transformers use an integer position centered
+// on zero.  The physical tap ratio or phase shift is the midpoint of the
+// source range plus the integer position times the uniform source step size.
+// These helpers retain that exact source discretization and refresh every
+// cached AC-flow coefficient after a position change.
+std::pair<int, int> transformer_step_bounds(const Branch& branch);
+double transformer_step_value(const Branch& branch, int step);
+void refresh_branch_flow_coefficients(Branch& branch);
+void set_transformer_step(Branch& branch, int step);
 
 }  // namespace gravityx

@@ -1,6 +1,7 @@
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 #include <Eigen/SparseLU>
+#include <highs/Highs.h>
 
 #include "gravityx/active_feasibility_repair.hpp"
 #include "gravityx/fast_power_flow.hpp"
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -335,7 +337,9 @@ NewtonResult run_distributed_active_newton(
     int max_iterations,
     double tolerance,
     std::vector<double>& vm,
-    std::vector<double>& va) {
+    std::vector<double>& va,
+    bool reuse_symbolic_analysis = false,
+    bool reuse_numeric_factorization = false) {
     const int nb = static_cast<int>(data.buses.size());
     if (component_of.size() != static_cast<std::size_t>(nb) ||
         active_slack_weights.size() != static_cast<std::size_t>(nb)) {
@@ -398,6 +402,13 @@ NewtonResult run_distributed_active_newton(
         return result;
     };
 
+    // The PQ/PV active set and outage topology are fixed for this call, so the
+    // distributed-slack Jacobian has one invariant sparsity pattern across all
+    // Newton iterations. Reusing its COLAMD symbolic analysis changes neither
+    // the equations nor the numerical factorization.
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
+    bool factorization_pattern_analyzed = false;
+    bool numerical_factorization_ready = false;
     for (int iteration = 0; iteration <= max_iterations; ++iteration) {
         network_injections(ybus, vm, va, p, q);
         const double norm = residual_norm();
@@ -421,9 +432,11 @@ NewtonResult run_distributed_active_newton(
             }
         }
 
-        std::vector<Triplet> entries;
-        entries.reserve(static_cast<std::size_t>(dimension) * 8);
-        for (int i = 0; i < nb; ++i) {
+        if (!numerical_factorization_ready ||
+            !reuse_numeric_factorization) {
+            std::vector<Triplet> entries;
+            entries.reserve(static_cast<std::size_t>(dimension) * 8);
+            for (int i = 0; i < nb; ++i) {
             const double vi = vm[i];
             if (vi <= 1e-8) {
                 return {false, iteration, "nonpositive voltage magnitude"};
@@ -499,16 +512,21 @@ NewtonResult run_distributed_active_newton(
                         vi * (gij * std::sin(delta) - bij * std::cos(delta)));
                 }
             }
-        }
+            }
 
-        SparseMatrix jacobian(dimension, dimension);
-        jacobian.setFromTriplets(entries.begin(), entries.end());
-        Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
-        factorization.analyzePattern(jacobian);
-        factorization.factorize(jacobian);
-        if (factorization.info() != Eigen::Success) {
-            return {false, iteration,
-                "distributed-slack Jacobian factorization failed"};
+            SparseMatrix jacobian(dimension, dimension);
+            jacobian.setFromTriplets(entries.begin(), entries.end());
+            if (!factorization_pattern_analyzed ||
+                !reuse_symbolic_analysis) {
+                factorization.analyzePattern(jacobian);
+                factorization_pattern_analyzed = true;
+            }
+            factorization.factorize(jacobian);
+            if (factorization.info() != Eigen::Success) {
+                return {false, iteration,
+                    "distributed-slack Jacobian factorization failed"};
+            }
+            numerical_factorization_ready = true;
         }
         const Eigen::VectorXd step = factorization.solve(mismatch);
         if (factorization.info() != Eigen::Success || !step.allFinite()) {
@@ -1453,6 +1471,591 @@ AcState interpolate_corrective_candidate(
     return candidate;
 }
 
+AcState interpolate_economic_control_reference(
+    const AcState& verified_state,
+    const AcState& economic_target,
+    double step) {
+    if (!std::isfinite(step) || step < 0.0 || step > 1.0) {
+        throw std::runtime_error(
+            "economic control interpolation step is outside [0, 1]");
+    }
+    if (verified_state.pg.size() != economic_target.pg.size() ||
+        verified_state.demand_factor.size() !=
+            economic_target.demand_factor.size()) {
+        throw std::runtime_error(
+            "economic control interpolation dimension mismatch");
+    }
+    AcState candidate = verified_state;
+    for (std::size_t generator = 0;
+         generator < candidate.pg.size(); ++generator) {
+        candidate.pg[generator] = verified_state.pg[generator] + step *
+            (economic_target.pg[generator] -
+             verified_state.pg[generator]);
+    }
+    for (std::size_t load = 0;
+         load < candidate.demand_factor.size(); ++load) {
+        candidate.demand_factor[load] =
+            verified_state.demand_factor[load] + step *
+                (economic_target.demand_factor[load] -
+                 verified_state.demand_factor[load]);
+    }
+    // The merit target optimizes only active generation and responsive load.
+    // Reactive dispatch, voltage, and discrete shunt changes in the verified
+    // state are feasibility controls, not economic targets.  Reverting them
+    // here can manufacture a large voltage violation before Newton starts.
+    return candidate;
+}
+
+struct ReactiveBalancePhaseOneResult {
+    bool attempted{};
+    bool model_built{};
+    bool primal_start_accepted{};
+    bool primal_basis_accepted{};
+    bool independently_feasible{};
+    bool accepted{};
+    int run_status{};
+    int model_status{};
+    int primal_solution_status{};
+    int primal_infeasibility_count{};
+    int iterations{};
+    int seed_bus_count{};
+    int voltage_control_bus_count{};
+    int reactive_generator_count{};
+    int affected_bus_count{};
+    double wall_seconds{};
+    double solver_objective{};
+    double residual_before{};
+    double residual_after{};
+    double maximum_column_violation{};
+    double maximum_row_violation{};
+    std::vector<double> vm;
+    std::vector<double> qg;
+
+    nlohmann::json to_json() const {
+        return {
+            {"attempted", attempted},
+            {"model_built", model_built},
+            {"primal_start_accepted", primal_start_accepted},
+            {"primal_basis_accepted", primal_basis_accepted},
+            {"independently_feasible", independently_feasible},
+            {"accepted", accepted},
+            {"run_status", run_status},
+            {"model_status", model_status},
+            {"primal_solution_status", primal_solution_status},
+            {"primal_infeasibility_count", primal_infeasibility_count},
+            {"iterations", iterations},
+            {"seed_bus_count", seed_bus_count},
+            {"voltage_control_bus_count", voltage_control_bus_count},
+            {"reactive_generator_count", reactive_generator_count},
+            {"affected_bus_count", affected_bus_count},
+            {"wall_seconds", wall_seconds},
+            {"solver_objective", solver_objective},
+            {"residual_before", residual_before},
+            {"residual_after", residual_after},
+            {"maximum_column_violation", maximum_column_violation},
+            {"maximum_row_violation", maximum_row_violation},
+        };
+    }
+};
+
+ReactiveBalancePhaseOneResult solve_reactive_balance_phase_one(
+    const SparseMatrix& reactive_jacobian,
+    const std::vector<int>& voltage_index,
+    const CaseData& data,
+    const std::vector<bool>& active,
+    const std::vector<double>& q_lower,
+    const std::vector<double>& q_upper,
+    const std::vector<double>& q_balance,
+    const AcState& reference_state,
+    double voltage_trust_radius,
+    double time_limit_seconds) {
+    const auto started = std::chrono::steady_clock::now();
+    ReactiveBalancePhaseOneResult output;
+    output.attempted = true;
+    const int nb = static_cast<int>(data.buses.size());
+    const int ng = static_cast<int>(data.generators.size());
+    output.vm = reference_state.vm;
+    output.qg = reference_state.qg;
+    const auto finish = [&] {
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        return output;
+    };
+    if (nb <= 0 || ng < 0 || reactive_jacobian.rows() != nb ||
+        reactive_jacobian.cols() != nb ||
+        voltage_index.size() != data.buses.size() ||
+        active.size() != data.generators.size() ||
+        q_lower.size() != data.generators.size() ||
+        q_upper.size() != data.generators.size() ||
+        q_balance.size() != data.buses.size() ||
+        reference_state.vm.size() != data.buses.size() ||
+        reference_state.qg.size() != data.generators.size() ||
+        !std::isfinite(voltage_trust_radius) ||
+        voltage_trust_radius <= 0.0 ||
+        !std::isfinite(time_limit_seconds) ||
+        time_limit_seconds <= 0.0) {
+        return finish();
+    }
+
+    std::vector<int> bus_from_voltage_index(
+        static_cast<std::size_t>(nb), -1);
+    for (int bus = 0; bus < nb; ++bus) {
+        const int index = voltage_index[bus];
+        if (index < 0 || index >= nb ||
+            bus_from_voltage_index[index] >= 0) {
+            return finish();
+        }
+        bus_from_voltage_index[index] = bus;
+        output.residual_before += std::abs(q_balance[bus]);
+    }
+
+    using RowSparseMatrix =
+        Eigen::SparseMatrix<double, Eigen::RowMajor>;
+    const RowSparseMatrix reactive_rows = reactive_jacobian;
+
+    // The complete Q/V Jacobian is sparse: changing one bus voltage affects
+    // only that bus and directly connected buses. Select the largest residual
+    // buses, their directly coupled voltage controls, and then every row those
+    // controls touch. Any row outside this induced model has an exact zero in
+    // every selected control column, so its linearized residual is constant
+    // and may be omitted without understating the Phase-I objective change.
+    std::vector<std::pair<double, int>> ranked_residuals;
+    ranked_residuals.reserve(static_cast<std::size_t>(nb));
+    for (int bus = 0; bus < nb; ++bus) {
+        const double magnitude = std::abs(q_balance[bus]);
+        if (magnitude > 1e-7) {
+            ranked_residuals.emplace_back(magnitude, bus);
+        }
+    }
+    std::sort(
+        ranked_residuals.begin(), ranked_residuals.end(),
+        [](const auto& left, const auto& right) {
+            if (left.first != right.first) {
+                return left.first > right.first;
+            }
+            return left.second < right.second;
+        });
+    constexpr std::size_t kMaximumSeedBuses = 256;
+    if (ranked_residuals.size() > kMaximumSeedBuses) {
+        ranked_residuals.resize(kMaximumSeedBuses);
+    }
+    output.seed_bus_count = static_cast<int>(ranked_residuals.size());
+    if (ranked_residuals.empty()) {
+        return finish();
+    }
+
+    constexpr std::size_t kMaximumVoltageControlBuses = 1024;
+    std::vector<int> control_buses;
+    std::vector<unsigned char> control_seen(
+        static_cast<std::size_t>(nb), 0);
+    const auto append_control_bus = [&](int bus) {
+        if (bus < 0 || bus >= nb || control_seen[bus] ||
+            control_buses.size() >= kMaximumVoltageControlBuses) {
+            return;
+        }
+        control_seen[bus] = 1;
+        control_buses.push_back(bus);
+    };
+    for (const auto& [unused_magnitude, bus] : ranked_residuals) {
+        static_cast<void>(unused_magnitude);
+        append_control_bus(bus);
+        const int voltage_row = voltage_index[bus];
+        for (RowSparseMatrix::InnerIterator entry(
+                 reactive_rows, voltage_row); entry; ++entry) {
+            append_control_bus(
+                bus_from_voltage_index[entry.col()]);
+        }
+    }
+    output.voltage_control_bus_count =
+        static_cast<int>(control_buses.size());
+    if (control_buses.empty()) {
+        return finish();
+    }
+    std::vector<int> local_voltage_control(
+        static_cast<std::size_t>(nb), -1);
+    for (int local = 0;
+         local < static_cast<int>(control_buses.size()); ++local) {
+        local_voltage_control[control_buses[local]] = local;
+    }
+
+    std::vector<int> reactive_generators;
+    std::vector<int> local_reactive_generator(
+        static_cast<std::size_t>(ng), -1);
+    for (int bus : control_buses) {
+        for (int generator : data.buses[bus].generators) {
+            if (generator < 0 || generator >= ng || !active[generator] ||
+                local_reactive_generator[generator] >= 0) {
+                continue;
+            }
+            local_reactive_generator[generator] =
+                static_cast<int>(reactive_generators.size());
+            reactive_generators.push_back(generator);
+        }
+    }
+    output.reactive_generator_count =
+        static_cast<int>(reactive_generators.size());
+
+    std::vector<int> affected_buses;
+    std::vector<unsigned char> affected_seen(
+        static_cast<std::size_t>(nb), 0);
+    const auto append_affected_bus = [&](int bus) {
+        if (bus < 0 || bus >= nb || affected_seen[bus]) {
+            return;
+        }
+        affected_seen[bus] = 1;
+        affected_buses.push_back(bus);
+    };
+    for (const auto& [unused_magnitude, bus] : ranked_residuals) {
+        static_cast<void>(unused_magnitude);
+        append_affected_bus(bus);
+    }
+    for (int control_bus : control_buses) {
+        const int voltage_column = voltage_index[control_bus];
+        for (SparseMatrix::InnerIterator entry(
+                 reactive_jacobian, voltage_column); entry; ++entry) {
+            append_affected_bus(
+                bus_from_voltage_index[entry.row()]);
+        }
+    }
+    for (int generator : reactive_generators) {
+        append_affected_bus(data.generators[generator].bus);
+    }
+    std::sort(affected_buses.begin(), affected_buses.end());
+    output.affected_bus_count = static_cast<int>(affected_buses.size());
+    if (affected_buses.empty()) {
+        return finish();
+    }
+    std::vector<int> local_affected_bus(
+        static_cast<std::size_t>(nb), -1);
+    for (int local = 0;
+         local < static_cast<int>(affected_buses.size()); ++local) {
+        local_affected_bus[affected_buses[local]] = local;
+    }
+
+    const HighsInt control_bus_count =
+        static_cast<HighsInt>(control_buses.size());
+    const HighsInt reactive_generator_count =
+        static_cast<HighsInt>(reactive_generators.size());
+    const HighsInt affected_bus_count =
+        static_cast<HighsInt>(affected_buses.size());
+    // Split every signed control into nonnegative up/down columns so a tiny
+    // movement cost selects a bounded deterministic point. The two elastic
+    // columns per affected row make the zero-control point primal feasible.
+    const HighsInt voltage_up_offset = 0;
+    const HighsInt voltage_down_offset =
+        voltage_up_offset + control_bus_count;
+    const HighsInt reactive_up_offset =
+        voltage_down_offset + control_bus_count;
+    const HighsInt reactive_down_offset =
+        reactive_up_offset + reactive_generator_count;
+    const HighsInt positive_slack_offset =
+        reactive_down_offset + reactive_generator_count;
+    const HighsInt negative_slack_offset =
+        positive_slack_offset + affected_bus_count;
+    const HighsInt column_count =
+        negative_slack_offset + affected_bus_count;
+    std::vector<double> lower(
+        static_cast<std::size_t>(column_count), 0.0);
+    std::vector<double> upper(
+        static_cast<std::size_t>(column_count), 0.0);
+    std::vector<double> cost(
+        static_cast<std::size_t>(column_count), 1e-8);
+    for (int local = 0;
+         local < static_cast<int>(control_buses.size()); ++local) {
+        const int bus = control_buses[local];
+        upper[voltage_up_offset + local] = std::max(
+            0.0, std::min(
+                voltage_trust_radius,
+                data.buses[bus].vmax - reference_state.vm[bus]));
+        upper[voltage_down_offset + local] = std::max(
+            0.0, std::min(
+                voltage_trust_radius,
+                reference_state.vm[bus] - data.buses[bus].vmin));
+    }
+    for (int local = 0;
+         local < static_cast<int>(reactive_generators.size()); ++local) {
+        const int generator = reactive_generators[local];
+        upper[reactive_up_offset + local] = std::max(
+            0.0, q_upper[generator] - reference_state.qg[generator]);
+        upper[reactive_down_offset + local] = std::max(
+            0.0, reference_state.qg[generator] - q_lower[generator]);
+    }
+    for (int local = 0;
+         local < static_cast<int>(affected_buses.size()); ++local) {
+        upper[positive_slack_offset + local] = kHighsInf;
+        upper[negative_slack_offset + local] = kHighsInf;
+        cost[positive_slack_offset + local] = 1.0;
+        cost[negative_slack_offset + local] = 1.0;
+    }
+
+    std::vector<double> row_lower(
+        static_cast<std::size_t>(affected_bus_count));
+    std::vector<double> row_upper(
+        static_cast<std::size_t>(affected_bus_count));
+    std::vector<HighsInt> starts;
+    std::vector<HighsInt> indices;
+    std::vector<double> values;
+    starts.reserve(static_cast<std::size_t>(affected_bus_count + 1));
+    starts.push_back(0);
+    for (int local_row = 0;
+         local_row < static_cast<int>(affected_buses.size()); ++local_row) {
+        const int bus = affected_buses[local_row];
+        const int voltage_row = voltage_index[bus];
+        const double right_hand_side = -q_balance[bus];
+        row_lower[local_row] = right_hand_side;
+        row_upper[local_row] = right_hand_side;
+        for (RowSparseMatrix::InnerIterator entry(
+                 reactive_rows, voltage_row); entry; ++entry) {
+            const int control_bus =
+                bus_from_voltage_index[entry.col()];
+            const int local_control =
+                local_voltage_control[control_bus];
+            if (local_control < 0) {
+                continue;
+            }
+            indices.push_back(voltage_up_offset + local_control);
+            values.push_back(entry.value());
+            indices.push_back(voltage_down_offset + local_control);
+            values.push_back(-entry.value());
+        }
+        for (int generator : data.buses[bus].generators) {
+            if (generator < 0 || generator >= ng) {
+                continue;
+            }
+            const int local_generator =
+                local_reactive_generator[generator];
+            if (local_generator < 0) {
+                continue;
+            }
+            indices.push_back(reactive_up_offset + local_generator);
+            values.push_back(-1.0);
+            indices.push_back(reactive_down_offset + local_generator);
+            values.push_back(1.0);
+        }
+        indices.push_back(positive_slack_offset + local_row);
+        values.push_back(-1.0);
+        indices.push_back(negative_slack_offset + local_row);
+        values.push_back(1.0);
+        starts.push_back(static_cast<HighsInt>(indices.size()));
+    }
+
+    Highs highs;
+    const char* highs_log =
+        std::getenv("GRAVITYX_REACTIVE_PHASE_ONE_HIGHS_LOG");
+    highs.setOptionValue(
+        "output_flag", highs_log != nullptr &&
+            std::string(highs_log) != "0");
+    highs.setOptionValue("threads", 1);
+    highs.setOptionValue("small_matrix_value", 1e-12);
+    highs.setOptionValue("time_limit", time_limit_seconds);
+    highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
+    highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
+    const char* solver =
+        std::getenv("GRAVITYX_REACTIVE_PHASE_ONE_SOLVER");
+    const std::string solver_name =
+        solver != nullptr ? std::string(solver) : "simplex";
+    highs.setOptionValue(
+        "solver", solver_name);
+    const bool install_elastic_basis = solver_name == "simplex";
+    highs.setOptionValue(
+        "presolve", install_elastic_basis ? "off" : "on");
+    if (install_elastic_basis) {
+        // The diagonal Q-elastic columns form an exact primal-feasible basis.
+        // Starting primal simplex from it avoids exposing a presolve-mapped,
+        // bound-violating terminal vector when the short wall limit fires.
+        highs.setOptionValue("simplex_strategy", 4);
+        highs.setOptionValue(
+            "primal_simplex_bound_perturbation_multiplier", 0.0);
+        highs.setOptionValue("simplex_iteration_limit", 5000);
+    }
+    if (highs.addVars(column_count, lower.data(), upper.data()) !=
+            HighsStatus::kOk ||
+        highs.changeColsCost(
+            0, column_count - 1, cost.data()) != HighsStatus::kOk ||
+        highs.addRows(
+            affected_bus_count, row_lower.data(), row_upper.data(),
+            static_cast<HighsInt>(indices.size()), starts.data(),
+            indices.data(), values.data()) != HighsStatus::kOk) {
+        return finish();
+    }
+    output.model_built = true;
+
+    std::vector<double> primal_start(
+        static_cast<std::size_t>(column_count), 0.0);
+    for (int local_row = 0;
+         local_row < static_cast<int>(affected_buses.size()); ++local_row) {
+        const int bus = affected_buses[local_row];
+        if (q_balance[bus] >= 0.0) {
+            primal_start[positive_slack_offset + local_row] =
+                q_balance[bus];
+        } else {
+            primal_start[negative_slack_offset + local_row] =
+                -q_balance[bus];
+        }
+    }
+    std::vector<HighsInt> start_indices(
+        static_cast<std::size_t>(column_count));
+    std::iota(
+        start_indices.begin(), start_indices.end(), HighsInt{0});
+    output.primal_start_accepted = highs.setSolution(
+        column_count, start_indices.data(), primal_start.data()) ==
+        HighsStatus::kOk;
+    if (install_elastic_basis) {
+        HighsBasis primal_basis;
+        primal_basis.alien = true;
+        primal_basis.useful = true;
+        primal_basis.col_status.assign(
+            static_cast<std::size_t>(column_count),
+            HighsBasisStatus::kLower);
+        primal_basis.row_status.assign(
+            static_cast<std::size_t>(affected_bus_count),
+            HighsBasisStatus::kLower);
+        for (int local_row = 0;
+             local_row < static_cast<int>(affected_buses.size());
+             ++local_row) {
+            const int bus = affected_buses[local_row];
+            const HighsInt elastic_column = q_balance[bus] >= 0.0
+                ? positive_slack_offset + local_row
+                : negative_slack_offset + local_row;
+            primal_basis.col_status[elastic_column] =
+                HighsBasisStatus::kBasic;
+        }
+        output.primal_basis_accepted = highs.setBasis(
+            primal_basis, "reactive_phase_one_elastic_diagonal") ==
+            HighsStatus::kOk;
+    }
+
+    output.run_status = static_cast<int>(highs.run());
+    output.model_status = static_cast<int>(highs.getModelStatus());
+    const auto& info = highs.getInfo();
+    const auto& solution = highs.getSolution();
+    output.primal_solution_status =
+        static_cast<int>(info.primal_solution_status);
+    output.primal_infeasibility_count =
+        static_cast<int>(info.num_primal_infeasibilities);
+    output.iterations = static_cast<int>(
+        info.ipm_iteration_count > 0 ?
+        info.ipm_iteration_count : info.simplex_iteration_count);
+    output.solver_objective = info.objective_function_value;
+    if (!solution.value_valid ||
+        solution.col_value.size() !=
+            static_cast<std::size_t>(column_count)) {
+        return finish();
+    }
+    // A short primal-simplex stop can expose a few control columns a small
+    // distance outside their exact original bounds. Canonicalize controls to
+    // those bounds, then reconstruct the diagonal elastic value of every row.
+    // This preserves an exact feasible Phase-I point without claiming solver
+    // optimality or weakening any source bound.
+    std::vector<double> candidate_values = solution.col_value;
+    for (HighsInt column = 0;
+         column < positive_slack_offset; ++column) {
+        candidate_values[column] = std::clamp(
+            candidate_values[column], lower[column], upper[column]);
+    }
+    for (int local_row = 0;
+         local_row < static_cast<int>(affected_buses.size()); ++local_row) {
+        candidate_values[positive_slack_offset + local_row] = 0.0;
+        candidate_values[negative_slack_offset + local_row] = 0.0;
+        double control_activity = 0.0;
+        for (HighsInt index = starts[local_row];
+             index < starts[local_row + 1]; ++index) {
+            const HighsInt column = indices[index];
+            if (column < positive_slack_offset) {
+                control_activity +=
+                    values[index] * candidate_values[column];
+            }
+        }
+        const double remaining =
+            row_lower[local_row] - control_activity;
+        if (remaining < 0.0) {
+            candidate_values[positive_slack_offset + local_row] =
+                -remaining;
+        } else {
+            candidate_values[negative_slack_offset + local_row] =
+                remaining;
+        }
+    }
+    output.solver_objective = 0.0;
+    for (HighsInt column = 0; column < column_count; ++column) {
+        const double value = candidate_values[column];
+        if (!std::isfinite(value)) {
+            return finish();
+        }
+        output.solver_objective += cost[column] * value;
+        output.maximum_column_violation = std::max(
+            output.maximum_column_violation,
+            std::max({
+                0.0,
+                lower[column] - value,
+                value - upper[column],
+            }));
+    }
+    for (int row = 0;
+         row < static_cast<int>(affected_buses.size()); ++row) {
+        double activity = 0.0;
+        for (HighsInt index = starts[row]; index < starts[row + 1]; ++index) {
+            activity += values[index] * candidate_values[indices[index]];
+        }
+        output.maximum_row_violation = std::max(
+            output.maximum_row_violation,
+            std::abs(activity - row_lower[row]));
+    }
+    output.independently_feasible =
+        output.maximum_column_violation <= 1e-7 &&
+        output.maximum_row_violation <= 1e-7;
+    if (!output.independently_feasible) {
+        return finish();
+    }
+
+    std::vector<double> linearized_balance = q_balance;
+    for (int local = 0;
+         local < static_cast<int>(control_buses.size()); ++local) {
+        const int bus = control_buses[local];
+        const double voltage_change =
+            candidate_values[voltage_up_offset + local] -
+            candidate_values[voltage_down_offset + local];
+        output.vm[bus] = std::clamp(
+            reference_state.vm[bus] + voltage_change,
+            data.buses[bus].vmin, data.buses[bus].vmax);
+    }
+    for (int bus : affected_buses) {
+        const int voltage_row = voltage_index[bus];
+        for (RowSparseMatrix::InnerIterator entry(
+                 reactive_rows, voltage_row); entry; ++entry) {
+            const int control_bus =
+                bus_from_voltage_index[entry.col()];
+            const int local_control =
+                local_voltage_control[control_bus];
+            if (local_control < 0) {
+                continue;
+            }
+            const double voltage_change =
+                candidate_values[voltage_up_offset + local_control] -
+                candidate_values[voltage_down_offset + local_control];
+            linearized_balance[bus] += entry.value() * voltage_change;
+        }
+    }
+    for (int local = 0;
+         local < static_cast<int>(reactive_generators.size()); ++local) {
+        const int generator = reactive_generators[local];
+        const double reactive_change =
+            candidate_values[reactive_up_offset + local] -
+            candidate_values[reactive_down_offset + local];
+        output.qg[generator] = std::clamp(
+            reference_state.qg[generator] + reactive_change,
+            q_lower[generator], q_upper[generator]);
+        linearized_balance[data.generators[generator].bus] -=
+            reactive_change;
+    }
+    for (double value : linearized_balance) {
+        output.residual_after += std::abs(value);
+    }
+    output.accepted = output.residual_after + 1e-10 <
+        output.residual_before;
+    return finish();
+}
+
 }  // namespace
 
 void run_fast_power_flow_topology_cache_regression() {
@@ -1528,6 +2131,20 @@ void run_fast_power_flow_topology_cache_regression() {
             "corrective candidate interpolation dropped a continuous or "
             "discrete control");
     }
+    const auto economic_interpolation =
+        interpolate_economic_control_reference(
+            interpolation_from, interpolation_to, 0.25);
+    if (std::abs(economic_interpolation.pg[0] - 1.5) > 1e-12 ||
+        std::abs(economic_interpolation.demand_factor[0] - 0.85) > 1e-12 ||
+        economic_interpolation.vm != interpolation_from.vm ||
+        economic_interpolation.va != interpolation_from.va ||
+        economic_interpolation.qg != interpolation_from.qg ||
+        economic_interpolation.shunt_bs != interpolation_from.shunt_bs ||
+        economic_interpolation.shunt_steps !=
+            interpolation_from.shunt_steps) {
+        throw std::runtime_error(
+            "economic control interpolation changed a feasibility control");
+    }
 
     data.branches[0].rate_c = 3.0;
     data.branches[1].rate_c = 2.0;
@@ -1584,6 +2201,28 @@ void run_fast_power_flow_topology_cache_regression() {
             "convex PWL solution");
     }
 
+    // With load fixed, a one-bus target must preserve the exact bus injection
+    // while moving output from the expensive co-located unit to the cheap one.
+    const auto bus_local_target = build_component_economic_merit_target(
+        economic_data, {{0}}, {true, true},
+        {0.0, 0.0}, {2.0, 2.0},
+        {1.0}, {1.0},
+        {0.0, 1.0}, {1.0});
+    if (!bus_local_target.feasible ||
+        std::abs(bus_local_target.pg[0] - 1.0) > 1e-12 ||
+        std::abs(bus_local_target.pg[1]) > 1e-12 ||
+        std::abs(bus_local_target.load_power[0] - 1.0) > 1e-12 ||
+        std::abs(
+            bus_local_target.pg[0] + bus_local_target.pg[1] -
+            bus_local_target.load_power[0]) > 1e-12 ||
+        std::abs(bus_local_target.initial_market_surplus - 70.0) > 1e-12 ||
+        std::abs(bus_local_target.target_market_surplus - 90.0) > 1e-12 ||
+        std::abs(bus_local_target.generation_movement - 2.0) > 1e-12) {
+        throw std::runtime_error(
+            "bus-local economic merit dispatch changed the bus injection or "
+            "missed the exact convex PWL optimum");
+    }
+
     economic_data.generators[0].ncost = 3;
     economic_data.generators[0].cost = {
         0.0, 0.0,
@@ -1602,6 +2241,35 @@ void run_fast_power_flow_topology_cache_regression() {
             "component economic merit dispatch accepted a nonconvex "
             "generator curve");
     }
+
+    CaseData reactive_phase_one_data;
+    reactive_phase_one_data.buses.resize(1);
+    reactive_phase_one_data.buses[0].vmin = 0.9;
+    reactive_phase_one_data.buses[0].vmax = 1.1;
+    reactive_phase_one_data.buses[0].generators = {0};
+    reactive_phase_one_data.generators.resize(1);
+    reactive_phase_one_data.generators[0].bus = 0;
+    SparseMatrix reactive_phase_one_jacobian(1, 1);
+    reactive_phase_one_jacobian.insert(0, 0) = 1.0;
+    reactive_phase_one_jacobian.makeCompressed();
+    AcState reactive_phase_one_reference;
+    reactive_phase_one_reference.vm = {1.0};
+    reactive_phase_one_reference.qg = {0.0};
+    const auto reactive_phase_one = solve_reactive_balance_phase_one(
+        reactive_phase_one_jacobian, {0}, reactive_phase_one_data,
+        {true}, {-1.0}, {1.0}, {0.4},
+        reactive_phase_one_reference, 0.05, 1.0);
+    const double reactive_phase_one_residual =
+        0.4 + (reactive_phase_one.vm[0] - 1.0) -
+        reactive_phase_one.qg[0];
+    if (!reactive_phase_one.model_built ||
+        !reactive_phase_one.primal_start_accepted ||
+        !reactive_phase_one.independently_feasible ||
+        !reactive_phase_one.accepted ||
+        std::abs(reactive_phase_one_residual) > 1e-7) {
+        throw std::runtime_error(
+            "reactive Phase-I LP failed its bounded one-bus regression");
+    }
 }
 
 struct FastContingencyPowerFlow::EconomicMeritTargetCache {
@@ -1614,6 +2282,12 @@ struct FastContingencyPowerFlow::EconomicMeritTargetCache {
     double generation_movement{};
     double load_movement{};
     int component_count{};
+};
+
+struct FastContingencyPowerFlow::EconomicExactActiveSetCache {
+    bool initialized{};
+    std::vector<unsigned char> pq;
+    std::vector<double> q_spec;
 };
 
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
@@ -2776,25 +3450,42 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             ranked_violations.resize(maximum_violation_rows);
         }
 
+        // Preserve relevance order when the local control set must be
+        // truncated.  The previous implementation collected the violated
+        // buses and their neighbours, sorted the union by internal bus index,
+        // and then kept only the first 256/1024 entries.  On large cases that
+        // could discard the high-index buses that actually carried the Q
+        // imbalance and retain unrelated low-index neighbours.  Ranked
+        // violations are already deterministic (magnitude, then bus index),
+        // so insert each violated bus first and its incident neighbours next,
+        // deduplicating without destroying that priority.
         std::vector<int> control_buses;
+        std::vector<unsigned char> control_bus_seen(
+            data.buses.size(), 0);
+        const auto append_control_bus = [&]
+            (int bus) {
+            if (bus < 0 ||
+                bus >= static_cast<int>(data.buses.size()) ||
+                control_bus_seen[bus]) {
+                return;
+            }
+            control_bus_seen[bus] = 1;
+            control_buses.push_back(bus);
+        };
         for (const auto& [unused_excess, bus] : ranked_violations) {
             static_cast<void>(unused_excess);
-            control_buses.push_back(bus);
+            append_control_bus(bus);
             for (int branch : data.buses[bus].branches_from) {
                 if (data.branches[branch].status != 0) {
-                    control_buses.push_back(data.branches[branch].to);
+                    append_control_bus(data.branches[branch].to);
                 }
             }
             for (int branch : data.buses[bus].branches_to) {
                 if (data.branches[branch].status != 0) {
-                    control_buses.push_back(data.branches[branch].from);
+                    append_control_bus(data.branches[branch].from);
                 }
             }
         }
-        std::sort(control_buses.begin(), control_buses.end());
-        control_buses.erase(
-            std::unique(control_buses.begin(), control_buses.end()),
-            control_buses.end());
         const std::size_t maximum_control_buses =
             use_full_active_set_row_space ? 1024 : 256;
         if (control_buses.size() > maximum_control_buses) {
@@ -2919,6 +3610,28 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          economic_merit_dispatch_load_movement},
         {"economic_merit_dispatch_component_count",
          economic_merit_dispatch_component_count},
+        {"economic_bus_local_merit_attempted",
+         economic_bus_local_merit_attempted},
+        {"economic_bus_local_merit_feasible",
+         economic_bus_local_merit_feasible},
+        {"economic_bus_local_merit_selected",
+         economic_bus_local_merit_selected},
+        {"economic_bus_local_merit_surplus_gain",
+         economic_bus_local_merit_surplus_gain},
+        {"economic_bus_local_merit_generation_movement",
+         economic_bus_local_merit_generation_movement},
+        {"economic_bus_local_merit_load_movement",
+         economic_bus_local_merit_load_movement},
+        {"economic_bus_local_merit_reactive_movement",
+         economic_bus_local_merit_reactive_movement},
+        {"economic_bus_local_merit_q_constrained_bus_count",
+         economic_bus_local_merit_q_constrained_bus_count},
+        {"economic_bus_local_merit_objective_before",
+         economic_bus_local_merit_objective_before},
+        {"economic_bus_local_merit_objective_after",
+         economic_bus_local_merit_objective_after},
+        {"economic_bus_local_merit_validation",
+         economic_bus_local_merit_validation.to_json()},
         {"economic_merit_fallback_attempted",
          economic_merit_fallback_attempted},
         {"economic_merit_fallback_selected",
@@ -2943,6 +3656,18 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          economic_balance_polish_wall_seconds},
         {"economic_exact_newton_attempted",
          economic_exact_newton_attempted},
+        {"economic_exact_newton_reused_symbolic_analysis",
+         economic_exact_newton_reused_symbolic_analysis},
+        {"economic_exact_newton_reused_numeric_factorization",
+         economic_exact_newton_reused_numeric_factorization},
+        {"economic_exact_newton_q_active_set_cache_hit",
+         economic_exact_newton_q_active_set_cache_hit},
+        {"economic_exact_newton_q_active_set_cache_initialized",
+         economic_exact_newton_q_active_set_cache_initialized},
+        {"economic_exact_newton_cached_q_bus_count",
+         economic_exact_newton_cached_q_bus_count},
+        {"economic_exact_newton_target_fraction",
+         economic_exact_newton_target_fraction},
         {"economic_exact_newton_converged",
          economic_exact_newton_converged},
         {"economic_exact_newton_selected",
@@ -3380,9 +4105,19 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
     }
     if (options_.economic_merit_cluster_max_buses <= 0 ||
         !std::isfinite(
-            options_.economic_merit_fallback_objective_threshold)) {
+            options_.economic_merit_fallback_objective_threshold) ||
+        !std::isfinite(
+            options_.economic_exact_newton_target_fraction) ||
+        options_.economic_exact_newton_target_fraction < 0.0 ||
+        options_.economic_exact_newton_target_fraction > 1.0) {
         throw std::runtime_error(
             "fast power flow economic merit options are invalid");
+    }
+    if (options_.economic_bus_local_merit_redispatch) {
+        economic_bus_components_.reserve(data_.buses.size());
+        for (int bus = 0; bus < static_cast<int>(data_.buses.size()); ++bus) {
+            economic_bus_components_.push_back({bus});
+        }
     }
 }
 
@@ -4485,6 +5220,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         double polished_objective = predictor_objective;
                         ValidationReport polished_validation =
                             predictor_validation;
+                        std::function<void(const char*)>
+                            apply_local_injection_projection =
+                                [](const char*) {};
+                        std::function<void()> apply_bus_local_merit_redispatch =
+                            []() {};
                         bool exact_newton_reactive_trigger = false;
                         bool outage_update_ready = true;
                         if (outaged_branch >= 0) {
@@ -4512,12 +5252,15 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             // remainder stays in the explicit paid balance
                             // variables and the full validator remains the
                             // acceptance gate.
-                            const auto apply_local_injection_projection = [&]() {
+                            apply_local_injection_projection = [&] (
+                                const char* trace_phase) {
                             AcState local_projection = polished_state;
+                            const YRows local_projection_ybus = build_ybus(
+                                data_, outaged_branch, &local_projection);
                             std::vector<double> local_p_network;
                             std::vector<double> local_q_network;
                             network_injections(
-                                polish_ybus, local_projection.vm,
+                                local_projection_ybus, local_projection.vm,
                                 local_projection.va, local_p_network,
                                 local_q_network);
                             std::vector<double> local_load_power(
@@ -5049,7 +5792,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 }
                             }
                             output.economic_balance_polish_trace.push_back({
-                                {"phase", "local_injection_projection"},
+                                {"phase", trace_phase},
                                 {"selected", local_projection_selected},
                                 {"selected_step",
                                  local_projection_selected_step},
@@ -5356,7 +6099,276 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     break;
                                 }
                             }
-                            apply_local_injection_projection();
+                            apply_local_injection_projection(
+                                "local_injection_projection");
+
+                            // The reusable economic target above is anchored
+                            // to the first branch contingency handled by this
+                            // resident worker.  Reusing that target can change
+                            // the total injection at a bus in a later outage,
+                            // which is why it needs the expensive AC-Newton
+                            // continuation below.  There is also an exact,
+                            // outage-specific improvement that needs no
+                            // network solve. At each bus, optimize the convex
+                            // PWL generation/load economics while preserving
+                            // total active injection. If responsive load moves,
+                            // move the aggregate Qg by the same change in Qd so
+                            // reactive injection is also unchanged. Vm, Va,
+                            // shunts, and every branch flow can therefore be
+                            // copied verbatim. Rebuild and validate the complete
+                            // source model anyway; an unexpected numerical or
+                            // source-bound defect must preserve the verified
+                            // incumbent.
+                            apply_bus_local_merit_redispatch = [&]() {
+                            if (options_.economic_bus_local_merit_redispatch &&
+                                !economic_bus_components_.empty()) {
+                                output.economic_bus_local_merit_attempted = true;
+                                output.economic_bus_local_merit_objective_before =
+                                    polished_objective;
+                                std::vector<double> current_load_power(
+                                    data_.loads.size(), 0.0);
+                                for (int load = 0;
+                                     load < static_cast<int>(data_.loads.size());
+                                     ++load) {
+                                    current_load_power[load] =
+                                        data_.loads[load].pd_nominal *
+                                        polished_state.demand_factor[load];
+                                }
+                                std::vector<double> merit_load_lower =
+                                    current_load_power;
+                                std::vector<double> merit_load_upper =
+                                    current_load_power;
+                                if (options_
+                                        .economic_bus_local_allow_load_movement) {
+                                    for (int bus = 0; bus < nb; ++bus) {
+                                        // A load-only bus has no local Qg with
+                                        // which to offset the load's reactive
+                                        // movement, so keep its load fixed.
+                                        if (active_at_bus[bus].empty()) {
+                                            continue;
+                                        }
+                                        for (int load : data_.buses[bus].loads) {
+                                            merit_load_lower[load] =
+                                                predictor_load_power_lower[load];
+                                            merit_load_upper[load] =
+                                                predictor_load_power_upper[load];
+                                        }
+                                    }
+                                }
+                                const auto bus_local_target =
+                                    build_component_economic_merit_target(
+                                        data_, economic_bus_components_, active,
+                                        p_lower, p_upper, merit_load_lower,
+                                        merit_load_upper, polished_state.pg,
+                                        current_load_power);
+                                double candidate_objective = polished_objective;
+                                ValidationReport candidate_validation =
+                                    polished_validation;
+                                bool controls_constructed =
+                                    bus_local_target.feasible;
+                                if (bus_local_target.feasible &&
+                                    data_.delta_ctg *
+                                            (bus_local_target
+                                                 .target_market_surplus -
+                                             bus_local_target
+                                                 .initial_market_surplus) >
+                                        1e-9 &&
+                                    bus_local_target.pg.size() ==
+                                        data_.generators.size() &&
+                                    bus_local_target.load_power.size() ==
+                                        data_.loads.size()) {
+                                    AcState candidate = polished_state;
+                                    for (int bus = 0; bus < nb; ++bus) {
+                                        if (active_at_bus[bus].empty()) {
+                                            continue;
+                                        }
+                                        double current_load_q = 0.0;
+                                        double target_load_q = 0.0;
+                                        for (int load : data_.buses[bus].loads) {
+                                            const auto& source = data_.loads[load];
+                                            current_load_q += source.qd_nominal *
+                                                polished_state
+                                                    .demand_factor[load];
+                                            double target_factor =
+                                                polished_state
+                                                    .demand_factor[load];
+                                            if (std::abs(source.pd_nominal) >
+                                                1e-12) {
+                                                target_factor =
+                                                    bus_local_target
+                                                        .load_power[load] /
+                                                    source.pd_nominal;
+                                            }
+                                            target_load_q +=
+                                                source.qd_nominal * target_factor;
+                                        }
+                                        double current_generation_q = 0.0;
+                                        double generation_q_lower = 0.0;
+                                        double generation_q_upper = 0.0;
+                                        for (int generator :
+                                             active_at_bus[bus]) {
+                                            current_generation_q +=
+                                                polished_state.qg[generator];
+                                            generation_q_lower +=
+                                                q_lower[generator];
+                                            generation_q_upper +=
+                                                q_upper[generator];
+                                        }
+                                        const double load_q_change =
+                                            target_load_q - current_load_q;
+                                        double fraction = 1.0;
+                                        if (load_q_change > 1e-12) {
+                                            fraction = std::min(
+                                                fraction,
+                                                std::max(
+                                                    0.0,
+                                                    generation_q_upper -
+                                                        current_generation_q) /
+                                                    load_q_change);
+                                        } else if (load_q_change < -1e-12) {
+                                            fraction = std::min(
+                                                fraction,
+                                                std::max(
+                                                    0.0,
+                                                    current_generation_q -
+                                                        generation_q_lower) /
+                                                    (-load_q_change));
+                                        }
+                                        fraction = std::clamp(
+                                            fraction, 0.0, 1.0);
+                                        if (fraction < 1.0 - 1e-10) {
+                                            ++output
+                                                .economic_bus_local_merit_q_constrained_bus_count;
+                                        }
+                                        for (int generator :
+                                             active_at_bus[bus]) {
+                                            candidate.pg[generator] =
+                                                polished_state.pg[generator] +
+                                                fraction *
+                                                    (bus_local_target
+                                                         .pg[generator] -
+                                                     polished_state
+                                                         .pg[generator]);
+                                        }
+                                        for (int load : data_.buses[bus].loads) {
+                                            const auto& source = data_.loads[load];
+                                            if (std::abs(source.pd_nominal) <=
+                                                1e-12) {
+                                                continue;
+                                            }
+                                            const double selected_load_power =
+                                                current_load_power[load] +
+                                                fraction *
+                                                    (bus_local_target
+                                                         .load_power[load] -
+                                                     current_load_power[load]);
+                                            candidate.demand_factor[load] =
+                                                selected_load_power /
+                                                source.pd_nominal;
+                                        }
+                                        const double selected_generation_q =
+                                            current_generation_q +
+                                            fraction * load_q_change;
+                                        if (!allocate_total(
+                                                active_at_bus[bus], q_lower,
+                                                q_upper, polished_state.qg,
+                                                selected_generation_q,
+                                                candidate.qg)) {
+                                            controls_constructed = false;
+                                            break;
+                                        }
+                                    }
+                                    if (controls_constructed) {
+                                        for (int generator = 0;
+                                             generator < ng; ++generator) {
+                                            output
+                                                .economic_bus_local_merit_generation_movement +=
+                                                std::abs(
+                                                    candidate.pg[generator] -
+                                                    polished_state.pg[generator]);
+                                            output
+                                                .economic_bus_local_merit_reactive_movement +=
+                                                std::abs(
+                                                    candidate.qg[generator] -
+                                                    polished_state.qg[generator]);
+                                        }
+                                        for (int load = 0;
+                                             load < static_cast<int>(
+                                                 data_.loads.size()); ++load) {
+                                            output
+                                                .economic_bus_local_merit_load_movement +=
+                                                std::abs(
+                                                    data_.loads[load].pd_nominal *
+                                                    (candidate
+                                                         .demand_factor[load] -
+                                                     polished_state
+                                                         .demand_factor[load]));
+                                        }
+                                        candidate_objective =
+                                            rebuild_contingency_state_derived_fields(
+                                                data_, base_state_, commitment_,
+                                                *contingency, candidate);
+                                        output
+                                            .economic_bus_local_merit_surplus_gain =
+                                            candidate_objective -
+                                            polished_objective;
+                                        candidate_validation = validate_state(
+                                            data_, ModelMode::ContingencySoft,
+                                            candidate, commitment_,
+                                            direct_context);
+                                        if (candidate_validation.max_residual <=
+                                                options_.validation_tolerance &&
+                                            candidate_objective >
+                                                polished_objective + 1e-9) {
+                                            output
+                                                .economic_bus_local_merit_selected =
+                                                true;
+                                            polished_state = std::move(candidate);
+                                            polished_objective =
+                                                candidate_objective;
+                                            polished_validation =
+                                                candidate_validation;
+                                        }
+                                    }
+                                }
+                                output.economic_bus_local_merit_feasible =
+                                    controls_constructed;
+                                output.economic_bus_local_merit_objective_after =
+                                    output.economic_bus_local_merit_selected
+                                    ? polished_objective : candidate_objective;
+                                output.economic_bus_local_merit_validation =
+                                    candidate_validation;
+                                output.economic_balance_polish_trace.push_back({
+                                    {"phase", "bus_local_merit_redispatch"},
+                                    {"feasible",
+                                     output.economic_bus_local_merit_feasible},
+                                    {"selected",
+                                     output.economic_bus_local_merit_selected},
+                                    {"surplus_gain",
+                                     output.economic_bus_local_merit_surplus_gain},
+                                    {"generation_movement",
+                                     output
+                                         .economic_bus_local_merit_generation_movement},
+                                    {"load_movement",
+                                     output
+                                         .economic_bus_local_merit_load_movement},
+                                    {"reactive_movement",
+                                     output
+                                         .economic_bus_local_merit_reactive_movement},
+                                    {"q_constrained_bus_count",
+                                     output
+                                         .economic_bus_local_merit_q_constrained_bus_count},
+                                    {"objective_before",
+                                     output
+                                         .economic_bus_local_merit_objective_before},
+                                    {"objective_after",
+                                     output
+                                         .economic_bus_local_merit_objective_after},
+                                    {"validation",
+                                     candidate_validation.to_json()},
+                                });
+                            }
+                            };
 
                             // Feasibility repair deliberately stops once
                             // every nodal Q mismatch fits inside the source
@@ -5421,20 +6433,87 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     break;
                                 }
 
-                                // The voltage direction is independent of the
-                                // damping scalar.  Build/factor it once, then
-                                // interpolate candidate voltages below.  Keep
-                                // the bounded 256-row active set: target_band=0
-                                // otherwise promotes thousands of harmless
-                                // floating-point residuals into an unbounded
-                                // dense least-squares problem.
+                                // Prefer a compact reactive-only Phase-I LP
+                                // when explicitly enabled. It couples bounded
+                                // voltage and generator-Q controls to every Q
+                                // balance row while retaining one diagonal
+                                // elastic pair per bus. This is much smaller
+                                // than the full corrective LP. The nonlinear
+                                // source rebuild and independent validator
+                                // below remain the only acceptance gate.
                                 std::vector<double> proposed_vm =
                                     polished_state.vm;
-                                if (!predictor_cache_
-                                        ->apply_local_reactive_least_squares(
-                                            data_, current_q_balance,
-                                            proposed_vm, 1.0, true, 0.0)) {
-                                    break;
+                                std::vector<double> proposed_qg =
+                                    polished_state.qg;
+                                bool reactive_direction_available = false;
+                                nlohmann::json reactive_phase_one_trace;
+                                if (options_.economic_reactive_phase_one) {
+                                    FixedJacobianPredictorCache
+                                        reactive_phase_one_cache(
+                                            data_, polished_state,
+                                            commitment_, outaged_branch);
+                                    if (reactive_phase_one_cache.reactive_valid) {
+                                        auto reactive_phase_one =
+                                            solve_reactive_balance_phase_one(
+                                                reactive_phase_one_cache
+                                                    .reactive_jacobian,
+                                                reactive_phase_one_cache
+                                                    .voltage_index,
+                                                data_, active, q_lower,
+                                                q_upper, current_q_balance,
+                                                polished_state,
+                                                options_
+                                                    .economic_reactive_phase_one_voltage_trust_radius,
+                                                options_
+                                                    .economic_reactive_phase_one_seconds);
+                                        reactive_phase_one_trace =
+                                            reactive_phase_one.to_json();
+                                        reactive_phase_one_trace[
+                                            "jacobian_preparation_seconds"] =
+                                            reactive_phase_one_cache
+                                                .preparation_seconds;
+                                        if (reactive_phase_one.accepted) {
+                                            proposed_vm =
+                                                std::move(reactive_phase_one.vm);
+                                            proposed_qg =
+                                                std::move(reactive_phase_one.qg);
+                                            reactive_direction_available = true;
+                                        }
+                                    } else {
+                                        reactive_phase_one_trace = {
+                                            {"attempted", true},
+                                            {"accepted", false},
+                                            {"failure_reason",
+                                             "reactive_jacobian_invalid"},
+                                            {"jacobian_preparation_seconds",
+                                             reactive_phase_one_cache
+                                                 .preparation_seconds},
+                                        };
+                                    }
+                                }
+
+                                // Preserve the established bounded local
+                                // least-squares proposal as the fallback. Its
+                                // voltage direction is independent of damping,
+                                // so build it once and interpolate below.
+                                if (!reactive_direction_available) {
+                                    if (!predictor_cache_
+                                            ->apply_local_reactive_least_squares(
+                                                data_, current_q_balance,
+                                                proposed_vm, 1.0, true, 0.0)) {
+                                        if (!reactive_phase_one_trace.is_null()) {
+                                            output.economic_balance_polish_trace
+                                                .push_back({
+                                                    {"phase",
+                                                     "reactive_phase_one"},
+                                                    {"round",
+                                                     zero_balance_round},
+                                                    {"solver",
+                                                     reactive_phase_one_trace},
+                                                });
+                                        }
+                                        break;
+                                    }
                                 }
 
                                 bool selected_zero_balance = false;
@@ -5463,6 +6542,17 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                                      polished_state.vm[bus]),
                                             data_.buses[bus].vmin,
                                             data_.buses[bus].vmax);
+                                    }
+                                    for (int generator = 0;
+                                         generator < ng; ++generator) {
+                                        candidate.qg[generator] = std::clamp(
+                                            polished_state.qg[generator] +
+                                                damping *
+                                                    (proposed_qg[generator] -
+                                                     polished_state
+                                                         .qg[generator]),
+                                            q_lower[generator],
+                                            q_upper[generator]);
                                     }
                                     std::vector<double> candidate_p_network;
                                     std::vector<double> candidate_q_network;
@@ -5517,6 +6607,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     {"reactive_slack_before", q_slack_before},
                                     {"validation",
                                      selected_zero_balance_validation.to_json()},
+                                    {"reactive_phase_one",
+                                     reactive_phase_one_trace},
                                 });
                                 if (!selected_zero_balance) {
                                     break;
@@ -5527,7 +6619,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     selected_zero_balance_objective;
                                 polished_validation =
                                     selected_zero_balance_validation;
-                                apply_local_injection_projection();
+                                apply_local_injection_projection(
+                                    "reactive_zero_balance_local_projection");
                             }
                         }
                         // The cached Jacobian is deliberately cheap, but a
@@ -5549,12 +6642,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                      slack_sum(polished_state.q_delta) >
                                  options_
                                      .economic_linearized_trigger_slack) &&
-                            (merit_exact_newton_target ||
-                             polished_objective <= options_
-                                 .economic_exact_newton_objective_threshold) &&
+                            polished_objective <= options_
+                                .economic_exact_newton_objective_threshold &&
                             options_.economic_exact_newton_max_iterations > 0 &&
                             !economic_polish_budget_exhausted()) {
                             output.economic_exact_newton_attempted = true;
+                            output.economic_exact_newton_reused_symbolic_analysis =
+                                options_
+                                    .economic_exact_newton_reuse_symbolic_analysis;
+                            output.economic_exact_newton_reused_numeric_factorization =
+                                options_
+                                    .economic_exact_newton_reuse_numeric_factorization;
+                            output.economic_exact_newton_target_fraction =
+                                options_
+                                    .economic_exact_newton_target_fraction;
                             const auto exact_newton_start =
                                 std::chrono::steady_clock::now();
                             // Generator outages need the feasibility-polished
@@ -5564,9 +6665,21 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             // outage leaves every generator available, so use
                             // the preserved economic target and retain the
                             // secure predictor only as the voltage start.
+                            AcState fractional_economic_target;
+                            const AcState* exact_control_reference_ptr =
+                                &polished_state;
+                            if (outaged_branch >= 0) {
+                                fractional_economic_target =
+                                    interpolate_economic_control_reference(
+                                        polished_state,
+                                        economic_target_state,
+                                        options_
+                                            .economic_exact_newton_target_fraction);
+                                exact_control_reference_ptr =
+                                    &fractional_economic_target;
+                            }
                             const AcState& exact_control_reference =
-                                outaged_branch >= 0
-                                ? economic_target_state : polished_state;
+                                *exact_control_reference_ptr;
                             const YRows exact_ybus = build_ybus(
                                 data_, outaged_branch,
                                 &exact_control_reference);
@@ -5656,6 +6769,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             std::vector<double> exact_va =
                                 polished_state.va;
                             std::vector<bool> exact_pq = pq;
+                            if (outaged_branch >= 0 &&
+                                options_
+                                    .economic_exact_newton_reuse_q_active_set &&
+                                economic_exact_active_set_cache_ &&
+                                economic_exact_active_set_cache_->initialized &&
+                                economic_exact_active_set_cache_->pq.size() ==
+                                    static_cast<std::size_t>(nb) &&
+                                economic_exact_active_set_cache_->q_spec.size() ==
+                                    static_cast<std::size_t>(nb)) {
+                                output.economic_exact_newton_q_active_set_cache_hit =
+                                    true;
+                                for (int bus = 0; bus < nb; ++bus) {
+                                    if (pq[bus] ||
+                                        !economic_exact_active_set_cache_
+                                             ->pq[bus]) {
+                                        continue;
+                                    }
+                                    exact_pq[bus] = true;
+                                    exact_q_spec[bus] =
+                                        economic_exact_active_set_cache_
+                                            ->q_spec[bus];
+                                    ++output
+                                        .economic_exact_newton_cached_q_bus_count;
+                                }
+                            }
                             NewtonResult exact_newton;
                             bool exact_active_set_complete = false;
                             constexpr int kExactQActiveSetPasses = 12;
@@ -5667,11 +6805,15 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     component_of, active_slack_weights,
                                     exact_p_spec, exact_q_spec,
                                     options_
-                                        .economic_exact_newton_max_iterations,
+                                     .economic_exact_newton_max_iterations,
                                     std::min(
                                         1e-8,
                                         options_.validation_tolerance * 0.1),
-                                    exact_vm, exact_va);
+                                    exact_vm, exact_va,
+                                    options_
+                                        .economic_exact_newton_reuse_symbolic_analysis,
+                                    options_
+                                        .economic_exact_newton_reuse_numeric_factorization);
                                 output.economic_exact_newton_iterations +=
                                     exact_newton.iterations;
                                 if (!exact_newton.converged) {
@@ -5717,6 +6859,27 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             }
                             output.economic_exact_newton_converged =
                                 exact_active_set_complete;
+                            if (outaged_branch >= 0 &&
+                                exact_active_set_complete &&
+                                options_
+                                    .economic_exact_newton_reuse_q_active_set &&
+                                (!economic_exact_active_set_cache_ ||
+                                 !economic_exact_active_set_cache_->initialized)) {
+                                if (!economic_exact_active_set_cache_) {
+                                    economic_exact_active_set_cache_ =
+                                        std::make_unique<
+                                            EconomicExactActiveSetCache>();
+                                }
+                                economic_exact_active_set_cache_->initialized =
+                                    true;
+                                economic_exact_active_set_cache_->pq.assign(
+                                    exact_pq.begin(), exact_pq.end());
+                                economic_exact_active_set_cache_->q_spec =
+                                    exact_q_spec;
+                                output
+                                    .economic_exact_newton_q_active_set_cache_initialized =
+                                    true;
+                            }
                             if (exact_newton.converged &&
                                 !exact_active_set_complete &&
                                 output.economic_exact_newton_failure_reason.empty()) {
@@ -5739,17 +6902,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     const double required_p =
                                         exact_p_network[bus] +
                                         exact_load_p[bus];
+                                    double total_lower = 0.0;
+                                    double total_upper = 0.0;
+                                    for (int generator :
+                                         active_at_bus[bus]) {
+                                        total_lower += p_lower[generator];
+                                        total_upper += p_upper[generator];
+                                    }
+                                    const double bounded_required_p =
+                                        std::clamp(
+                                            required_p, total_lower,
+                                            total_upper);
+                                    // Sparse Newton may request an aggregate
+                                    // control just beyond a source generator
+                                    // bound. Keep every generator at its exact
+                                    // source bound. The source corrective model
+                                    // already contains a paid nodal-balance
+                                    // variable for the remainder; rebuilding the
+                                    // state computes it exactly, and the
+                                    // unchanged 0.5-p.u. variable bound plus
+                                    // full nonlinear validator remain decisive.
                                     if (!allocate_total(
                                             active_at_bus[bus], p_lower,
                                             p_upper, exact_control_reference.pg,
-                                            required_p, exact_state.pg)) {
-                                        double total_lower = 0.0;
-                                        double total_upper = 0.0;
-                                        for (int generator :
-                                             active_at_bus[bus]) {
-                                            total_lower += p_lower[generator];
-                                            total_upper += p_upper[generator];
-                                        }
+                                            bounded_required_p,
+                                            exact_state.pg)) {
                                         output.economic_exact_newton_failure_reason =
                                             "exact Newton active controls exceed "
                                             "source bounds at " +
@@ -5765,17 +6942,22 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     const double required_q =
                                         exact_q_network[bus] +
                                         exact_load_q[bus];
+                                    total_lower = 0.0;
+                                    total_upper = 0.0;
+                                    for (int generator :
+                                         active_at_bus[bus]) {
+                                        total_lower += q_lower[generator];
+                                        total_upper += q_upper[generator];
+                                    }
+                                    const double bounded_required_q =
+                                        std::clamp(
+                                            required_q, total_lower,
+                                            total_upper);
                                     if (!allocate_total(
                                             active_at_bus[bus], q_lower,
                                             q_upper, exact_control_reference.qg,
-                                            required_q, exact_state.qg)) {
-                                        double total_lower = 0.0;
-                                        double total_upper = 0.0;
-                                        for (int generator :
-                                             active_at_bus[bus]) {
-                                            total_lower += q_lower[generator];
-                                            total_upper += q_upper[generator];
-                                        }
+                                            bounded_required_q,
+                                            exact_state.qg)) {
                                         output.economic_exact_newton_failure_reason =
                                             "exact Newton reactive controls exceed "
                                             "source bounds at " +
@@ -6094,11 +7276,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             !economic_polish_budget_exhausted()) {
                                             const double balance_seconds =
                                                 bounded_economic_solver_seconds(
-                                                    1.0);
+                                                    options_
+                                                        .economic_projected_exact_phase_one_seconds);
                                             if (balance_seconds > 1e-3) {
                                                 const auto balance_repair =
                                                     solve_linearized_active_feasibility_repair(
-                                                        data_, security_reference,
+                                                        data_, polished_state,
                                                         commitment_,
                                                         *direct_context,
                                                         0.5, 0.05,
@@ -6132,6 +7315,26 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() -
                                     exact_newton_start).count();
+                        }
+                        // Exact Newton and its sequential security repair can
+                        // reach a much better verified network state only after
+                        // the first local projection has already run.  Project
+                        // that final state once more onto source-bounded local
+                        // controls.  This does not alter any network injection;
+                        // it may replace the incumbent only after the unchanged
+                        // nonlinear validator proves feasibility and the exact
+                        // GO2 objective strictly improves.
+                        // The direct exact-Newton line search and the subsequent
+                        // security repair record selection separately.  Use the
+                        // broader attempted flag so a verified state accepted by
+                        // the sequential security repair is projected as well.
+                        if (output.economic_exact_newton_attempted &&
+                            slack_sum(polished_state.p_delta) +
+                                    slack_sum(polished_state.q_delta) >
+                                1e-7 &&
+                            !economic_polish_budget_exhausted()) {
+                            apply_local_injection_projection(
+                                "post_exact_local_injection_projection");
                         }
                         for (int linearized_round = 1;
                              linearized_round <=
@@ -6414,6 +7617,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             polished_objective = selected_objective;
                             polished_validation = selected_validation;
                         }
+                        // This network-invariant refinement is deliberately
+                        // last.  It cannot perturb the starting point or active
+                        // set of any nonlinear repair, and it may replace the
+                        // incumbent only after its own complete validation.
+                        apply_bus_local_merit_redispatch();
                         output.economic_balance_polish_objective_after =
                             polished_objective;
                         output.economic_balance_polish_active_slack_after =

@@ -16,6 +16,13 @@ struct SparseAcEconomicOptions {
     double tolerance{1e-7};
     double acceptable_tolerance{1e-5};
     int print_level{};
+    // The verified economic incumbents deliberately place many dispatch,
+    // demand, balance-slack, and soft-margin variables on their source
+    // bounds.  Ipopt's default 1e-2 bound push can move tens of thousands of
+    // those variables before iteration zero, destroying both feasibility and
+    // the value of the supplied start.  This profile keeps the initial point
+    // within a tiny numerical interior while retaining the original bounds.
+    bool preserve_bound_active_start{};
 };
 
 struct SparseAcEconomicResult {
@@ -25,6 +32,7 @@ struct SparseAcEconomicResult {
     bool candidate_verified{};
     bool best_intermediate_found{};
     bool improved{};
+    bool preserve_bound_active_start{};
     int application_status{-99};
     int solver_return_status{-99};
     int iterations{-1};

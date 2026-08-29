@@ -27,6 +27,7 @@ from run_experiment import (  # noqa: E402
     code2_time_limit,
     completion_order_shard_groups,
     contiguous_shard_groups,
+    cpp_command,
     effective_process_timeout,
     evaluator_priority_popen_options,
     evaluator_subprocess_environment,
@@ -138,6 +139,37 @@ class SolutionWriterTests(unittest.TestCase):
 
 
 class CompetitionTimingTests(unittest.TestCase):
+    def test_cpp_command_passes_explicit_gravityx_environment_into_wsl(self):
+        command = cpp_command(
+            Path("C:/repo/build/gravityx"),
+            "Ubuntu-24.04",
+            ["contingency-worker"],
+            12.0,
+            {
+                "GRAVITYX_ECONOMIC_EXACT_REUSE_NUMERIC": "1",
+                "GRAVITYX_ECONOMIC_EXACT_TARGET_FRACTION": "0.0125",
+            },
+        )
+        timeout_position = command.index("timeout")
+        self.assertIn(
+            "GRAVITYX_ECONOMIC_EXACT_REUSE_NUMERIC=1",
+            command[:timeout_position],
+        )
+        self.assertIn(
+            "GRAVITYX_ECONOMIC_EXACT_TARGET_FRACTION=0.0125",
+            command[:timeout_position],
+        )
+
+    def test_cpp_command_rejects_non_gravityx_environment(self):
+        with self.assertRaisesRegex(ValueError, "GRAVITYX_ prefix"):
+            cpp_command(
+                Path("C:/repo/build/gravityx"),
+                "Ubuntu-24.04",
+                ["solve"],
+                12.0,
+                {"LD_LIBRARY_PATH": "unexpected"},
+            )
+
     def test_compact_summary_uses_measured_short_finalization_reserve(self) -> None:
         self.assertEqual(finalization_reserve_seconds(False), 5.0)
         self.assertEqual(finalization_reserve_seconds(True), 0.5)

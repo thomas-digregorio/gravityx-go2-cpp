@@ -50,6 +50,7 @@ def run_trial(
     heavy_worker_count: int = 0,
     heavy_label_seconds: dict[str, float] | None = None,
     economic_contingency_polish: bool = False,
+    worker_environment: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=False)
     if task_groups is None:
@@ -97,6 +98,7 @@ def run_trial(
             distro,
             worker_arguments,
             remaining,
+            worker_environment,
         )
         output_lines: list[str] = []
         labels: list[str] = []
@@ -388,7 +390,31 @@ def main() -> int:
     parser.add_argument("--linearized-fallback", action="store_true")
     parser.add_argument("--precomputed-fast-screen-dir", type=Path)
     parser.add_argument("--wsl-fast-screen-scratch", action="store_true")
+    parser.add_argument(
+        "--worker-env",
+        action="append",
+        default=[],
+        metavar="GRAVITYX_NAME=VALUE",
+        help=(
+            "explicitly pass one GRAVITYX_ setting through wsl.exe to every "
+            "resident worker; may be repeated"
+        ),
+    )
     args = parser.parse_args()
+
+    worker_environment: dict[str, str] = {}
+    for assignment in args.worker_env:
+        if "=" not in assignment:
+            parser.error(f"--worker-env requires NAME=VALUE: {assignment!r}")
+        name, value = assignment.split("=", 1)
+        if not name.startswith("GRAVITYX_"):
+            parser.error(
+                "--worker-env names must use the GRAVITYX_ prefix: "
+                f"{name!r}"
+            )
+        if name in worker_environment:
+            parser.error(f"duplicate --worker-env name: {name}")
+        worker_environment[name] = value
 
     for path in (args.case_json, args.base_json, args.output_dir, args.executable):
         reject_onedrive(path)
@@ -522,6 +548,7 @@ def main() -> int:
             if args.precomputed_fast_screen_dir is not None
             else None
         ),
+        "worker_environment": worker_environment,
         "schedule": [item["label"] for item in records],
         "trials": [],
     }
@@ -553,6 +580,7 @@ def main() -> int:
             args.fast_screen_heavy_workers,
             heavy_label_seconds,
             args.economic_contingency_polish,
+            worker_environment,
         )
         summary["trials"].append(trial)
         write_json(args.output_dir / "calibration_summary.json", summary)

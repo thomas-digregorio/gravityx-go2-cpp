@@ -23,6 +23,13 @@ struct FastPowerFlowOptions {
     bool economic_merit_dispatch{false};
     int economic_merit_cluster_max_buses{1};
     bool economic_merit_allow_load_movement{false};
+    // Once a contingency state is independently feasible, re-optimize only
+    // the split of active generation among units connected to the same bus.
+    // The total Pg at every bus and every other AC control remain fixed, so
+    // this proposal cannot alter the network injections.  The complete source
+    // rebuild and nonlinear validator still decide whether it is accepted.
+    bool economic_bus_local_merit_redispatch{false};
+    bool economic_bus_local_allow_load_movement{false};
     bool economic_merit_retry_from_fallback{false};
     double economic_merit_fallback_objective_threshold{2e5};
     bool minimize_active_balance_slack{false};
@@ -48,9 +55,21 @@ struct FastPowerFlowOptions {
     double economic_reactive_zero_balance_objective_threshold{
         std::numeric_limits<double>::infinity()};
     double economic_reactive_zero_balance_trigger_slack{0.0};
+    bool economic_reactive_phase_one{false};
+    double economic_reactive_phase_one_seconds{1.0};
+    double economic_reactive_phase_one_voltage_trust_radius{0.02};
     bool economic_exact_newton_rescue{false};
+    bool economic_exact_newton_reuse_symbolic_analysis{true};
+    bool economic_exact_newton_reuse_numeric_factorization{false};
+    bool economic_exact_newton_reuse_q_active_set{false};
     double economic_exact_newton_objective_threshold{-5e5};
     int economic_exact_newton_max_iterations{4};
+    // Diagnostic continuation fraction for a branch-outage exact-Newton
+    // control target.  One preserves the established full-target behavior;
+    // values below one test an intermediate point without weakening any
+    // source bound or nonlinear acceptance gate.
+    double economic_exact_newton_target_fraction{1.0};
+    double economic_projected_exact_phase_one_seconds{1.0};
     int max_economic_linearized_phase_two_rounds{1};
     double economic_linearized_phase_two_seconds{0.75};
     int max_newton_iterations{50};
@@ -86,6 +105,17 @@ struct FastPowerFlowResult {
     double economic_merit_dispatch_generation_movement{};
     double economic_merit_dispatch_load_movement{};
     int economic_merit_dispatch_component_count{};
+    bool economic_bus_local_merit_attempted{};
+    bool economic_bus_local_merit_feasible{};
+    bool economic_bus_local_merit_selected{};
+    double economic_bus_local_merit_surplus_gain{};
+    double economic_bus_local_merit_generation_movement{};
+    double economic_bus_local_merit_load_movement{};
+    double economic_bus_local_merit_reactive_movement{};
+    int economic_bus_local_merit_q_constrained_bus_count{};
+    double economic_bus_local_merit_objective_before{};
+    double economic_bus_local_merit_objective_after{};
+    ValidationReport economic_bus_local_merit_validation;
     bool economic_merit_fallback_attempted{};
     bool economic_merit_fallback_selected{};
     double economic_merit_candidate_objective{};
@@ -98,6 +128,12 @@ struct FastPowerFlowResult {
     bool economic_balance_polish_time_limit_reached{};
     double economic_balance_polish_wall_seconds{};
     bool economic_exact_newton_attempted{};
+    bool economic_exact_newton_reused_symbolic_analysis{};
+    bool economic_exact_newton_reused_numeric_factorization{};
+    bool economic_exact_newton_q_active_set_cache_hit{};
+    bool economic_exact_newton_q_active_set_cache_initialized{};
+    int economic_exact_newton_cached_q_bus_count{};
+    double economic_exact_newton_target_fraction{1.0};
     bool economic_exact_newton_converged{};
     bool economic_exact_newton_selected{};
     int economic_exact_newton_iterations{};
@@ -213,12 +249,16 @@ private:
     std::vector<int> commitment_;
     FastPowerFlowOptions options_;
     std::vector<std::vector<int>> base_components_;
+    std::vector<std::vector<int>> economic_bus_components_;
     std::vector<unsigned char> bridge_branch_;
     struct FixedJacobianPredictorCache;
     mutable std::unique_ptr<FixedJacobianPredictorCache> predictor_cache_;
     struct EconomicMeritTargetCache;
     mutable std::unique_ptr<EconomicMeritTargetCache>
         economic_merit_target_cache_;
+    struct EconomicExactActiveSetCache;
+    mutable std::unique_ptr<EconomicExactActiveSetCache>
+        economic_exact_active_set_cache_;
     mutable std::unique_ptr<FastContingencyPowerFlow>
         economic_merit_fallback_;
 

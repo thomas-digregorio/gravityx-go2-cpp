@@ -23,8 +23,11 @@
 #include <limits>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace gravity;
@@ -465,6 +468,69 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 int run_component_tests() {
     gravityx::run_fast_power_flow_topology_cache_regression();
     gravityx::run_active_network_reduction_regression();
+    gravityx::Branch tap_control;
+    tap_control.source_key = "tap-control";
+    tap_control.transformer = true;
+    tap_control.control_mode = 1;
+    tap_control.r = 0.01;
+    tap_control.x = 0.10;
+    tap_control.tap = 1.045;
+    tap_control.tm_min = 0.76;
+    tap_control.tm_max = 1.14;
+    tap_control.tm_steps = 5;
+    tap_control.tm_step = 1;
+    const auto tap_bounds = gravityx::transformer_step_bounds(tap_control);
+    if (tap_bounds.first != -2 || tap_bounds.second != 2) {
+        throw std::runtime_error(
+            "component test failed: transformer tap-step bounds");
+    }
+    require_near(
+        gravityx::transformer_step_value(tap_control, -2), 0.76, 1e-12,
+        "transformer lower tap value");
+    require_near(
+        gravityx::transformer_step_value(tap_control, 1), 1.045, 1e-12,
+        "transformer source tap value");
+    gravityx::refresh_branch_flow_coefficients(tap_control);
+    const double prior_cross = tap_control.flow_from_cross_cos;
+    gravityx::set_transformer_step(tap_control, 2);
+    require_near(tap_control.tap, 1.14, 1e-12,
+                 "transformer changed tap value");
+    if (tap_control.tm_step != 2 || !tap_control.flow_coefficients_valid ||
+        tap_control.flow_from_cross_cos == prior_cross) {
+        throw std::runtime_error(
+            "component test failed: transformer tap coefficient refresh");
+    }
+
+    gravityx::Branch phase_control = tap_control;
+    phase_control.source_key = "phase-control";
+    phase_control.control_mode = 3;
+    phase_control.tap = 1.0;
+    phase_control.shift = 0.034906585039886584;
+    phase_control.ta_min = -0.3141592653589793;
+    phase_control.ta_max = 0.3839724354387525;
+    phase_control.ta_steps = 5;
+    phase_control.ta_step = 0;
+    require_near(
+        gravityx::transformer_step_value(phase_control, 0),
+        0.03490658503988659, 1e-12,
+        "transformer midpoint phase value");
+    gravityx::set_transformer_step(phase_control, -2);
+    require_near(phase_control.shift, phase_control.ta_min, 1e-12,
+                 "transformer lower phase value");
+    if (phase_control.ta_step != -2) {
+        throw std::runtime_error(
+            "component test failed: transformer phase position");
+    }
+    bool invalid_transformer_step_rejected = false;
+    try {
+        gravityx::set_transformer_step(phase_control, 3);
+    } catch (const std::runtime_error&) {
+        invalid_transformer_step_rejected = true;
+    }
+    if (!invalid_transformer_step_rejected) {
+        throw std::runtime_error(
+            "component test failed: invalid transformer step was accepted");
+    }
     const auto points = gravityx::active_pwl_points(
         {0.0, 0.0, 10.0, 100.0, 20.0, 300.0}, 3, 5.0, 15.0);
     if (points.size() != 3) {
@@ -817,6 +883,300 @@ int run_component_tests() {
             "component test failed: greedy economic commitment: " +
             greedy_commitment.to_json(false).dump());
     }
+    gravityx::ReducedNetworkCommitmentOptions reduced_commitment_options;
+    reduced_commitment_options.time_limit_seconds = 5.0;
+    reduced_commitment_options.proposal_time_limit_seconds = 1.0;
+    reduced_commitment_options.maximum_rounds = 2;
+    reduced_commitment_options.maximum_candidate_generators = 2;
+    reduced_commitment_options.generation_trust_radius = 1.0;
+    reduced_commitment_options.enforce_generator_contingency_headroom = false;
+    const auto reduced_commitment =
+        gravityx::refine_reduced_network_economic_commitment(
+            commitment_case, commitment_before,
+            commitment_incumbent,
+            reduced_commitment_options);
+    if (!reduced_commitment.incumbent_verified ||
+        !reduced_commitment.proposal_feasible ||
+        !reduced_commitment.improved ||
+        reduced_commitment.accepted_moves != 1 ||
+        reduced_commitment.selected_commitment !=
+            std::vector<int>({0, 1}) ||
+        reduced_commitment.selected_validation.max_residual > 1e-8 ||
+        std::abs(reduced_commitment.selected.state.pg[0]) > 1e-8 ||
+        std::abs(reduced_commitment.selected.state.pg[1] - 1.0) > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: reduced-network commitment: " +
+            reduced_commitment.to_json(false).dump());
+    }
+    auto enumerated_bridge_options = reduced_commitment_options;
+    enumerated_bridge_options.maximum_rounds = 1;
+    enumerated_bridge_options.maximum_rejected_patterns_per_round = 2;
+    enumerated_bridge_options.objective_tolerance = 1e9;
+    enumerated_bridge_options.allow_nonimproving_continuation = true;
+    enumerated_bridge_options.enumerate_nonimproving_patterns = true;
+    enumerated_bridge_options.reuse_solver_between_constraint_passes = true;
+    const auto enumerated_bridge =
+        gravityx::refine_reduced_network_economic_commitment(
+            commitment_case, commitment_before,
+            commitment_incumbent, enumerated_bridge_options);
+    bool enumerated_bridge_reused_model = false;
+    for (const auto& round : enumerated_bridge.rounds) {
+        enumerated_bridge_reused_model =
+            enumerated_bridge_reused_model ||
+            round.value("incremental_solver_reused", false);
+    }
+    if (!enumerated_bridge.incumbent_verified ||
+        !enumerated_bridge.proposal_feasible ||
+        enumerated_bridge.improved ||
+        enumerated_bridge.accepted_moves != 1 ||
+        enumerated_bridge.rejected_patterns <= 0 ||
+        !enumerated_bridge_reused_model ||
+        enumerated_bridge.selected_commitment != commitment_before ||
+        enumerated_bridge.frontier_commitment !=
+            std::vector<int>({0, 1}) ||
+        enumerated_bridge.frontier_validation.max_residual > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: exact no-good bridge enumeration: " +
+            enumerated_bridge.to_json(false).dump());
+    }
+    auto enumerated_improvement_options = reduced_commitment_options;
+    enumerated_improvement_options.maximum_rounds = 1;
+    enumerated_improvement_options.maximum_rejected_patterns_per_round = 2;
+    enumerated_improvement_options.allow_nonimproving_continuation = true;
+    enumerated_improvement_options.enumerate_nonimproving_patterns = true;
+    enumerated_improvement_options.enumerate_improving_patterns = true;
+    enumerated_improvement_options.reuse_solver_between_constraint_passes =
+        true;
+    const auto enumerated_improvement =
+        gravityx::refine_reduced_network_economic_commitment(
+            commitment_case, commitment_before,
+            commitment_incumbent, enumerated_improvement_options);
+    if (!enumerated_improvement.incumbent_verified ||
+        !enumerated_improvement.proposal_feasible ||
+        !enumerated_improvement.improved ||
+        enumerated_improvement.accepted_moves != 1 ||
+        enumerated_improvement.rejected_patterns < 1 ||
+        enumerated_improvement.selected_commitment !=
+            reduced_commitment.selected_commitment ||
+        std::abs(
+            enumerated_improvement.selected_official_proxy -
+                reduced_commitment.selected_official_proxy) > 1e-8 ||
+        enumerated_improvement.selected_validation.max_residual > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: improving no-good enumeration: " +
+            enumerated_improvement.to_json(false).dump());
+    }
+    auto incremental_reduced_options = reduced_commitment_options;
+    incremental_reduced_options.reuse_solver_between_constraint_passes =
+        true;
+    incremental_reduced_options.reuse_component_proposal_candidates = true;
+    const auto incremental_reduced_commitment =
+        gravityx::refine_reduced_network_economic_commitment(
+            commitment_case, commitment_before,
+            commitment_incumbent, incremental_reduced_options);
+    if (!incremental_reduced_commitment.incumbent_verified ||
+        !incremental_reduced_commitment.proposal_feasible ||
+        !incremental_reduced_commitment.improved ||
+        incremental_reduced_commitment.selected_commitment !=
+            reduced_commitment.selected_commitment ||
+        std::abs(
+            incremental_reduced_commitment.selected_official_proxy -
+            reduced_commitment.selected_official_proxy) > 1e-8 ||
+        incremental_reduced_commitment.selected_validation.max_residual >
+            1e-8) {
+        throw std::runtime_error(
+            "component test failed: incremental reduced-network commitment: " +
+            incremental_reduced_commitment.to_json(false).dump());
+    }
+    auto polished_reduced_options = incremental_reduced_options;
+    polished_reduced_options.post_repair_economic_seconds = 0.25;
+    polished_reduced_options.post_repair_economic_maximum_rounds = 1;
+    const auto polished_reduced_commitment =
+        gravityx::refine_reduced_network_economic_commitment(
+            commitment_case, commitment_before,
+            commitment_incumbent, polished_reduced_options);
+    if (!polished_reduced_commitment.incumbent_verified ||
+        !polished_reduced_commitment.proposal_feasible ||
+        !polished_reduced_commitment.improved ||
+        polished_reduced_commitment.economic_polish_attempts <= 0 ||
+        polished_reduced_commitment.selected_commitment !=
+            reduced_commitment.selected_commitment ||
+        polished_reduced_commitment.selected_official_proxy + 1e-8 <
+            reduced_commitment.selected_official_proxy ||
+        polished_reduced_commitment.selected_validation.max_residual >
+            1e-8) {
+        throw std::runtime_error(
+            "component test failed: post-repair economic polish: " +
+            polished_reduced_commitment.to_json(false).dump());
+    }
+    auto startup_correction_options = reduced_commitment_options;
+    startup_correction_options.maximum_rounds = 1;
+    startup_correction_options.maximum_candidate_generators = 2;
+    startup_correction_options.maximum_startup_correction_candidates = 1;
+    startup_correction_options.allow_startup_corrections_at_pv_bus = true;
+    startup_correction_options.expand_candidate_pool_beyond_component_proposal =
+        true;
+    startup_correction_options.require_one_startup_correction = true;
+    startup_correction_options.reuse_component_proposal_candidates = false;
+    const auto startup_corrected_reduced_commitment =
+        gravityx::refine_reduced_network_economic_commitment(
+            component_commitment_case, component_commitment_before,
+            component_commitment_incumbent, startup_correction_options);
+    if (!startup_corrected_reduced_commitment.incumbent_verified ||
+        !startup_corrected_reduced_commitment.proposal_feasible ||
+        !startup_corrected_reduced_commitment.improved ||
+        startup_corrected_reduced_commitment.accepted_moves != 1 ||
+        startup_corrected_reduced_commitment.selected_commitment !=
+            std::vector<int>({1, 1}) ||
+        startup_corrected_reduced_commitment.selected_validation.max_residual >
+            1e-8 ||
+        std::abs(
+            startup_corrected_reduced_commitment.selected.state.pg[0] +
+            startup_corrected_reduced_commitment.selected.state.pg[1] -
+                1.0) > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: reduced startup correction: " +
+            startup_corrected_reduced_commitment.to_json(false).dump());
+    }
+    // A restart beam may need to pair a startup with a shutdown that changes
+    // the bus's reactive-capability envelope, even when an immediately cheaper
+    // reactive-easy shutdown is available.  The search row must select the
+    // coupled direction without relaxing the subsequent exact AC validation.
+    auto coupled_shutdown_case = commitment_case;
+    coupled_shutdown_case.name =
+        "reduced-reactive-coupled-shutdown-fixture";
+    coupled_shutdown_case.generators[0].oncost = 20.0;
+    coupled_shutdown_case.generators[0].qmin = -2.0;
+    coupled_shutdown_case.generators[0].qmax = 2.0;
+    coupled_shutdown_case.generators[1].oncost = 1.0;
+    coupled_shutdown_case.generators[1].qmin = -0.25;
+    coupled_shutdown_case.generators[1].qmax = 0.25;
+    coupled_shutdown_case.generators.push_back(
+        coupled_shutdown_case.generators[1]);
+    auto& coupled_startup = coupled_shutdown_case.generators.back();
+    coupled_startup.source_key = "1:G3";
+    coupled_startup.index = 2;
+    // Source-on, but currently off: this is a reversal of an earlier
+    // internal shutdown, not a relaxation of source startup eligibility.
+    coupled_startup.status_prev = 1;
+    coupled_startup.pg_start = 0.5;
+    coupled_startup.pg_prev = 0.5;
+    coupled_startup.qmin = -2.0;
+    coupled_startup.qmax = 2.0;
+    coupled_startup.oncost = 1.0;
+    coupled_startup.sucost = 2.0;
+    coupled_shutdown_case.buses[0].generators = {0, 1, 2};
+    coupled_shutdown_case.loads[0].qd_nominal = 1.0;
+    coupled_shutdown_case.loads[0].tmin = 0.9;
+    coupled_shutdown_case.loads[0].tmax = 1.1;
+    coupled_shutdown_case.loads[0].pd_max = 1.1;
+    coupled_shutdown_case.loads[0].prumax = 1.0;
+    coupled_shutdown_case.loads[0].prdmax = 1.0;
+    gravityx::SolveResult coupled_shutdown_incumbent;
+    coupled_shutdown_incumbent.status = 0;
+    coupled_shutdown_incumbent.state.vm = {1.0};
+    coupled_shutdown_incumbent.state.va = {0.0};
+    coupled_shutdown_incumbent.state.pg = {0.5, 0.5, 0.0};
+    coupled_shutdown_incumbent.state.qg = {1.0, 0.0, 0.0};
+    coupled_shutdown_incumbent.state.demand_factor = {1.0};
+    const std::vector<int> coupled_shutdown_before{1, 1, 0};
+    coupled_shutdown_incumbent.objective =
+        gravityx::rebuild_base_state_derived_fields(
+            coupled_shutdown_case, coupled_shutdown_before,
+            coupled_shutdown_incumbent.state);
+    const auto coupled_shutdown_incumbent_validation =
+        gravityx::validate_state(
+            coupled_shutdown_case, gravityx::ModelMode::BaseSoft,
+            coupled_shutdown_incumbent.state, coupled_shutdown_before);
+    if (coupled_shutdown_incumbent_validation.max_residual > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: coupled shutdown fixture incumbent: " +
+            coupled_shutdown_incumbent_validation.to_json().dump());
+    }
+    gravityx::ReducedNetworkCommitmentOptions coupled_shutdown_options;
+    coupled_shutdown_options.time_limit_seconds = 5.0;
+    coupled_shutdown_options.proposal_time_limit_seconds = 1.0;
+    coupled_shutdown_options.maximum_rounds = 1;
+    coupled_shutdown_options.minimum_commitment_changes_per_round = 2;
+    coupled_shutdown_options.maximum_commitment_changes_per_round = 2;
+    coupled_shutdown_options.maximum_candidate_generators = 3;
+    coupled_shutdown_options.maximum_startup_correction_candidates = 1;
+    coupled_shutdown_options.maximum_new_shutdowns_per_bus = 2;
+    coupled_shutdown_options.generation_trust_radius = 1.0;
+    coupled_shutdown_options.freeze_load_movement = false;
+    coupled_shutdown_options.maximum_movable_loads = 1;
+    coupled_shutdown_options.load_factor_trust_radius = 0.2;
+    coupled_shutdown_options.enforce_generator_contingency_headroom = false;
+    coupled_shutdown_options.allow_startup_corrections_at_pv_bus = true;
+    coupled_shutdown_options.expand_candidate_pool_beyond_component_proposal =
+        true;
+    coupled_shutdown_options.require_one_startup_correction = true;
+    coupled_shutdown_options.require_additional_same_bus_shutdown = true;
+    coupled_shutdown_options.require_reactive_coupled_shutdown = true;
+    coupled_shutdown_options.maximum_rejected_patterns_per_round = 2;
+    coupled_shutdown_options.allow_nonimproving_continuation = true;
+    coupled_shutdown_options.enumerate_nonimproving_patterns = true;
+    coupled_shutdown_options.enumerate_improving_patterns = true;
+    coupled_shutdown_options.diversify_reactive_shutdowns_between_patterns =
+        true;
+    coupled_shutdown_options.reuse_solver_between_constraint_passes = true;
+    const auto coupled_shutdown_result =
+        gravityx::refine_reduced_network_economic_commitment(
+            coupled_shutdown_case, coupled_shutdown_before,
+            coupled_shutdown_incumbent, coupled_shutdown_options);
+    if (!coupled_shutdown_result.incumbent_verified ||
+        !coupled_shutdown_result.proposal_feasible ||
+        !coupled_shutdown_result.improved ||
+        coupled_shutdown_result.rejected_patterns < 1 ||
+        coupled_shutdown_result.proposals.empty() ||
+        coupled_shutdown_result.proposals[0].value(
+            "eligible_movable_load_count", 0) != 1 ||
+        coupled_shutdown_result.selected_commitment !=
+            std::vector<int>({0, 1, 1}) ||
+        coupled_shutdown_result.selected_validation.max_residual > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: reactive-coupled shutdown beam: " +
+            coupled_shutdown_result.to_json(false).dump());
+    }
+    // A reduced commitment continuation must not keep retiring source-online
+    // generators at a bus that already supplied a newly accepted shutdown.
+    // The tiny fixture remains feasible with either of its two online units,
+    // so an unconstrained continuation would economically prefer a second
+    // shutdown.  The diversity guard must retain the verified incumbent and
+    // expose that it rejected the concentrated proposal direction.
+    auto shutdown_guard_case = commitment_case;
+    shutdown_guard_case.name = "reduced-commitment-bus-shutdown-guard-fixture";
+    shutdown_guard_case.generators.push_back(
+        shutdown_guard_case.generators[1]);
+    shutdown_guard_case.generators[2].source_key = "1:G3";
+    shutdown_guard_case.generators[2].index = 2;
+    shutdown_guard_case.buses[0].generators = {0, 1, 2};
+    gravityx::SolveResult shutdown_guard_incumbent;
+    shutdown_guard_incumbent.status = 0;
+    shutdown_guard_incumbent.state = commitment_incumbent.state;
+    shutdown_guard_incumbent.state.pg = {0.0, 0.5, 0.5};
+    shutdown_guard_incumbent.state.qg = {0.0, 0.0, 0.0};
+    const std::vector<int> shutdown_guard_commitment{0, 1, 1};
+    shutdown_guard_incumbent.objective =
+        gravityx::rebuild_base_state_derived_fields(
+            shutdown_guard_case, shutdown_guard_commitment,
+            shutdown_guard_incumbent.state);
+    auto shutdown_guard_options = reduced_commitment_options;
+    shutdown_guard_options.maximum_rounds = 1;
+    const auto shutdown_guard =
+        gravityx::refine_reduced_network_economic_commitment(
+            shutdown_guard_case, shutdown_guard_commitment,
+            shutdown_guard_incumbent, shutdown_guard_options);
+    if (!shutdown_guard.incumbent_verified ||
+        !shutdown_guard.proposal_feasible ||
+        shutdown_guard.improved ||
+        shutdown_guard.bus_shutdown_guard_rejections <= 0 ||
+        shutdown_guard.selected_commitment != shutdown_guard_commitment ||
+        shutdown_guard.selected_validation.max_residual > 1e-8) {
+        throw std::runtime_error(
+            "component test failed: reduced commitment bus shutdown guard: " +
+            shutdown_guard.to_json(false).dump());
+    }
     auto q_retarget_case = component_commitment_case;
     q_retarget_case.name = "greedy-commitment-q-retarget-fixture";
     q_retarget_case.generators[0].qmin = -1.0;
@@ -1049,6 +1409,28 @@ int run_component_tests() {
             "component test failed: linearized network commitment: " +
             network_commitment.to_json(false).dump());
     }
+    auto preserved_dispatch_commitment_options = network_commitment_options;
+    preserved_dispatch_commitment_options
+        .preserve_candidate_dispatch_during_repair = true;
+    const auto preserved_dispatch_commitment =
+        gravityx::refine_component_economic_commitment(
+            network_commitment_case, network_commitment_before,
+            network_source, preserved_dispatch_commitment_options);
+    if (!preserved_dispatch_commitment.incumbent_verified ||
+        !preserved_dispatch_commitment.solver_feasible ||
+        !preserved_dispatch_commitment.solver_optimal ||
+        !preserved_dispatch_commitment.candidate_repair_attempted ||
+        !preserved_dispatch_commitment
+             .candidate_repair_preserved_dispatch ||
+        preserved_dispatch_commitment.selected_validation.max_residual >
+            1e-5 ||
+        (!preserved_dispatch_commitment.candidate_verified &&
+         preserved_dispatch_commitment.selected_commitment !=
+             network_commitment_before)) {
+        throw std::runtime_error(
+            "component test failed: preserved-dispatch commitment repair: " +
+            preserved_dispatch_commitment.to_json(false).dump());
+    }
     auto active_only_commitment_options = network_commitment_options;
     active_only_commitment_options.linearized_reactive_network = false;
     const auto active_only_commitment =
@@ -1118,6 +1500,12 @@ int run_component_tests() {
     active_dispatch_options.time_limit_seconds = 5.0;
     active_dispatch_options.maximum_rounds = 3;
     active_dispatch_options.maximum_candidate_trials = 4;
+    active_dispatch_options.load_factor_trust_radius = 0.5;
+    active_dispatch_options.accept_first_improving_fraction = true;
+    active_dispatch_options.thermal_polygon_side_cuts = 1;
+    // Exercise the convex-QP proposal path. The deliberately tiny weight
+    // leaves this fixture's unique bound solution unchanged.
+    active_dispatch_options.control_proximal_weight = 1e-6;
     const auto active_dispatch =
         gravityx::refine_fixed_commitment_active_network_economic(
             commitment_case, commitment_before,
@@ -1463,6 +1851,7 @@ int run_parallel_circuit_regression() {
     sparse_ac_options.time_limit_seconds = 2.0;
     sparse_ac_options.tolerance = 1e-8;
     sparse_ac_options.acceptable_tolerance = 1e-5;
+    sparse_ac_options.preserve_bound_active_start = true;
     const auto sparse_ac_economic =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, {1}, source_base.solve, sparse_ac_options);
@@ -3392,6 +3781,117 @@ BasePoint load_base_point(const std::string& base_result_path) {
     };
 }
 
+int apply_base_transformer_overrides(
+    gravityx::CaseData& data,
+    const nlohmann::json& base_json) {
+    if (!base_json.contains("transformer_overrides")) {
+        return 0;
+    }
+    const auto& overrides = base_json.at("transformer_overrides");
+    if (!overrides.is_array()) {
+        throw std::runtime_error(
+            "base transformer_overrides must be an array");
+    }
+    std::unordered_set<int> seen_branch_indices;
+    int applied = 0;
+    for (const auto& override : overrides) {
+        const int branch_index = override.at("branch_index").get<int>();
+        const int step = override.at("new_step").get<int>();
+        if (!seen_branch_indices.insert(branch_index).second) {
+            throw std::runtime_error(
+                "duplicate base transformer override for branch " +
+                std::to_string(branch_index));
+        }
+        const auto match = std::find_if(
+            data.branches.begin(), data.branches.end(),
+            [branch_index](const gravityx::Branch& branch) {
+                return branch.index == branch_index;
+            });
+        if (match == data.branches.end()) {
+            throw std::runtime_error(
+                "base transformer override references a missing branch: " +
+                std::to_string(branch_index));
+        }
+        if (!match->present || !match->transformer ||
+            (std::abs(match->control_mode) != 1 &&
+             std::abs(match->control_mode) != 3)) {
+            throw std::runtime_error(
+                "base transformer override references a non-controllable "
+                "transformer: " + match->source_key);
+        }
+        if (override.contains("source_from") &&
+            override.at("source_from").get<int>() != match->source_from) {
+            throw std::runtime_error(
+                "base transformer override source-from identity mismatch: " +
+                match->source_key);
+        }
+        if (override.contains("source_to") &&
+            override.at("source_to").get<int>() != match->source_to) {
+            throw std::runtime_error(
+                "base transformer override source-to identity mismatch: " +
+                match->source_key);
+        }
+        if (override.contains("source_id") &&
+            override.at("source_id").get<std::string>() != match->source_id) {
+            throw std::runtime_error(
+                "base transformer override source-ID identity mismatch: " +
+                match->source_key);
+        }
+        gravityx::set_transformer_step(*match, step);
+        ++applied;
+    }
+    return applied;
+}
+
+gravityx::CaseData load_case_with_base_transformer_overrides(
+    const std::string& case_path,
+    const std::string& base_result_path) {
+    auto data = gravityx::CaseData::load(case_path);
+    const auto base_json = read_json_file(base_result_path);
+    apply_base_transformer_overrides(data, base_json);
+    return data;
+}
+
+int apply_transformer_override_specification(
+    gravityx::CaseData& data,
+    const std::string& specification) {
+    if (specification.empty()) {
+        return 0;
+    }
+    std::unordered_set<int> seen_branch_indices;
+    std::stringstream stream(specification);
+    std::string token;
+    int applied = 0;
+    while (std::getline(stream, token, ',')) {
+        const auto separator = token.find(':');
+        if (separator == std::string::npos ||
+            token.find(':', separator + 1) != std::string::npos) {
+            throw std::runtime_error(
+                "transformer override must use BRANCH_INDEX:STEP entries");
+        }
+        const int branch_index = std::stoi(token.substr(0, separator));
+        const int step = std::stoi(token.substr(separator + 1));
+        if (!seen_branch_indices.insert(branch_index).second) {
+            throw std::runtime_error(
+                "duplicate transformer override branch index: " +
+                std::to_string(branch_index));
+        }
+        const auto match = std::find_if(
+            data.branches.begin(), data.branches.end(),
+            [branch_index](const gravityx::Branch& branch) {
+                return branch.index == branch_index;
+            });
+        if (match == data.branches.end()) {
+            throw std::runtime_error(
+                "transformer override references a missing branch: " +
+                std::to_string(branch_index));
+        }
+        gravityx::set_transformer_step(*match, step);
+        ++applied;
+    }
+    return applied;
+}
+
 int run_sparse_economic_refinement_json(
     const std::string& case_path,
     const std::string& base_result_path,
@@ -3404,9 +3904,10 @@ int run_sparse_economic_refinement_json(
         throw std::runtime_error(
             "sparse economic refinement time limit must be finite and positive");
     }
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
-    const auto base = load_base_point(base_result_path);
+    auto base = load_base_point(base_result_path);
     gravityx::SolveResult incumbent;
     incumbent.status = 0;
     incumbent.state = base.state;
@@ -3458,9 +3959,10 @@ int run_bus_injection_commitment_json(
         throw std::runtime_error(
             "bus-injection commitment time limit must be finite and positive");
     }
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
-    const auto base = load_base_point(base_result_path);
+    auto base = load_base_point(base_result_path);
     gravityx::SolveResult incumbent;
     incumbent.status = 0;
     incumbent.state = base.state;
@@ -3525,7 +4027,8 @@ int run_component_economic_dispatch_json(
         throw std::runtime_error(
             "component economic dispatch time limit must be finite and positive");
     }
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
     const auto base = load_base_point(base_result_path);
     gravityx::SolveResult incumbent;
@@ -3589,7 +4092,8 @@ int run_component_commitment_json(
         throw std::runtime_error(
             "component commitment time limit must be finite and positive");
     }
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
     const auto base = load_base_point(base_result_path);
     gravityx::SolveResult incumbent;
@@ -3645,6 +4149,11 @@ int run_component_commitment_json(
             "GRAVITYX_COMPONENT_COMMITMENT_COMPACT_PWL")) {
         options.compact_pwl_formulation =
             std::string(compact_pwl) != "0";
+    }
+    if (const char* preserve_dispatch = std::getenv(
+            "GRAVITYX_COMPONENT_COMMITMENT_PRESERVE_DISPATCH")) {
+        options.preserve_candidate_dispatch_during_repair =
+            std::string(preserve_dispatch) != "0";
     }
     const auto refinement = gravityx::refine_component_economic_commitment(
         data, base.commitment, incumbent, options);
@@ -3747,7 +4256,8 @@ int run_greedy_commitment_json(
         throw std::runtime_error(
             "greedy commitment time limit must be finite and positive");
     }
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
     const auto base = load_base_point(base_result_path);
     gravityx::SolveResult incumbent;
@@ -3844,9 +4354,25 @@ int run_active_network_economic_dispatch_json(
         throw std::runtime_error(
             "active-network economic dispatch time limit must be finite and positive");
     }
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
-    const auto base = load_base_point(base_result_path);
+    auto base = load_base_point(base_result_path);
+    bool used_reduced_commitment_frontier = false;
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_USE_REDUCED_FRONTIER");
+        value != nullptr && std::string(value) != "0") {
+        if (!input_json.contains("reduced_network_frontier_commitment") ||
+            !input_json.contains("reduced_network_frontier_state")) {
+            throw std::runtime_error(
+                "requested reduced-commitment frontier is absent from base result");
+        }
+        base.commitment = input_json.at(
+            "reduced_network_frontier_commitment").get<std::vector<int>>();
+        base.state = gravityx::ac_state_from_json(
+            input_json.at("reduced_network_frontier_state"));
+        used_reduced_commitment_frontier = true;
+    }
     gravityx::SolveResult incumbent;
     incumbent.status = 0;
     incumbent.state = base.state;
@@ -3881,12 +4407,44 @@ int run_active_network_economic_dispatch_json(
         options.reduced_pv_pq_partition = std::string(value) != "0";
     }
     if (const char* value =
+            std::getenv("GRAVITYX_ACTIVE_ECONOMIC_STABLE_PV_PQ")) {
+        options.stable_reduced_pv_pq_partition =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_REACTIVE_GUARD_ROWS")) {
+        options.reactive_capability_guard_row_target =
+            std::max(0, std::stoi(value));
+        options.maximum_trust_region_rows_per_pass = std::max(
+            options.maximum_trust_region_rows_per_pass,
+            options.reactive_capability_guard_row_target);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_THERMAL_UTILIZATION")) {
+        options.thermal_row_utilization_threshold = std::stod(value);
+    }
+    if (const char* value =
             std::getenv("GRAVITYX_ACTIVE_ECONOMIC_GENERATE_TRUST_ROWS")) {
         options.generate_trust_region_rows = std::string(value) != "0";
     }
     if (const char* value =
             std::getenv("GRAVITYX_ACTIVE_ECONOMIC_MAX_ROUNDS")) {
         options.maximum_rounds = std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_CANDIDATE_TRIALS")) {
+        options.maximum_candidate_trials =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_ADAPTIVE_FRACTIONS")) {
+        options.adaptive_candidate_fractions =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_FIRST_IMPROVEMENT")) {
+        options.accept_first_improving_fraction =
+            std::string(value) != "0";
     }
     if (const char* value = std::getenv(
             "GRAVITYX_ACTIVE_ECONOMIC_TRUST_ROWS_PER_PASS")) {
@@ -3900,6 +4458,23 @@ int run_active_network_economic_dispatch_json(
     if (const char* value = std::getenv(
             "GRAVITYX_ACTIVE_ECONOMIC_VOLTAGE_TRUST_RADIUS")) {
         options.voltage_trust_radius = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_GENERATION_TRUST_RADIUS")) {
+        options.generation_trust_radius = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_LOAD_TRUST_RADIUS")) {
+        options.load_factor_trust_radius = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_PROXIMAL_WEIGHT")) {
+        options.control_proximal_weight = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_ACTIVE_ECONOMIC_THERMAL_SIDE_CUTS")) {
+        options.thermal_polygon_side_cuts =
+            std::max(0, std::stoi(value));
     }
     if (const char* value =
             std::getenv("GRAVITYX_ACTIVE_ECONOMIC_SPARSE_FULL_AC")) {
@@ -3918,9 +4493,12 @@ int run_active_network_economic_dispatch_json(
     output["success"] = refinement.incumbent_verified;
     output["active_network_economic_dispatch"] =
         refinement.to_json(false);
+    output["active_network_economic_used_reduced_frontier"] =
+        used_reduced_commitment_frontier;
     output["base_optimization_performed"] = refinement.attempted;
     output["base"] = gravityx::solve_result_to_json(
         refinement.selected, true);
+    output["commitment"] = base.commitment;
     output["base_validation"] =
         refinement.selected_validation.to_json();
     output["selected_state"] =
@@ -3955,6 +4533,1067 @@ int run_active_network_economic_dispatch_json(
     return refinement.incumbent_verified ? 0 : 1;
 }
 
+struct TransformerCoordinateCandidate {
+    int branch_position{};
+    int old_step{};
+    int new_step{};
+    double old_value{};
+    double new_value{};
+    double objective{-std::numeric_limits<double>::infinity()};
+    double maximum_sm_slack{std::numeric_limits<double>::infinity()};
+    double limiting_branch_sm_slack{std::numeric_limits<double>::infinity()};
+    double total_sm_slack{std::numeric_limits<double>::infinity()};
+    int saturated_branch_count{std::numeric_limits<int>::max()};
+    double repair_wall_seconds{};
+    gravityx::AcState state;
+    gravityx::ValidationReport validation;
+};
+
+nlohmann::json transformer_coordinate_identity(
+    const gravityx::Branch& branch,
+    int branch_position,
+    int old_step,
+    int new_step,
+    double old_value,
+    double new_value) {
+    return {
+        {"branch_position", branch_position},
+        {"branch_index", branch.index},
+        {"source_from", branch.source_from},
+        {"source_to", branch.source_to},
+        {"source_id", branch.source_id},
+        {"control_mode", branch.control_mode},
+        {"control_kind", std::abs(branch.control_mode) == 1
+             ? "tap_ratio" : "phase_shift"},
+        {"old_step", old_step},
+        {"new_step", new_step},
+        {"old_value", old_value},
+        {"new_value", new_value},
+    };
+}
+
+int run_transformer_coordinate_diagnostic_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "transformer-coordinate time limit must be finite and positive");
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    const auto base = load_base_point(base_result_path);
+    nlohmann::json inherited_overrides = nlohmann::json::array();
+    if (input_json.contains("transformer_overrides")) {
+        for (const auto& inherited :
+             input_json.at("transformer_overrides")) {
+            const int branch_index =
+                inherited.at("branch_index").get<int>();
+            const int step = inherited.at("new_step").get<int>();
+            const auto match = std::find_if(
+                data.branches.begin(), data.branches.end(),
+                [branch_index](const gravityx::Branch& branch) {
+                    return branch.index == branch_index;
+                });
+            if (match == data.branches.end()) {
+                throw std::runtime_error(
+                    "inherited coordinate override references a missing branch: " +
+                    std::to_string(branch_index));
+            }
+            gravityx::set_transformer_step(*match, step);
+            inherited_overrides.push_back(inherited);
+        }
+    }
+
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    incumbent.objective = gravityx::rebuild_base_state_derived_fields(
+        data, base.commitment, incumbent.state);
+    const auto incumbent_validation = gravityx::validate_state(
+        data, gravityx::ModelMode::BaseSoft,
+        incumbent.state, base.commitment);
+    if (!gravityx::validated_candidate_is_feasible(
+            incumbent, incumbent_validation, 1e-5)) {
+        throw std::runtime_error(
+            "transformer-coordinate diagnostic requires a verified base incumbent");
+    }
+
+    std::vector<int> controlled_positions;
+    nlohmann::json source_controls = nlohmann::json::array();
+    for (int position = 0;
+         position < static_cast<int>(data.branches.size()); ++position) {
+        const auto& branch = data.branches[position];
+        if (!branch.present || !branch.transformer ||
+            (std::abs(branch.control_mode) != 1 &&
+             std::abs(branch.control_mode) != 3)) {
+            continue;
+        }
+        const int step = std::abs(branch.control_mode) == 1
+            ? branch.tm_step : branch.ta_step;
+        const double value = std::abs(branch.control_mode) == 1
+            ? branch.tap : branch.shift;
+        const double exact_value =
+            gravityx::transformer_step_value(branch, step);
+        if (std::abs(value - exact_value) > 1e-10) {
+            throw std::runtime_error(
+                "source transformer value does not match its integer position: " +
+                branch.source_key);
+        }
+        const auto [lower_step, upper_step] =
+            gravityx::transformer_step_bounds(branch);
+        controlled_positions.push_back(position);
+        source_controls.push_back({
+            {"branch_position", position},
+            {"branch_index", branch.index},
+            {"source_from", branch.source_from},
+            {"source_to", branch.source_to},
+            {"source_id", branch.source_id},
+            {"control_mode", branch.control_mode},
+            {"step", step},
+            {"value", value},
+            {"lower_step", lower_step},
+            {"upper_step", upper_step},
+        });
+    }
+    if (controlled_positions.empty()) {
+        throw std::runtime_error(
+            "case has no source-authorized controllable transformers");
+    }
+
+    const int limiting_branch_position = incumbent.state.sm_slack.empty()
+        ? -1
+        : static_cast<int>(std::distance(
+            incumbent.state.sm_slack.begin(),
+            std::max_element(
+                incumbent.state.sm_slack.begin(),
+                incumbent.state.sm_slack.end())));
+    const auto collect_metrics = [&](TransformerCoordinateCandidate& candidate) {
+        candidate.maximum_sm_slack = candidate.state.sm_slack.empty()
+            ? 0.0
+            : *std::max_element(
+                candidate.state.sm_slack.begin(),
+                candidate.state.sm_slack.end());
+        candidate.total_sm_slack = 0.0;
+        candidate.saturated_branch_count = 0;
+        for (double slack : candidate.state.sm_slack) {
+            candidate.total_sm_slack += std::max(0.0, slack);
+            if (slack >= data.sm_vio_limit - 1e-4) {
+                ++candidate.saturated_branch_count;
+            }
+        }
+        candidate.limiting_branch_sm_slack =
+            limiting_branch_position >= 0 &&
+                limiting_branch_position <
+                    static_cast<int>(candidate.state.sm_slack.size())
+            ? candidate.state.sm_slack[limiting_branch_position]
+            : 0.0;
+    };
+    const char* requested_maximum_objective_loss =
+        std::getenv("GRAVITYX_TRANSFORMER_MAX_OBJECTIVE_LOSS");
+    const double maximum_objective_loss =
+        requested_maximum_objective_loss == nullptr
+        ? 500.0
+        : std::max(0.0, std::stod(requested_maximum_objective_loss));
+    const auto headroom_better = [&incumbent, maximum_objective_loss](
+        const TransformerCoordinateCandidate& left,
+        const TransformerCoordinateCandidate& right) {
+        const bool left_economic = left.objective >=
+            incumbent.objective - maximum_objective_loss;
+        const bool right_economic = right.objective >=
+            incumbent.objective - maximum_objective_loss;
+        if (left_economic != right_economic) {
+            return left_economic;
+        }
+        if (!left_economic) {
+            return left.objective > right.objective;
+        }
+        if (left.saturated_branch_count != right.saturated_branch_count) {
+            return left.saturated_branch_count < right.saturated_branch_count;
+        }
+        if (std::abs(left.maximum_sm_slack - right.maximum_sm_slack) > 1e-10) {
+            return left.maximum_sm_slack < right.maximum_sm_slack;
+        }
+        if (std::abs(
+                left.limiting_branch_sm_slack -
+                right.limiting_branch_sm_slack) > 1e-10) {
+            return left.limiting_branch_sm_slack <
+                right.limiting_branch_sm_slack;
+        }
+        if (std::abs(left.total_sm_slack - right.total_sm_slack) > 1e-10) {
+            return left.total_sm_slack < right.total_sm_slack;
+        }
+        return left.objective > right.objective;
+    };
+
+    const char* requested_shortlist =
+        std::getenv("GRAVITYX_TRANSFORMER_ECONOMIC_CANDIDATES");
+    const int economic_candidate_count = requested_shortlist == nullptr
+        ? 6 : std::max(1, std::stoi(requested_shortlist));
+    const char* requested_candidate_seconds =
+        std::getenv("GRAVITYX_TRANSFORMER_ECONOMIC_SECONDS");
+    const double economic_seconds_per_candidate =
+        requested_candidate_seconds == nullptr
+        ? 5.0 : std::max(0.1, std::stod(requested_candidate_seconds));
+
+    std::vector<TransformerCoordinateCandidate> shortlist;
+    std::optional<TransformerCoordinateCandidate> best_direct_objective;
+    nlohmann::json repair_trials = nlohmann::json::array();
+    bool time_limit_reached = false;
+    int feasible_repairs = 0;
+    int attempted_repairs = 0;
+    for (int position : controlled_positions) {
+        const auto& source_branch = data.branches[position];
+        const int old_step = std::abs(source_branch.control_mode) == 1
+            ? source_branch.tm_step : source_branch.ta_step;
+        const double old_value = std::abs(source_branch.control_mode) == 1
+            ? source_branch.tap : source_branch.shift;
+        const auto [lower_step, upper_step] =
+            gravityx::transformer_step_bounds(source_branch);
+        for (int direction : {-1, 1}) {
+            const int new_step = old_step + direction;
+            if (new_step < lower_step || new_step > upper_step) {
+                continue;
+            }
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+            const double reserved_economic_seconds =
+                economic_seconds_per_candidate * economic_candidate_count + 2.0;
+            if (elapsed + reserved_economic_seconds >= time_limit_seconds) {
+                time_limit_reached = true;
+                break;
+            }
+            ++attempted_repairs;
+            auto candidate_data = data;
+            auto& candidate_branch = candidate_data.branches[position];
+            gravityx::set_transformer_step(candidate_branch, new_step);
+            auto seed_state = incumbent.state;
+            static_cast<void>(gravityx::rebuild_base_state_derived_fields(
+                candidate_data, base.commitment, seed_state));
+
+            gravityx::FastPowerFlowOptions repair_options;
+            repair_options.minimize_active_balance_slack = true;
+            repair_options.minimize_reactive_balance_slack = true;
+            repair_options.skip_balance_cleanup_prepasses = true;
+            repair_options.max_newton_iterations = 25;
+            repair_options.validation_tolerance = 1e-5;
+            const auto repair_start = std::chrono::steady_clock::now();
+            gravityx::FastContingencyPowerFlow repair_solver(
+                candidate_data, seed_state, base.commitment,
+                repair_options);
+            auto repaired = repair_solver.solve_base();
+            const double repair_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - repair_start).count();
+            const double canonical_objective =
+                gravityx::rebuild_base_state_derived_fields(
+                    candidate_data, base.commitment,
+                    repaired.solve.state);
+            repaired.solve.objective = canonical_objective;
+            const auto validation = gravityx::validate_state(
+                candidate_data, gravityx::ModelMode::BaseSoft,
+                repaired.solve.state, base.commitment);
+            const bool feasible = gravityx::validated_candidate_is_feasible(
+                repaired.solve, validation, 1e-5);
+
+            TransformerCoordinateCandidate candidate;
+            candidate.branch_position = position;
+            candidate.old_step = old_step;
+            candidate.new_step = new_step;
+            candidate.old_value = old_value;
+            candidate.new_value = std::abs(candidate_branch.control_mode) == 1
+                ? candidate_branch.tap : candidate_branch.shift;
+            candidate.objective = canonical_objective;
+            candidate.repair_wall_seconds = repair_seconds;
+            candidate.state = std::move(repaired.solve.state);
+            candidate.validation = validation;
+            collect_metrics(candidate);
+
+            auto trial = transformer_coordinate_identity(
+                source_branch, position, old_step, new_step,
+                old_value, candidate.new_value);
+            trial.update({
+                {"feasible", feasible},
+                {"objective", canonical_objective},
+                {"objective_change", canonical_objective - incumbent.objective},
+                {"maximum_sm_slack", candidate.maximum_sm_slack},
+                {"limiting_branch_sm_slack",
+                 candidate.limiting_branch_sm_slack},
+                {"total_sm_slack", candidate.total_sm_slack},
+                {"saturated_branch_count", candidate.saturated_branch_count},
+                {"repair_wall_seconds", repair_seconds},
+                {"max_residual", validation.max_residual},
+                {"worst_category", validation.worst_category},
+                {"worst_identity", validation.worst_identity},
+            });
+            repair_trials.push_back(trial);
+            std::cerr << "GRAVITYX_TRANSFORMER_CANDIDATE "
+                      << trial.dump() << '\n';
+            std::cerr.flush();
+            if (!feasible) {
+                continue;
+            }
+            ++feasible_repairs;
+            if (!best_direct_objective ||
+                candidate.objective > best_direct_objective->objective) {
+                best_direct_objective = candidate;
+            }
+            shortlist.push_back(std::move(candidate));
+            std::sort(shortlist.begin(), shortlist.end(), headroom_better);
+            if (static_cast<int>(shortlist.size()) > economic_candidate_count) {
+                shortlist.resize(economic_candidate_count);
+            }
+        }
+        if (time_limit_reached) {
+            break;
+        }
+    }
+    if (best_direct_objective) {
+        const bool already_shortlisted = std::any_of(
+            shortlist.begin(), shortlist.end(),
+            [&](const TransformerCoordinateCandidate& candidate) {
+                return candidate.branch_position ==
+                        best_direct_objective->branch_position &&
+                    candidate.new_step == best_direct_objective->new_step;
+            });
+        if (!already_shortlisted) {
+            shortlist.push_back(*best_direct_objective);
+        }
+    }
+
+    gravityx::SolveResult selected = incumbent;
+    gravityx::ValidationReport selected_validation = incumbent_validation;
+    std::optional<TransformerCoordinateCandidate> selected_candidate;
+    if (best_direct_objective &&
+        best_direct_objective->objective > selected.objective + 1e-9) {
+        selected.status = 0;
+        selected.objective = best_direct_objective->objective;
+        selected.state = best_direct_objective->state;
+        selected_validation = best_direct_objective->validation;
+        selected_candidate = *best_direct_objective;
+    }
+
+    nlohmann::json economic_trials = nlohmann::json::array();
+    for (const auto& candidate : shortlist) {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        const double remaining = time_limit_seconds - elapsed - 1.0;
+        if (remaining <= 0.1) {
+            time_limit_reached = true;
+            break;
+        }
+        auto candidate_data = data;
+        gravityx::set_transformer_step(
+            candidate_data.branches[candidate.branch_position],
+            candidate.new_step);
+        gravityx::SolveResult candidate_incumbent;
+        candidate_incumbent.status = 0;
+        candidate_incumbent.objective = candidate.objective;
+        candidate_incumbent.state = candidate.state;
+        gravityx::ActiveNetworkEconomicDispatchOptions options;
+        options.time_limit_seconds = std::min(
+            economic_seconds_per_candidate, remaining);
+        options.maximum_rounds = 32;
+        options.maximum_candidate_trials = 5;
+        options.adaptive_candidate_fractions = true;
+        options.accept_first_improving_fraction = true;
+        options.compact_signed_columns = true;
+        options.eliminate_angles = true;
+        options.reduced_pv_pq_partition = true;
+        options.thermal_polygon_side_cuts = 1;
+        options.generation_trust_radius = 0.02;
+        options.load_factor_trust_radius = 0.002;
+        const auto refinement =
+            gravityx::refine_fixed_commitment_active_network_economic(
+                candidate_data, base.commitment,
+                candidate_incumbent, options);
+        auto trial = transformer_coordinate_identity(
+            data.branches[candidate.branch_position],
+            candidate.branch_position,
+            candidate.old_step, candidate.new_step,
+            candidate.old_value, candidate.new_value);
+        trial["repair_objective"] = candidate.objective;
+        trial["economic_refinement"] = refinement.to_json(false);
+        economic_trials.push_back(std::move(trial));
+        if (refinement.incumbent_verified &&
+            refinement.selected_validation.max_residual <= 1e-5 &&
+            refinement.selected_objective > selected.objective + 1e-9) {
+            selected = refinement.selected;
+            selected_validation = refinement.selected_validation;
+            selected_candidate = candidate;
+        }
+    }
+
+    const double wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    nlohmann::json selected_override = nullptr;
+    nlohmann::json selected_overrides = inherited_overrides;
+    if (selected_candidate) {
+        selected_override = transformer_coordinate_identity(
+            data.branches[selected_candidate->branch_position],
+            selected_candidate->branch_position,
+            selected_candidate->old_step,
+            selected_candidate->new_step,
+            selected_candidate->old_value,
+            selected_candidate->new_value);
+        bool replaced_inherited = false;
+        for (auto& inherited : selected_overrides) {
+            if (inherited.at("branch_index").get<int>() ==
+                    data.branches[selected_candidate->branch_position].index) {
+                inherited = selected_override;
+                replaced_inherited = true;
+                break;
+            }
+        }
+        if (!replaced_inherited) {
+            selected_overrides.push_back(selected_override);
+        }
+    }
+    const nlohmann::json output = {
+        {"success", selected_validation.max_residual <= 1e-5},
+        {"diagnostic_only", true},
+        {"case", data.name},
+        {"case_path", case_path},
+        {"base_result_path", base_result_path},
+        {"requested_time_limit_seconds", time_limit_seconds},
+        {"time_limit_reached", time_limit_reached},
+        {"wall_seconds", wall_seconds},
+        {"source_control_count", controlled_positions.size()},
+        {"source_controls", std::move(source_controls)},
+        {"limiting_branch_position", limiting_branch_position},
+        {"attempted_repairs", attempted_repairs},
+        {"feasible_repairs", feasible_repairs},
+        {"incumbent_objective", incumbent.objective},
+        {"selected_objective", selected.objective},
+        {"objective_improvement", selected.objective - incumbent.objective},
+        {"improved", selected_candidate.has_value()},
+        {"selected_transformer_override", selected_override},
+        {"transformer_overrides", selected_overrides},
+        {"commitment", base.commitment},
+        {"selected_state", gravityx::ac_state_to_json(selected.state)},
+        {"base", gravityx::solve_result_to_json(selected, true)},
+        {"base_validation", selected_validation.to_json()},
+        {"selected", gravityx::solve_result_to_json(selected, true)},
+        {"selected_validation", selected_validation.to_json()},
+        {"repair_trials", std::move(repair_trials)},
+        {"economic_trials", std::move(economic_trials)},
+    };
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", selected_validation.max_residual <= 1e-5},
+        {"time_limit_reached", time_limit_reached},
+        {"source_control_count", controlled_positions.size()},
+        {"attempted_repairs", attempted_repairs},
+        {"feasible_repairs", feasible_repairs},
+        {"incumbent_objective", incumbent.objective},
+        {"selected_objective", selected.objective},
+        {"objective_improvement", selected.objective - incumbent.objective},
+        {"selected_transformer_override", selected_override},
+        {"max_residual", selected_validation.max_residual},
+        {"wall_seconds", wall_seconds},
+    }).dump(2) << '\n';
+    return selected_validation.max_residual <= 1e-5 ? 0 : 1;
+}
+
+int run_transformer_override_diagnostic_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds,
+    const std::string& override_specification) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "transformer-override time limit must be finite and positive");
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto data = gravityx::CaseData::load(case_path);
+    const auto input_json = read_json_file(base_result_path);
+    std::vector<int> commitment;
+    gravityx::AcState input_state;
+    if (input_json.contains("commitment")) {
+        commitment = input_json.at("commitment").get<std::vector<int>>();
+    } else if (input_json.contains("base_result_path")) {
+        const auto parent_json = read_json_file(
+            input_json.at("base_result_path").get<std::string>());
+        commitment = parent_json.at("commitment").get<std::vector<int>>();
+    } else {
+        throw std::runtime_error(
+            "transformer-override input lacks commitment provenance");
+    }
+    if (input_json.contains("selected_state")) {
+        input_state = gravityx::ac_state_from_json(
+            input_json.at("selected_state"));
+    } else if (input_json.contains("selected") &&
+               input_json.at("selected").contains("state")) {
+        input_state = gravityx::ac_state_from_json(
+            input_json.at("selected").at("state"));
+    } else {
+        throw std::runtime_error(
+            "transformer-override input lacks a selected AC state");
+    }
+
+    nlohmann::json overrides = nlohmann::json::array();
+    std::unordered_map<int, int> inherited_branch_steps;
+    if (input_json.contains("transformer_overrides")) {
+        for (const auto& inherited :
+             input_json.at("transformer_overrides")) {
+            const int branch_index =
+                inherited.at("branch_index").get<int>();
+            const int step = inherited.at("new_step").get<int>();
+            const auto match = std::find_if(
+                data.branches.begin(), data.branches.end(),
+                [branch_index](const gravityx::Branch& branch) {
+                    return branch.index == branch_index;
+                });
+            if (match == data.branches.end()) {
+                throw std::runtime_error(
+                    "inherited transformer override references a missing branch: " +
+                    std::to_string(branch_index));
+            }
+            gravityx::set_transformer_step(*match, step);
+            inherited_branch_steps.emplace(branch_index, step);
+            overrides.push_back(inherited);
+        }
+    }
+
+    gravityx::SolveResult original;
+    original.status = 0;
+    original.state = input_state;
+    original.objective = gravityx::rebuild_base_state_derived_fields(
+        data, commitment, original.state);
+    const auto original_validation = gravityx::validate_state(
+        data, gravityx::ModelMode::BaseSoft,
+        original.state, commitment);
+    if (!gravityx::validated_candidate_is_feasible(
+            original, original_validation, 1e-5)) {
+        throw std::runtime_error(
+            "transformer-override diagnostic requires a verified base incumbent");
+    }
+
+    std::unordered_set<int> seen_branch_indices;
+    std::stringstream specification(override_specification);
+    std::string token;
+    while (std::getline(specification, token, ',')) {
+        const auto separator = token.find(':');
+        if (separator == std::string::npos ||
+            token.find(':', separator + 1) != std::string::npos) {
+            throw std::runtime_error(
+                "transformer override must use BRANCH_INDEX:STEP entries");
+        }
+        const int branch_index = std::stoi(token.substr(0, separator));
+        const int new_step = std::stoi(token.substr(separator + 1));
+        const auto inherited = inherited_branch_steps.find(branch_index);
+        if (inherited != inherited_branch_steps.end()) {
+            if (inherited->second == new_step) {
+                continue;
+            }
+        }
+        if (!seen_branch_indices.insert(branch_index).second) {
+            throw std::runtime_error(
+                "duplicate transformer override branch index: " +
+                std::to_string(branch_index));
+        }
+        const auto match = std::find_if(
+            data.branches.begin(), data.branches.end(),
+            [branch_index](const gravityx::Branch& branch) {
+                return branch.index == branch_index;
+            });
+        if (match == data.branches.end()) {
+            throw std::runtime_error(
+                "transformer override references a missing branch index: " +
+                std::to_string(branch_index));
+        }
+        const int position = static_cast<int>(std::distance(
+            data.branches.begin(), match));
+        const int old_step = std::abs(match->control_mode) == 1
+            ? match->tm_step : match->ta_step;
+        const double old_value = std::abs(match->control_mode) == 1
+            ? match->tap : match->shift;
+        gravityx::set_transformer_step(*match, new_step);
+        const double new_value = std::abs(match->control_mode) == 1
+            ? match->tap : match->shift;
+        auto replacement = transformer_coordinate_identity(
+            *match, position, old_step, new_step, old_value, new_value);
+        bool replaced_inherited_override = false;
+        if (inherited != inherited_branch_steps.end()) {
+            for (auto& prior : overrides) {
+                if (prior.at("branch_index").get<int>() == branch_index) {
+                    prior = replacement;
+                    replaced_inherited_override = true;
+                    break;
+                }
+            }
+            inherited->second = new_step;
+        }
+        if (!replaced_inherited_override) {
+            overrides.push_back(std::move(replacement));
+        }
+    }
+    if (overrides.empty()) {
+        throw std::runtime_error(
+            "transformer override specification is empty");
+    }
+
+    gravityx::SolveResult transformed;
+    transformed.status = 0;
+    transformed.state = original.state;
+    transformed.objective = gravityx::rebuild_base_state_derived_fields(
+        data, commitment, transformed.state);
+    const auto transformed_validation = gravityx::validate_state(
+        data, gravityx::ModelMode::BaseSoft,
+        transformed.state, commitment);
+    const bool transformed_feasible =
+        gravityx::validated_candidate_is_feasible(
+            transformed, transformed_validation, 1e-5);
+
+    auto seed_state = transformed.state;
+    gravityx::FastPowerFlowOptions repair_options;
+    repair_options.minimize_active_balance_slack = true;
+    repair_options.minimize_reactive_balance_slack = true;
+    repair_options.skip_balance_cleanup_prepasses = true;
+    repair_options.max_newton_iterations = 25;
+    repair_options.validation_tolerance = 1e-5;
+    gravityx::FastContingencyPowerFlow repair_solver(
+        data, seed_state, commitment, repair_options);
+    auto repaired = repair_solver.solve_base();
+    repaired.solve.objective = gravityx::rebuild_base_state_derived_fields(
+        data, commitment, repaired.solve.state);
+    repaired.validation = gravityx::validate_state(
+        data, gravityx::ModelMode::BaseSoft,
+        repaired.solve.state, commitment);
+    const bool repair_feasible = gravityx::validated_candidate_is_feasible(
+        repaired.solve, repaired.validation, 1e-5);
+
+    gravityx::SolveResult selected = transformed;
+    gravityx::ValidationReport selected_validation = transformed_validation;
+    if (repair_feasible &&
+        (!transformed_feasible ||
+         repaired.solve.objective > transformed.objective + 1e-9)) {
+        selected = repaired.solve;
+        selected_validation = repaired.validation;
+    }
+    nlohmann::json refinement_json = nullptr;
+    if (repair_feasible) {
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        const double remaining = time_limit_seconds - elapsed - 1.0;
+        if (remaining > 0.1) {
+            gravityx::ActiveNetworkEconomicDispatchOptions options;
+            options.time_limit_seconds = remaining;
+            options.maximum_rounds = 128;
+            options.maximum_candidate_trials = 5;
+            options.adaptive_candidate_fractions = true;
+            options.accept_first_improving_fraction = true;
+            options.compact_signed_columns = true;
+            options.eliminate_angles = true;
+            options.reduced_pv_pq_partition = true;
+            options.thermal_polygon_side_cuts = 1;
+            options.generation_trust_radius = 0.02;
+            options.load_factor_trust_radius = 0.002;
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_REDUCED_PV_PQ")) {
+                options.reduced_pv_pq_partition =
+                    std::string(value) != "0";
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_STABLE_PV_PQ")) {
+                options.stable_reduced_pv_pq_partition =
+                    std::string(value) != "0";
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_REACTIVE_GUARD_ROWS")) {
+                options.reactive_capability_guard_row_target =
+                    std::max(0, std::stoi(value));
+                options.maximum_trust_region_rows_per_pass = std::max(
+                    options.maximum_trust_region_rows_per_pass,
+                    options.reactive_capability_guard_row_target);
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_THERMAL_UTILIZATION")) {
+                options.thermal_row_utilization_threshold =
+                    std::stod(value);
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_REUSE_SIMPLEX_BASIS")) {
+                options.reuse_simplex_basis_between_rounds =
+                    std::string(value) != "0";
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_MAXIMUM_ROUNDS")) {
+                options.maximum_rounds =
+                    std::max(1, std::stoi(value));
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_GENERATION_TRUST")) {
+                options.generation_trust_radius = std::stod(value);
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_LOAD_TRUST")) {
+                options.load_factor_trust_radius = std::stod(value);
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_OPTIMIZE_SHUNTS")) {
+                options.optimize_switched_shunts =
+                    std::string(value) != "0";
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_SHUNT_TRUST")) {
+                options.switched_shunt_susceptance_trust_radius =
+                    std::stod(value);
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_SHUNT_BUDGET")) {
+                options.switched_shunt_total_movement_budget =
+                    std::stod(value);
+            }
+            if (const char* value = std::getenv(
+                    "GRAVITYX_TRANSFORMER_SHUNT_PENALTY")) {
+                options.switched_shunt_movement_penalty =
+                    std::stod(value);
+            }
+            const auto refinement =
+                gravityx::refine_fixed_commitment_active_network_economic(
+                    data, commitment, selected, options);
+            refinement_json = refinement.to_json(false);
+            if (refinement.incumbent_verified &&
+                refinement.selected_validation.max_residual <= 1e-5 &&
+                refinement.selected_objective > selected.objective + 1e-9) {
+                selected = refinement.selected;
+                selected_validation = refinement.selected_validation;
+            }
+        }
+    }
+    const double wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    const bool improved = repair_feasible &&
+        selected.objective > original.objective + 1e-9;
+    const nlohmann::json output = {
+        {"success", selected_validation.max_residual <= 1e-5},
+        {"diagnostic_only", true},
+        {"case", data.name},
+        {"case_path", case_path},
+        {"base_result_path", base_result_path},
+        {"requested_time_limit_seconds", time_limit_seconds},
+        {"override_specification", override_specification},
+        {"transformer_overrides", overrides},
+        {"commitment", commitment},
+        {"selected_state", gravityx::ac_state_to_json(selected.state)},
+        {"base", gravityx::solve_result_to_json(selected, true)},
+        {"base_validation", selected_validation.to_json()},
+        {"transformed_feasible", transformed_feasible},
+        {"transformed_validation", transformed_validation.to_json()},
+        {"repair_feasible", repair_feasible},
+        {"repair", repaired.to_json()},
+        {"economic_refinement", refinement_json},
+        {"incumbent_objective", original.objective},
+        {"selected_objective", selected.objective},
+        {"objective_improvement", selected.objective - original.objective},
+        {"improved", improved},
+        {"selected", gravityx::solve_result_to_json(selected, true)},
+        {"selected_validation", selected_validation.to_json()},
+        {"wall_seconds", wall_seconds},
+    };
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", selected_validation.max_residual <= 1e-5},
+        {"repair_feasible", repair_feasible},
+        {"override_count", overrides.size()},
+        {"incumbent_objective", original.objective},
+        {"repaired_objective", repaired.solve.objective},
+        {"selected_objective", selected.objective},
+        {"objective_improvement", selected.objective - original.objective},
+        {"max_residual", selected_validation.max_residual},
+        {"wall_seconds", wall_seconds},
+    }).dump(2) << '\n';
+    return selected_validation.max_residual <= 1e-5 ? 0 : 1;
+}
+
+int run_reduced_network_commitment_json(
+    const std::string& case_path,
+    const std::string& base_result_path,
+    const std::string& output_path,
+    double time_limit_seconds) {
+    reject_onedrive(case_path);
+    reject_onedrive(base_result_path);
+    reject_onedrive(output_path);
+    if (!std::isfinite(time_limit_seconds) || time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "reduced-network commitment time limit must be finite and positive");
+    }
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
+    const auto input_json = read_json_file(base_result_path);
+    auto base = load_base_point(base_result_path);
+    bool used_reduced_commitment_frontier = false;
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_USE_PRIOR_FRONTIER");
+        value != nullptr && std::string(value) != "0") {
+        if (!input_json.contains("reduced_network_frontier_commitment") ||
+            !input_json.contains("reduced_network_frontier_state")) {
+            throw std::runtime_error(
+                "requested prior reduced-commitment frontier is absent");
+        }
+        base.commitment = input_json.at(
+            "reduced_network_frontier_commitment").get<std::vector<int>>();
+        base.state = gravityx::ac_state_from_json(
+            input_json.at("reduced_network_frontier_state"));
+        used_reduced_commitment_frontier = true;
+    }
+    gravityx::SolveResult incumbent;
+    incumbent.status = 0;
+    incumbent.state = base.state;
+    gravityx::ReducedNetworkCommitmentOptions options;
+    options.time_limit_seconds = time_limit_seconds;
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_PROPOSAL_SECONDS")) {
+        options.proposal_time_limit_seconds = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_ROUNDS")) {
+        options.maximum_rounds = std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_CHANGES_PER_ROUND")) {
+        options.maximum_commitment_changes_per_round =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_MIN_CHANGES_PER_ROUND")) {
+        options.minimum_commitment_changes_per_round =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_CANDIDATES")) {
+        options.maximum_candidate_generators =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REJECTED_PATTERNS")) {
+        options.maximum_rejected_patterns_per_round =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_CONSTRAINT_PASSES")) {
+        options.maximum_constraint_generation_passes =
+            std::max(0, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_ROWS_PER_PASS")) {
+        options.maximum_rows_per_constraint_pass =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_SHUTDOWNS_PER_BUS")) {
+        options.maximum_new_shutdowns_per_bus =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_STARTUP_CANDIDATES")) {
+        options.maximum_startup_correction_candidates =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_STARTUP_CANDIDATE_OFFSET")) {
+        options.startup_correction_candidate_offset =
+            std::max(0, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_MOVABLE_LOADS")) {
+        options.maximum_movable_loads =
+            std::max(0, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REACTIVE_PREP")) {
+        options.prepare_reactive_headroom =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REACTIVE_PREP_BUSES")) {
+        options.reactive_headroom_maximum_buses =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REACTIVE_PREP_VOLTAGE")) {
+        options.reactive_headroom_maximum_voltage_step =
+            std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REACTIVE_PREP_MARGIN")) {
+        options.reactive_headroom_margin = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REACTIVE_PREP_MAX_RESIDUAL")) {
+        options.reactive_headroom_maximum_residual = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_GENERATION_TRUST")) {
+        options.generation_trust_radius = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_LOAD_TRUST")) {
+        options.load_factor_trust_radius = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_LOAD_MOVEMENT")) {
+        options.freeze_load_movement = std::string(value) == "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_HEADROOM")) {
+        options.enforce_generator_contingency_headroom =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_CONTINUATION")) {
+        options.allow_nonimproving_continuation =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_STARTUP_CORRECTIONS")) {
+        options.allow_startup_corrections_at_pv_bus =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_EXPAND_CANDIDATES")) {
+        options.expand_candidate_pool_beyond_component_proposal =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REQUIRE_STARTUP_CORRECTION")) {
+        options.require_one_startup_correction =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REQUIRE_SAME_BUS_SHUTDOWN")) {
+        options.require_additional_same_bus_shutdown =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_SAME_BUS_PRIOR_SHUTDOWNS")) {
+        options.same_bus_minimum_prior_shutdowns =
+            std::max(1, std::stoi(value));
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REQUIRE_MIXED_REACTIVE")) {
+        options.require_mixed_reactive_shutdowns =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REQUIRE_REACTIVE_SHUTDOWN")) {
+        options.require_reactive_coupled_shutdown =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_ENUMERATE_PATTERNS")) {
+        options.enumerate_nonimproving_patterns =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_ENUMERATE_IMPROVEMENTS")) {
+        options.enumerate_improving_patterns =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_DIVERSIFY_REACTIVE_SHUTDOWNS")) {
+        options.diversify_reactive_shutdowns_between_patterns =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_INCREMENTAL")) {
+        options.reuse_solver_between_constraint_passes =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_REUSE_CANDIDATES")) {
+        options.reuse_component_proposal_candidates =
+            std::string(value) != "0";
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_POST_REPAIR_ECONOMIC_SECONDS")) {
+        options.post_repair_economic_seconds = std::stod(value);
+    }
+    if (const char* value = std::getenv(
+            "GRAVITYX_REDUCED_COMMITMENT_POST_REPAIR_ECONOMIC_ROUNDS")) {
+        options.post_repair_economic_maximum_rounds =
+            std::max(1, std::stoi(value));
+    }
+    const auto refinement =
+        gravityx::refine_reduced_network_economic_commitment(
+            data, base.commitment, incumbent, options);
+
+    auto output = input_json;
+    output["success"] = refinement.incumbent_verified;
+    output["reduced_network_economic_commitment"] =
+        refinement.to_json(false);
+    output["reduced_network_used_prior_frontier"] =
+        used_reduced_commitment_frontier;
+    output["reduced_network_frontier_commitment"] =
+        refinement.frontier_commitment;
+    output["reduced_network_frontier_state"] =
+        gravityx::ac_state_to_json(refinement.frontier.state);
+    output["reduced_network_frontier_validation"] =
+        refinement.frontier_validation.to_json();
+    output["base_optimization_performed"] = true;
+    output["commitment"] = refinement.selected_commitment;
+    output["base"] = gravityx::solve_result_to_json(
+        refinement.selected, true);
+    output["base_validation"] =
+        refinement.selected_validation.to_json();
+    output["selected_state"] =
+        gravityx::ac_state_to_json(refinement.selected.state);
+    output["wall_seconds"] =
+        input_json.value("wall_seconds", 0.0) + refinement.wall_seconds;
+    if (refinement.improved) {
+        output["base_method"] =
+            "verified_reduced_network_economic_commitment";
+    }
+    write_json_file(output_path, output);
+    std::cout << nlohmann::json({
+        {"output", output_path},
+        {"success", refinement.incumbent_verified},
+        {"proposal_feasible", refinement.proposal_feasible},
+        {"improved", refinement.improved},
+        {"time_limit_reached", refinement.time_limit_reached},
+        {"incumbent_official_proxy",
+         refinement.incumbent_official_proxy},
+        {"selected_official_proxy",
+         refinement.selected_official_proxy},
+        {"proposal_change_count",
+         refinement.proposal_change_count},
+        {"candidate_generator_count",
+         refinement.candidate_generator_count},
+        {"rounds_completed", refinement.rounds_completed},
+        {"accepted_moves", refinement.accepted_moves},
+        {"best_incumbent_updates",
+         refinement.best_incumbent_updates},
+        {"frontier_official_proxy",
+         refinement.frontier_official_proxy},
+        {"rejected_patterns", refinement.rejected_patterns},
+        {"bus_shutdown_guard_rejections",
+         refinement.bus_shutdown_guard_rejections},
+        {"solver_wall_seconds", refinement.solver_wall_seconds},
+        {"repair_wall_seconds", refinement.repair_wall_seconds},
+        {"economic_polish_wall_seconds",
+         refinement.economic_polish_wall_seconds},
+        {"economic_polish_attempts",
+         refinement.economic_polish_attempts},
+        {"economic_polish_improvements",
+         refinement.economic_polish_improvements},
+        {"wall_seconds", refinement.wall_seconds},
+        {"max_residual", refinement.selected_validation.max_residual},
+        {"status", refinement.status},
+    }).dump(2) << '\n';
+    return refinement.incumbent_verified ? 0 : 1;
+}
+
 int run_sparse_ac_economic_json(
     const std::string& case_path,
     const std::string& base_result_path,
@@ -3964,7 +5603,8 @@ int run_sparse_ac_economic_json(
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     reject_onedrive(output_path);
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto input_json = read_json_file(base_result_path);
     const auto base = load_base_point(base_result_path);
     gravityx::SolveResult incumbent;
@@ -3973,6 +5613,11 @@ int run_sparse_ac_economic_json(
     gravityx::SparseAcEconomicOptions options;
     options.time_limit_seconds = time_limit_seconds;
     options.print_level = print_level;
+    if (const char* value =
+            std::getenv("GRAVITYX_SPARSE_AC_BOUND_ACTIVE_START")) {
+        options.preserve_bound_active_start =
+            std::string(value) != "0";
+    }
     const auto refinement =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, base.commitment, incumbent, options);
@@ -5270,7 +6915,13 @@ int solve_contingency(
     int print_level) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
-    const auto data = gravityx::CaseData::load(case_path);
+    auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
+    if (const char* corrective_transformer_overrides = std::getenv(
+            "GRAVITYX_CONTINGENCY_TRANSFORMER_OVERRIDES")) {
+        apply_transformer_override_specification(
+            data, corrective_transformer_overrides);
+    }
     const auto base = load_base_point(base_result_path);
     return solve_loaded_contingency(
         data, base, label, output_path, print_level) ? 0 : 1;
@@ -5283,7 +6934,8 @@ int screen_all_contingencies(
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     reject_onedrive(output_path);
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto base = load_base_point(base_result_path);
     gravityx::FastContingencyPowerFlow screen(
         data, base.state, base.commitment);
@@ -5327,7 +6979,8 @@ int solve_contingency_batch(
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     reject_onedrive(manifest_path);
-    const auto data = gravityx::CaseData::load(case_path);
+    const auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
     const auto base = load_base_point(base_result_path);
     const auto manifest = read_json_file(manifest_path);
     if (!manifest.contains("tasks") || !manifest.at("tasks").is_array() ||
@@ -5365,7 +7018,13 @@ int run_contingency_worker(
     bool economic_contingency_polish) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
-    const auto data = gravityx::CaseData::load(case_path);
+    auto data = load_case_with_base_transformer_overrides(
+        case_path, base_result_path);
+    if (const char* corrective_transformer_overrides = std::getenv(
+            "GRAVITYX_CONTINGENCY_TRANSFORMER_OVERRIDES")) {
+        apply_transformer_override_specification(
+            data, corrective_transformer_overrides);
+    }
     const auto base = load_base_point(base_result_path);
     const gravityx::GoSolutionWriter solution_writer(data);
     if (fast_only && !fast_power_flow_screen) {
@@ -5401,6 +7060,16 @@ int run_contingency_worker(
             fast_options.economic_merit_allow_load_movement =
                 merit_load_movement != nullptr &&
                 std::string(merit_load_movement) != "0";
+            if (const char* bus_local_merit = std::getenv(
+                    "GRAVITYX_ECONOMIC_BUS_LOCAL_MERIT")) {
+                fast_options.economic_bus_local_merit_redispatch =
+                    std::string(bus_local_merit) != "0";
+            }
+            if (const char* bus_local_load = std::getenv(
+                    "GRAVITYX_ECONOMIC_BUS_LOCAL_LOAD_MOVEMENT")) {
+                fast_options.economic_bus_local_allow_load_movement =
+                    std::string(bus_local_load) != "0";
+            }
             const char* merit_anchored_retry =
                 std::getenv("GRAVITYX_ECONOMIC_MERIT_ANCHORED_RETRY");
             fast_options.economic_merit_retry_from_fallback =
@@ -5414,17 +7083,168 @@ int run_contingency_worker(
             fast_options.economic_balance_polish_objective_threshold =
                 std::numeric_limits<double>::infinity();
             fast_options.economic_linearized_objective_threshold = 1e5;
+            if (const char* linearized_threshold = std::getenv(
+                    "GRAVITYX_ECONOMIC_LINEARIZED_THRESHOLD")) {
+                const double parsed_threshold =
+                    std::stod(linearized_threshold);
+                if (!std::isfinite(parsed_threshold)) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_LINEARIZED_THRESHOLD must be "
+                        "finite");
+                }
+                fast_options.economic_linearized_objective_threshold =
+                    parsed_threshold;
+            }
             fast_options.max_economic_linearized_polish_rounds = 1;
+            if (const char* linearized_rounds = std::getenv(
+                    "GRAVITYX_ECONOMIC_LINEARIZED_ROUNDS")) {
+                fast_options.max_economic_linearized_polish_rounds =
+                    std::max(0, std::stoi(linearized_rounds));
+            }
             fast_options.economic_linearized_polish_seconds = 2.0;
+            if (const char* linearized_seconds = std::getenv(
+                    "GRAVITYX_ECONOMIC_LINEARIZED_SECONDS")) {
+                const double parsed_seconds = std::stod(linearized_seconds);
+                if (!std::isfinite(parsed_seconds) ||
+                    parsed_seconds <= 0.0) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_LINEARIZED_SECONDS must be finite "
+                        "and positive");
+                }
+                fast_options.economic_linearized_polish_seconds =
+                    parsed_seconds;
+            }
             fast_options.max_economic_linearized_phase_two_rounds = 0;
+            if (const char* phase_two_rounds = std::getenv(
+                    "GRAVITYX_ECONOMIC_PHASE_TWO_ROUNDS")) {
+                fast_options.max_economic_linearized_phase_two_rounds =
+                    std::max(0, std::stoi(phase_two_rounds));
+            }
+            if (const char* phase_two_seconds = std::getenv(
+                    "GRAVITYX_ECONOMIC_PHASE_TWO_SECONDS")) {
+                const double parsed_seconds = std::stod(phase_two_seconds);
+                if (!std::isfinite(parsed_seconds) ||
+                    parsed_seconds <= 0.0) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_PHASE_TWO_SECONDS must be finite "
+                        "and positive");
+                }
+                fast_options.economic_linearized_phase_two_seconds =
+                    parsed_seconds;
+            }
+            if (const char* polish_iterations = std::getenv(
+                    "GRAVITYX_ECONOMIC_BALANCE_POLISH_ITERATIONS")) {
+                fast_options.max_economic_balance_polish_iterations =
+                    std::max(1, std::stoi(polish_iterations));
+            }
             fast_options.economic_balance_polish_wall_seconds = 4.0;
+            if (const char* polish_seconds = std::getenv(
+                    "GRAVITYX_ECONOMIC_BALANCE_POLISH_SECONDS")) {
+                const double parsed_seconds = std::stod(polish_seconds);
+                if (!std::isfinite(parsed_seconds) ||
+                    parsed_seconds <= 0.0) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_BALANCE_POLISH_SECONDS must be "
+                        "finite and positive");
+                }
+                fast_options.economic_balance_polish_wall_seconds =
+                    parsed_seconds;
+            }
             fast_options.max_economic_reactive_zero_balance_rounds = 8;
             fast_options.economic_reactive_zero_balance_objective_threshold =
                 1.8e5;
             fast_options.economic_reactive_zero_balance_trigger_slack = 0.25;
+            if (const char* reactive_phase_one = std::getenv(
+                    "GRAVITYX_ECONOMIC_REACTIVE_PHASE_ONE")) {
+                fast_options.economic_reactive_phase_one =
+                    std::string(reactive_phase_one) != "0";
+            }
+            if (const char* reactive_phase_one_seconds = std::getenv(
+                    "GRAVITYX_ECONOMIC_REACTIVE_PHASE_ONE_SECONDS")) {
+                const double parsed_seconds =
+                    std::stod(reactive_phase_one_seconds);
+                if (!std::isfinite(parsed_seconds) ||
+                    parsed_seconds <= 0.0) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_REACTIVE_PHASE_ONE_SECONDS must "
+                        "be finite and positive");
+                }
+                fast_options.economic_reactive_phase_one_seconds =
+                    parsed_seconds;
+            }
+            if (const char* reactive_phase_one_voltage_trust = std::getenv(
+                    "GRAVITYX_ECONOMIC_REACTIVE_PHASE_ONE_VOLTAGE_TRUST")) {
+                const double parsed_trust =
+                    std::stod(reactive_phase_one_voltage_trust);
+                if (!std::isfinite(parsed_trust) || parsed_trust <= 0.0) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_REACTIVE_PHASE_ONE_VOLTAGE_TRUST "
+                        "must be finite and positive");
+                }
+                fast_options
+                    .economic_reactive_phase_one_voltage_trust_radius =
+                    parsed_trust;
+            }
+            if (const char* phase_one_seconds = std::getenv(
+                    "GRAVITYX_ECONOMIC_PROJECTED_PHASE_ONE_SECONDS")) {
+                const double parsed_seconds = std::stod(phase_one_seconds);
+                if (!std::isfinite(parsed_seconds) ||
+                    parsed_seconds <= 0.0) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_PROJECTED_PHASE_ONE_SECONDS must "
+                        "be finite and positive");
+                }
+                fast_options.economic_projected_exact_phase_one_seconds =
+                    parsed_seconds;
+            }
             fast_options.economic_exact_newton_rescue = true;
-            fast_options.economic_exact_newton_objective_threshold = 1.8e5;
+            if (const char* reuse_symbolic = std::getenv(
+                    "GRAVITYX_ECONOMIC_EXACT_REUSE_SYMBOLIC")) {
+                fast_options
+                    .economic_exact_newton_reuse_symbolic_analysis =
+                    std::string(reuse_symbolic) != "0";
+            }
+            if (const char* reuse_numeric = std::getenv(
+                    "GRAVITYX_ECONOMIC_EXACT_REUSE_NUMERIC")) {
+                fast_options
+                    .economic_exact_newton_reuse_numeric_factorization =
+                    std::string(reuse_numeric) != "0";
+            }
+            if (const char* reuse_q_active_set = std::getenv(
+                    "GRAVITYX_ECONOMIC_EXACT_REUSE_Q_ACTIVE_SET")) {
+                fast_options.economic_exact_newton_reuse_q_active_set =
+                    std::string(reuse_q_active_set) != "0";
+            }
+            auto verified_base_state = base.state;
+            const double verified_base_objective =
+                gravityx::rebuild_base_state_derived_fields(
+                    data, base.commitment, verified_base_state);
+            // The exact sparse-Newton tail is valuable for genuinely damaged
+            // outage economics, but it is wasted on a corrective state that
+            // is already close to its verified base objective.  Scale the
+            // gate with each scenario instead of embedding a 19k-specific
+            // absolute score.  Every skipped state is still the existing
+            // independently validated incumbent.
+            fast_options.economic_exact_newton_objective_threshold =
+                verified_base_objective -
+                0.06 * std::max(1.0, std::abs(verified_base_objective));
+            if (const char* exact_threshold = std::getenv(
+                    "GRAVITYX_ECONOMIC_EXACT_THRESHOLD")) {
+                const double parsed_threshold =
+                    std::stod(exact_threshold);
+                if (!std::isfinite(parsed_threshold)) {
+                    throw std::runtime_error(
+                        "GRAVITYX_ECONOMIC_EXACT_THRESHOLD must be finite");
+                }
+                fast_options.economic_exact_newton_objective_threshold =
+                    parsed_threshold;
+            }
             fast_options.economic_exact_newton_max_iterations = 15;
+            if (const char* target_fraction = std::getenv(
+                    "GRAVITYX_ECONOMIC_EXACT_TARGET_FRACTION")) {
+                fast_options.economic_exact_newton_target_fraction =
+                    std::stod(target_fraction);
+            }
         }
         const char* fast_diagnostics =
             std::getenv("GRAVITYX_FAST_PF_DIAGNOSTICS");
@@ -5824,6 +7644,23 @@ int main(int argc, char** argv) {
             return run_active_network_economic_dispatch_json(
                 argv[2], argv[3], argv[4], std::stod(argv[5]));
         }
+        if (argc == 6 &&
+            std::string(argv[1]) ==
+                "transformer-coordinate-diagnostic-json") {
+            return run_transformer_coordinate_diagnostic_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]));
+        }
+        if (argc == 7 &&
+            std::string(argv[1]) ==
+                "transformer-override-diagnostic-json") {
+            return run_transformer_override_diagnostic_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]), argv[6]);
+        }
+        if (argc == 6 && std::string(argv[1]) ==
+                "reduced-network-commitment-base-json") {
+            return run_reduced_network_commitment_json(
+                argv[2], argv[3], argv[4], std::stod(argv[5]));
+        }
         if ((argc == 6 || argc == 7) &&
             std::string(argv[1]) == "sparse-ac-economic-base-json") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;
@@ -5896,6 +7733,8 @@ int main(int argc, char** argv) {
                   << "  gravityx_go2 component-commitment-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
                   << "  gravityx_go2 greedy-commitment-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
                   << "  gravityx_go2 active-network-economic-base-json CASE.json BASE.json OUTPUT.json SECONDS\n"
+                  << "  gravityx_go2 transformer-coordinate-diagnostic-json CASE.json BASE.json OUTPUT.json SECONDS\n"
+                  << "  gravityx_go2 transformer-override-diagnostic-json CASE.json BASE.json OUTPUT.json SECONDS BRANCH_INDEX:STEP[,BRANCH_INDEX:STEP...]\n"
                   << "  gravityx_go2 sparse-ac-economic-base-json CASE.json BASE.json OUTPUT.json SECONDS [print-level]\n"
                   << "  gravityx_go2 solve-contingency CASE.json BASE.json LABEL OUTPUT.json [print-level]\n"
                   << "  gravityx_go2 screen-all-contingencies CASE.json BASE.json OUTPUT.json\n"

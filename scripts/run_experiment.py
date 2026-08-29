@@ -1937,10 +1937,23 @@ def cpp_command(
     distro: str,
     arguments: list[str],
     timeout: float,
+    environment: dict[str, str] | None = None,
 ) -> list[str]:
     if timeout <= 0:
         raise ValueError("C++ subprocess timeout must be positive")
     inner_timeout = max(timeout, 0.001)
+    environment_assignments: list[str] = []
+    for name, value in sorted((environment or {}).items()):
+        if re.fullmatch(r"GRAVITYX_[A-Z0-9_]+", name) is None:
+            raise ValueError(
+                "C++ subprocess environment names must use the "
+                f"GRAVITYX_ prefix: {name!r}"
+            )
+        if "\x00" in value:
+            raise ValueError(
+                f"C++ subprocess environment value contains NUL: {name}"
+            )
+        environment_assignments.append(f"{name}={value}")
     return [
         "wsl",
         "-d",
@@ -1950,6 +1963,7 @@ def cpp_command(
         f"LD_LIBRARY_PATH={WSL_LIBRARY_PATH}",
         "OMP_NUM_THREADS=1",
         "OPENBLAS_NUM_THREADS=1",
+        *environment_assignments,
         "timeout",
         "--signal=TERM",
         "--kill-after=5s",

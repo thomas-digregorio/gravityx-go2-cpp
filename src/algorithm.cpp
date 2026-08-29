@@ -685,6 +685,8 @@ nlohmann::json ComponentCommitmentResult::to_json(
         {"mip_start_accepted", mip_start_accepted},
         {"compact_pwl_formulation", compact_pwl_formulation},
         {"candidate_repair_attempted", candidate_repair_attempted},
+        {"candidate_repair_preserved_dispatch",
+         candidate_repair_preserved_dispatch},
         {"candidate_repair_feasible", candidate_repair_feasible},
         {"candidate_repair_converged", candidate_repair_converged},
         {"candidate_verified", candidate_verified},
@@ -2862,9 +2864,11 @@ ComponentCommitmentResult refine_component_economic_commitment(
             output.incumbent_penalty_slack + 1e-8;
     const double elapsed_before_repair = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - wall_start).count();
-    if (!output.candidate_verified &&
+    if (options.repair_candidate && !output.candidate_verified &&
         elapsed_before_repair < options.time_limit_seconds - 0.02) {
         output.candidate_repair_attempted = true;
+        output.candidate_repair_preserved_dispatch =
+            options.preserve_candidate_dispatch_during_repair;
         FastPowerFlowOptions fast_options;
         fast_options.minimize_active_balance_slack = true;
         fast_options.minimize_reactive_balance_slack = true;
@@ -2874,11 +2878,12 @@ ComponentCommitmentResult refine_component_economic_commitment(
             0.05, std::min(
                 1.0, options.time_limit_seconds -
                     elapsed_before_repair));
-        // A commitment change is a feasibility problem first.  Keep the local
-        // and active/reactive zero-balance prepasses enabled; unlike a fixed-
-        // commitment economic direction, there is no trusted injection target
-        // worth preserving if the newly shut unit leaves a local deficit.
-        fast_options.skip_balance_cleanup_prepasses = false;
+        // The default remains the legacy feasibility-first repair.  Economic
+        // proposal consumers can instead preserve the component-balanced MILP
+        // dispatch; exact Newton/Q-limit recovery and the complete validator
+        // still decide whether that candidate may replace the incumbent.
+        fast_options.skip_balance_cleanup_prepasses =
+            options.preserve_candidate_dispatch_during_repair;
         fast_options.max_newton_iterations = 30;
         fast_options.max_active_redispatch_passes = 12;
         fast_options.max_reactive_limit_passes = 8;
@@ -3190,6 +3195,7 @@ GreedyCommitmentSearchResult refine_greedy_economic_commitment(
     proposal_options.enforce_generator_contingency_headroom =
         options.enforce_generator_contingency_headroom;
     proposal_options.initialize_near_incumbent_dispatch = false;
+    proposal_options.repair_candidate = false;
     const auto proposal_start = std::chrono::steady_clock::now();
     const auto proposal = refine_component_economic_commitment(
         data, incumbent_commitment, output.selected, proposal_options);

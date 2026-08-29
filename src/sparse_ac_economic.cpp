@@ -1118,6 +1118,7 @@ nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
         {"candidate_verified", candidate_verified},
         {"best_intermediate_found", best_intermediate_found},
         {"improved", improved},
+        {"preserve_bound_active_start", preserve_bound_active_start},
         {"application_status", application_status},
         {"solver_return_status", solver_return_status},
         {"iterations", iterations},
@@ -1162,6 +1163,8 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
     const auto wall_start = std::chrono::steady_clock::now();
     SparseAcEconomicResult output;
     output.attempted = true;
+    output.preserve_bound_active_start =
+        options.preserve_bound_active_start;
     output.selected = incumbent;
     output.selected.status = 0;
     output.selected.objective = rebuild_base_state_derived_fields(
@@ -1191,6 +1194,33 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
         "mu_strategy", "adaptive");
     application->Options()->SetStringValue(
         "nlp_scaling_method", "gradient-based");
+    if (options.preserve_bound_active_start) {
+        // Keep the verified incumbent essentially where it was supplied.
+        // These are initialization controls only: source bounds, nonlinear
+        // equations, tolerances, and the independent acceptance gate remain
+        // unchanged.
+        constexpr double kInitialInterior = 1e-9;
+        application->Options()->SetNumericValue(
+            "bound_push", kInitialInterior);
+        application->Options()->SetNumericValue(
+            "bound_frac", kInitialInterior);
+        application->Options()->SetNumericValue(
+            "slack_bound_push", kInitialInterior);
+        application->Options()->SetNumericValue(
+            "slack_bound_frac", kInitialInterior);
+        application->Options()->SetNumericValue(
+            "bound_relax_factor", 0.0);
+        application->Options()->SetStringValue(
+            "honor_original_bounds", "yes");
+        // Adaptive free-mode can increase mu by several orders of magnitude
+        // after the first step.  On a high-quality bound-active incumbent
+        // that recreates the same destructive central-path excursion the
+        // small bound push is meant to avoid.  Monotone mode keeps the
+        // deliberately small initial barrier and decreases it thereafter.
+        application->Options()->SetStringValue(
+            "mu_strategy", "monotone");
+        application->Options()->SetNumericValue("mu_init", 1e-6);
+    }
     application->Options()->SetNumericValue("tol", options.tolerance);
     application->Options()->SetNumericValue(
         "acceptable_tol", options.acceptable_tolerance);

@@ -358,14 +358,16 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             continue;
         }
         const auto& generator = data.generators[i];
+        const double previous = contingency.effective_base_state().pg[i];
+        const double ramp_interval = data.delta_r_ctg;
+        const double downward_ramp = generator.prdmaxctg;
+        const double upward_ramp = generator.prumaxctg;
         p_lower[i] = std::max(
             generator.pmin,
-            contingency.effective_base_state().pg[i] -
-                data.delta_r_ctg * generator.prdmaxctg);
+            previous - ramp_interval * downward_ramp);
         p_upper[i] = std::min(
             generator.pmax,
-            contingency.effective_base_state().pg[i] +
-                data.delta_r_ctg * generator.prumaxctg);
+            previous + ramp_interval * upward_ramp);
         q_lower[i] = generator.qmin;
         q_upper[i] = generator.qmax;
         if (p_lower[i] > p_upper[i] + 1e-12 ||
@@ -388,6 +390,9 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         const auto& load = data.loads[i];
         const double previous = load.pd_nominal *
             contingency.effective_base_state().demand_factor[i];
+        const double ramp_interval = data.delta_r_ctg;
+        const double downward_ramp = load.prdmaxctg;
+        const double upward_ramp = load.prumaxctg;
         if (std::abs(load.pd_nominal) <= 1e-12) {
             load_factor_lower[i] = load.tmin;
             load_factor_upper[i] = load.tmax;
@@ -398,11 +403,11 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         }
         const double factor_lower = std::max(
             load.tmin,
-            (previous - data.delta_r_ctg * load.prdmaxctg) /
+            (previous - ramp_interval * downward_ramp) /
                 load.pd_nominal);
         const double factor_upper = std::min(
             load.tmax,
-            (previous + data.delta_r_ctg * load.prumaxctg) /
+            (previous + ramp_interval * upward_ramp) /
                 load.pd_nominal);
         if (factor_lower > factor_upper + 1e-12) {
             output.status = "empty_load_interval";
@@ -886,11 +891,12 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             continue;
         }
         const auto& branch = data.branches[i];
+        const double branch_rating = branch.rate_c;
         if (include_component_box_rows) {
             const double box_margin = std::min(
-                1e-4, std::max(0.0, 0.01 * branch.rate_c));
+                1e-4, std::max(0.0, 0.01 * branch_rating));
             const double box_target = std::max(
-                0.0, branch.rate_c - box_margin);
+                0.0, branch_rating - box_margin);
             append_security_row(
                 output.state.pf[i], derivative[i].pf,
                 voltage_derivative[i].from.pf,
@@ -923,13 +929,13 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
                    output.state.qf[i] *
                        voltage_derivative[i].from.qf) -
                 (branch.transformer ? 0.0 :
-                    2.0 * branch.rate_c * branch.rate_c * from_scale),
+                    2.0 * branch_rating * branch_rating * from_scale),
             2.0 * (output.state.pf[i] *
                        voltage_derivative[i].to.pf +
                    output.state.qf[i] *
                        voltage_derivative[i].to.qf),
             branch,
-            branch.rate_c * branch.rate_c * from_scale * from_scale);
+            branch_rating * branch_rating * from_scale * from_scale);
         append_apparent_row(
             output.state.pt[i], output.state.qt[i],
             2.0 * (output.state.pt[i] * derivative[i].pt +
@@ -943,9 +949,9 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
                    output.state.qt[i] *
                        voltage_derivative[i].to.qt) -
                 (branch.transformer ? 0.0 :
-                    2.0 * branch.rate_c * branch.rate_c * to_scale),
+                    2.0 * branch_rating * branch_rating * to_scale),
             branch,
-            branch.rate_c * branch.rate_c * to_scale * to_scale);
+            branch_rating * branch_rating * to_scale * to_scale);
 
         const double source_delta =
             contingency.effective_base_state().va[branch.from] -
@@ -1009,7 +1015,14 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     // elastic columns before HiGHS installs the user basis, defeating the
     // purpose of the start within this deliberately short solve.  All ordinary
     // active-repair solves retain the existing presolve-on behavior.
-    output.presolve_enabled = !minimize_balance_slack;
+    bool phase_one_presolve = false;
+    if (minimize_balance_slack) {
+        if (const char* value = std::getenv(
+                "GRAVITYX_ACTIVE_REPAIR_PHASE_ONE_PRESOLVE")) {
+            phase_one_presolve = std::string(value) != "0";
+        }
+    }
+    output.presolve_enabled = !minimize_balance_slack || phase_one_presolve;
     highs.setOptionValue(
         "presolve", output.presolve_enabled ? "on" : "off");
     highs.setOptionValue("run_crossover", "off");
@@ -1018,8 +1031,12 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
     highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     highs.setOptionValue("ipm_optimality_tolerance", 1e-6);
-    const char* solver_override =
-        std::getenv("GRAVITYX_ACTIVE_REPAIR_SOLVER");
+    const char* solver_override = minimize_balance_slack
+        ? std::getenv("GRAVITYX_ACTIVE_REPAIR_PHASE_ONE_SOLVER")
+        : nullptr;
+    if (solver_override == nullptr) {
+        solver_override = std::getenv("GRAVITYX_ACTIVE_REPAIR_SOLVER");
+    }
     output.solver = solver_override != nullptr
         ? std::string(solver_override) : "simplex";
     highs.setOptionValue("solver", output.solver);
@@ -1138,10 +1155,16 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         const HighsStatus start_status = highs.setSolution(
             column_count, start_indices.data(), primal_start.data());
         output.primal_start_status = static_cast<int>(start_status);
-        output.primal_basis_attempted = true;
-        const HighsStatus basis_status = highs.setBasis(
-            primal_basis, "active_repair_balance_diagonal");
-        output.primal_basis_status = static_cast<int>(basis_status);
+        // A user basis suppresses presolve in HiGHS.  Preserve the proven
+        // diagonal-basis route by default, but when the bounded Phase-I
+        // diagnostic explicitly enables presolve, provide the complete primal
+        // point without the basis so HiGHS can reduce the elastic model.
+        if (!output.presolve_enabled && output.solver == "simplex") {
+            output.primal_basis_attempted = true;
+            const HighsStatus basis_status = highs.setBasis(
+                primal_basis, "active_repair_balance_diagonal");
+            output.primal_basis_status = static_cast<int>(basis_status);
+        }
     }
 
     const HighsStatus run_status = highs.run();

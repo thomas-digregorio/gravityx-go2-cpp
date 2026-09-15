@@ -106,6 +106,31 @@ class ReliabilityAuditTests(unittest.TestCase):
         self.assertEqual(after[len(before)], "--fast-screen-heavy-profile")
         self.assertEqual(after[-2:], ["--fast-screen-heavy-workers", "4"])
 
+    def test_predictor_handoff_budget_is_explicit_hash_bound_and_not_a_measurement(self):
+        profile = {"schema_version": 4, "case_sha256": "case", "heavy_threshold_seconds": 10,
+                   "contingencies": [{"label": "a", "measured_solver_wall_seconds": 20}],
+                   "unfinished_priority_labels": ["b"], "screen_handoff_seconds": {"b": 15}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            path.write_text(json.dumps(profile))
+            labels, _, meta = load_fast_screen_heavy_profile(path, "case", {"a", "b"})
+            self.assertEqual(labels, {"a", "b"})
+            self.assertEqual(meta["screen_handoff_seconds"], {"b": 15})
+            self.assertEqual(meta["measured_solver_seconds_sum"], 20)
+            self.assertFalse(meta["uses_prior_solution_state"])
+            for bad in ({"unknown": 15}, {"b": 0}, {"b": -1}, {"b": 300},
+                        {"b": float("nan")}, {"b": float("inf")}, {"b": True},
+                        {"b": "15"}, [15]):
+                profile["screen_handoff_seconds"] = bad
+                path.write_text(json.dumps(profile))
+                with self.assertRaises(ValueError):
+                    load_fast_screen_heavy_profile(path, "case", {"a", "b"})
+            profile["screen_handoff_seconds"] = {"b": 15}
+            profile["schema_version"] = 3
+            path.write_text(json.dumps(profile))
+            with self.assertRaises(ValueError):
+                load_fast_screen_heavy_profile(path, "case", {"a", "b"})
+
     def test_empty_corrective_queue_never_starts_native_solver(self):
         def forbidden():
             self.fail("Empty work queue started a solver")

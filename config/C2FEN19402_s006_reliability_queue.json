@@ -39,8 +39,9 @@
     }
   ],
   "heavy_threshold_seconds": 30.0,
-  "purpose": "Scheduling-only heavy-screen concurrency profile. Contains no primal, dual, commitment, network, or solver state. Repeated cold timings are merged by maximum measured solver time.",
-  "schema_version": 3,
+  "purpose": "Timing-only heavy-screen profile with an explicit predictor handoff budget for a diagnosed stalled task. Contains no primal, dual, commitment, network, or solver state. Prior cold timings are merged by maximum measured solver time.",
+  "schema_version": 4,
+  "screen_handoff_seconds": {"CTG_000263": 20.0},
   "source_measurement": {
     "complete_contingency_coverage": false,
     "unfinished_corrective_priority_labels": ["CTG_000179"],

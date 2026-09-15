@@ -81,6 +81,15 @@ void require_near(double actual, double expected, double tolerance, const std::s
     }
 }
 
+gravityx::FastPowerFlowOptions bounded_fast_newton_rescue_options() {
+    gravityx::FastPowerFlowOptions options;
+    options.enable_fixed_jacobian_predictor = false;
+    options.max_newton_iterations = 12;
+    options.max_active_redispatch_passes = 4;
+    options.max_reactive_limit_passes = 4;
+    return options;
+}
+
 bool bounded_fast_newton_rescue_candidate(
     const gravityx::ValidationReport& validation) {
     return validation.max_residual <= 0.35 &&
@@ -635,6 +644,13 @@ int run_component_tests() {
             "component test failed: invalid nonconverged candidate was accepted");
     }
     gravityx::ValidationReport rescue_validation;
+    const auto rescue_options = bounded_fast_newton_rescue_options();
+    if (rescue_options.enable_fixed_jacobian_predictor ||
+        rescue_options.max_newton_iterations != 12 ||
+        rescue_options.max_active_redispatch_passes != 4 ||
+        rescue_options.max_reactive_limit_passes != 4) {
+        throw std::runtime_error("bounded Newton rescue re-enabled the predictor search");
+    }
     rescue_validation.max_residual = 0.15;
     rescue_validation.worst_category = "reactive_balance";
     if (!bounded_fast_newton_rescue_candidate(rescue_validation)) {
@@ -923,6 +939,27 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "validated source-base regression failed with residual " +
             std::to_string(source_base.validation.max_residual));
+    }
+    for (double invalid_budget : {0.0, -1.0,
+            std::numeric_limits<double>::quiet_NaN()}) {
+        gravityx::FastPowerFlowOptions invalid_options;
+        invalid_options.fixed_jacobian_time_limit_seconds = invalid_budget;
+        bool rejected = false;
+        try {
+            gravityx::FastContingencyPowerFlow invalid_solver(
+                data, source_base.solve.state, {1}, invalid_options);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error("invalid predictor budget was accepted");
+        }
+    }
+    gravityx::FastPowerFlowResult budget_result;
+    budget_result.fixed_jacobian_budget_exhausted = true;
+    if (!budget_result.to_json().at("fixed_jacobian_budget_exhausted").get<bool>() ||
+        budget_result.to_json().at("feasible").get<bool>()) {
+        throw std::runtime_error("predictor budget exhaustion was not preserved as failure");
     }
     gravityx::SparseAcEconomicOptions sparse_ac_options;
     sparse_ac_options.time_limit_seconds = 2.0;
@@ -3167,10 +3204,10 @@ bool solve_loaded_contingency(
                 fast_result->validation)) {
             const double prior_screen_seconds = fast_result->wall_seconds;
             const auto rescue_start = std::chrono::steady_clock::now();
-            gravityx::FastPowerFlowOptions rescue_options;
-            rescue_options.max_newton_iterations = 12;
-            rescue_options.max_active_redispatch_passes = 4;
-            rescue_options.max_reactive_limit_passes = 4;
+            // This is a Newton rescue of an already exhausted predictor,
+            // not another complete 224-step predictor search. The Newton
+            // caps below do not constrain fixed-Jacobian iterations.
+            const auto rescue_options = bounded_fast_newton_rescue_options();
             gravityx::FastContingencyPowerFlow rescue_solver(
                 data, base.state, base.commitment, rescue_options);
             auto rescue_result = rescue_solver.solve(
@@ -4383,8 +4420,8 @@ int run_contingency_worker(
     }
     std::unique_ptr<gravityx::AcModel> resident_model;
     std::unique_ptr<gravityx::FastContingencyPowerFlow> fast_power_flow;
+    gravityx::FastPowerFlowOptions fast_options;
     if (fast_power_flow_screen) {
-        gravityx::FastPowerFlowOptions fast_options;
         fast_options.fixed_jacobian_screen_only =
             fast_only && data.buses.size() >= 16000;
         fast_options.economic_balance_polish =
@@ -4400,6 +4437,19 @@ int run_contingency_worker(
             std::getenv("GRAVITYX_FAST_PF_DIAGNOSTICS");
         fast_options.capture_diagnostics = fast_diagnostics != nullptr &&
             std::string(fast_diagnostics) != "0";
+        const char* screen_budget =
+            std::getenv("GRAVITYX_FAST_PF_SCREEN_SECONDS");
+        if (screen_budget != nullptr) {
+            std::size_t parsed = 0;
+            const double seconds = std::stod(screen_budget, &parsed);
+            if (!fast_only || parsed != std::string(screen_budget).size() ||
+                !std::isfinite(seconds) || seconds <= 0.0) {
+                throw std::runtime_error(
+                    "GRAVITYX_FAST_PF_SCREEN_SECONDS requires fast-only "
+                    "mode and a positive finite budget");
+            }
+            fast_options.fixed_jacobian_time_limit_seconds = seconds;
+        }
         fast_power_flow = std::make_unique<gravityx::FastContingencyPowerFlow>(
             data, base.state, base.commitment, fast_options);
     }
@@ -4459,11 +4509,30 @@ int run_contingency_worker(
         const CorrectiveSeed* rolling_corrective_seed =
             economic_contingency_polish || corrective_seed_bank.empty()
             ? nullptr : &corrective_seed_bank.front();
+        std::unique_ptr<gravityx::FastContingencyPowerFlow> budgeted_fast_power_flow;
         const auto solve_call_start = std::chrono::steady_clock::now();
+        if (task.contains("screen_handoff_seconds")) {
+            if (!fast_only || !task.at("screen_handoff_seconds").is_number()) {
+                throw std::runtime_error("screen handoff budget requires a numeric fast-only task");
+            }
+            const double seconds = task.at("screen_handoff_seconds").get<double>();
+            if (!std::isfinite(seconds) || seconds <= 0.0 || seconds >= 300.0) {
+                throw std::runtime_error("invalid per-task screen handoff budget");
+            }
+            auto task_options = fast_options;
+            task_options.fixed_jacobian_time_limit_seconds = seconds;
+            // A task-local instance leaves other tasks' default budget and
+            // resident predictor cache untouched. No prior-run state enters.
+            budgeted_fast_power_flow =
+                std::make_unique<gravityx::FastContingencyPowerFlow>(
+                    data, base.state, base.commitment, task_options);
+        }
         const bool success = solve_loaded_contingency(
             data, base, label, output_path, print_level,
             reusable_model ? &resident_model : nullptr,
-            acceptable_termination, fast_power_flow.get(), fast_only,
+            acceptable_termination,
+            budgeted_fast_power_flow ? budgeted_fast_power_flow.get() : fast_power_flow.get(),
+            fast_only,
             linearized_fallback, linearized_only,
             precomputed_fast_state ? &*precomputed_fast_state : nullptr,
             rolling_corrective_seed
@@ -4635,6 +4704,7 @@ int run_contingency_worker(
         std::cout << "GRAVITYX_TASK_RESULT " << nlohmann::json({
             {"label", label},
             {"success", success},
+            {"screen_handoff_seconds", task.value("screen_handoff_seconds", nlohmann::json(nullptr))},
             {"precomputed_fast_screen_reference",
              precomputed_fast_state.has_value()},
             {"rolling_corrective_seed_updated",

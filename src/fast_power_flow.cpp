@@ -2372,6 +2372,7 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          fixed_jacobian_predictor_attempted},
         {"fixed_jacobian_predictor_selected",
          fixed_jacobian_predictor_selected},
+        {"fixed_jacobian_budget_exhausted", fixed_jacobian_budget_exhausted},
         {"fixed_jacobian_predictor_iterations",
          fixed_jacobian_predictor_iterations},
         {"fixed_jacobian_predictor_preparation_seconds",
@@ -2805,6 +2806,11 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
         throw std::runtime_error(
             "fast power flow balance cleanup fraction must be in (0, 1]");
     }
+    if (std::isnan(options_.fixed_jacobian_time_limit_seconds) ||
+        options_.fixed_jacobian_time_limit_seconds <= 0.0) {
+        throw std::runtime_error(
+            "fixed-Jacobian time limit must be positive or infinity");
+    }
 }
 
 FastContingencyPowerFlow::~FastContingencyPowerFlow() = default;
@@ -3211,7 +3217,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
     }
 
-    if (!base_mode && nb >= 16000) {
+    if (!base_mode && nb >= 16000 && options_.enable_fixed_jacobian_predictor) {
         output.fixed_jacobian_predictor_attempted = true;
         if (!predictor_cache_) {
             predictor_cache_ = std::make_unique<FixedJacobianPredictorCache>(
@@ -3528,6 +3534,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     predictor_iteration;
                 output.fixed_jacobian_predictor_validation =
                     predictor_validation;
+                log_newton_progress("fixed_jacobian", predictor_iteration,
+                    predictor_validation.max_residual, wall_start);
                 if (predictor_iteration == 0) {
                     initial_predictor_validation_residual =
                         predictor_validation.max_residual;
@@ -4135,6 +4143,15 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         std::chrono::steady_clock::now() - wall_start).count();
                     output.solve.wall_seconds = output.wall_seconds;
                     return output;
+                }
+                // Preserve the best fully rebuilt state before handing an
+                // unfinished screen to corrective repair. This is not a
+                // feasibility acceptance and never raises source tolerances.
+                if (std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - wall_start).count()
+                        >= options_.fixed_jacobian_time_limit_seconds) {
+                    output.fixed_jacobian_budget_exhausted = true;
+                    break;
                 }
                 if (predictor_iteration ==
                     kMaximumFixedJacobianIterations) {

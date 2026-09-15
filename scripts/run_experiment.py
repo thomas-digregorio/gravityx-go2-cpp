@@ -2594,9 +2594,9 @@ def load_fast_screen_heavy_profile(
     """Load timing-only heavy classification and group-ordering data."""
     reject_onedrive(path)
     raw = read_json(path)
-    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2, 3}:
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2, 3, 4}:
         raise ValueError(
-            "fast-screen heavy profile must use schema_version 1, 2 or 3"
+            "fast-screen heavy profile must use schema_version 1, 2, 3 or 4"
         )
     schema_version = int(raw["schema_version"])
     if raw.get("case_sha256") != case_sha256:
@@ -2641,8 +2641,8 @@ def load_fast_screen_heavy_profile(
     # a timing measurement or importing a prior solution. The finite weight
     # is ordering-only and never changes a solver budget or acceptance gate.
     priority_labels = raw.get("unfinished_priority_labels", [])
-    if not isinstance(priority_labels, list) or (priority_labels and schema_version != 3):
-        raise ValueError("unfinished priority labels require schema version 3")
+    if not isinstance(priority_labels, list) or (priority_labels and schema_version not in {3, 4}):
+        raise ValueError("unfinished priority labels require schema version 3 or 4")
     if any(not isinstance(label, str) or label not in contingency_labels
            for label in priority_labels):
         raise ValueError("unknown unfinished priority label")
@@ -2655,6 +2655,15 @@ def load_fast_screen_heavy_profile(
     if not heavy_labels:
         raise ValueError("fast-screen profile contains no heavy labels")
 
+    handoff_seconds = raw.get("screen_handoff_seconds", {})
+    if not isinstance(handoff_seconds, dict) or (handoff_seconds and schema_version != 4):
+        raise ValueError("screen handoff budgets require a schema-4 object")
+    for label, seconds in handoff_seconds.items():
+        if (label not in contingency_labels or isinstance(seconds, bool) or
+                not isinstance(seconds, (float, int)) or
+                not math.isfinite(seconds) or not 0 < seconds < 300):
+            raise ValueError(f"invalid screen handoff budget for {label}")
+
     metadata = {
         "path": str(path.resolve()),
         "sha256": sha256(path),
@@ -2664,11 +2673,12 @@ def load_fast_screen_heavy_profile(
         "profiled_heavy_contingency_count": len(heavy_labels),
         "measured_solver_seconds_sum": sum(measured_seconds),
         "unfinished_priority_labels": priority_labels,
+        "screen_handoff_seconds": handoff_seconds,
         "unfinished_priority_ordering_weight": priority_weight if priority_labels else None,
         "uses_prior_solution_state": False,
         "dispatch_semantics": (
             "timing-only heavy-lane classification and descending predicted "
-            "group-work ordering using every available timing; no primal, "
+            "group-work ordering, with explicit opt-in predictor handoff budgets; no primal, "
             "dual, commitment, network, or solver state"
         ),
     }
@@ -3816,6 +3826,10 @@ def main() -> int:
                                 result_path
                             )
                             task["remove_output_after_result"] = True
+                        handoff_seconds = (fast_screen_heavy_profile_metadata or {}).get(
+                            "screen_handoff_seconds", {}).get(label)
+                        if handoff_seconds is not None:
+                            task["screen_handoff_seconds"] = handoff_seconds
                         if args.cpp_solution_writer:
                             task["solution_path"] = to_wsl(
                                 args.output_dir / f"solution_{label}.txt"
@@ -3835,6 +3849,8 @@ def main() -> int:
                                 f"fast screen {label} failed to execute on worker "
                                 f"{worker_id}; see {log_path}"
                             )
+                        if acknowledgement.get("screen_handoff_seconds") != handoff_seconds:
+                            raise RuntimeError(f"fast screen {label} did not acknowledge its handoff budget")
                         if time.perf_counter() > contingency_deadline:
                             raise CompetitionTimeout(
                                 f"fast screen {label} finished after the "

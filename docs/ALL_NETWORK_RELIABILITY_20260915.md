@@ -147,6 +147,50 @@ Failure reporting now distinguishes absent final verification evidence from
 an actual observed revision or executable-hash mismatch. All missing
 evidence remains a failed acceptance gate.
 
+The security-collector correction fixed the saved CTG_000179 diagnostic in
+12.085 seconds, and that outage also passed in the next cold 006 run
+(`target_19402_s006_v2`, c396f66) in 50.665 seconds under concurrency. The full
+run still stopped at 295.356 seconds with 6,691/6,693 contingencies completed.
+Its affinity schedule places CTG_000263 first and CTG_000262 second in the
+same generator-bus group. The group's worker log contains only its ready
+message: 263 had not returned, so 262 was not a second concurrently stalled
+solve. Both still lack certification.
+
+A saved-base direct-LP diagnostic on 263 timed out, as did a second diagnostic
+that first tried a 20-second projected-balance LP (152.531 seconds including
+termination). The short probe found no feasible LP point and is removed from
+the production path; it is not a claimed improvement. A 90-second fast-only
+diagnostic also timed out without returning its intermediate trace. The next
+diagnostic mechanism therefore adds an opt-in cooperative predictor budget:
+between iterations it can return the best rebuilt, still-unverified state for
+corrective repair. Default execution remains unbounded internally, subject to
+the existing hard scenario deadline. Fixed-Jacobian progress is logged only
+when repair logging is explicitly enabled. These diagnostics do not count as
+cold scenario passes or replace any of the final 37 required checks.
+
+The first budgeted diagnostic returned a secure CTG_000263 candidate in
+65.946 seconds, with independent maximum residual `1.7763568394002505e-15`.
+It also exposed a control-flow bug: the nominally bounded Newton rescue ran
+the full fixed-Jacobian predictor before its capped Newton steps. The first
+predictor stopped around 20 seconds, then the rescue repeated 114 predictor
+iterations. A dedicated option now disables that predictor only for the
+bounded Newton rescue; ordinary fast screens retain their existing search.
+The next diagnostic passed in 25.451 seconds via compact linearized repair,
+again with residual `1.7763568394002505e-15`. Its solve time was 23.732 seconds;
+the rest was diagnostic setup and serialization. These are saved-base
+diagnostics, not official cold-run times or score improvements.
+
+The diagnosed 263 task now has an explicit 20-second predictor-stage budget
+in the hash-bound schema-4 scheduling profile. This is a cooperative handoff
+between iterations, not a relaxation of the global 300-second cap. The
+Newton/compact repair still needs to pass complete AC validation. No other
+task receives this budget; 262 remains an unmeasured queued sibling. A
+task-local predictor instance prevents the override leaking into other work,
+and the worker must acknowledge the requested budget. Tiny tests cover
+invalid budgets, failure-status preservation, the rescue option, and profile
+identity/range checks. Diagnostic stdout and stderr are now merged through a
+pipe with one file writer, avoiding overlapping WSL file-output offsets.
+
 ## Storage pruning during development
 
 After the five-case batch ended and solver processes were absent, checked

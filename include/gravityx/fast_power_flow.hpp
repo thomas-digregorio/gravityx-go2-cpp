@@ -14,7 +14,12 @@ namespace gravityx {
 
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
+    bool enable_fixed_jacobian_predictor{true};
     bool fixed_jacobian_screen_only{false};
+    // Cooperative diagnostic/first-stage budget, checked between predictor
+    // iterations. The caller's process deadline remains the hard limit.
+    double fixed_jacobian_time_limit_seconds{
+        std::numeric_limits<double>::infinity()};
     bool economic_balance_polish{false};
     bool minimize_active_balance_slack{false};
     bool minimize_reactive_balance_slack{false};
@@ -48,6 +53,7 @@ struct FastPowerFlowResult {
     ValidationReport local_balance_candidate_validation;
     bool fixed_jacobian_predictor_attempted{};
     bool fixed_jacobian_predictor_selected{};
+    bool fixed_jacobian_budget_exhausted{};
     int fixed_jacobian_predictor_iterations{};
     double fixed_jacobian_predictor_preparation_seconds{};
     ValidationReport fixed_jacobian_predictor_validation;

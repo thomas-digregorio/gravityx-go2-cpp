@@ -1,6 +1,12 @@
 # All-network reliability work — 2026-09-15
 
-Status: **in progress; full-suite success is not yet established.**
+Status: **complete: 37/37 scenarios PASS on frozen `a1bebd5`.**
+
+The final common-revision campaign verified all 44,517 source contingency
+evaluations within 300 seconds per scenario. See the
+[complete results and audited evidence](FROZEN_A1BEBD5_ALL_NETWORK_PASS_20260915.md).
+The chronological development notes below describe earlier intermediate states;
+they are not the final campaign results. Economic optimality is not certified.
 
 ## Scope and acceptance
 

@@ -7,7 +7,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from run_reliability_suite import audit_success, normalized_case, arguments
-from run_experiment import load_fast_screen_heavy_profile
+from run_experiment import (load_fast_screen_heavy_profile, start_worker_if_task,
+                            additional_corrective_workers)
 
 
 class ReliabilityAuditTests(unittest.TestCase):
@@ -96,6 +97,25 @@ class ReliabilityAuditTests(unittest.TestCase):
         self.assertEqual(after[:len(before)], before)
         self.assertEqual(after[len(before)], "--fast-screen-heavy-profile")
         self.assertEqual(after[-2:], ["--fast-screen-heavy-workers", "4"])
+
+    def test_empty_corrective_queue_never_starts_native_solver(self):
+        def forbidden():
+            self.fail("Empty work queue started a solver")
+        self.assertEqual(start_worker_if_task(lambda: None, forbidden), (None, None))
+        self.assertEqual(additional_corrective_workers(4, 8, 0), 0)
+
+    def test_corrective_process_starts_only_after_claiming_real_task(self):
+        order = []
+        def claim():
+            order.append("claim")
+            return {"label": "a"}
+        def launch():
+            order.append("launch")
+            return "native"
+        self.assertEqual(start_worker_if_task(claim, launch), ({"label": "a"}, "native"))
+        self.assertEqual(order, ["claim", "launch"])
+        self.assertEqual(additional_corrective_workers(4, 8, 2), 2)
+        self.assertEqual(additional_corrective_workers(4, 8, 100), 4)
 
 
 if __name__ == "__main__":

@@ -2193,6 +2193,21 @@ def longest_first_contingencies(
     return scheduled
 
 
+def start_worker_if_task(get_task, start_process):
+    """Claim real work before starting a native solver and its deadline clock."""
+    first_task = get_task()
+    if first_task is None:
+        return None, None
+    return first_task, start_process()
+
+
+def additional_corrective_workers(initial: int, configured: int, queued: int) -> int:
+    """Do not expand a finished queue, including the all-fast-feasible case."""
+    if min(initial, configured, queued) < 0:
+        raise ValueError("worker/queue counts must be nonnegative")
+    return min(max(0, configured - initial), queued)
+
+
 class AffinityScreenWorkQueue:
     """Serve affinity groups through optional heavy and bulk worker lanes.
 
@@ -4013,9 +4028,6 @@ def main() -> int:
             raise CompetitionTimeout("Code2 was cancelled after another worker failed")
         log_path = internal / "worker_logs" / f"worker_{worker_id:03d}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        task_timeout = effective_process_timeout(
-            args.contingency_timeout, contingency_deadline
-        )
         worker_arguments = [
             "contingency-worker",
             worker_case_argument,
@@ -4038,24 +4050,40 @@ def main() -> int:
             worker_arguments.append("linearized")
         if args.linearized_contingency_only:
             worker_arguments.append("linearized-only")
-        command = cpp_command(
-            args.executable,
-            args.distro,
-            worker_arguments,
-            task_timeout,
-        )
-        started = time.perf_counter()
         output_lines: list[str] = []
         assigned_labels: list[str] = []
         stolen_labels: list[str] = []
-        process = subprocess.Popen(
-            command,
-            text=True,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
+        if args.defer_fallback_until_screen_complete:
+            while not screening_finished.wait(timeout=0.1):
+                if abort_contingencies.is_set():
+                    raise CompetitionTimeout("corrective fallback cancelled during fast screening")
+
+        def start_native_process():
+            # Compute the remaining global budget only after a task is claimed.
+            command = cpp_command(
+                args.executable, args.distro, worker_arguments,
+                effective_process_timeout(args.contingency_timeout, contingency_deadline),
+            )
+            return subprocess.Popen(
+                command, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, bufsize=1,
+            )
+
+        waiting_started = time.perf_counter()
+        first_item, process = start_worker_if_task(
+            lambda: streamed_queue_get(
+                task_queue, screening_finished, abort_contingencies,
+                profiled_queue=profiled_task_queue if fallback_schedule else None,
+            ),
+            start_native_process,
         )
+        waiting_seconds = time.perf_counter() - waiting_started
+        started = time.perf_counter()
+        if process is None:
+            log_path.write_text("No corrective task; native solver not started.\n", encoding="utf-8")
+            return {"phase": "exact_fallback", "worker_id": worker_id, "task_count": 0,
+                    "process_wall_seconds": 0.0, "queue_wait_seconds": waiting_seconds,
+                    "labels": [], "native_process_started": False}
 
         def read_until(prefix: str) -> str:
             assert process.stdout is not None
@@ -4079,21 +4107,17 @@ def main() -> int:
 
         try:
             read_until("GRAVITYX_WORKER_READY")
-            if args.defer_fallback_until_screen_complete:
-                while not screening_finished.wait(timeout=0.1):
-                    if abort_contingencies.is_set():
-                        raise CompetitionTimeout(
-                            "corrective fallback cancelled during fast screening"
-                        )
+            item = first_item
             while not abort_contingencies.is_set():
-                item = streamed_queue_get(
-                    task_queue,
-                    screening_finished,
-                    abort_contingencies,
-                    profiled_queue=(
-                        profiled_task_queue if fallback_schedule else None
-                    ),
-                )
+                if item is None:
+                    item = streamed_queue_get(
+                        task_queue,
+                        screening_finished,
+                        abort_contingencies,
+                        profiled_queue=(
+                            profiled_task_queue if fallback_schedule else None
+                        ),
+                    )
                 if item is None:
                     break
                 label = str(item["label"])
@@ -4176,6 +4200,7 @@ def main() -> int:
                     if args.two_stage_contingency_screen
                     else "combined_screen_and_fallback",
                 )
+                item = None
             if process.poll() is None:
                 assert process.stdin is not None
                 process.stdin.write('{"stop":true}\n')
@@ -4205,6 +4230,8 @@ def main() -> int:
                 "process_wall_seconds": time.perf_counter() - started,
                 "labels": assigned_labels,
                 "profiled_stolen_labels": stolen_labels,
+                "native_process_started": True,
+                "queue_wait_seconds": waiting_seconds,
             }
         except Exception:
             abort_contingencies.set()
@@ -4270,17 +4297,21 @@ def main() -> int:
             run_status["streaming_fallback_overlap"] = (
                 not args.defer_fallback_until_screen_complete
             )
-            if post_screen_worker_count > worker_count:
-                for worker_id in range(worker_count, post_screen_worker_count):
+            extra_workers = additional_corrective_workers(
+                worker_count, post_screen_worker_count,
+                task_queue.qsize() + profiled_task_queue.qsize(),
+            )
+            if extra_workers:
+                for worker_id in range(worker_count, worker_count + extra_workers):
                     future = pool.submit(solve_worker, worker_id)
                     futures[future] = worker_id
                 print(
                     "expanded corrective worker pool after screening: "
-                    f"{worker_count} -> {post_screen_worker_count}",
+                    f"{worker_count} -> {worker_count + extra_workers}",
                     flush=True,
                 )
             run_status["active_post_screen_corrective_worker_count"] = (
-                post_screen_worker_count
+                worker_count + extra_workers
             )
             checkpoint()
             screening_finished.set()
@@ -4296,6 +4327,8 @@ def main() -> int:
                     "profiled_stolen_labels": worker.get(
                         "profiled_stolen_labels", []
                     ),
+                    "native_process_started": worker.get("native_process_started", True),
+                    "queue_wait_seconds": worker.get("queue_wait_seconds", 0.0),
                 }
             )
             with progress_lock:

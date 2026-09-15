@@ -2835,6 +2835,10 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
         throw std::runtime_error(
             "fixed-Jacobian time limit must be positive or infinity");
     }
+    if (!std::isfinite(options_.economic_balance_polish_stop_slack) ||
+        options_.economic_balance_polish_stop_slack < 0.0) {
+        throw std::runtime_error("economic work target must be finite and nonnegative");
+    }
 }
 
 FastContingencyPowerFlow::~FastContingencyPowerFlow() = default;
@@ -3894,7 +3898,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 polished_validation = selected_validation;
                                 if (slack_sum(polished_state.p_delta) +
                                         slack_sum(polished_state.q_delta) <=
-                                    1e-7) {
+                                    options_.economic_balance_polish_stop_slack) {
                                     break;
                                 }
                             }

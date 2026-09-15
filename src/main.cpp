@@ -649,7 +649,8 @@ int run_component_tests() {
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
         cached_economic_options.max_economic_linearized_phase_two_rounds != 0 ||
-        cached_economic_options.max_economic_balance_polish_iterations != 1 ||
+        cached_economic_options.max_economic_balance_polish_iterations != 3 ||
+        cached_economic_options.economic_balance_polish_stop_slack != 0.025 ||
         cached_economic_options.validation_tolerance != 1e-5 ||
         !cached_economic_options.fixed_jacobian_screen_only ||
         cached_economic_options.fixed_jacobian_time_limit_seconds != 7.0) {
@@ -731,6 +732,17 @@ int run_component_tests() {
     rescue_validation.max_residual = 0.36;
     if (bounded_fast_candidate_repair_candidate(rescue_validation)) {
         throw std::runtime_error("compact repair routing lost its finite eligibility bound");
+    }
+    for (const char* category : {"active_balance", "reactive_balance"}) {
+        rescue_validation.worst_category = category;
+        rescue_validation.max_residual = 0.0222;
+        if (!bounded_fast_candidate_repair_candidate(rescue_validation)) {
+            throw std::runtime_error("compact P/Q repair rejected a near-feasible balance residual");
+        }
+        rescue_validation.max_residual = 0.36;
+        if (bounded_fast_candidate_repair_candidate(rescue_validation)) {
+            throw std::runtime_error("compact P/Q repair exceeded its eligibility bound");
+        }
     }
     feasible_validation.max_residual = 1e-8;
     nonconverged_feasible.objective = std::numeric_limits<double>::quiet_NaN();
@@ -3325,9 +3337,11 @@ bool solve_loaded_contingency(
                 }
             }
             if (!fast_result->feasible &&
-                fast_result->validation.worst_category == "variable_bound" &&
-                fast_result->validation.max_residual <=
-                    kCompactSecurityRepairCandidateResidual) {
+                bounded_fast_candidate_repair_candidate(
+                    fast_result->validation)) {
+                // This compact LP includes both active and reactive balance.
+                // Near-feasible P/Q residuals merit the same bounded attempt
+                // as a security-bound residual before a full-network LP.
                 double wall_after_linearized_repair =
                     fast_result->wall_seconds;
                 auto linearized_reference = fast_result->solve.state;

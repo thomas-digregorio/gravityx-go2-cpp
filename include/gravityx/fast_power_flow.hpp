@@ -30,6 +30,8 @@ struct FastPowerFlowOptions {
     double balance_cleanup_fraction{1.0};
     bool capture_diagnostics{false};
     int max_economic_balance_polish_iterations{4};
+    // Work-allocation target on summed P/Q slack, not a feasibility tolerance.
+    double economic_balance_polish_stop_slack{1e-7};
     int max_economic_linearized_polish_rounds{1};
     double economic_linearized_polish_seconds{0.75};
     double economic_linearized_trigger_slack{0.05};
@@ -48,7 +50,8 @@ struct FastPowerFlowOptions {
 // never invokes either of the optional per-contingency LP polish stages.
 inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.economic_balance_polish = true;
-    options.max_economic_balance_polish_iterations = 1;
+    options.max_economic_balance_polish_iterations = 3;
+    options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
         std::numeric_limits<double>::infinity();
     options.max_economic_linearized_polish_rounds = 0;

@@ -52,6 +52,7 @@ are frozen and recorded by the suite runner.
 | 19,402 | 010 | 7fe014d | 295.101 | 6,693/6,693 | Not certified | Unused corrective-worker startup hit deadline |
 | 16,789 | 094 | 7fe014d | 295.289 | 236/238 | Not certified | Two generator-outage repairs unfinished |
 | 19,402 | 010 | 69596b2 | 296.761 | 6,693/6,693 | 164,882.98 | PASS |
+| 16,789 | 094 | cc53fca | 295.129 | 236/238 | Not certified | Same two generator-outage repairs unfinished |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -83,6 +84,10 @@ pivoting still occur at every step. The cache is not shared across calls or
 outages. Tiny lossless and lossy AC fixtures compare cached and uncached
 solutions, iteration counts and symbolic-analysis counts; voltages/angles
 must agree to `1e-12`. All four CTest groups and 59 Python tests pass.
+The full 094 run still timed out after this exact computational improvement;
+it is not sufficient by itself. An opt-in, bounded single-contingency trace
+uses its saved base/fast-screen state to identify the stalled repair phase.
+That diagnostic is explicitly separate from cold scenario acceptance.
 
 Run evidence is under
 `C:\Users\thoma\Documents\gravityx-go2-cpp\runs\reliability_20260915`.

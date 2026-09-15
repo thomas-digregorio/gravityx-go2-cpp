@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -137,6 +139,18 @@ struct NewtonResult {
     std::string failure_reason;
 };
 
+void log_newton_progress(const char* method, int iteration, double residual,
+                         std::chrono::steady_clock::time_point start) {
+    const char* enabled = std::getenv("GRAVITYX_REPAIR_LOG");
+    if (enabled == nullptr || std::string(enabled) == "0" || iteration % 10 != 0) {
+        return;
+    }
+    std::cerr << "GRAVITYX_NEWTON_PROGRESS " << nlohmann::json({
+        {"method", method}, {"iteration", iteration}, {"residual", residual},
+        {"seconds", std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()},
+    }).dump() << std::endl;
+}
+
 NewtonResult run_newton(
     const CaseData& data,
     const YRows& ybus,
@@ -150,6 +164,7 @@ NewtonResult run_newton(
     std::vector<double>& va,
     bool reuse_symbolic_analysis = true,
     int* symbolic_analysis_count = nullptr) {
+    const auto newton_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     std::vector<int> angle_index(nb, -1);
     std::vector<int> voltage_index(nb, -1);
@@ -179,6 +194,7 @@ NewtonResult run_newton(
         network_injections(ybus, vm, va, p, q);
         const double norm = mismatch_norm(
             p_spec, q_spec, p, q, angle_index, voltage_index);
+        log_newton_progress("ordinary", iteration, norm, newton_start);
         if (norm <= tolerance) {
             return {true, iteration, {}};
         }
@@ -350,6 +366,7 @@ NewtonResult run_distributed_active_newton(
     std::vector<double>& va,
     bool reuse_symbolic_analysis = true,
     int* symbolic_analysis_count = nullptr) {
+    const auto newton_start = std::chrono::steady_clock::now();
     const int nb = static_cast<int>(data.buses.size());
     if (component_of.size() != static_cast<std::size_t>(nb) ||
         active_slack_weights.size() != static_cast<std::size_t>(nb)) {
@@ -417,6 +434,7 @@ NewtonResult run_distributed_active_newton(
     for (int iteration = 0; iteration <= max_iterations; ++iteration) {
         network_injections(ybus, vm, va, p, q);
         const double norm = residual_norm();
+        log_newton_progress("distributed", iteration, norm, newton_start);
         if (norm <= tolerance) {
             return {true, iteration, {}};
         }

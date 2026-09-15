@@ -3624,8 +3624,22 @@ bool solve_loaded_contingency(
                 return true;
             };
 
+            const char* repair_log = std::getenv("GRAVITYX_REPAIR_LOG");
+            if (repair_log != nullptr && std::string(repair_log) != "0") {
+                std::cerr << "GRAVITYX_REPAIR_PHASE " << nlohmann::json({
+                    {"label", label}, {"phase", "prelinear_newton_start"},
+                    {"residual", best_validation.max_residual},
+                }).dump() << std::endl;
+            }
             prelinear_fast_repair =
                 fast_power_flow->solve(*match, best_state);
+            if (repair_log != nullptr && std::string(repair_log) != "0") {
+                std::cerr << "GRAVITYX_REPAIR_PHASE " << nlohmann::json({
+                    {"label", label}, {"phase", "prelinear_newton_finished"},
+                    {"seconds", prelinear_fast_repair->wall_seconds},
+                    {"residual", prelinear_fast_repair->validation.max_residual},
+                }).dump() << std::endl;
+            }
             if (evaluate_fast_repair(
                     *prelinear_fast_repair,
                     "iterated_fast_newton_power_flow", nullptr)) {

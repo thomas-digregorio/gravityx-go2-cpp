@@ -63,6 +63,7 @@ are frozen and recorded by the suite runner.
 | 19,402 | 006 | c396f66 | 295.356 | 6,691/6,693 | Not certified | 263 unfinished; 262 queued behind it |
 | 19,402 | 006 | 23f601e | 295.333 | 6,692/6,693 | Not certified | 263 passed; 262 unfinished |
 | 19,402 | 006 | 357596e | 295.348 | 6,466/6,693 | Not certified | Different base point; 262 took expensive fallback; bulk work incomplete |
+| 19,402 | 006 | 6e88e04 | 295.326 | 6,692/6,693 | Not certified | 262 and 263 passed; generator outage 459 unfinished |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -223,6 +224,22 @@ The corresponding newer-base diagnostic passed in 27.970 seconds (23.633
 seconds solve time), maximum independent residual `5.25072478857469e-6`.
 Native tests explicitly distinguish this routing bound from acceptance.
 
+The cold run on 6e88e04 completed both original stalls but timed out with
+6,692/6,693 complete; generator outage CTG_000459 was the remaining task.
+Its saved-base 20-second handoff diagnostic passed in 25.113 seconds
+(20.543 seconds solve time), maximum residual `1.7763568394002505e-15`.
+Rather than add another label-specific exception, the common first-stage
+policy now uses a cooperative 20-second predictor budget for generator
+outages on networks with at least 16,000 buses. The cache remains resident;
+no per-outage factorization rebuild is introduced by this default. Branch
+outages, small cases and ordinary repair calls retain their prior policy.
+The 006 profile is scheduling-only again. Explicit diagnostic overrides
+remain available and are separately logged. First-stage time, predictor
+iterations, effective budget, exhaustion and residual are retained even if
+a later rescue replaces the candidate. Boundary/type policy tests and all
+62 Python tests / four native test groups pass. A full cold run is required
+before this general policy can be credited as a scenario success.
+
 ## Storage pruning during development
 
 After the five-case batch ended and solver processes were absent, checked
@@ -251,6 +268,13 @@ those two directories. Logs, internal states, input data, code, and evidence
 archives remain. C: free space rose from the preceding 58.03-GB observation
 to 82.34 GB (approximately 24.3 GB recovered). The latest v3 payloads and all
 four successful 3790e89 19k case payloads were retained.
+
+Later, with solver processes again absent, applied the same containment,
+reparse-point, archived-hash and post-delete checks to the failed 006 v3 run.
+Permanently removed its 13,416 solution-text entries (22.937 GiB logical).
+Physical free space rose from 50,067,554,304 to 62,350,479,360 bytes, recovering
+12,282,925,056 bytes. Its status, logs, internal JSON states and evidence
+archive remain. The newer v4/v5 records and payloads were left untouched.
 
 ## Tests and publication
 

@@ -12,12 +12,16 @@
 
 namespace gravityx {
 
+double default_fixed_jacobian_screen_seconds(
+    std::size_t bus_count, ContingencyType contingency_type);
+
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool enable_fixed_jacobian_predictor{true};
     bool fixed_jacobian_screen_only{false};
-    // Cooperative diagnostic/first-stage budget, checked between predictor
-    // iterations. The caller's process deadline remains the hard limit.
+    // Explicit cooperative override. Infinity selects the class policy for
+    // first-stage screens; ordinary repair calls remain unbounded here.
+    // The caller's process deadline remains the hard limit.
     double fixed_jacobian_time_limit_seconds{
         std::numeric_limits<double>::infinity()};
     bool economic_balance_polish{false};
@@ -54,6 +58,8 @@ struct FastPowerFlowResult {
     bool fixed_jacobian_predictor_attempted{};
     bool fixed_jacobian_predictor_selected{};
     bool fixed_jacobian_budget_exhausted{};
+    double effective_predictor_time_limit_seconds{
+        std::numeric_limits<double>::infinity()};
     int fixed_jacobian_predictor_iterations{};
     double fixed_jacobian_predictor_preparation_seconds{};
     ValidationReport fixed_jacobian_predictor_validation;

@@ -39,9 +39,8 @@
     }
   ],
   "heavy_threshold_seconds": 30.0,
-  "purpose": "Timing-only heavy-screen profile with explicit predictor handoff budgets for two diagnosed stalled tasks. Contains no primal, dual, commitment, network, or solver state. Prior cold timings are merged by maximum measured solver time.",
-  "schema_version": 4,
-  "screen_handoff_seconds": {"CTG_000262": 20.0, "CTG_000263": 20.0},
+  "purpose": "Scheduling-only timing profile. Generator predictor budgets now come from the common algorithm policy, not label exceptions. Contains no primal, dual, commitment, network, or solver state. Prior cold timings are merged by maximum measured solver time.",
+  "schema_version": 3,
   "source_measurement": {
     "complete_contingency_coverage": false,
     "unfinished_corrective_priority_labels": ["CTG_000179"],

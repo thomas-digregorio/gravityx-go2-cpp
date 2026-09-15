@@ -1007,6 +1007,12 @@ void normalize_source_reference_angles(
 
 }  // namespace
 
+double default_fixed_jacobian_screen_seconds(
+    std::size_t bus_count, ContingencyType contingency_type) {
+    return bus_count >= 16000 && contingency_type == ContingencyType::Generator
+        ? 20.0 : std::numeric_limits<double>::infinity();
+}
+
 void run_fast_power_flow_topology_cache_regression() {
     CaseData data;
     data.buses.resize(3);
@@ -2373,6 +2379,7 @@ nlohmann::json FastPowerFlowResult::to_json() const {
         {"fixed_jacobian_predictor_selected",
          fixed_jacobian_predictor_selected},
         {"fixed_jacobian_budget_exhausted", fixed_jacobian_budget_exhausted},
+        {"effective_predictor_time_limit_seconds", effective_predictor_time_limit_seconds},
         {"fixed_jacobian_predictor_iterations",
          fixed_jacobian_predictor_iterations},
         {"fixed_jacobian_predictor_preparation_seconds",
@@ -2845,6 +2852,15 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     const int nb = static_cast<int>(data_.buses.size());
     const int ng = static_cast<int>(data_.generators.size());
     const bool base_mode = contingency == nullptr;
+    output.effective_predictor_time_limit_seconds =
+        options_.fixed_jacobian_time_limit_seconds;
+    if (!base_mode && options_.fixed_jacobian_screen_only &&
+        !std::isfinite(output.effective_predictor_time_limit_seconds)) {
+        // Keep the resident predictor factorization. Only the search-stage
+        // budget changes for generator outages; branch searches are intact.
+        output.effective_predictor_time_limit_seconds =
+            default_fixed_jacobian_screen_seconds(data_.buses.size(), contingency->type);
+    }
     const auto branch_rating = [&](int index) {
         return base_mode
             ? data_.branches[index].rate_a
@@ -4149,7 +4165,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 // feasibility acceptance and never raises source tolerances.
                 if (std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - wall_start).count()
-                        >= options_.fixed_jacobian_time_limit_seconds) {
+                        >= output.effective_predictor_time_limit_seconds) {
                     output.fixed_jacobian_budget_exhausted = true;
                     break;
                 }

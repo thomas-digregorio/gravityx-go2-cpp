@@ -649,6 +649,16 @@ int run_component_tests() {
     }
     gravityx::ValidationReport rescue_validation;
     const auto rescue_options = bounded_fast_newton_rescue_options();
+    if (gravityx::default_fixed_jacobian_screen_seconds(
+            19402, gravityx::ContingencyType::Generator) != 20.0 ||
+        gravityx::default_fixed_jacobian_screen_seconds(
+            16000, gravityx::ContingencyType::Generator) != 20.0 ||
+        !std::isinf(gravityx::default_fixed_jacobian_screen_seconds(
+            15999, gravityx::ContingencyType::Generator)) ||
+        !std::isinf(gravityx::default_fixed_jacobian_screen_seconds(
+            19402, gravityx::ContingencyType::Branch))) {
+        throw std::runtime_error("generator predictor budget changed branch/small-case policy");
+    }
     if (rescue_options.enable_fixed_jacobian_predictor ||
         rescue_options.max_newton_iterations != 12 ||
         rescue_options.max_active_redispatch_passes != 4 ||
@@ -3110,9 +3120,11 @@ bool solve_loaded_contingency(
         return *deferred_context;
     };
 
+    nlohmann::json first_screen_diagnostics = nullptr;
     auto complete = [&](nlohmann::json output,
                         gravityx::AcState state,
                         bool persist_full_state = false) {
+        output["first_screen"] = first_screen_diagnostics;
         if (persist_result) {
             output["solve"]["state"] = persist_full_state
                 ? gravityx::ac_state_to_json(state)
@@ -3189,6 +3201,14 @@ bool solve_loaded_contingency(
         }
         if (!rolling_seed_fast_screen_selected) {
             fast_result = fast_power_flow->solve(*match);
+            first_screen_diagnostics = {
+                {"seconds", fast_result->wall_seconds},
+                {"predictor_iterations", fast_result->fixed_jacobian_predictor_iterations},
+                {"predictor_budget_seconds", fast_result->effective_predictor_time_limit_seconds},
+                {"budget_exhausted", fast_result->fixed_jacobian_budget_exhausted},
+                {"feasible", fast_result->feasible},
+                {"max_residual", fast_result->validation.max_residual},
+            };
         }
         // A failed predictor is rare and the exact corrective fallback is
         // expensive on the largest cases.  Before escalating, direct-screen
@@ -4692,6 +4712,10 @@ int run_contingency_worker(
                     {"failure_reason", fast_screen_failure_reason},
                 }},
             };
+        }
+        if (completed_computation) {
+            result_summary["first_screen"] = completed_computation->result.value(
+                "first_screen", nlohmann::json(nullptr));
         }
         bool transient_output_removed = false;
         if (remove_output_after_result) {

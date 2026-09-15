@@ -37,6 +37,13 @@ def audit_success(status: dict, summary: dict, expected: int, revision: str,
     failures = []
     if not status.get("success") or status.get("stage") != "complete":
         failures.append("not complete")
+    if not summary:
+        # A stopped run does not have final verification evidence. Do not
+        # mislabel absent metadata as an observed revision/hash mismatch.
+        failures.append("final summary and verification evidence missing")
+        if status.get("completed_contingency_count") != expected:
+            failures.append("incomplete contingency count")
+        return failures
     if summary.get("git_revision") != revision:
         failures.append("revision mismatch")
     for field in ("base_exact_executable_sha256", "fast_screen_executable_sha256"):

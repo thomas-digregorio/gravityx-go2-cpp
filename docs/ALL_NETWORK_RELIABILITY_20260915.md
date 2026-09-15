@@ -54,6 +54,12 @@ are frozen and recorded by the suite runner.
 | 19,402 | 010 | 69596b2 | 296.761 | 6,693/6,693 | 164,882.98 | PASS |
 | 16,789 | 094 | cc53fca | 295.129 | 236/238 | Not certified | Same two generator-outage repairs unfinished |
 | 16,789 | 094 | f471795 | 295.131 | 236/238 | Not certified | IPM policy alone did not finish the cold run |
+| 16,789 | 094 | 3790e89 | 185.940 | 238/238 | 10,359,780.01 | PASS |
+| 19,402 | 006 | 3790e89 | 295.351 | 6,690/6,693 | Not certified | Two unfinished screens and one corrective LP |
+| 19,402 | 010 | 3790e89 | 295.600 | 6,693/6,693 | 163,091.10 | PASS |
+| 19,402 | 069 | 3790e89 | 213.551 | 6,620/6,620 | 627,542.21 | PASS |
+| 19,402 | 077 | 3790e89 | 184.786 | 6,584/6,584 | 84,914.92 | PASS |
+| 19,402 | 095 | 3790e89 | 214.897 | 6,579/6,579 | 183,630.65 | PASS |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -110,6 +116,49 @@ the cause of the cold timeout. Corrective worker logging is now enabled in
 the suite. The elastic LP's inner budget is raised from 90 to 180 seconds;
 the outer 300-second scenario deadline and five-second finalization reserve
 are unchanged. Small and explicit-security repair LP budgets are unchanged.
+
+With that headroom, cold 16,789-bus scenario 094 passed. Its two concurrent
+elastic LPs took 109.424 and 110.972 seconds, both exceeding the former
+90-second inner cap. The final native contingency residual was
+`7.163773372287352e-6`, with all 239 official labels and zero infeasibility.
+
+The ensuing five-case 19,402-bus batch passed four cases. Scenario 006
+stopped with 6,690/6,693 completed. Fast-screen logs contain 6,691 task
+acknowledgements, but one was a failed screen requiring corrective repair;
+an acknowledgement is not a feasibility certificate. CTG_000262/000263 had
+no completed fast-screen result. CTG_000179's corrective elastic IPM hit
+180.145 seconds after seven iterations without an accepted candidate, after
+22.32 seconds of prelinear Newton work. A timing-only profile now promotes
+these unfinished tasks and the nine measured screens exceeding 30 seconds.
+An analytic primal/basis simplex diagnostic is separate from cold runs.
+
+That primal/basis diagnostic did not pass: its 150-second native limit
+expired without an accepted corrective candidate (155.088 seconds including
+diagnostic setup/termination). It is not enabled as a production default.
+Inspection then found a concrete row-generation bug: base and contingency
+security collectors used the state's reconstructed `sm_slack` even when it
+exceeded the source cap. This masks the very branch violation that needs a
+repair constraint. Both collectors now evaluate flow excess at the allowed
+slack; they do not clip or alter the candidate, source cap, or final checker.
+Tiny tests cover illegal versus permitted slack, both line terminals, voltage
+dependence, transformer behavior, and nonmutation of candidate state.
+
+Failure reporting now distinguishes absent final verification evidence from
+an actual observed revision or executable-hash mismatch. All missing
+evidence remains a failed acceptance gate.
+
+## Storage pruning during development
+
+After the five-case batch ended and solver processes were absent, checked
+exact target containment, absence of reparse points, and archived status /
+adjacent-JSON hashes for old 19,402-bus 010 targets v1, v2, and v3. Removed
+only their 40,284 `solution_*.txt` file entries (74,185,604,185 logical bytes,
+including duplicate/hard-linked payload entries). C: free space increased
+from 49,013,534,720 to 86,038,650,880 bytes: 37,025,116,160 bytes recovered.
+All archived JSON hashes still matched after pruning. Source, code, logs,
+internal JSON states, summaries, certificates, and the latest five-case
+batch were retained. Deletion was permanent; certificates retain the record
+of verification, not the removed full solution text for direct re-evaluation.
 
 Run evidence is under
 `C:\Users\thoma\Documents\gravityx-go2-cpp\runs\reliability_20260915`.

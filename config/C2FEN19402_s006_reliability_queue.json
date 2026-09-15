@@ -1,0 +1,65 @@
+{
+  "case_sha256": "66504eaef8cbed2d6f85a9621ee6aaf0a9c8ecbb52ecf090df33c66cc7af5b22",
+  "contingencies": [
+    {
+      "label": "CTG_000000",
+      "measured_solver_wall_seconds": 48.472180714
+    },
+    {
+      "label": "CTG_000002",
+      "measured_solver_wall_seconds": 35.02933608
+    },
+    {
+      "label": "CTG_000178",
+      "measured_solver_wall_seconds": 45.775446034
+    },
+    {
+      "label": "CTG_000261",
+      "measured_solver_wall_seconds": 58.025589404
+    },
+    {
+      "label": "CTG_000273",
+      "measured_solver_wall_seconds": 31.022837253
+    },
+    {
+      "label": "CTG_000390",
+      "measured_solver_wall_seconds": 30.714483093
+    },
+    {
+      "label": "CTG_000475",
+      "measured_solver_wall_seconds": 68.56051283
+    },
+    {
+      "label": "CTG_003858",
+      "measured_solver_wall_seconds": 39.488578789
+    },
+    {
+      "label": "CTG_004455",
+      "measured_solver_wall_seconds": 43.695590952
+    }
+  ],
+  "heavy_threshold_seconds": 30.0,
+  "purpose": "Scheduling-only heavy-screen concurrency profile. Contains no primal, dual, commitment, network, or solver state. Repeated cold timings are merged by maximum measured solver time.",
+  "schema_version": 3,
+  "source_measurement": {
+    "complete_contingency_coverage": false,
+    "unfinished_corrective_priority_labels": ["CTG_000179"],
+    "merge_rule": "maximum measured solver wall time by label",
+    "runs": [
+      {
+        "completed_task_result_count": 6691,
+        "git_revision": "3790e894f803e4c77e68f6b3b7ec0aa08e605981",
+        "scenario_run_name": "C2FEN19402_s006_cold",
+        "source_run_success": false,
+        "worker_log_count": 24
+      }
+    ],
+    "source_profiles": [],
+    "unfinished_semantics": "Unobserved completion is a priority, not a measured duration or feasibility claim"
+  },
+  "unfinished_priority_labels": [
+    "CTG_000179",
+    "CTG_000262",
+    "CTG_000263"
+  ]
+}

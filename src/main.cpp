@@ -101,6 +101,26 @@ struct PassivePocket {
     std::vector<int> buses;
 };
 
+double branch_violation_at_allowed_slack(
+    const gravityx::Branch& branch, const gravityx::AcState& state,
+    std::size_t position, double rating, double slack_limit) {
+    // Derived states can require more overload slack than the source allows.
+    // Using that illegal value to screen rows hides the physical violation.
+    // Clamp only the screening allowance, never the candidate or source data.
+    const double slack = std::clamp(state.sm_slack[position], 0.0, slack_limit);
+    const double from_scale = branch.transformer
+        ? 1.0 + slack : state.vm[branch.from] + slack;
+    const double to_scale = branch.transformer
+        ? 1.0 + slack : state.vm[branch.to] + slack;
+    return std::max(
+        state.pf[position] * state.pf[position] +
+            state.qf[position] * state.qf[position] -
+            rating * rating * from_scale * from_scale,
+        state.pt[position] * state.pt[position] +
+            state.qt[position] * state.qt[position] -
+            rating * rating * to_scale * to_scale);
+}
+
 std::vector<PassivePocket> find_small_passive_outage_pockets(
     const gravityx::CaseData& data,
     int outaged_branch,
@@ -464,6 +484,35 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 
 int run_component_tests() {
     gravityx::run_fast_power_flow_topology_cache_regression();
+    {
+        gravityx::Branch branch;
+        branch.from = 0;
+        branch.to = 1;
+        gravityx::AcState state;
+        state.vm = {1.0, 1.0};
+        state.pf = {1.3};
+        state.qf = {0.0};
+        state.pt = {-1.3};
+        state.qt = {0.0};
+        state.sm_slack = {0.3};
+        require_near(branch_violation_at_allowed_slack(branch, state, 0, 1.0, 0.2),
+                     0.25, 1e-12, "illegal slack must not mask a security row");
+        require_near(state.sm_slack[0], 0.3, 0.0, "screen must not modify candidate slack");
+        state.pf[0] = 1.1;
+        state.pt[0] = -1.1;
+        state.sm_slack[0] = 0.1;
+        require_near(branch_violation_at_allowed_slack(branch, state, 0, 1.0, 0.2),
+                     0.0, 1e-12, "permitted soft allowance remains permitted");
+        state.vm = {0.9, 0.8};
+        state.sm_slack[0] = 0.3;
+        state.pt[0] = -1.05;
+        require_near(branch_violation_at_allowed_slack(branch, state, 0, 1.0, 0.2),
+                     0.1025, 1e-12, "screen checks both line terminals and voltage");
+        branch.transformer = true;
+        state.pf[0] = 1.3;
+        require_near(branch_violation_at_allowed_slack(branch, state, 0, 1.0, 0.2),
+                     0.25, 1e-12, "transformer allowance ignores bus voltage");
+    }
     const auto require_lp_policy = [](bool feasibility, std::size_t buses,
                                       bool economic, bool elastic,
                                       const char* expected) {
@@ -2151,18 +2200,9 @@ int run_validated_source_base_json(
                             angle - branch.angmax,
                             branch.angmin - angle);
                     }
-                    const double slack = state.sm_slack[i];
-                    const double from_scale = branch.transformer
-                        ? 1.0 + slack : state.vm[branch.from] + slack;
-                    const double to_scale = branch.transformer
-                        ? 1.0 + slack : state.vm[branch.to] + slack;
-                    const double apparent_violation = std::max(
-                        state.pf[i] * state.pf[i] +
-                            state.qf[i] * state.qf[i] -
-                            rating * rating * from_scale * from_scale,
-                        state.pt[i] * state.pt[i] +
-                            state.qt[i] * state.qt[i] -
-                            rating * rating * to_scale * to_scale);
+                    const double apparent_violation =
+                        branch_violation_at_allowed_slack(
+                            branch, state, i, rating, data.sm_vio_limit);
                     if (std::max(angle_violation, apparent_violation) <=
                             kSecurityCollectionTolerance ||
                         dynamic_security_selected[i]) {
@@ -3755,18 +3795,9 @@ bool solve_loaded_contingency(
                             angle - branch.angmax,
                             branch.angmin - angle);
                     }
-                    const double slack = state.sm_slack[i];
-                    const double from_scale = branch.transformer
-                        ? 1.0 + slack : state.vm[branch.from] + slack;
-                    const double to_scale = branch.transformer
-                        ? 1.0 + slack : state.vm[branch.to] + slack;
-                    const double apparent_violation = std::max(
-                        state.pf[i] * state.pf[i] +
-                            state.qf[i] * state.qf[i] -
-                            rating * rating * from_scale * from_scale,
-                        state.pt[i] * state.pt[i] +
-                            state.qt[i] * state.qt[i] -
-                            rating * rating * to_scale * to_scale);
+                    const double apparent_violation =
+                        branch_violation_at_allowed_slack(
+                            branch, state, i, rating, data.sm_vio_limit);
                     if (std::max(angle_violation, apparent_violation) <=
                         kSecurityCollectionTolerance ||
                         dynamic_security_selected[i]) {

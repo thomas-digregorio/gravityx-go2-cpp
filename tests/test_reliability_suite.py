@@ -32,6 +32,14 @@ class ReliabilityAuditTests(unittest.TestCase):
     def test_complete_negative_objective_is_not_infeasibility(self):
         self.assertEqual(self.check(), [])
 
+    def test_missing_summary_is_not_reported_as_observed_hash_mismatch(self):
+        failures = audit_success({"success": False, "stage": "code2",
+                                  "completed_contingency_count": 1}, {}, 2,
+                                 "frozen", "binary", 300)
+        self.assertIn("final summary and verification evidence missing", failures)
+        self.assertIn("incomplete contingency count", failures)
+        self.assertFalse(any("mismatch" in message for message in failures))
+
     def test_missing_or_nonfinite_fields_fail_closed(self):
         for key in ("total_wall_seconds", "max_independent_contingency_residual"):
             for value in (None, float("nan"), float("inf")):

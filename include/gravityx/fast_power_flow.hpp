@@ -55,6 +55,14 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.max_economic_linearized_phase_two_rounds = 0;
 }
 
+inline bool needs_contingency_economic_cleanup(
+    const FastPowerFlowOptions& options, std::size_t bus_count,
+    bool base_mode, bool direct_only) {
+    // A seed-bank probe is a validator, not another optimization attempt.
+    return !base_mode && !direct_only && bus_count >= 16000 &&
+        options.economic_balance_polish;
+}
+
 struct FastPowerFlowResult {
     bool converged{};
     bool feasible{};
@@ -126,6 +134,7 @@ struct FastPowerFlowResult {
     ValidationReport validation;
 
     nlohmann::json to_json() const;
+    nlohmann::json economic_summary_json() const;
 };
 
 struct ValidatedSourceBaseResult {

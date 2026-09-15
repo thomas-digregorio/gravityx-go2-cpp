@@ -655,6 +655,27 @@ int run_component_tests() {
         cached_economic_options.fixed_jacobian_time_limit_seconds != 7.0) {
         throw std::runtime_error("cached economic polish changed safety policy or enabled an LP");
     }
+    if (gravityx::needs_contingency_economic_cleanup(
+            cached_economic_options, 19402, false, true) ||
+        gravityx::needs_contingency_economic_cleanup(
+            cached_economic_options, 19402, true, false) ||
+        gravityx::needs_contingency_economic_cleanup(
+            cached_economic_options, 15999, false, false) ||
+        !gravityx::needs_contingency_economic_cleanup(
+            cached_economic_options, 19402, false, false)) {
+        throw std::runtime_error("economic cleanup violated direct-only seed screening");
+    }
+    gravityx::FastPowerFlowResult economic_log_fixture;
+    economic_log_fixture.economic_balance_polish_attempted = true;
+    economic_log_fixture.economic_balance_polish_objective_before = 12.0;
+    economic_log_fixture.economic_balance_polish_objective_after = 15.0;
+    const auto economic_log = economic_log_fixture.economic_summary_json();
+    if (!economic_log.at("economic_balance_polish_attempted").get<bool>() ||
+        economic_log.at("economic_balance_polish_objective_before") != 12.0 ||
+        economic_log.at("economic_balance_polish_objective_after") != 15.0 ||
+        economic_log.contains("solve") || economic_log.contains("state")) {
+        throw std::runtime_error("compact economic logging lost attribution or included vectors");
+    }
     feasible_validation.max_residual = 1e-4;
     if (gravityx::validated_candidate_is_feasible(
             nonconverged_feasible, feasible_validation, 1e-5)) {
@@ -3567,10 +3588,7 @@ bool solve_loaded_contingency(
                 {"fast_power_flow_screen", true},
                 {"fast_screen", persist_result
                     ? fast_result->to_json()
-                    : nlohmann::json({
-                          {"failure_reason", fast_result->failure_reason},
-                          {"wall_seconds", fast_result->wall_seconds},
-                      })},
+                    : fast_result->economic_summary_json()},
                 {"bounded_fast_linearized_repair",
                  bounded_fast_linearized_repair
                      ? bounded_fast_linearized_repair->to_json(false)

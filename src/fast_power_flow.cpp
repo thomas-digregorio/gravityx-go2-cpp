@@ -2358,6 +2358,23 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     }
 };
 
+nlohmann::json FastPowerFlowResult::economic_summary_json() const {
+    return {
+        {"failure_reason", failure_reason},
+        {"wall_seconds", wall_seconds},
+        {"economic_balance_polish_attempted", economic_balance_polish_attempted},
+        {"economic_balance_polish_selected", economic_balance_polish_selected},
+        {"economic_balance_polish_iterations", economic_balance_polish_iterations},
+        {"economic_balance_polish_backtracking_attempts", economic_balance_polish_backtracking_attempts},
+        {"economic_balance_polish_objective_before", economic_balance_polish_objective_before},
+        {"economic_balance_polish_objective_after", economic_balance_polish_objective_after},
+        {"economic_balance_polish_active_slack_before", economic_balance_polish_active_slack_before},
+        {"economic_balance_polish_active_slack_after", economic_balance_polish_active_slack_after},
+        {"economic_balance_polish_reactive_slack_before", economic_balance_polish_reactive_slack_before},
+        {"economic_balance_polish_reactive_slack_after", economic_balance_polish_reactive_slack_after},
+    };
+}
+
 nlohmann::json FastPowerFlowResult::to_json() const {
     return {
         {"converged", converged},
@@ -3024,7 +3041,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
               direct_state.q_delta.begin(),
               direct_state.q_delta.end(), 0.0) > 1e-9));
     const bool contingency_economic_cleanup_pending =
-        !base_mode && nb >= 16000 && options_.economic_balance_polish;
+        needs_contingency_economic_cleanup(
+            options_, data_.buses.size(), base_mode,
+            supplied_candidate_direct_only);
     if (output.direct_candidate_validation.max_residual <=
             options_.validation_tolerance &&
         !direct_balance_cleanup_pending &&
@@ -3242,7 +3261,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 predictor_cache_->preparation_seconds;
         }
         bool branch_outage_low_rank_update = false;
-        if (predictor_cache_ && outaged_branch < 0) {
+        if (predictor_cache_) {
+            // Never carry a previous branch's Woodbury update into a new
+            // outage. In particular, transformer searches do not prepare the
+            // line-only update below before their first correction.
             predictor_cache_->configure_branch_outage_update(
                 data_, base_state_, -1);
         }

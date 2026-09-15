@@ -51,6 +51,7 @@ are frozen and recorded by the suite runner.
 | 19,402 | 010 | 7326430 | 295.419 | 6,692/6,693 | Not certified | Deadline during CTG_002365 |
 | 19,402 | 010 | 7fe014d | 295.101 | 6,693/6,693 | Not certified | Unused corrective-worker startup hit deadline |
 | 16,789 | 094 | 7fe014d | 295.289 | 236/238 | Not certified | Two generator-outage repairs unfinished |
+| 19,402 | 010 | 69596b2 | 296.761 | 6,693/6,693 | 164,882.98 | PASS |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -65,10 +66,23 @@ launching a native corrective process and caps pool expansion by actual
 queued work. This removes wasted work; it does not suppress a failure from
 an assigned contingency or waive final evaluation.
 
+The controller-fix run passed with all 6,694 official labels (base plus
+6,693 contingencies), zero official infeasibility, and maximum independent
+contingency residual `9.703835222196755e-6`. It has only 3.24 seconds of margin
+to the 300-second cap; the full-suite robustness goal is still outstanding.
+
 The separate 16,789-bus 094 issue is not that lifecycle bug: CTG_000007 and
 CTG_000008 remained in corrective repair. Their saved fast-screen states
 have roughly 2.87 p.u. active-balance residual at bus 14110. Further repair
 work is required before registering the final regression campaign.
+
+The next exact computational improvement reuses sparse symbolic analysis
+within each ordinary or distributed-slack Newton call. Its topology and
+PQ/reference mask are fixed within that call; numerical factorization and
+pivoting still occur at every step. The cache is not shared across calls or
+outages. Tiny lossless and lossy AC fixtures compare cached and uncached
+solutions, iteration counts and symbolic-analysis counts; voltages/angles
+must agree to `1e-12`. All four CTest groups and 59 Python tests pass.
 
 Run evidence is under
 `C:\Users\thoma\Documents\gravityx-go2-cpp\runs\reliability_20260915`.

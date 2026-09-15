@@ -147,7 +147,9 @@ NewtonResult run_newton(
     int max_iterations,
     double tolerance,
     std::vector<double>& vm,
-    std::vector<double>& va) {
+    std::vector<double>& va,
+    bool reuse_symbolic_analysis = true,
+    int* symbolic_analysis_count = nullptr) {
     const int nb = static_cast<int>(data.buses.size());
     std::vector<int> angle_index(nb, -1);
     std::vector<int> voltage_index(nb, -1);
@@ -168,6 +170,11 @@ NewtonResult run_newton(
 
     std::vector<double> p;
     std::vector<double> q;
+    // Topology, reference buses and the PQ mask are constant for this call.
+    // Only values change. A later call (including a changed mask or outage)
+    // gets a fresh factorization; numeric pivoting is still redone every step.
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
+    bool symbolic_ready = false;
     for (int iteration = 0; iteration <= max_iterations; ++iteration) {
         network_injections(ybus, vm, va, p, q);
         const double norm = mismatch_norm(
@@ -259,8 +266,13 @@ NewtonResult run_newton(
 
         SparseMatrix jacobian(dimension, dimension);
         jacobian.setFromTriplets(entries.begin(), entries.end());
-        Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
-        factorization.analyzePattern(jacobian);
+        if (!reuse_symbolic_analysis || !symbolic_ready) {
+            factorization.analyzePattern(jacobian);
+            symbolic_ready = true;
+            if (symbolic_analysis_count) {
+                ++*symbolic_analysis_count;
+            }
+        }
         factorization.factorize(jacobian);
         if (factorization.info() != Eigen::Success) {
             return {false, iteration, "sparse Jacobian factorization failed"};
@@ -335,7 +347,9 @@ NewtonResult run_distributed_active_newton(
     int max_iterations,
     double tolerance,
     std::vector<double>& vm,
-    std::vector<double>& va) {
+    std::vector<double>& va,
+    bool reuse_symbolic_analysis = true,
+    int* symbolic_analysis_count = nullptr) {
     const int nb = static_cast<int>(data.buses.size());
     if (component_of.size() != static_cast<std::size_t>(nb) ||
         active_slack_weights.size() != static_cast<std::size_t>(nb)) {
@@ -398,6 +412,8 @@ NewtonResult run_distributed_active_newton(
         return result;
     };
 
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
+    bool symbolic_ready = false;
     for (int iteration = 0; iteration <= max_iterations; ++iteration) {
         network_injections(ybus, vm, va, p, q);
         const double norm = residual_norm();
@@ -503,8 +519,13 @@ NewtonResult run_distributed_active_newton(
 
         SparseMatrix jacobian(dimension, dimension);
         jacobian.setFromTriplets(entries.begin(), entries.end());
-        Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
-        factorization.analyzePattern(jacobian);
+        if (!reuse_symbolic_analysis || !symbolic_ready) {
+            factorization.analyzePattern(jacobian);
+            symbolic_ready = true;
+            if (symbolic_analysis_count) {
+                ++*symbolic_analysis_count;
+            }
+        }
         factorization.factorize(jacobian);
         if (factorization.info() != Eigen::Success) {
             return {false, iteration,
@@ -1010,6 +1031,54 @@ void run_fast_power_flow_topology_cache_regression() {
         std::abs(angles[2]) > 1e-12) {
         throw std::runtime_error(
             "fast power-flow topology cache normalized the wrong island");
+    }
+
+    // Compare cached and fresh symbolic analysis on a nonlinear tiny AC
+    // fixture, both ordinary and distributed-slack Newton. Demand/injection
+    // values come from a known voltage state, not from a production case.
+    for (double conductance : {0.0, 0.5}) {
+    YRows admittance(3);
+    for (const auto& edge : std::vector<std::pair<int, int>>{{0, 1}, {1, 2}, {0, 2}}) {
+        const Complex y(conductance, -10.0);
+        admittance[edge.first][edge.first] += y;
+        admittance[edge.second][edge.second] += y;
+        admittance[edge.first][edge.second] -= y;
+        admittance[edge.second][edge.first] -= y;
+    }
+    const std::vector<double> target_vm{1.0, 0.98, 1.01};
+    const std::vector<double> target_va{0.0, -0.04, -0.01};
+    std::vector<double> p_target, q_target;
+    network_injections(admittance, target_vm, target_va, p_target, q_target);
+    for (bool distributed : {false, true}) {
+        std::vector<double> cached_vm(3, 1.0), cached_va(3, 0.0);
+        auto fresh_vm = cached_vm;
+        auto fresh_va = cached_va;
+        int cached_analyses = 0;
+        int fresh_analyses = 0;
+        const auto run = [&](bool reuse, std::vector<double>& vm,
+                             std::vector<double>& va, int& analyses) {
+            return distributed
+                ? run_distributed_active_newton(data, admittance,
+                    {true, false, false}, {false, true, true}, {0, 0, 0},
+                    {1.0, 0.0, 0.0}, p_target, q_target, 20, 1e-12,
+                    vm, va, reuse, &analyses)
+                : run_newton(data, admittance, {true, false, false},
+                    {false, true, true}, p_target, q_target, 20, 1e-12,
+                    vm, va, reuse, &analyses);
+        };
+        const auto cached = run(true, cached_vm, cached_va, cached_analyses);
+        const auto fresh = run(false, fresh_vm, fresh_va, fresh_analyses);
+        if (!cached.converged || !fresh.converged || cached_analyses != 1 ||
+            fresh_analyses <= 1 || cached.iterations != fresh.iterations) {
+            throw std::runtime_error("Newton symbolic-reuse regression failed");
+        }
+        for (int bus = 0; bus < 3; ++bus) {
+            if (std::abs(cached_vm[bus] - fresh_vm[bus]) > 1e-12 ||
+                std::abs(cached_va[bus] - fresh_va[bus]) > 1e-12) {
+                throw std::runtime_error("Newton symbolic reuse changed the solution");
+            }
+        }
+    }
     }
 }
 

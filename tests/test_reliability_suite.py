@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from run_reliability_suite import audit_success, normalized_case, arguments
 from run_experiment import (load_fast_screen_heavy_profile, start_worker_if_task,
-                            additional_corrective_workers)
+                            additional_corrective_workers, cpp_command)
 
 
 class ReliabilityAuditTests(unittest.TestCase):
@@ -103,6 +103,15 @@ class ReliabilityAuditTests(unittest.TestCase):
             self.fail("Empty work queue started a solver")
         self.assertEqual(start_worker_if_task(lambda: None, forbidden), (None, None))
         self.assertEqual(additional_corrective_workers(4, 8, 0), 0)
+
+    def test_repair_logging_does_not_change_process_deadline(self):
+        normal = cpp_command(Path("C:/local/solver"), "Ubuntu-24.04", ["worker"], 123)
+        logged = cpp_command(Path("C:/local/solver"), "Ubuntu-24.04", ["worker"], 123,
+                             repair_logging=True)
+        self.assertEqual([s for s in logged if not s.startswith("GRAVITYX_")], normal)
+        self.assertIn("123.000s", logged)
+        self.assertIn("GRAVITYX_HIGHS_LOG=1", logged)
+        self.assertIn("GRAVITYX_REPAIR_LOG=1", logged)
 
     def test_corrective_process_starts_only_after_claiming_real_task(self):
         order = []

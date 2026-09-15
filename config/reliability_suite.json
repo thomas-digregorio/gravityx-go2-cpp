@@ -7,6 +7,7 @@
   "vendor_evaluator": "C:/Users/thoma/Documents/goc2-dc-scopf-cpu/vendor/C2DataUtilities/data_utilities/evaluation.py",
   "total_time_limit": 300,
   "minimum_free_space_gib": 30,
+  "native_repair_log": true,
   "screen_profiles": {
     "19402/010": "config/C2FEN19402_s010_reliability_queue.json"
   },

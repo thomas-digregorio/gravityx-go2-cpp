@@ -479,6 +479,12 @@ int run_component_tests() {
     require_lp_policy(false, 4224, true, false, "simplex");
     require_lp_policy(true, 8300, false, false, "ipm");
     require_lp_policy(false, 4224, false, false, "ipm");
+    require_near(gravityx::default_contingency_repair_lp_seconds(8300, false),
+                 60.0, 0.0, "small repair LP budget unchanged");
+    require_near(gravityx::default_contingency_repair_lp_seconds(16789, true),
+                 90.0, 0.0, "security repair LP budget unchanged");
+    require_near(gravityx::default_contingency_repair_lp_seconds(16789, false),
+                 180.0, 0.0, "elastic repair LP budget");
     const auto points = gravityx::active_pwl_points(
         {0.0, 0.0, 10.0, 100.0, 20.0, 300.0}, 3, 5.0, 15.0);
     if (points.size() != 3) {
@@ -3803,7 +3809,8 @@ bool solve_loaded_contingency(
             const double linearized_balance_slack =
                 balance_only_phase_one ? 0.25 : 0.49;
             const double linearized_time_limit_seconds =
-                balance_only_phase_one ? 90.0 : 60.0;
+                gravityx::default_contingency_repair_lp_seconds(
+                    data.buses.size(), !dynamic_security_branches.empty());
             auto linear = gravityx::solve_linearized_ac_seed(
                 data, reference, base.commitment,
                 linearized_balance_slack, contingency_context(),

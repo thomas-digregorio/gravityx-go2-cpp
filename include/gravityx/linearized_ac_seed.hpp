@@ -16,6 +16,8 @@ namespace gravityx {
 std::string default_linearized_seed_lp_solver(
     bool feasibility_only, std::size_t bus_count,
     bool economic_objective, bool elastic_balance_phase_one);
+double default_contingency_repair_lp_seconds(
+    std::size_t bus_count, bool has_security_rows);
 
 struct LinearizedAcSeedResult {
     bool success{};

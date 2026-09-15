@@ -96,6 +96,8 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
         "--streaming-persistent-evaluator-processes", "--streaming-evaluation-tail-shard-sizes",
         "96,64,48,32,16" if large else "32,16,8,4"]
     profile = config.get("screen_profiles", {}).get(f"{family}/{scenario}")
+    if config.get("native_repair_log", False):
+        command.append("--native-repair-log")
     if profile:
         command += ["--fast-screen-heavy-profile", str(REPO / profile),
                     "--fast-screen-heavy-workers", "4"]

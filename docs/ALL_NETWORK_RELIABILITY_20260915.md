@@ -53,6 +53,7 @@ are frozen and recorded by the suite runner.
 | 16,789 | 094 | 7fe014d | 295.289 | 236/238 | Not certified | Two generator-outage repairs unfinished |
 | 19,402 | 010 | 69596b2 | 296.761 | 6,693/6,693 | 164,882.98 | PASS |
 | 16,789 | 094 | cc53fca | 295.129 | 236/238 | Not certified | Same two generator-outage repairs unfinished |
+| 16,789 | 094 | f471795 | 295.131 | 236/238 | Not certified | IPM policy alone did not finish the cold run |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -99,6 +100,16 @@ The numerical-method policy now selects IPM for elastic balance Phase I;
 economic and non-elastic large-network LPs retain their previous policy.
 Matrix construction, LP tolerances, and physical acceptance are unchanged.
 The result log records the actual selected LP method, including overrides.
+
+The cold IPM-policy replacement still timed out. Its saved base voltages,
+angles, active/reactive dispatch and demand factors exactly match the prior
+diagnostic input. Replaying CTG_000007 alone again passed in 95.238 seconds
+(88.603 seconds reported for LP plus postlinear Newton). This points to a
+runtime/context issue rather than a changed base point, but does not prove
+the cause of the cold timeout. Corrective worker logging is now enabled in
+the suite. The elastic LP's inner budget is raised from 90 to 180 seconds;
+the outer 300-second scenario deadline and five-second finalization reserve
+are unchanged. Small and explicit-security repair LP budgets are unchanged.
 
 Run evidence is under
 `C:\Users\thoma\Documents\gravityx-go2-cpp\runs\reliability_20260915`.

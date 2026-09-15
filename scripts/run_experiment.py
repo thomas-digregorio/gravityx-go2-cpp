@@ -1937,6 +1937,8 @@ def cpp_command(
     distro: str,
     arguments: list[str],
     timeout: float,
+    *,
+    repair_logging: bool = False,
 ) -> list[str]:
     if timeout <= 0:
         raise ValueError("C++ subprocess timeout must be positive")
@@ -1950,6 +1952,7 @@ def cpp_command(
         f"LD_LIBRARY_PATH={WSL_LIBRARY_PATH}",
         "OMP_NUM_THREADS=1",
         "OPENBLAS_NUM_THREADS=1",
+        *(["GRAVITYX_HIGHS_LOG=1", "GRAVITYX_REPAIR_LOG=1"] if repair_logging else []),
         "timeout",
         "--signal=TERM",
         "--kill-after=5s",
@@ -2818,6 +2821,7 @@ def main() -> int:
     parser.add_argument("--compact-final-summary", action="store_true")
     parser.add_argument("--resident-contingency-model", action="store_true")
     parser.add_argument("--ipopt-acceptable-termination", action="store_true")
+    parser.add_argument("--native-repair-log", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--economic-contingency-polish", action="store_true")
     parser.add_argument("--cpp-solution-writer", action="store_true")
@@ -4063,6 +4067,7 @@ def main() -> int:
             command = cpp_command(
                 args.executable, args.distro, worker_arguments,
                 effective_process_timeout(args.contingency_timeout, contingency_deadline),
+                repair_logging=args.native_repair_log,
             )
             return subprocess.Popen(
                 command, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -4726,6 +4731,7 @@ def main() -> int:
         "requested_fast_workers": args.fast_workers,
         "resident_contingency_model": args.resident_contingency_model,
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
+        "native_repair_log": args.native_repair_log,
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "economic_contingency_polish": args.economic_contingency_polish,
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,

@@ -331,6 +331,14 @@ std::string default_linearized_seed_lp_solver(
     return feasibility_only && bus_count >= 16000 ? "simplex" : "ipm";
 }
 
+double default_contingency_repair_lp_seconds(
+    std::size_t bus_count, bool has_security_rows) {
+    // The unchanged process-level deadline remains authoritative. An elastic
+    // IPM solve measured near the former 90-second inner cap needs headroom
+    // when multiple repairs share the CPU; do not discard it prematurely.
+    return bus_count < 16000 ? 60.0 : (has_security_rows ? 90.0 : 180.0);
+}
+
 nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
     nlohmann::json value = {
         {"success", success},

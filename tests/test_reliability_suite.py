@@ -118,6 +118,16 @@ class ReliabilityAuditTests(unittest.TestCase):
         self.assertIn("--validated-source-base", candidate)
         self.assertNotIn("--skip-evaluation", candidate)
 
+    def test_epigraph_changes_only_an_explicit_base_flag(self):
+        config = {"python": "python", "data_repository": "data", "source_root": "sources",
+                  "vendor_evaluator": "evaluator", "total_time_limit": 300,
+                  "minimum_free_space_gib": 30}
+        before = arguments(config, "19402", "095", Path("run"))
+        config["base_pwl_epigraph"] = True
+        after = arguments(config, "19402", "095", Path("run"))
+        self.assertEqual(after, before + ["--base-pwl-epigraph"])
+        self.assertIn("--validated-source-base", after)
+
     def test_predictor_handoff_budget_is_explicit_hash_bound_and_not_a_measurement(self):
         profile = {"schema_version": 4, "case_sha256": "case", "heavy_threshold_seconds": 10,
                    "contingencies": [{"label": "a", "measured_solver_wall_seconds": 20}],

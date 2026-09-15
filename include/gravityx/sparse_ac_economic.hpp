@@ -16,6 +16,7 @@ struct SparseAcEconomicOptions {
     double tolerance{1e-7};
     double acceptable_tolerance{1e-5};
     int print_level{};
+    bool pwl_epigraph{false};
 };
 
 struct SparseAcEconomicResult {
@@ -31,6 +32,10 @@ struct SparseAcEconomicResult {
     int variable_count{};
     int constraint_count{};
     int jacobian_nonzero_count{};
+    bool pwl_epigraph_enabled{};
+    int pwl_epigraph_curve_count{};
+    int pwl_epigraph_row_count{};
+    int pwl_original_curve_count{};
     int intermediate_callbacks{};
     int intermediate_iterates_retrieved{};
     int intermediate_verified_candidates{};
@@ -59,5 +64,11 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
     const std::vector<int>& commitment,
     const SolveResult& incumbent,
     const SparseAcEconomicOptions& options = {});
+
+// Tiny-fixture checks of equivalent costs, unchanged physical rows/bounds,
+// and the new analytic cost Jacobian. Does not solve a production case.
+void run_sparse_ac_pwl_epigraph_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& start);
 
 }  // namespace gravityx

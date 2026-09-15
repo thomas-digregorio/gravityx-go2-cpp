@@ -118,6 +118,40 @@ std::pair<double, double> pwl_value_slope(
     return {value, derivative};
 }
 
+struct EpigraphSegment {
+    double slope{};
+    double intercept{};
+};
+
+bool convex_epigraph_segments(
+    const std::vector<PwlPoint>& points, double sign,
+    std::vector<EpigraphSegment>& segments, double& scale) {
+    segments.clear();
+    scale = 1.0;
+    if (points.size() < 2) {
+        return false;
+    }
+    double previous_slope = -std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+        const auto& left = points[i];
+        const auto& right = points[i + 1];
+        const double width = right.mw - left.mw;
+        const double slope = sign * (right.cost - left.cost) / width;
+        const double intercept = sign * left.cost - slope * left.mw;
+        // Never convexify a source curve or repair its slopes. Even a small
+        // decreasing slope retains the original piecewise representation.
+        if (!(width > 1e-14) || !std::isfinite(slope) ||
+            !std::isfinite(intercept) || slope < previous_slope) {
+            segments.clear();
+            return false;
+        }
+        segments.push_back({slope, intercept});
+        scale = std::max(scale, std::abs(slope));
+        previous_slope = slope;
+    }
+    return true;
+}
+
 BranchCoefficients branch_coefficients(const Branch& branch) {
     const double denominator = branch.r * branch.r + branch.x * branch.x;
     const double g = denominator > 1e-20 ? branch.r / denominator : 0.0;
@@ -230,7 +264,8 @@ public:
         const CaseData& data,
         std::vector<int> commitment,
         const AcState& start,
-        double verification_tolerance)
+        double verification_tolerance,
+        bool pwl_epigraph = false)
         : data_(data),
           commitment_(std::move(commitment)),
           start_state_(start),
@@ -271,7 +306,15 @@ public:
         start_x_.assign(variable_count_, 0.0);
         generator_points_.resize(ng_);
         load_points_.resize(nd_);
+        generator_epigraph_column_.assign(ng_, -1);
+        load_epigraph_column_.assign(nd_, -1);
         build_variables();
+        if (pwl_epigraph) {
+            build_pwl_epigraph();
+        } else {
+            pwl_original_curve_count_ = nd_ + static_cast<int>(
+                std::count(commitment_.begin(), commitment_.end(), 1));
+        }
         ybus_ = build_ybus(data_, start_state_);
         coefficients_.reserve(nl_);
         for (const auto& branch : data_.branches) {
@@ -301,8 +344,10 @@ public:
                 reference_buses_.push_back(bus);
             }
         }
-        constraint_count_ = reference_row_offset_ +
+        epigraph_row_offset_ = reference_row_offset_ +
             static_cast<int>(reference_buses_.size());
+        constraint_count_ = epigraph_row_offset_ +
+            static_cast<int>(epigraph_rows_.size());
         build_jacobian_structure();
         std::vector<double> initial_constraints(constraint_count_);
         evaluate_constraints(start_x_.data(), initial_constraints.data());
@@ -389,7 +434,7 @@ public:
         }
         std::fill(gradient, gradient + n, 0.0);
         for (int i = 0; i < ng_; ++i) {
-            if (commitment_[i] == 0) {
+            if (commitment_[i] == 0 || generator_epigraph_column_[i] >= 0) {
                 continue;
             }
             gradient[pg_offset_ + i] = data_.delta *
@@ -398,6 +443,9 @@ public:
                 objective_scale_;
         }
         for (int i = 0; i < nd_; ++i) {
+            if (load_epigraph_column_[i] >= 0) {
+                continue;
+            }
             const auto& load = data_.loads[i];
             gradient[demand_offset_ + i] = -data_.delta * load.pd_nominal *
                 pwl_value_slope(
@@ -420,6 +468,9 @@ public:
         std::fill(
             gradient + sm_offset_,
             gradient + sm_offset_ + nl_, sm_penalty);
+        for (const auto& [column, scale] : epigraph_weights_) {
+            gradient[column] = data_.delta * scale / objective_scale_;
+        }
         return true;
     }
 
@@ -561,6 +612,13 @@ public:
 
     int variable_count() const { return variable_count_; }
     int constraint_count() const { return constraint_count_; }
+    int pwl_epigraph_curve_count() const {
+        return static_cast<int>(epigraph_weights_.size());
+    }
+    int pwl_epigraph_row_count() const {
+        return static_cast<int>(epigraph_rows_.size());
+    }
+    int pwl_original_curve_count() const { return pwl_original_curve_count_; }
     int jacobian_nonzero_count() const {
         return static_cast<int>(jacobian_rows_.size());
     }
@@ -628,7 +686,8 @@ private:
             x.begin() + p_delta_offset_, x.begin() + q_delta_offset_);
         state.q_delta.assign(
             x.begin() + q_delta_offset_, x.begin() + sm_offset_);
-        state.sm_slack.assign(x.begin() + sm_offset_, x.end());
+        state.sm_slack.assign(
+            x.begin() + sm_offset_, x.begin() + sm_offset_ + nl_);
         return state;
     }
 
@@ -699,21 +758,65 @@ private:
         }
     }
 
+    void build_pwl_epigraph() {
+        const auto append_curve = [&](const std::vector<PwlPoint>& points,
+                                      int physical_column, double power_factor,
+                                      double sign, int& value_column) {
+            std::vector<EpigraphSegment> segments;
+            double scale = 1.0;
+            if (!convex_epigraph_segments(points, sign, segments, scale)) {
+                ++pwl_original_curve_count_;
+                return;
+            }
+            value_column = variable_count_++;
+            x_lower_.push_back(-kInfinity);
+            x_upper_.push_back(kInfinity);
+            start_x_.push_back(sign * pwl_value_slope(
+                points, power_factor * start_x_[physical_column]).first / scale);
+            epigraph_weights_.emplace_back(value_column, scale);
+            for (const auto& segment : segments) {
+                epigraph_rows_.push_back({
+                    physical_column, value_column,
+                    segment.slope * power_factor / scale,
+                    segment.intercept / scale});
+            }
+        };
+        for (int i = 0; i < ng_; ++i) {
+            if (commitment_[i]) {
+                append_curve(generator_points_[i], pg_offset_ + i, 1.0,
+                             1.0, generator_epigraph_column_[i]);
+            }
+        }
+        for (int i = 0; i < nd_; ++i) {
+            // Minimize negative load benefit, a convex PWL function when
+            // the supplied benefit curve is concave.
+            append_curve(load_points_[i], demand_offset_ + i,
+                         data_.loads[i].pd_nominal, -1.0,
+                         load_epigraph_column_[i]);
+        }
+    }
+
     double objective_value(const double* x) const {
         double objective = 0.0;
         for (int i = 0; i < ng_; ++i) {
             if (commitment_[i] == 0) {
                 continue;
             }
-            objective += data_.delta *
-                pwl_value_slope(
+            if (generator_epigraph_column_[i] < 0) {
+                objective += data_.delta * pwl_value_slope(
                     generator_points_[i], x[pg_offset_ + i]).first;
+            }
             objective += data_.delta * data_.generators[i].oncost;
         }
         for (int i = 0; i < nd_; ++i) {
-            objective -= data_.delta * pwl_value_slope(
-                load_points_[i],
-                data_.loads[i].pd_nominal * x[demand_offset_ + i]).first;
+            if (load_epigraph_column_[i] < 0) {
+                objective -= data_.delta * pwl_value_slope(
+                    load_points_[i],
+                    data_.loads[i].pd_nominal * x[demand_offset_ + i]).first;
+            }
+        }
+        for (const auto& [column, scale] : epigraph_weights_) {
+            objective += data_.delta * scale * x[column];
         }
         objective += data_.delta * data_.p_delta_cost_approx *
             std::accumulate(
@@ -807,6 +910,12 @@ private:
              ++position) {
             constraints[reference_row_offset_ + position] =
                 x[va_offset_ + reference_buses_[position]];
+        }
+        for (int i = 0; i < static_cast<int>(epigraph_rows_.size()); ++i) {
+            const auto& row = epigraph_rows_[i];
+            constraints[epigraph_row_offset_ + i] =
+                row.slope * x[row.physical_column] + row.intercept -
+                x[row.value_column];
         }
     }
 
@@ -977,6 +1086,12 @@ private:
             append_structure(reference_row_offset_ + position,
                              va_offset_ + reference_buses_[position]);
         }
+        for (int i = 0; i < static_cast<int>(epigraph_rows_.size()); ++i) {
+            append_structure(epigraph_row_offset_ + i,
+                             epigraph_rows_[i].physical_column);
+            append_structure(epigraph_row_offset_ + i,
+                             epigraph_rows_[i].value_column);
+        }
     }
 
     void fill_jacobian_values(const double* x, double* values) const {
@@ -1001,6 +1116,10 @@ private:
         for (std::size_t position = 0;
              position < reference_buses_.size(); ++position) {
             emit(0, 0, 1.0);
+        }
+        for (const auto& row : epigraph_rows_) {
+            emit(0, 0, row.slope);
+            emit(0, 0, -1.0);
         }
         if (next != jacobian_rows_.size()) {
             throw std::runtime_error("sparse AC Jacobian fill count mismatch");
@@ -1032,6 +1151,9 @@ private:
                 violation,
                 std::abs(constraints[reference_row_offset_ + i]));
         }
+        for (int row = epigraph_row_offset_; row < constraint_count_; ++row) {
+            violation = std::max(violation, constraints[row]);
+        }
         return violation;
     }
 
@@ -1056,13 +1178,25 @@ private:
     int thermal_row_offset_{};
     int angle_row_offset_{};
     int reference_row_offset_{};
+    int epigraph_row_offset_{};
     int constraint_count_{};
+    int pwl_original_curve_count_{};
     double objective_scale_{1.0};
     std::vector<double> x_lower_;
     std::vector<double> x_upper_;
     std::vector<double> start_x_;
     std::vector<std::vector<PwlPoint>> generator_points_;
     std::vector<std::vector<PwlPoint>> load_points_;
+    struct EpigraphRow {
+        int physical_column{};
+        int value_column{};
+        double slope{};
+        double intercept{};
+    };
+    std::vector<int> generator_epigraph_column_;
+    std::vector<int> load_epigraph_column_;
+    std::vector<EpigraphRow> epigraph_rows_;
+    std::vector<std::pair<int, double>> epigraph_weights_;
     YRows ybus_;
     std::vector<BranchCoefficients> coefficients_;
     std::vector<int> active_branches_;
@@ -1110,6 +1244,105 @@ std::string application_status_string(Ipopt::ApplicationReturnStatus status) {
 
 }  // namespace
 
+void run_sparse_ac_pwl_epigraph_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& start) {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) {
+            throw std::runtime_error(std::string("PWL epigraph regression: ") + message);
+        }
+    };
+    for (double sign : {1.0, -1.0}) {
+        const std::vector<PwlPoint> points{
+            {2.0, sign * 3.0}, {3.0, sign * 5.0}, {5.0, sign * 13.0}};
+        std::vector<EpigraphSegment> segments;
+        double scale = 0.0;
+        require(convex_epigraph_segments(points, sign, segments, scale),
+                "valid convex signed cost rejected");
+        for (double power : {2.0, 2.5, 3.0, 4.0, 5.0}) {
+            double envelope = -kInfinity;
+            for (const auto& segment : segments) {
+                envelope = std::max(envelope,
+                    segment.slope * power + segment.intercept);
+            }
+            require(std::abs(envelope - sign *
+                pwl_value_slope(points, power).first) < 1e-12,
+                "source cost changed at a breakpoint or segment interior");
+        }
+    }
+    std::vector<EpigraphSegment> rejected;
+    double scale = 0.0;
+    require(!convex_epigraph_segments({{2.0, 0.0}, {3.0, 2.0}, {4.0, 3.0}},
+                1.0, rejected, scale) && rejected.empty(),
+            "nonconvex source curve was convexified");
+    require(!convex_epigraph_segments({{2.0, 0.0}, {2.0, 1.0}},
+                1.0, rejected, scale), "duplicate abscissa accepted");
+
+    SparseAcEconomicNlp original(data, commitment, start, 1e-5, false);
+    SparseAcEconomicNlp epigraph(data, commitment, start, 1e-5, true);
+    Ipopt::Index n0, m0, j0, h0, n1, m1, j1, h1;
+    Ipopt::TNLP::IndexStyleEnum style;
+    original.get_nlp_info(n0, m0, j0, h0, style);
+    epigraph.get_nlp_info(n1, m1, j1, h1, style);
+    require(n1 > n0 && m1 > m0 && epigraph.pwl_epigraph_curve_count() > 0,
+            "tiny fixture did not exercise the reformulation");
+    std::vector<double> x0(n0), x1(n1), lo0(n0), hi0(n0), lo1(n1), hi1(n1);
+    std::vector<double> gl0(m0), gu0(m0), gl1(m1), gu1(m1), g0(m0), g1(m1);
+    original.get_bounds_info(n0, lo0.data(), hi0.data(), m0, gl0.data(), gu0.data());
+    epigraph.get_bounds_info(n1, lo1.data(), hi1.data(), m1, gl1.data(), gu1.data());
+    original.get_starting_point(n0, true, x0.data(), false, nullptr, nullptr,
+                               m0, false, nullptr);
+    epigraph.get_starting_point(n1, true, x1.data(), false, nullptr, nullptr,
+                               m1, false, nullptr);
+    require(std::equal(lo0.begin(), lo0.end(), lo1.begin()) &&
+            std::equal(hi0.begin(), hi0.end(), hi1.begin()) &&
+            std::equal(x0.begin(), x0.end(), x1.begin()) &&
+            std::equal(gl0.begin(), gl0.end(), gl1.begin()) &&
+            std::equal(gu0.begin(), gu0.end(), gu1.begin()),
+            "source bounds, PMIN, physical start or row bounds changed");
+    original.eval_g(n0, x0.data(), true, m0, g0.data());
+    epigraph.eval_g(n1, x1.data(), true, m1, g1.data());
+    require(std::equal(g0.begin(), g0.end(), g1.begin()),
+            "physical constraints changed");
+    for (int row = m0; row < m1; ++row) {
+        require(g1[row] <= 1e-12, "mapped source cost is not epigraph feasible");
+    }
+    double f0 = 0.0, f1 = 0.0;
+    original.eval_f(n0, x0.data(), true, f0);
+    epigraph.eval_f(n1, x1.data(), true, f1);
+    require(std::abs(f0 - f1) < 1e-12, "mapped objective changed");
+
+    std::vector<Ipopt::Index> jr(j1), jc(j1);
+    std::vector<double> values(j1), gradient(n1);
+    epigraph.eval_jac_g(n1, x1.data(), true, m1, j1, jr.data(), jc.data(), nullptr);
+    epigraph.eval_jac_g(n1, x1.data(), true, m1, j1, nullptr, nullptr, values.data());
+    epigraph.eval_grad_f(n1, x1.data(), true, gradient.data());
+    constexpr double step = 1e-6;
+    for (int column = 0; column < n1; ++column) {
+        auto lower = x1, upper = x1;
+        lower[column] -= step;
+        upper[column] += step;
+        std::vector<double> lower_g(m1), upper_g(m1);
+        epigraph.eval_g(n1, lower.data(), true, m1, lower_g.data());
+        epigraph.eval_g(n1, upper.data(), true, m1, upper_g.data());
+        for (int row = m0; row < m1; ++row) {
+            double analytic = 0.0;
+            for (int entry = j0; entry < j1; ++entry) {
+                if (jr[entry] == row && jc[entry] == column) {
+                    analytic += values[entry];
+                }
+            }
+            require(std::abs(analytic - (upper_g[row] - lower_g[row]) /
+                    (2.0 * step)) < 1e-7, "cost-row Jacobian mismatch");
+        }
+        double lower_f = 0.0, upper_f = 0.0;
+        epigraph.eval_f(n1, lower.data(), true, lower_f);
+        epigraph.eval_f(n1, upper.data(), true, upper_f);
+        require(std::abs(gradient[column] - (upper_f - lower_f) /
+                (2.0 * step)) < 1e-7, "objective gradient mismatch");
+    }
+}
+
 nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
     nlohmann::json result = {
         {"attempted", attempted},
@@ -1124,6 +1357,10 @@ nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
         {"variable_count", variable_count},
         {"constraint_count", constraint_count},
         {"jacobian_nonzero_count", jacobian_nonzero_count},
+        {"pwl_epigraph_enabled", pwl_epigraph_enabled},
+        {"pwl_epigraph_curve_count", pwl_epigraph_curve_count},
+        {"pwl_epigraph_row_count", pwl_epigraph_row_count},
+        {"pwl_original_curve_count", pwl_original_curve_count},
         {"intermediate_callbacks", intermediate_callbacks},
         {"intermediate_iterates_retrieved", intermediate_iterates_retrieved},
         {"intermediate_verified_candidates", intermediate_verified_candidates},
@@ -1172,11 +1409,15 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
 
     auto* raw_problem = new SparseAcEconomicNlp(
         data, commitment, output.selected.state,
-        options.acceptable_tolerance);
+        options.acceptable_tolerance, options.pwl_epigraph);
     Ipopt::SmartPtr<Ipopt::TNLP> problem = raw_problem;
     output.variable_count = raw_problem->variable_count();
     output.constraint_count = raw_problem->constraint_count();
     output.jacobian_nonzero_count = raw_problem->jacobian_nonzero_count();
+    output.pwl_epigraph_enabled = options.pwl_epigraph;
+    output.pwl_epigraph_curve_count = raw_problem->pwl_epigraph_curve_count();
+    output.pwl_epigraph_row_count = raw_problem->pwl_epigraph_row_count();
+    output.pwl_original_curve_count = raw_problem->pwl_original_curve_count();
     output.initial_constraint_violation =
         raw_problem->initial_constraint_violation();
 

@@ -1034,6 +1034,8 @@ int run_parallel_circuit_regression() {
     sparse_ac_options.time_limit_seconds = 2.0;
     sparse_ac_options.tolerance = 1e-8;
     sparse_ac_options.acceptable_tolerance = 1e-5;
+    gravityx::run_sparse_ac_pwl_epigraph_regression(
+        data, {1}, source_base.solve.state);
     const auto sparse_ac_economic =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, {1}, source_base.solve, sparse_ac_options);
@@ -1049,6 +1051,22 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "direct sparse AC economic regression failed: " +
             sparse_ac_economic.to_json(false).dump());
+    }
+    auto epigraph_options = sparse_ac_options;
+    epigraph_options.pwl_epigraph = true;
+    const auto epigraph_economic =
+        gravityx::solve_sparse_fixed_commitment_ac_economic(
+            data, {1}, source_base.solve, epigraph_options);
+    if (!epigraph_economic.solver_initialized ||
+        !epigraph_economic.pwl_epigraph_enabled ||
+        epigraph_economic.pwl_epigraph_curve_count <= 0 ||
+        epigraph_economic.pwl_epigraph_row_count <= 0 ||
+        epigraph_economic.initial_constraint_violation > 1e-7 ||
+        epigraph_economic.selected_validation.max_residual > 1e-5 ||
+        epigraph_economic.selected.state.sm_slack.size() != data.branches.size() ||
+        epigraph_economic.selected.objective + 1e-9 < source_base.solve.objective) {
+        throw std::runtime_error("epigraph economic tiny solve failed: " +
+                                 epigraph_economic.to_json(false).dump());
     }
     auto inactive_branch_data = data;
     inactive_branch_data.branches[0].status = 0;
@@ -2028,7 +2046,8 @@ int run_validated_source_base_json(
     bool allow_large_base_newton_restart = true,
     double economic_refinement_seconds = 0.0,
     double sparse_economic_refinement_seconds = 0.0,
-    double sparse_ac_economic_refinement_seconds = 0.0) {
+    double sparse_ac_economic_refinement_seconds = 0.0,
+    bool base_pwl_epigraph = false) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto command_start = std::chrono::steady_clock::now();
@@ -2909,6 +2928,7 @@ int run_validated_source_base_json(
         log_base_phase("sparse_ac_economic_refinement_start", attempt);
         try {
             gravityx::SparseAcEconomicOptions options;
+            options.pwl_epigraph = base_pwl_epigraph;
             options.time_limit_seconds =
                 sparse_ac_economic_refinement_seconds;
             const auto refinement =
@@ -4883,17 +4903,20 @@ int main(int argc, char** argv) {
             }
             return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
-        if ((argc >= 4 && argc <= 9) &&
+        if ((argc >= 4 && argc <= 10) &&
             std::string(argv[1]) == "validated-source-base-json") {
             bool allow_exact_fallback = true;
             bool allow_large_base_newton_restart = true;
             double economic_refinement_seconds = 0.0;
             double sparse_economic_refinement_seconds = 0.0;
             double sparse_ac_economic_refinement_seconds = 0.0;
+            bool base_pwl_epigraph = false;
             for (int i = 4; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "fast-only") {
                     allow_exact_fallback = false;
+                } else if (option == "pwl-epigraph") {
+                    base_pwl_epigraph = true;
                 } else if (option == "robust-contingency-seed") {
                     allow_large_base_newton_restart = false;
                 } else if (option.rfind(
@@ -4933,12 +4956,16 @@ int main(int argc, char** argv) {
                         "unknown validated-source-base-json option: " + option);
                 }
             }
+            if (base_pwl_epigraph && sparse_ac_economic_refinement_seconds <= 0.0) {
+                throw std::runtime_error("pwl-epigraph requires a positive sparse AC stage");
+            }
             return run_validated_source_base_json(
                 argv[2], argv[3], allow_exact_fallback,
                 allow_large_base_newton_restart,
                 economic_refinement_seconds,
                 sparse_economic_refinement_seconds,
-                sparse_ac_economic_refinement_seconds);
+                sparse_ac_economic_refinement_seconds,
+                base_pwl_epigraph);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;

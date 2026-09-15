@@ -2853,6 +2853,7 @@ def main() -> int:
     parser.add_argument(
         "--base-sparse-ac-economic-refinement-seconds", type=float, default=0.0
     )
+    parser.add_argument("--base-pwl-epigraph", action="store_true")
     parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
     parser.add_argument(
@@ -2966,6 +2967,11 @@ def main() -> int:
             parser.error(f"{option} must be finite and nonnegative")
         if value > 0.0 and not args.validated_source_base:
             parser.error(f"{option} requires --validated-source-base")
+    if args.base_pwl_epigraph and (
+        not args.validated_source_base or
+        args.base_sparse_ac_economic_refinement_seconds <= 0.0
+    ):
+        parser.error("--base-pwl-epigraph requires a positive validated-source sparse AC stage")
     if (args.linearized_contingency_only and
             not args.linearized_contingency_fallback):
         parser.error(
@@ -3223,6 +3229,7 @@ def main() -> int:
         "base_sparse_ac_economic_refinement_seconds": (
             args.base_sparse_ac_economic_refinement_seconds
         ),
+        "base_pwl_epigraph": args.base_pwl_epigraph,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (
@@ -3343,6 +3350,8 @@ def main() -> int:
                     "sparse-ac-economic-refinement-seconds="
                     f"{args.base_sparse_ac_economic_refinement_seconds:.17g}"
                 )
+            if args.base_pwl_epigraph:
+                base_arguments.append("pwl-epigraph")
         else:
             base_arguments = [
                 "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
@@ -4771,6 +4780,7 @@ def main() -> int:
         "base_sparse_ac_economic_refinement_seconds": (
             args.base_sparse_ac_economic_refinement_seconds
         ),
+        "base_pwl_epigraph": args.base_pwl_epigraph,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (

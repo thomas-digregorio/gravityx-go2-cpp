@@ -107,6 +107,8 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
         command.append("--native-repair-log")
     if config.get("cached_economic_contingency_polish", False):
         command.append("--cached-economic-contingency-polish")
+    if config.get("base_pwl_epigraph", False):
+        command.append("--base-pwl-epigraph")
     if profile:
         command += ["--fast-screen-heavy-profile", str(REPO / profile),
                     "--fast-screen-heavy-workers", "4"]

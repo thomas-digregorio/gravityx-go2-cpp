@@ -325,6 +325,7 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"projected_balance_slack", projected_balance_slack},
         {"branch_security_rows_omitted", branch_security_rows_omitted},
         {"branch_security_subset_count", branch_security_subset_count},
+        {"terminal_current_supporting_cuts", terminal_current_supporting_cuts},
         {"feasibility_only", feasibility_only},
         {"elastic_balance_phase_one", elastic_balance_phase_one},
         {"primal_start_attempted", primal_start_attempted},
@@ -1091,6 +1092,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
         return std::pair<double, double>{minimum, maximum};
     };
 
+    int terminal_current_supporting_cuts = 0;
     for (int i = 0; i < nl; ++i) {
         if (omit_branch_security_rows &&
             !selected_branch_security[static_cast<std::size_t>(i)]) {
@@ -1130,6 +1132,55 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
             append(row, va_offset + branch.to, flow->va_to);
             normalize(row);
             rows.push_back(std::move(row));
+        }
+        // Separate P/Q component boxes are only an outer relaxation of the
+        // apparent-current limit.  For an overloaded reference terminal add
+        // a supporting half-plane of ||(P_affine,Q_affine)|| <= R*(V+s_max).
+        // Cauchy-Schwarz makes this valid for the affine cone.  Rebuild and
+        // independently check the actual nonlinear state after every solve;
+        // these rows do not replace that check or change any source limit.
+        if (!economic_objective && rating > 1e-12) {
+            const auto flow_at_reference = branch_flows(
+                branch, linearization_vm[branch.from],
+                linearization_vm[branch.to], reference.va[branch.from],
+                reference.va[branch.to]);
+            const auto add_current_cut = [&](const AffineFlow& p,
+                                            const AffineFlow& q,
+                                            double p0, double q0,
+                                            int terminal) {
+                const double magnitude = std::hypot(p0, q0);
+                const double voltage = branch.transformer
+                    ? 1.0 : linearization_vm[terminal];
+                if (magnitude <= rating * (voltage + data.sm_vio_limit)
+                                     + 1e-7 || magnitude <= 1e-12) {
+                    return;
+                }
+                const double dp = p0 / magnitude;
+                const double dq = q0 / magnitude;
+                SparseRow row;
+                row.lower = -kHighsInf;
+                row.upper = rating * (data.sm_vio_limit
+                    + (branch.transformer ? 1.0 : 0.0))
+                    - dp * p.constant - dq * q.constant;
+                append(row, vm_offset + branch.from,
+                    dp * p.vm_from + dq * q.vm_from);
+                append(row, vm_offset + branch.to,
+                    dp * p.vm_to + dq * q.vm_to);
+                append(row, va_offset + branch.from,
+                    dp * p.va_from + dq * q.va_from);
+                append(row, va_offset + branch.to,
+                    dp * p.va_to + dq * q.va_to);
+                if (!branch.transformer) {
+                    append(row, vm_offset + terminal, -rating);
+                }
+                normalize(row);
+                rows.push_back(std::move(row));
+                ++terminal_current_supporting_cuts;
+            };
+            add_current_cut(linearized[i].pf, linearized[i].qf,
+                flow_at_reference.pf, flow_at_reference.qf, branch.from);
+            add_current_cut(linearized[i].pt, linearized[i].qt,
+                flow_at_reference.pt, flow_at_reference.qt, branch.to);
         }
         if (economic_objective && !compact_economic_objective) {
             const auto base_flow = branch_flows(
@@ -1427,6 +1478,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     }
 
     LinearizedAcSeedResult output;
+    output.terminal_current_supporting_cuts = terminal_current_supporting_cuts;
     output.economic_objective = economic_objective;
     output.compact_economic_objective = compact_economic_objective;
     output.projected_balance_slack = projected_balance_slack;

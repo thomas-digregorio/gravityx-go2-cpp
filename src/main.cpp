@@ -1205,6 +1205,52 @@ int run_parallel_circuit_regression() {
                 "component test failed: official apparent-current slack rejected");
         }
     }
+    {
+        // Feasibility LPs must react to joint P/Q loading, not merely the
+        // per-component box.  Tighten one tiny-fixture rating so the supplied
+        // state needs more than its allowed soft margin; this is fixture
+        // construction, never a mutation of benchmark source data.
+        auto limited = data;
+        auto reference = solve.state;
+        int limited_branch = -1;
+        for (int i = 0; i < static_cast<int>(limited.branches.size()); ++i) {
+            auto& branch = limited.branches[i];
+            const double loading = std::max(
+                std::hypot(reference.pf[i], reference.qf[i]),
+                std::hypot(reference.pt[i], reference.qt[i]));
+            if (branch.status && loading > 1e-5) {
+                const double vf = branch.transformer ? 1.0
+                    : reference.vm[branch.from];
+                const double vt = branch.transformer ? 1.0
+                    : reference.vm[branch.to];
+                branch.rate_a = std::max(
+                    std::hypot(reference.pf[i], reference.qf[i]) /
+                        (vf + limited.sm_vio_limit + 0.02),
+                    std::hypot(reference.pt[i], reference.qt[i]) /
+                        (vt + limited.sm_vio_limit + 0.02));
+                limited_branch = i;
+                break;
+            }
+        }
+        if (limited_branch < 0) {
+            throw std::runtime_error("missing current-cut fixture branch");
+        }
+        gravityx::rebuild_base_state_derived_fields(limited, {1}, reference);
+        const auto current_seed = gravityx::solve_linearized_ac_seed(
+            limited, reference, {1});
+        if (!current_seed.success ||
+            current_seed.terminal_current_supporting_cuts == 0) {
+            throw std::runtime_error("current-supporting-cut seed failed: " +
+                current_seed.to_json(false).dump());
+        }
+        auto candidate = current_seed.state;
+        gravityx::rebuild_base_state_derived_fields(limited, {1}, candidate);
+        if (!std::isfinite(candidate.sm_slack[limited_branch]) ||
+            candidate.sm_slack[limited_branch] >=
+                reference.sm_slack[limited_branch] - 1e-6) {
+            throw std::runtime_error("current-supporting-cut did not reduce overload");
+        }
+    }
     gravityx::Contingency branch_contingency;
     branch_contingency.label = "parallel-outage";
     branch_contingency.type = gravityx::ContingencyType::Branch;

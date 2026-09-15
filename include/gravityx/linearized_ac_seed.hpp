@@ -19,6 +19,7 @@ struct LinearizedAcSeedResult {
     bool projected_balance_slack{};
     bool branch_security_rows_omitted{};
     int branch_security_subset_count{};
+    int terminal_current_supporting_cuts{};
     bool feasibility_only{};
     bool elastic_balance_phase_one{};
     bool primal_start_attempted{};

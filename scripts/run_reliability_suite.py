@@ -43,7 +43,7 @@ def audit_success(status: dict, summary: dict, expected: int, revision: str,
         if summary.get(field) != executable_hash:
             failures.append(field + " mismatch")
     wall = summary.get("total_wall_seconds")
-    if not isinstance(wall, (int, float)) or not math.isfinite(wall) or wall > limit:
+    if not isinstance(wall, (int, float)) or not math.isfinite(wall) or wall > limit or wall < 0:
         failures.append("end-to-end deadline")
     if (summary.get("contingency_count") != expected or
             status.get("completed_contingency_count") != expected):
@@ -71,7 +71,7 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
     data = Path(config["data_repository"])
     source = Path(config["source_root"]) / f"C2FEN{family}" / f"scenario_{scenario}"
     large = family == "19402"
-    return [config["python"], "-B", str(REPO / "scripts/run_experiment.py"),
+    command = [config["python"], "-B", str(REPO / "scripts/run_experiment.py"),
         "--case-json", str(normalized_case(data, family, scenario)),
         "--case-dir", str(source), "--output-dir", str(output),
         "--executable", str(REPO / ".build-native/gravityx_go2"),
@@ -95,6 +95,11 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
         "--streaming-evaluation-idle-screen-ramp", "--streaming-evaluation-completion-order-shards",
         "--streaming-persistent-evaluator-processes", "--streaming-evaluation-tail-shard-sizes",
         "96,64,48,32,16" if large else "32,16,8,4"]
+    profile = config.get("screen_profiles", {}).get(f"{family}/{scenario}")
+    if profile:
+        command += ["--fast-screen-heavy-profile", str(REPO / profile),
+                    "--fast-screen-heavy-workers", "4"]
+    return command
 
 
 def main() -> int:
@@ -128,8 +133,14 @@ def main() -> int:
                 if not file.is_file():
                     raise FileNotFoundError(file)
             expected = len(read_contingency_blocks(source / "case.con"))
+            profile = config.get("screen_profiles", {}).get(f"{family}/{scenario}")
+            if profile:
+                reject_onedrive(REPO / profile)
             entries.append({"family": family, "buses": network["buses"], "scenario": scenario,
-                            "source_contingencies": expected, "model_sha256": digest(model)})
+                            "source_contingencies": expected, "model_sha256": digest(model),
+                            "source_sha256": {name: digest(source / name)
+                                for name in ("case.raw", "case.json", "case.con")},
+                            "screen_profile_sha256": digest(REPO / profile) if profile else None})
     if not entries:
         raise RuntimeError("No scenarios selected")
     opts.output.mkdir(parents=True)
@@ -143,6 +154,14 @@ def main() -> int:
             break
         if digest(REPO / ".build-native/gravityx_go2") != executable_hash:
             raise RuntimeError("Executable changed during campaign")
+        source = Path(config["source_root"]) / f"C2FEN{entry['family']}" / f"scenario_{entry['scenario']}"
+        model = normalized_case(Path(config["data_repository"]), entry["family"], entry["scenario"])
+        if digest(model) != entry["model_sha256"] or any(
+                digest(source / name) != sha for name, sha in entry["source_sha256"].items()):
+            raise RuntimeError("Source input changed during campaign")
+        profile = config.get("screen_profiles", {}).get(f"{entry['family']}/{entry['scenario']}")
+        if profile and digest(REPO / profile) != entry["screen_profile_sha256"]:
+            raise RuntimeError("Scheduling profile changed during campaign")
         name = f"C2FEN{entry['family']}_s{entry['scenario']}_cold"
         run = opts.output / name
         command = arguments(config, entry["family"], entry["scenario"], run)
@@ -158,6 +177,8 @@ def main() -> int:
         summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
         failures = audit_success(status, summary, entry["source_contingencies"], revision,
                                  executable_hash, config["total_time_limit"])
+        if result.returncode != 0:
+            failures.append("runner nonzero exit")
         record = dict(entry, returncode=result.returncode, passed=not failures,
                       gates=failures, seconds=status.get("total_wall_seconds"),
                       objective=summary.get("official_evaluation", {}).get("obj"),

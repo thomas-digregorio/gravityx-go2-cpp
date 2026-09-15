@@ -1,10 +1,13 @@
 import copy
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from run_reliability_suite import audit_success, normalized_case
+from run_reliability_suite import audit_success, normalized_case, arguments
+from run_experiment import load_fast_screen_heavy_profile
 
 
 class ReliabilityAuditTests(unittest.TestCase):
@@ -58,6 +61,41 @@ class ReliabilityAuditTests(unittest.TestCase):
                          Path("repo/.data/final_617_005/model.json"))
         self.assertEqual(normalized_case(Path("repo"), "19402", "095"),
                          Path("repo/.data/final_19402/scenario_095/model.json"))
+
+    def test_unfinished_priority_is_not_a_measured_duration(self):
+        profile = {"schema_version": 3, "case_sha256": "case", "heavy_threshold_seconds": 10,
+                   "contingencies": [{"label": "a", "measured_solver_wall_seconds": 20}],
+                   "unfinished_priority_labels": ["b"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.json"
+            path.write_text(json.dumps(profile))
+            labels, ordering, meta = load_fast_screen_heavy_profile(path, "case", {"a", "b"})
+            self.assertEqual(labels, {"a", "b"})
+            self.assertGreater(ordering["b"], ordering["a"])
+            self.assertEqual(meta["measured_solver_seconds_sum"], 20)
+            self.assertEqual(meta["unfinished_priority_labels"], ["b"])
+            self.assertFalse(meta["uses_prior_solution_state"])
+            for bad in (["unknown"], ["b", "b"], [1]):
+                profile["unfinished_priority_labels"] = bad
+                path.write_text(json.dumps(profile))
+                with self.assertRaises(ValueError):
+                    load_fast_screen_heavy_profile(path, "case", {"a", "b"})
+            profile["unfinished_priority_labels"] = ["b"]
+            profile["schema_version"] = 2
+            path.write_text(json.dumps(profile))
+            with self.assertRaises(ValueError):
+                load_fast_screen_heavy_profile(path, "case", {"a", "b"})
+
+    def test_suite_profiles_only_change_queue_configuration(self):
+        config = {"python": "python", "data_repository": "data", "source_root": "sources",
+                  "vendor_evaluator": "evaluator", "total_time_limit": 300,
+                  "minimum_free_space_gib": 30}
+        before = arguments(config, "19402", "010", Path("run"))
+        config["screen_profiles"] = {"19402/010": "config/profile.json"}
+        after = arguments(config, "19402", "010", Path("run"))
+        self.assertEqual(after[:len(before)], before)
+        self.assertEqual(after[len(before)], "--fast-screen-heavy-profile")
+        self.assertEqual(after[-2:], ["--fast-screen-heavy-workers", "4"])
 
 
 if __name__ == "__main__":

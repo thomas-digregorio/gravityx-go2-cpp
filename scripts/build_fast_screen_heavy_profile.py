@@ -72,9 +72,9 @@ def existing_profile_measurements(
 ) -> dict[str, float]:
     """Read timing-only measurements from a previously validated profile."""
     raw = read_json(path)
-    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2, 3}:
         raise ValueError(
-            "existing heavy profile must use schema_version 1 or 2"
+            "existing heavy profile must use schema_version 1, 2 or 3"
         )
     if raw.get("case_sha256") != expected_case_sha256:
         raise ValueError("existing heavy profile case hash does not match")
@@ -117,6 +117,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--threshold", type=float, default=5.0)
     parser.add_argument("--require-complete-coverage", action="store_true")
+    parser.add_argument(
+        "--prioritize-unfinished", action="store_true",
+        help="Prioritize unobserved labels explicitly, without inventing solve times.",
+    )
     parser.add_argument(
         "--include-all-measurements",
         action="store_true",
@@ -176,7 +180,7 @@ def main() -> int:
     heavy_count = sum(
         measured[label] >= args.threshold for label in measured
     )
-    if not selected or heavy_count == 0:
+    if not selected or (heavy_count == 0 and not (args.prioritize_unfinished and missing)):
         raise ValueError("no measured screens meet the heavy threshold")
 
     sources: list[dict[str, Any]] = []
@@ -203,7 +207,7 @@ def main() -> int:
             }
         )
     profile = {
-        "schema_version": 2 if args.include_all_measurements else 1,
+        "schema_version": 3 if args.prioritize_unfinished else (2 if args.include_all_measurements else 1),
         "purpose": (
             "Scheduling-only heavy-screen concurrency profile. Contains no "
             "primal, dual, commitment, network, or solver state. Repeated "
@@ -211,9 +215,11 @@ def main() -> int:
         ),
         "case_sha256": case_sha256,
         "heavy_threshold_seconds": args.threshold,
+        "unfinished_priority_labels": sorted(missing) if args.prioritize_unfinished else [],
         "source_measurement": {
             "complete_contingency_coverage": not missing,
             "merge_rule": "maximum measured solver wall time by label",
+            "unfinished_semantics": "Unobserved completion is a priority, not a measured duration or feasibility claim",
             "source_profiles": [str(path) for path in args.existing_profile],
             "runs": sources,
         },

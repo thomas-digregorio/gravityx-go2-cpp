@@ -2576,9 +2576,9 @@ def load_fast_screen_heavy_profile(
     """Load timing-only heavy classification and group-ordering data."""
     reject_onedrive(path)
     raw = read_json(path)
-    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2, 3}:
         raise ValueError(
-            "fast-screen heavy profile must use schema_version 1 or 2"
+            "fast-screen heavy profile must use schema_version 1, 2 or 3"
         )
     schema_version = int(raw["schema_version"])
     if raw.get("case_sha256") != case_sha256:
@@ -2618,6 +2618,22 @@ def load_fast_screen_heavy_profile(
             heavy_labels.add(label)
         measured_by_label[label] = measured
         measured_seconds.append(measured)
+    # Unfinished tasks are censored observations, not measured solve times.
+    # Version 3 lets the scheduler try those groups first without fabricating
+    # a timing measurement or importing a prior solution. The finite weight
+    # is ordering-only and never changes a solver budget or acceptance gate.
+    priority_labels = raw.get("unfinished_priority_labels", [])
+    if not isinstance(priority_labels, list) or (priority_labels and schema_version != 3):
+        raise ValueError("unfinished priority labels require schema version 3")
+    if any(not isinstance(label, str) or label not in contingency_labels
+           for label in priority_labels):
+        raise ValueError("unknown unfinished priority label")
+    if len(set(priority_labels)) != len(priority_labels):
+        raise ValueError("duplicate unfinished priority label")
+    priority_weight = max([threshold, *measured_seconds]) + 1.0
+    for label in priority_labels:
+        heavy_labels.add(label)
+        measured_by_label[label] = priority_weight
     if not heavy_labels:
         raise ValueError("fast-screen profile contains no heavy labels")
 
@@ -2629,6 +2645,8 @@ def load_fast_screen_heavy_profile(
         "profiled_contingency_count": len(profiled_labels),
         "profiled_heavy_contingency_count": len(heavy_labels),
         "measured_solver_seconds_sum": sum(measured_seconds),
+        "unfinished_priority_labels": priority_labels,
+        "unfinished_priority_ordering_weight": priority_weight if priority_labels else None,
         "uses_prior_solution_state": False,
         "dispatch_semantics": (
             "timing-only heavy-lane classification and descending predicted "

@@ -7,6 +7,9 @@
   "vendor_evaluator": "C:/Users/thoma/Documents/goc2-dc-scopf-cpu/vendor/C2DataUtilities/data_utilities/evaluation.py",
   "total_time_limit": 300,
   "minimum_free_space_gib": 30,
+  "screen_profiles": {
+    "19402/010": "config/C2FEN19402_s010_reliability_queue.json"
+  },
   "families": [
     {"family": "00617", "buses": 617, "scenarios": ["005", "017", "024", "062", "073"]},
     {"family": "02020", "buses": 2020, "scenarios": ["025", "121", "134", "260", "262"]},

@@ -1,0 +1,242 @@
+{
+  "case_sha256": "1f0b056260851e105be0c79809e87de9cba4c9981a5feb8c23598deedb89ac7b",
+  "contingencies": [
+    {
+      "label": "CTG_000000",
+      "measured_solver_wall_seconds": 15.752536739
+    },
+    {
+      "label": "CTG_000005",
+      "measured_solver_wall_seconds": 17.50524034
+    },
+    {
+      "label": "CTG_000014",
+      "measured_solver_wall_seconds": 15.762548026
+    },
+    {
+      "label": "CTG_000055",
+      "measured_solver_wall_seconds": 12.75186777
+    },
+    {
+      "label": "CTG_000057",
+      "measured_solver_wall_seconds": 20.681654662
+    },
+    {
+      "label": "CTG_000064",
+      "measured_solver_wall_seconds": 13.914663318
+    },
+    {
+      "label": "CTG_000129",
+      "measured_solver_wall_seconds": 11.379309428
+    },
+    {
+      "label": "CTG_000176",
+      "measured_solver_wall_seconds": 19.479064712
+    },
+    {
+      "label": "CTG_000177",
+      "measured_solver_wall_seconds": 14.696522111
+    },
+    {
+      "label": "CTG_000179",
+      "measured_solver_wall_seconds": 14.567349078
+    },
+    {
+      "label": "CTG_000180",
+      "measured_solver_wall_seconds": 23.651445957
+    },
+    {
+      "label": "CTG_000218",
+      "measured_solver_wall_seconds": 15.032684569
+    },
+    {
+      "label": "CTG_000262",
+      "measured_solver_wall_seconds": 20.081453128
+    },
+    {
+      "label": "CTG_000297",
+      "measured_solver_wall_seconds": 14.601294194
+    },
+    {
+      "label": "CTG_000306",
+      "measured_solver_wall_seconds": 13.055948502
+    },
+    {
+      "label": "CTG_000315",
+      "measured_solver_wall_seconds": 14.81103996
+    },
+    {
+      "label": "CTG_000336",
+      "measured_solver_wall_seconds": 18.40551507
+    },
+    {
+      "label": "CTG_000339",
+      "measured_solver_wall_seconds": 15.459987332
+    },
+    {
+      "label": "CTG_000386",
+      "measured_solver_wall_seconds": 14.225808491
+    },
+    {
+      "label": "CTG_000387",
+      "measured_solver_wall_seconds": 13.804329585
+    },
+    {
+      "label": "CTG_000440",
+      "measured_solver_wall_seconds": 12.104017248
+    },
+    {
+      "label": "CTG_000442",
+      "measured_solver_wall_seconds": 14.823168659
+    },
+    {
+      "label": "CTG_000443",
+      "measured_solver_wall_seconds": 17.289597606
+    },
+    {
+      "label": "CTG_000487",
+      "measured_solver_wall_seconds": 15.49962117
+    },
+    {
+      "label": "CTG_000489",
+      "measured_solver_wall_seconds": 27.426998125
+    },
+    {
+      "label": "CTG_000493",
+      "measured_solver_wall_seconds": 27.281271173999997
+    },
+    {
+      "label": "CTG_000494",
+      "measured_solver_wall_seconds": 19.324009396
+    },
+    {
+      "label": "CTG_000495",
+      "measured_solver_wall_seconds": 36.55197817
+    },
+    {
+      "label": "CTG_000499",
+      "measured_solver_wall_seconds": 30.393908854
+    },
+    {
+      "label": "CTG_000545",
+      "measured_solver_wall_seconds": 12.55078221
+    },
+    {
+      "label": "CTG_000560",
+      "measured_solver_wall_seconds": 15.338522319
+    },
+    {
+      "label": "CTG_000567",
+      "measured_solver_wall_seconds": 27.685169081999998
+    },
+    {
+      "label": "CTG_000568",
+      "measured_solver_wall_seconds": 29.299794624
+    },
+    {
+      "label": "CTG_000569",
+      "measured_solver_wall_seconds": 16.062603973
+    },
+    {
+      "label": "CTG_000628",
+      "measured_solver_wall_seconds": 11.375213411
+    },
+    {
+      "label": "CTG_000715",
+      "measured_solver_wall_seconds": 23.465579830000003
+    },
+    {
+      "label": "CTG_001547",
+      "measured_solver_wall_seconds": 14.973664973
+    },
+    {
+      "label": "CTG_001564",
+      "measured_solver_wall_seconds": 32.737709961
+    },
+    {
+      "label": "CTG_001633",
+      "measured_solver_wall_seconds": 23.213268543
+    },
+    {
+      "label": "CTG_001690",
+      "measured_solver_wall_seconds": 19.873147779
+    },
+    {
+      "label": "CTG_001697",
+      "measured_solver_wall_seconds": 149.229659003
+    },
+    {
+      "label": "CTG_001738",
+      "measured_solver_wall_seconds": 27.996983201
+    },
+    {
+      "label": "CTG_001753",
+      "measured_solver_wall_seconds": 18.687091235999997
+    },
+    {
+      "label": "CTG_001782",
+      "measured_solver_wall_seconds": 11.438919277
+    },
+    {
+      "label": "CTG_001783",
+      "measured_solver_wall_seconds": 26.9866682
+    },
+    {
+      "label": "CTG_001792",
+      "measured_solver_wall_seconds": 27.969594618
+    },
+    {
+      "label": "CTG_002277",
+      "measured_solver_wall_seconds": 16.586899278
+    },
+    {
+      "label": "CTG_002278",
+      "measured_solver_wall_seconds": 21.787988512000002
+    },
+    {
+      "label": "CTG_002370",
+      "measured_solver_wall_seconds": 14.992890734
+    },
+    {
+      "label": "CTG_002543",
+      "measured_solver_wall_seconds": 70.099999433
+    },
+    {
+      "label": "CTG_005417",
+      "measured_solver_wall_seconds": 45.493046932999995
+    },
+    {
+      "label": "CTG_005538",
+      "measured_solver_wall_seconds": 21.876756068
+    },
+    {
+      "label": "CTG_005622",
+      "measured_solver_wall_seconds": 24.746181038
+    },
+    {
+      "label": "CTG_005944",
+      "measured_solver_wall_seconds": 14.651824007
+    }
+  ],
+  "heavy_threshold_seconds": 30.0,
+  "purpose": "Scheduling-only heavy-screen concurrency profile. Contains no primal, dual, commitment, network, or solver state. Repeated cold timings are merged by maximum measured solver time.",
+  "schema_version": 3,
+  "source_measurement": {
+    "complete_contingency_coverage": false,
+    "merge_rule": "maximum measured solver wall time by label",
+    "runs": [
+      {
+        "completed_task_result_count": 6692,
+        "git_revision": "73264304422060fc607cbf1cfd9da06557514a4a",
+        "scenario_run_name": "C2FEN19402_s010_cold",
+        "source_run_success": false,
+        "worker_log_count": 24
+      }
+    ],
+    "source_profiles": [],
+    "unfinished_semantics": "Unobserved completion is a priority, not a measured duration or feasibility claim"
+  },
+  "unfinished_priority_labels": [
+    "CTG_002365"
+  ]
+}

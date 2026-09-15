@@ -48,6 +48,7 @@ struct FastPowerFlowOptions {
 // never invokes either of the optional per-contingency LP polish stages.
 inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.economic_balance_polish = true;
+    options.max_economic_balance_polish_iterations = 1;
     options.economic_balance_polish_objective_threshold =
         std::numeric_limits<double>::infinity();
     options.max_economic_linearized_polish_rounds = 0;

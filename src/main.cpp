@@ -649,7 +649,7 @@ int run_component_tests() {
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
         cached_economic_options.max_economic_linearized_phase_two_rounds != 0 ||
-        cached_economic_options.max_economic_balance_polish_iterations != 4 ||
+        cached_economic_options.max_economic_balance_polish_iterations != 1 ||
         cached_economic_options.validation_tolerance != 1e-5 ||
         !cached_economic_options.fixed_jacobian_screen_only ||
         cached_economic_options.fixed_jacobian_time_limit_seconds != 7.0) {
@@ -4562,7 +4562,7 @@ int run_contingency_worker(
         // the common optimized base and consults the seed bank only after the
         // fresh predictor fails.
         const CorrectiveSeed* rolling_corrective_seed =
-            economic_contingency_polish || corrective_seed_bank.empty()
+            fast_options.economic_balance_polish || corrective_seed_bank.empty()
             ? nullptr : &corrective_seed_bank.front();
         std::unique_ptr<gravityx::FastContingencyPowerFlow> budgeted_fast_power_flow;
         const auto solve_call_start = std::chrono::steady_clock::now();
@@ -4738,6 +4738,25 @@ int run_contingency_worker(
         if (completed_computation) {
             result_summary["first_screen"] = completed_computation->result.value(
                 "first_screen", nlohmann::json(nullptr));
+            const auto& details = completed_computation->result;
+            if (details.contains("fast_screen") && details.at("fast_screen").is_object()) {
+                const auto& screen = details.at("fast_screen");
+                for (const char* key : {
+                         "economic_balance_polish_attempted",
+                         "economic_balance_polish_selected",
+                         "economic_balance_polish_iterations",
+                         "economic_balance_polish_backtracking_attempts",
+                         "economic_balance_polish_objective_before",
+                         "economic_balance_polish_objective_after",
+                         "economic_balance_polish_active_slack_before",
+                         "economic_balance_polish_active_slack_after",
+                         "economic_balance_polish_reactive_slack_before",
+                         "economic_balance_polish_reactive_slack_after"}) {
+                    if (screen.contains(key)) {
+                        result_summary["fast_screen"][key] = screen.at(key);
+                    }
+                }
+            }
         }
         bool transient_output_removed = false;
         if (remove_output_after_result) {

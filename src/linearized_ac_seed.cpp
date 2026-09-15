@@ -316,6 +316,21 @@ LinearizedModelAudit audit_and_prune_model(
 
 }  // namespace
 
+std::string default_linearized_seed_lp_solver(
+    bool feasibility_only, std::size_t bus_count,
+    bool economic_objective, bool elastic_balance_phase_one) {
+    // The measured large-network elastic Phase I stalls in simplex but is
+    // repaired by IPM followed by exact AC validation. Keep economic and
+    // non-elastic large-network LP policy unchanged.
+    if (economic_objective) {
+        return "simplex";
+    }
+    if (elastic_balance_phase_one) {
+        return "ipm";
+    }
+    return feasibility_only && bus_count >= 16000 ? "simplex" : "ipm";
+}
+
 nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
     nlohmann::json value = {
         {"success", success},
@@ -346,6 +361,7 @@ nlohmann::json LinearizedAcSeedResult::to_json(bool include_state) const {
         {"primal_simplex_bound_perturbation_multiplier",
          primal_simplex_bound_perturbation_multiplier},
         {"simplex_strategy", simplex_strategy},
+        {"lp_solver", lp_solver},
         {"maximum_column_scale", maximum_column_scale},
         {"maximum_row_scale", maximum_row_scale},
         {"objective_scale", objective_scale},
@@ -1416,27 +1432,22 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     }
 
     const char* highs_log = std::getenv("GRAVITYX_HIGHS_LOG");
-    // The 8k-bus trust-region seed has a much smaller, better-scaled presolved
-    // system than the original full contingency LP.  IPM solves this form in
-    // less than half the measured dual-simplex time and returns a candidate
-    // that the nonlinear correction can validate in one round.
     const char* solver_override = std::getenv("GRAVITYX_LINEAR_SEED_SOLVER");
     const std::string solver = solver_override != nullptr
         ? std::string(solver_override)
-        : ((feasibility_only && nb >= 16000) || economic_objective
-            ? "simplex" : "ipm");
+        : default_linearized_seed_lp_solver(
+            feasibility_only, nb, economic_objective, elastic_balance_phase_one);
     int simplex_strategy = elastic_balance_phase_one ? 1 : 4;
     const char* simplex_strategy_override =
         std::getenv("GRAVITYX_LINEAR_SEED_SIMPLEX_STRATEGY");
     if (simplex_strategy_override != nullptr) {
         simplex_strategy = std::stoi(simplex_strategy_override);
     }
-    // The feasibility-only LP has an identically zero objective, so every
-    // primal-feasible point is already an exact optimum for Phase I.  A looser
-    // IPM dual-gap stopping test avoids spending tens of seconds proving an
-    // economically meaningless zero-objective dual certificate.  The returned
-    // primal must still satisfy the unchanged 1e-8 HiGHS feasibility test and
-    // the exact nonlinear validator below this layer.
+    // Non-elastic feasibility LPs have zero objective; elastic Phase I
+    // minimizes artificial balance violations. This existing IPM stopping
+    // tolerance is only for candidate generation, never a physical acceptance
+    // test or a certificate of zero elastic violation. Returned candidates
+    // still face the unchanged primal checks and exact nonlinear validator.
     constexpr double kOrdinaryIpmOptimalityTolerance = 1e-8;
     constexpr double kPhaseOneIpmOptimalityTolerance = 1e-4;
     const double ipm_optimality_tolerance = feasibility_only
@@ -1487,6 +1498,7 @@ LinearizedAcSeedResult solve_linearized_ac_seed(
     output.feasibility_only = feasibility_only;
     output.elastic_balance_phase_one = elastic_balance_phase_one;
     output.simplex_strategy = simplex_strategy;
+    output.lp_solver = solver;
     output.maximum_column_scale = *std::max_element(
         column_scale.begin(), column_scale.end());
     output.maximum_row_scale = maximum_row_scale;

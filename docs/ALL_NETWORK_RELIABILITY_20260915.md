@@ -89,6 +89,17 @@ it is not sufficient by itself. An opt-in, bounded single-contingency trace
 uses its saved base/fast-screen state to identify the stalled repair phase.
 That diagnostic is explicitly separate from cold scenario acceptance.
 
+The trace identified the actual 094 bottleneck: prelinear Newton repair
+finished in 2.8 seconds; the subsequent large elastic Phase-I LP stalled
+under simplex. A bounded diagnostic on CTG_000007 using the existing IPM
+option completed in 94.495 seconds (87.851 seconds in that LP), followed by
+exact AC repair with maximum residual `1.7763568394002505e-15`. This used a
+saved base and fast-screen state and is **not** a cold scenario PASS.
+The numerical-method policy now selects IPM for elastic balance Phase I;
+economic and non-elastic large-network LPs retain their previous policy.
+Matrix construction, LP tolerances, and physical acceptance are unchanged.
+The result log records the actual selected LP method, including overrides.
+
 Run evidence is under
 `C:\Users\thoma\Documents\gravityx-go2-cpp\runs\reliability_20260915`.
 The two `target_*_v1` controller runs have hash-backed evidence archives,

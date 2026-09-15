@@ -464,6 +464,21 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 
 int run_component_tests() {
     gravityx::run_fast_power_flow_topology_cache_regression();
+    const auto require_lp_policy = [](bool feasibility, std::size_t buses,
+                                      bool economic, bool elastic,
+                                      const char* expected) {
+        if (gravityx::default_linearized_seed_lp_solver(
+                feasibility, buses, economic, elastic) != expected) {
+            throw std::runtime_error("linearized seed solver-policy regression");
+        }
+    };
+    require_lp_policy(true, 16789, false, true, "ipm");
+    require_lp_policy(true, 19402, false, true, "ipm");
+    require_lp_policy(true, 16789, false, false, "simplex");
+    require_lp_policy(false, 19402, true, false, "simplex");
+    require_lp_policy(false, 4224, true, false, "simplex");
+    require_lp_policy(true, 8300, false, false, "ipm");
+    require_lp_policy(false, 4224, false, false, "ipm");
     const auto points = gravityx::active_pwl_points(
         {0.0, 0.0, 10.0, 100.0, 20.0, 300.0}, 3, 5.0, 15.0);
     if (points.size() != 3) {
@@ -911,7 +926,8 @@ int run_parallel_circuit_regression() {
     }
     const auto linear_seed = gravityx::solve_linearized_ac_seed(
         data, source_base.solve.state, {1});
-    if (!linear_seed.success) {
+    if (!linear_seed.success || linear_seed.lp_solver != "ipm" ||
+        linear_seed.to_json(false).at("lp_solver") != "ipm") {
         throw std::runtime_error(
             "linearized AC seed regression failed: " + linear_seed.status);
     }
@@ -952,6 +968,7 @@ int run_parallel_circuit_regression() {
         10.0, false, false, {}, false,
         kTestVoltageTrustRadius, kTestAngleTrustRadius, true);
     if (!economic_linear_seed.success ||
+        economic_linear_seed.lp_solver != "simplex" ||
         !economic_linear_seed.economic_objective ||
         !economic_linear_seed.primal_start_attempted ||
         !economic_linear_seed.primal_start_accepted ||

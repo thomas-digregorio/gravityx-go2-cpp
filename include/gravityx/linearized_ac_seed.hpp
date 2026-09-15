@@ -5,11 +5,17 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace gravityx {
+
+// Numerical-method policy only; it does not construct or alter the LP.
+std::string default_linearized_seed_lp_solver(
+    bool feasibility_only, std::size_t bus_count,
+    bool economic_objective, bool elastic_balance_phase_one);
 
 struct LinearizedAcSeedResult {
     bool success{};
@@ -37,6 +43,7 @@ struct LinearizedAcSeedResult {
     bool presolve_enabled{true};
     double primal_simplex_bound_perturbation_multiplier{-1.0};
     int simplex_strategy{};
+    std::string lp_solver;
     double maximum_column_scale{1.0};
     double maximum_row_scale{1.0};
     double objective_scale{1.0};

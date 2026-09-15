@@ -17,6 +17,7 @@ def main() -> int:
         parser.add_argument("--" + option, type=Path, required=True)
     parser.add_argument("--label", required=True)
     parser.add_argument("--seconds", type=float, default=45)
+    parser.add_argument("--linear-seed-solver", choices=("simplex", "ipm"))
     args = parser.parse_args()
     if not re.fullmatch(r"CTG_\d{6}", args.label) or not 0 < args.seconds <= 300:
         raise ValueError("Invalid diagnostic label or time budget")
@@ -29,6 +30,9 @@ def main() -> int:
         "contingency-worker", to_wsl(args.case_json), to_wsl(args.base_json),
         "0", "fast-pf", "linearized"], args.seconds)
     command.insert(command.index("timeout"), "GRAVITYX_REPAIR_LOG=1")
+    command.insert(command.index("timeout"), "GRAVITYX_HIGHS_LOG=1")
+    if args.linear_seed_solver:
+        command.insert(command.index("timeout"), "GRAVITYX_LINEAR_SEED_SOLVER=" + args.linear_seed_solver)
     task = {"label": args.label, "output_path": to_wsl(args.output / "contingency.json"),
             "fast_screen_path": to_wsl(args.fast_screen_json)}
     manifest = {"purpose": "single-contingency diagnostic, not an official scenario run",

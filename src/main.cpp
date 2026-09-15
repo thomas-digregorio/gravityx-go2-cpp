@@ -641,6 +641,20 @@ int run_component_tests() {
         throw std::runtime_error(
             "component test failed: worse economic candidate replaced incumbent");
     }
+    gravityx::FastPowerFlowOptions cached_economic_options;
+    cached_economic_options.fixed_jacobian_screen_only = true;
+    cached_economic_options.fixed_jacobian_time_limit_seconds = 7.0;
+    gravityx::enable_cached_economic_polish(cached_economic_options);
+    if (!cached_economic_options.economic_balance_polish ||
+        !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
+        cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
+        cached_economic_options.max_economic_linearized_phase_two_rounds != 0 ||
+        cached_economic_options.max_economic_balance_polish_iterations != 4 ||
+        cached_economic_options.validation_tolerance != 1e-5 ||
+        !cached_economic_options.fixed_jacobian_screen_only ||
+        cached_economic_options.fixed_jacobian_time_limit_seconds != 7.0) {
+        throw std::runtime_error("cached economic polish changed safety policy or enabled an LP");
+    }
     feasible_validation.max_residual = 1e-4;
     if (gravityx::validated_candidate_is_feasible(
             nonconverged_feasible, feasible_validation, 1e-5)) {
@@ -4433,7 +4447,8 @@ int run_contingency_worker(
     bool fast_only,
     bool linearized_fallback,
     bool linearized_only,
-    bool economic_contingency_polish) {
+    bool economic_contingency_polish,
+    bool cached_economic_contingency_polish) {
     reject_onedrive(case_path);
     reject_onedrive(base_result_path);
     const auto data = gravityx::CaseData::load(case_path);
@@ -4447,9 +4462,13 @@ int run_contingency_worker(
         throw std::runtime_error(
             "linearized-only contingency worker requires linearized mode");
     }
-    if (economic_contingency_polish && !fast_power_flow_screen) {
+    if ((economic_contingency_polish || cached_economic_contingency_polish) &&
+        !fast_power_flow_screen) {
         throw std::runtime_error(
             "economic contingency polish requires fast-pf mode");
+    }
+    if (economic_contingency_polish && cached_economic_contingency_polish) {
+        throw std::runtime_error("choose one contingency economic polish mode");
     }
     std::unique_ptr<gravityx::AcModel> resident_model;
     std::unique_ptr<gravityx::FastContingencyPowerFlow> fast_power_flow;
@@ -4465,6 +4484,9 @@ int run_contingency_worker(
             // secure predictor exists; all other contingencies retain that
             // independently verified incumbent unchanged.
             fast_options.economic_balance_polish_objective_threshold = -2e6;
+        }
+        if (cached_economic_contingency_polish) {
+            gravityx::enable_cached_economic_polish(fast_options);
         }
         const char* fast_diagnostics =
             std::getenv("GRAVITYX_FAST_PF_DIAGNOSTICS");
@@ -4900,6 +4922,7 @@ int main(int argc, char** argv) {
             bool linearized_fallback = false;
             bool linearized_only = false;
             bool economic_contingency_polish = false;
+            bool cached_economic_contingency_polish = false;
             for (int i = 5; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "resident") {
@@ -4917,6 +4940,8 @@ int main(int argc, char** argv) {
                     linearized_only = true;
                 } else if (option == "economic-polish") {
                     economic_contingency_polish = true;
+                } else if (option == "cached-economic-polish") {
+                    cached_economic_contingency_polish = true;
                 } else {
                     throw std::runtime_error(
                         "unknown contingency-worker option: " + option);
@@ -4930,7 +4955,7 @@ int main(int argc, char** argv) {
                 argv[2], argv[3], print_level, reusable_model,
                 acceptable_termination, fast_power_flow_screen, fast_only,
                 linearized_fallback, linearized_only,
-                economic_contingency_polish);
+                economic_contingency_polish, cached_economic_contingency_polish);
         }
         std::cerr << "usage:\n"
                   << "  gravityx_go2 smoke\n"

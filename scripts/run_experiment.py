@@ -2834,6 +2834,7 @@ def main() -> int:
     parser.add_argument("--native-repair-log", action="store_true")
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--economic-contingency-polish", action="store_true")
+    parser.add_argument("--cached-economic-contingency-polish", action="store_true")
     parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
@@ -2885,7 +2886,9 @@ def main() -> int:
         parser.error(
             "--two-stage-contingency-screen requires --fast-power-flow-screen"
         )
-    if (args.economic_contingency_polish and
+    if (args.economic_contingency_polish and args.cached_economic_contingency_polish):
+        parser.error("Choose only one contingency economic polish mode")
+    if ((args.economic_contingency_polish or args.cached_economic_contingency_polish) and
             not args.fast_power_flow_screen):
         parser.error(
             "--economic-contingency-polish requires "
@@ -3202,6 +3205,7 @@ def main() -> int:
         "ipopt_acceptable_termination": args.ipopt_acceptable_termination,
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "economic_contingency_polish": args.economic_contingency_polish,
+        "cached_economic_contingency_polish": args.cached_economic_contingency_polish,
         "cpp_solution_writer": args.cpp_solution_writer,
         "fast_screen_easy_first": args.fast_screen_easy_first,
         "fast_screen_heavy_profile": fast_screen_heavy_profile_metadata,
@@ -3756,6 +3760,8 @@ def main() -> int:
             ]
             if args.economic_contingency_polish:
                 worker_arguments.append("economic-polish")
+            if args.cached_economic_contingency_polish:
+                worker_arguments.append("cached-economic-polish")
             command = cpp_command(
                 fast_screen_executable,
                 args.distro,
@@ -4066,6 +4072,8 @@ def main() -> int:
             worker_arguments.append("fast-pf")
         if args.economic_contingency_polish:
             worker_arguments.append("economic-polish")
+        if args.cached_economic_contingency_polish:
+            worker_arguments.append("cached-economic-polish")
         if args.linearized_contingency_fallback:
             worker_arguments.append("linearized")
         if args.linearized_contingency_only:
@@ -4750,6 +4758,7 @@ def main() -> int:
         "native_repair_log": args.native_repair_log,
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "economic_contingency_polish": args.economic_contingency_polish,
+        "cached_economic_contingency_polish": args.cached_economic_contingency_polish,
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,

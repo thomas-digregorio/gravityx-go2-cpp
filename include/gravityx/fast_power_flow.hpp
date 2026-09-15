@@ -44,6 +44,16 @@ struct FastPowerFlowOptions {
     double validation_tolerance{1e-5};
 };
 
+// Opt-in economic cleanup using only the resident Jacobian factors. This
+// never invokes either of the optional per-contingency LP polish stages.
+inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
+    options.economic_balance_polish = true;
+    options.economic_balance_polish_objective_threshold =
+        std::numeric_limits<double>::infinity();
+    options.max_economic_linearized_polish_rounds = 0;
+    options.max_economic_linearized_phase_two_rounds = 0;
+}
+
 struct FastPowerFlowResult {
     bool converged{};
     bool feasible{};

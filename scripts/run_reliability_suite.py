@@ -105,6 +105,8 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
     profile = config.get("screen_profiles", {}).get(f"{family}/{scenario}")
     if config.get("native_repair_log", False):
         command.append("--native-repair-log")
+    if config.get("cached_economic_contingency_polish", False):
+        command.append("--cached-economic-contingency-polish")
     if profile:
         command += ["--fast-screen-heavy-profile", str(REPO / profile),
                     "--fast-screen-heavy-workers", "4"]

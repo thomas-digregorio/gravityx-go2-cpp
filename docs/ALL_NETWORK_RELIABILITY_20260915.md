@@ -60,6 +60,8 @@ are frozen and recorded by the suite runner.
 | 19,402 | 069 | 3790e89 | 213.551 | 6,620/6,620 | 627,542.21 | PASS |
 | 19,402 | 077 | 3790e89 | 184.786 | 6,584/6,584 | 84,914.92 | PASS |
 | 19,402 | 095 | 3790e89 | 214.897 | 6,579/6,579 | 183,630.65 | PASS |
+| 19,402 | 006 | c396f66 | 295.356 | 6,691/6,693 | Not certified | 263 unfinished; 262 queued behind it |
+| 19,402 | 006 | 23f601e | 295.333 | 6,692/6,693 | Not certified | 263 passed; 262 unfinished |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -191,6 +193,16 @@ invalid budgets, failure-status preservation, the rescue option, and profile
 identity/range checks. Diagnostic stdout and stderr are now merged through a
 pipe with one file writer, avoiding overlapping WSL file-output offsets.
 
+The subsequent cold 006 run on 23f601e still missed its gate: 6,692/6,693
+completed at 295.333 seconds. CTG_000263 acknowledged its 20-second predictor
+budget and passed via compact linearized repair in 39.220 seconds under
+concurrency, with residual `1.7763568394002505e-15`. CTG_000262 was then the
+sole unfinished task. A separate saved-base diagnostic on 262 with the same
+handoff passed in 29.236 seconds (24.806 seconds solve time), maximum residual
+`2.0306992198904084e-9`. The profile now explicitly applies 20 seconds to both
+diagnosed tasks. This still requires a new full cold run; the single-outage
+diagnostics are not substituted for complete verification.
+
 ## Storage pruning during development
 
 After the five-case batch ended and solver processes were absent, checked
@@ -208,6 +220,17 @@ Run evidence is under
 `C:\Users\thoma\Documents\gravityx-go2-cpp\runs\reliability_20260915`.
 The two `target_*_v1` controller runs have hash-backed evidence archives,
 while the 4,224-bus development run retains its full summary and certificate.
+
+Before the next 006 replacement, pruned only solution text from the older
+failed 006 directories in `frozen_3790e89_19402` and `target_19402_s006_v2`.
+No experiment or native solver process was active. Resolved both targets
+inside the campaign, rejected reparse ancestors/descendants, verified each
+archived status and adjacent-JSON hash, and rechecked hashes after deletion.
+Removed 26,829 `solution_*.txt` entries permanently; no such text remained in
+those two directories. Logs, internal states, input data, code, and evidence
+archives remain. C: free space rose from the preceding 58.03-GB observation
+to 82.34 GB (approximately 24.3 GB recovered). The latest v3 payloads and all
+four successful 3790e89 19k case payloads were retained.
 
 ## Tests and publication
 

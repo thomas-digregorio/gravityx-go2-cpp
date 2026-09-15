@@ -90,6 +90,10 @@ gravityx::FastPowerFlowOptions bounded_fast_newton_rescue_options() {
     return options;
 }
 
+// Eligibility for a bounded repair attempt, NOT physical acceptance.
+// The complete independent validator still requires residual <= 1e-5.
+constexpr double kCompactSecurityRepairCandidateResidual = 0.35;
+
 bool bounded_fast_newton_rescue_candidate(
     const gravityx::ValidationReport& validation) {
     return validation.max_residual <= 0.35 &&
@@ -100,7 +104,7 @@ bool bounded_fast_newton_rescue_candidate(
 bool bounded_fast_candidate_repair_candidate(
     const gravityx::ValidationReport& validation) {
     return bounded_fast_newton_rescue_candidate(validation) ||
-        (validation.max_residual <= 0.1 &&
+        (validation.max_residual <= kCompactSecurityRepairCandidateResidual &&
          validation.worst_category == "variable_bound");
 }
 
@@ -674,6 +678,14 @@ int run_component_tests() {
         !bounded_fast_candidate_repair_candidate(rescue_validation)) {
         throw std::runtime_error(
             "component test failed: bounded security repair routing failed");
+    }
+    rescue_validation.max_residual = 0.10365;
+    if (!bounded_fast_candidate_repair_candidate(rescue_validation)) {
+        throw std::runtime_error("compact repair routing rejected a moderate security residual");
+    }
+    rescue_validation.max_residual = 0.36;
+    if (bounded_fast_candidate_repair_candidate(rescue_validation)) {
+        throw std::runtime_error("compact repair routing lost its finite eligibility bound");
     }
     feasible_validation.max_residual = 1e-8;
     nonconverged_feasible.objective = std::numeric_limits<double>::quiet_NaN();
@@ -3259,7 +3271,8 @@ bool solve_loaded_contingency(
             }
             if (!fast_result->feasible &&
                 fast_result->validation.worst_category == "variable_bound" &&
-                fast_result->validation.max_residual <= 0.1) {
+                fast_result->validation.max_residual <=
+                    kCompactSecurityRepairCandidateResidual) {
                 double wall_after_linearized_repair =
                     fast_result->wall_seconds;
                 auto linearized_reference = fast_result->solve.state;

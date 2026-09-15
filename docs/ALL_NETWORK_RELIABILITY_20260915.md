@@ -62,6 +62,7 @@ are frozen and recorded by the suite runner.
 | 19,402 | 095 | 3790e89 | 214.897 | 6,579/6,579 | 183,630.65 | PASS |
 | 19,402 | 006 | c396f66 | 295.356 | 6,691/6,693 | Not certified | 263 unfinished; 262 queued behind it |
 | 19,402 | 006 | 23f601e | 295.333 | 6,692/6,693 | Not certified | 263 passed; 262 unfinished |
+| 19,402 | 006 | 357596e | 295.348 | 6,466/6,693 | Not certified | Different base point; 262 took expensive fallback; bulk work incomplete |
 
 The failed 19,402-bus test did not establish complete security. Its logs
 show a 149.23-second solver task for CTG_001697 and a late unfinished
@@ -202,6 +203,25 @@ handoff passed in 29.236 seconds (24.806 seconds solve time), maximum residual
 `2.0306992198904084e-9`. The profile now explicitly applies 20 seconds to both
 diagnosed tasks. This still requires a new full cold run; the single-outage
 diagnostics are not substituted for complete verification.
+
+The cold two-budget run on 357596e timed out with 6,466/6,693 complete.
+Its 968 commitments exactly match v3, but its base controls differ (maximum
+PG difference 0.558034 p.u.; maximum voltage difference 0.011828 p.u.). The
+time-limited initial economic LP selected objective 155,811.21 instead of
+152,450.04; subsequent 40-second AC refinement selected 193,003.99 instead
+of 192,599.54. Neither old base state is reused in a cold run. CTG_000380 and
+381 passed corrective repair in 28.211 and 36.368 seconds respectively.
+
+CTG_000262 correctly acknowledged its budget and returned a failed screen in
+23.831 seconds, with variable-bound residual 0.103649. This was just outside
+the old 0.1 compact-repair eligibility threshold, so no compact repair was
+attempted before the expensive fallback. A saved-base diagnostic reproduced
+that routing decision. Eligibility for *attempting* bounded security repair
+now extends to 0.35, matching the existing balance-rescue eligibility range;
+all source constraints and the final 1e-5 acceptance limit remain unchanged.
+The corresponding newer-base diagnostic passed in 27.970 seconds (23.633
+seconds solve time), maximum independent residual `5.25072478857469e-6`.
+Native tests explicitly distinguish this routing bound from acceptance.
 
 ## Storage pruning during development
 

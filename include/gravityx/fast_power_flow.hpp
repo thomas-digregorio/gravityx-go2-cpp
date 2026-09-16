@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <string>
@@ -18,6 +19,9 @@ double default_fixed_jacobian_screen_seconds(
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool enable_fixed_jacobian_predictor{true};
+    // Size routing policy. Tiny tests can exercise the identical predictor
+    // and economic-incumbent path without manufacturing a large network.
+    std::size_t fixed_jacobian_minimum_bus_count{16000};
     bool fixed_jacobian_screen_only{false};
     // Explicit cooperative override. Infinity selects the class policy for
     // first-stage screens; ordinary repair calls remain unbounded here.
@@ -62,7 +66,8 @@ inline bool needs_contingency_economic_cleanup(
     const FastPowerFlowOptions& options, std::size_t bus_count,
     bool base_mode, bool direct_only) {
     // A seed-bank probe is a validator, not another optimization attempt.
-    return !base_mode && !direct_only && bus_count >= 16000 &&
+    return !base_mode && !direct_only &&
+        bus_count >= options.fixed_jacobian_minimum_bus_count &&
         options.economic_balance_polish;
 }
 
@@ -87,6 +92,9 @@ struct FastPowerFlowResult {
     ValidationReport fixed_jacobian_predictor_validation;
     nlohmann::json fixed_jacobian_predictor_trace = nlohmann::json::array();
     bool economic_balance_polish_attempted{};
+    bool economic_direct_candidate_verified{};
+    bool economic_direct_incumbent_selected{};
+    double economic_direct_candidate_objective{};
     bool economic_balance_polish_threshold_passed{};
     double economic_balance_polish_objective_threshold{};
     bool economic_balance_polish_selected{};

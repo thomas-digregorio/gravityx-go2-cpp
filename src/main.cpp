@@ -668,10 +668,16 @@ int run_component_tests() {
     }
     gravityx::FastPowerFlowResult economic_log_fixture;
     economic_log_fixture.economic_balance_polish_attempted = true;
+    economic_log_fixture.economic_direct_candidate_verified = true;
+    economic_log_fixture.economic_direct_incumbent_selected = true;
+    economic_log_fixture.economic_direct_candidate_objective = 12.0;
     economic_log_fixture.economic_balance_polish_objective_before = 12.0;
     economic_log_fixture.economic_balance_polish_objective_after = 15.0;
     const auto economic_log = economic_log_fixture.economic_summary_json();
     if (!economic_log.at("economic_balance_polish_attempted").get<bool>() ||
+        !economic_log.at("economic_direct_candidate_verified").get<bool>() ||
+        !economic_log.at("economic_direct_incumbent_selected").get<bool>() ||
+        economic_log.at("economic_direct_candidate_objective") != 12.0 ||
         economic_log.at("economic_balance_polish_objective_before") != 12.0 ||
         economic_log.at("economic_balance_polish_objective_after") != 15.0 ||
         economic_log.contains("solve") || economic_log.contains("state")) {
@@ -1459,6 +1465,89 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "validated fast power-flow contingency regression failed: "
             + fast_result.failure_reason);
+    }
+    {
+        // A small generator outage is already feasible with source-allowed
+        // imbalance. Redispatching the lost power elsewhere without changing
+        // voltages can double the imbalance penalty. Exercise the production
+        // incumbent-selection path on two buses, with no full-case solve.
+        auto economic_data = data;
+        auto local_generator = generator;
+        local_generator.source_key = "local-test-generator";
+        local_generator.index = 2;
+        local_generator.bus = 1;
+        local_generator.pmin = local_generator.pmax = 0.1;
+        local_generator.pg_prev = local_generator.pg_start = 0.1;
+        local_generator.qmin = local_generator.qmax = 0.0;
+        economic_data.generators.push_back(local_generator);
+        economic_data.buses[1].generators = {1};
+        gravityx::AcModel economic_model(
+            economic_data, gravityx::ModelMode::BaseSoft, {1, 1});
+        const auto economic_base = economic_model.solve(0, 1e-7);
+        if (gravityx::validate_state(economic_data,
+                gravityx::ModelMode::BaseSoft, economic_base.state, {1, 1})
+                .max_residual > 1e-5) {
+            throw std::runtime_error("economic incumbent tiny base invalid");
+        }
+        gravityx::Contingency outage;
+        outage.label = "tiny-local-generator-outage";
+        outage.type = gravityx::ContingencyType::Generator;
+        outage.component = 1;
+        outage.source_index = 2;
+        gravityx::FastPowerFlowOptions economic_options;
+        gravityx::enable_cached_economic_polish(economic_options);
+        economic_options.fixed_jacobian_minimum_bus_count = 0;
+        economic_options.fixed_jacobian_screen_only = true;
+        economic_options.max_economic_balance_polish_iterations = 0;
+        gravityx::FastContingencyPowerFlow economic_solver(
+            economic_data, economic_base.state, {1, 1}, economic_options);
+        const auto protected_result = economic_solver.solve(outage);
+        if (!protected_result.feasible ||
+            !protected_result.fixed_jacobian_predictor_attempted ||
+            !protected_result.economic_direct_candidate_verified ||
+            !protected_result.economic_direct_incumbent_selected ||
+            protected_result.validation.max_residual > 1e-5 ||
+            protected_result.solve.objective + 1e-8 <
+                protected_result.economic_direct_candidate_objective) {
+            throw std::runtime_error("economic direct incumbent was lost: " +
+                                     protected_result.to_json().dump());
+        }
+        const auto direct_probe = economic_solver.screen_candidate(
+            outage, protected_result.solve.state);
+        if (!direct_probe.feasible ||
+            direct_probe.fixed_jacobian_predictor_attempted ||
+            direct_probe.economic_balance_polish_attempted) {
+            throw std::runtime_error("economic direct-only probe ran an optimization");
+        }
+        economic_options.max_economic_balance_polish_iterations = 3;
+        gravityx::FastContingencyPowerFlow polished_solver(
+            economic_data, economic_base.state, {1, 1}, economic_options);
+        const auto protected_polish = polished_solver.solve(outage);
+        if (!protected_polish.feasible ||
+            !protected_polish.economic_balance_polish_attempted ||
+            protected_polish.validation.max_residual > 1e-5 ||
+            protected_polish.solve.objective + 1e-8 <
+                protected_polish.economic_direct_candidate_objective) {
+            throw std::runtime_error("economic polish degraded the verified direct incumbent");
+        }
+        auto invalid_direct = economic_base.state;
+        invalid_direct.vm[1] = economic_data.buses[1].vmax + 0.25;
+        const auto invalid_probe = polished_solver.screen_candidate(outage, invalid_direct);
+        if (invalid_probe.feasible || invalid_probe.economic_direct_candidate_verified ||
+            invalid_probe.fixed_jacobian_predictor_attempted) {
+            throw std::runtime_error("invalid direct candidate was accepted or optimized");
+        }
+        // The verified incumbent also survives unavailable predictor routing.
+        economic_options.enable_fixed_jacobian_predictor = false;
+        gravityx::FastContingencyPowerFlow no_predictor(
+            economic_data, economic_base.state, {1, 1}, economic_options);
+        const auto protected_fallback = no_predictor.solve(outage);
+        if (!protected_fallback.feasible ||
+            !protected_fallback.economic_direct_incumbent_selected ||
+            protected_fallback.fixed_jacobian_predictor_attempted ||
+            protected_fallback.validation.max_residual > 1e-5) {
+            throw std::runtime_error("verified direct incumbent was lost without predictor");
+        }
     }
     {
         const gravityx::GoSolutionWriter writer(data);
@@ -4795,6 +4884,9 @@ int run_contingency_worker(
                 const auto& screen = details.at("fast_screen");
                 for (const char* key : {
                          "economic_balance_polish_attempted",
+                         "economic_direct_candidate_verified",
+                         "economic_direct_incumbent_selected",
+                         "economic_direct_candidate_objective",
                          "economic_balance_polish_selected",
                          "economic_balance_polish_iterations",
                          "economic_balance_polish_backtracking_attempts",

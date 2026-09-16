@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "description": "Cold 19402 experiment v6: preserve verified direct economic incumbents with checked PWL epigraph primary optimization",
+  "data_repository": "C:/Users/thoma/Documents/gravityx-go2-cpp",
+  "source_root": "C:/Users/thoma/Documents/goc2-ac-score-check/final-event4-data",
+  "python": "C:/Users/thoma/Documents/goc2-ac-score-check/evaluator-venv/Scripts/python.exe",
+  "vendor_evaluator": "C:/Users/thoma/Documents/goc2-dc-scopf-cpu/vendor/C2DataUtilities/data_utilities/evaluation.py",
+  "total_time_limit": 300,
+  "minimum_free_space_gib": 30,
+  "native_repair_log": true,
+  "cached_economic_contingency_polish": true,
+  "base_pwl_epigraph": true,
+  "screen_profiles": {
+    "19402/006": "config/C2FEN19402_s006_reliability_queue.json",
+    "19402/010": "config/C2FEN19402_s010_reliability_queue.json"
+  },
+  "families": [
+    {"family": "19402", "buses": 19402, "scenarios": ["006", "010", "069", "077", "095"]}
+  ],
+  "comparison": {
+    "source_url": "https://data.openei.org/files/6197/Challenge_2_Final_Event_Results.xlsx",
+    "event": "Final Event",
+    "division": 1,
+    "metric": "raw official objective, higher is better",
+    "benchmark_entry_excluded": true,
+    "fifth_best_objective": {
+      "006": 436687.482340259,
+      "010": 534621.593420241,
+      "069": 949809.594696075,
+      "077": 392060.669448444,
+      "095": 434319.522756719
+    }
+  }
+}

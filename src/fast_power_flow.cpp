@@ -2363,6 +2363,9 @@ nlohmann::json FastPowerFlowResult::economic_summary_json() const {
         {"failure_reason", failure_reason},
         {"wall_seconds", wall_seconds},
         {"economic_balance_polish_attempted", economic_balance_polish_attempted},
+        {"economic_direct_candidate_verified", economic_direct_candidate_verified},
+        {"economic_direct_incumbent_selected", economic_direct_incumbent_selected},
+        {"economic_direct_candidate_objective", economic_direct_candidate_objective},
         {"economic_balance_polish_selected", economic_balance_polish_selected},
         {"economic_balance_polish_iterations", economic_balance_polish_iterations},
         {"economic_balance_polish_backtracking_attempts", economic_balance_polish_backtracking_attempts},
@@ -2407,6 +2410,9 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          fixed_jacobian_predictor_trace},
         {"economic_balance_polish_attempted",
          economic_balance_polish_attempted},
+        {"economic_direct_candidate_verified", economic_direct_candidate_verified},
+        {"economic_direct_incumbent_selected", economic_direct_incumbent_selected},
+        {"economic_direct_candidate_objective", economic_direct_candidate_objective},
         {"economic_balance_polish_threshold_passed",
          economic_balance_polish_threshold_passed},
         {"economic_balance_polish_objective_threshold",
@@ -3048,6 +3054,20 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         needs_contingency_economic_cleanup(
             options_, data_.buses.size(), base_mode,
             supplied_candidate_direct_only);
+    if (contingency_economic_cleanup_pending &&
+        output.direct_candidate_validation.max_residual <=
+            options_.validation_tolerance) {
+        output.economic_direct_candidate_objective =
+            rebuild_contingency_economic_fields(
+                data_, base_state_, commitment_, *contingency, direct_state);
+        output.direct_candidate_validation = validate_state(
+            data_, ModelMode::ContingencySoft, direct_state, commitment_,
+            direct_context);
+        output.economic_direct_candidate_verified =
+            std::isfinite(output.economic_direct_candidate_objective) &&
+            output.direct_candidate_validation.max_residual <=
+                options_.validation_tolerance;
+    }
     if (output.direct_candidate_validation.max_residual <=
             options_.validation_tolerance &&
         !direct_balance_cleanup_pending &&
@@ -3256,7 +3276,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         }
     }
 
-    if (!base_mode && nb >= 16000 && options_.enable_fixed_jacobian_predictor) {
+    if (!base_mode &&
+        static_cast<std::size_t>(nb) >= options_.fixed_jacobian_minimum_bus_count &&
+        options_.enable_fixed_jacobian_predictor) {
         output.fixed_jacobian_predictor_attempted = true;
         if (!predictor_cache_) {
             predictor_cache_ = std::make_unique<FixedJacobianPredictorCache>(
@@ -3571,6 +3593,23 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         validate_rebuilt_contingency_economic_and_ohms(
                             data_, predictor_state, commitment_,
                             *direct_context, predictor_validation);
+                }
+                // Feasibility-directed projections need not improve economic
+                // value. Never discard a better, independently verified
+                // direct-outage incumbent merely to enter economic cleanup.
+                // Cleanup then starts from this incumbent and accepts only
+                // verified improvements under the original base context.
+                if (output.economic_direct_candidate_verified &&
+                    (predictor_validation.max_residual >
+                         options_.validation_tolerance ||
+                     !std::isfinite(predictor_objective) ||
+                     output.economic_direct_candidate_objective >
+                         predictor_objective + 1e-9)) {
+                    predictor_state = direct_state;
+                    predictor_validation = output.direct_candidate_validation;
+                    predictor_objective =
+                        output.economic_direct_candidate_objective;
+                    output.economic_direct_incumbent_selected = true;
                 }
                 output.fixed_jacobian_predictor_iterations =
                     predictor_iteration;
@@ -6643,6 +6682,24 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 predictor_state = std::move(selected_correction);
             }
         }
+    }
+
+    // A missing/unusable predictor factorization is not permission to lose
+    // a fully verified direct incumbent. Economic cleanup is optional work;
+    // all source constraints were already checked for this exact outage.
+    if (output.economic_direct_candidate_verified) {
+        output.converged = true;
+        output.feasible = true;
+        output.direct_candidate_selected = true;
+        output.economic_direct_incumbent_selected = true;
+        output.solve.status = 0;
+        output.solve.objective = output.economic_direct_candidate_objective;
+        output.solve.state = std::move(direct_state);
+        output.validation = output.direct_candidate_validation;
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        output.solve.wall_seconds = output.wall_seconds;
+        return output;
     }
 
     // The first pass of the two-stage large-case scheduler is only a

@@ -109,3 +109,26 @@ they cannot recreate the deleted exact solution vectors. Source data, source
 code, Git history, unrelated files, V18/V20/V21 vectors and other scenarios'
 retained solutions were not removed. This supersedes earlier V16 retention
 statements in this report.
+
+## Superseded V21 payload cleanup after accepted V23
+
+V23 passed all gates in 298.0589177999973 seconds with objective
+379236.3363775767, replacing V21's accepted objective 375925.97863455745.
+Its full raw-label set, source/model/config/binary/revision hashes, independent
+residuals and official score were rechecked; all 6,580 root vectors remain.
+
+After verifying the V21/V23 compact archive and status hashes, no active
+related controller/native processes, exact contained paths, and no ancestor
+or subtree reparse points, only
+`runs/top5_cold_20260915/v21_s095/C2FEN19402_s095_cold/**/solution_*.txt`
+was pruned. The operation removed 13,206 entries; zero matching text files
+remain. C: free bytes changed from 57,207,144,448 to 68,958,728,192, a measured
+net recovery of **10.9445152283 GiB**, leaving about **64.22 GiB free**.
+The 21.953-GiB sum of removed file lengths includes hard-linked duplicates and
+is not the physical recovery figure.
+
+V21 logs, official detail records, certificates and committed audits remain.
+Its deleted exact outputs cannot be independently re-evaluated without
+recreating them. V20/V22 candidate vectors, V23's new accepted set, every
+other scenario's retained solutions, raw sources, code and Git history were
+untouched. This supersedes earlier V21 full-vector retention statements.

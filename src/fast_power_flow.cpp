@@ -2978,6 +2978,8 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"local_dispatch_qg_changes", local_dispatch_qg_changes},
         {"local_dispatch_load_changes", local_dispatch_load_changes},
         {"local_dispatch_seconds", local_dispatch_seconds},
+        {"local_dispatch_preparation_seconds", local_dispatch_preparation_seconds},
+        {"local_dispatch_cache_hit", local_dispatch_cache_hit},
         {"local_dispatch_objective_before", local_dispatch_objective_before},
         {"local_dispatch_objective_after", local_dispatch_objective_after},
         {"local_dispatch_predicted_gain", local_dispatch_predicted_gain},
@@ -4571,41 +4573,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         double polished_objective = predictor_objective;
                         ValidationReport polished_validation =
                             predictor_validation;
-                        if (options_.local_bus_dispatch_polish) {
-                            AccumulateSeconds local_timer(&output.local_dispatch_seconds);
-                            output.local_dispatch_attempted = true;
-                            output.local_dispatch_objective_before = polished_objective;
-                            output.local_dispatch_objective_after = polished_objective;
-                            std::vector<double> local_p, local_q;
-                            network_injections_from_branch_flows(data_, outaged_branch,
-                                polished_state, local_p, local_q);
-                            AcState local_state = make_trial(polished_state);
-                            const auto local = improve_fixed_network_bus_dispatch(data_,
-                                base_state_, commitment_, *contingency, local_p, local_q, local_state);
-                            output.local_dispatch_pg_changes = local.active_generation_changes;
-                            output.local_dispatch_qg_changes = local.reactive_generation_changes;
-                            output.local_dispatch_load_changes = local.load_changes;
-                            output.local_dispatch_predicted_gain = local.predicted_native_gain;
-                            if (local.changed()) {
-                                const double local_objective = rebuild_contingency_state_derived_fields(
-                                    data_, base_state_, commitment_, *contingency, local_state);
-                                const auto local_validation = validate_state(data_,
-                                    ModelMode::ContingencySoft, local_state, commitment_, direct_context);
-                                if (std::isfinite(local_objective) &&
-                                    local_validation.max_residual <= options_.validation_tolerance &&
-                                    local_objective > polished_objective + 1e-9) {
-                                    output.local_dispatch_selected = true;
-                                    output.local_dispatch_objective_after = local_objective;
-                                    polished_state = std::move(local_state);
-                                    polished_objective = local_objective;
-                                    polished_validation = local_validation;
-                                } else {
-                                    output.local_dispatch_rejection_category =
-                                        local_validation.max_residual > options_.validation_tolerance
-                                        ? local_validation.worst_category : "no_verified_objective_gain";
-                                }
-                            }
-                        }
                         bool outage_update_ready = true;
                         if (outaged_branch >= 0) {
                             outage_update_ready =
@@ -4642,10 +4609,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 0.00390625, 0.001953125};
                             for (int polish_iteration = 1;
                                  polish_iteration <=
-                                     options_.max_economic_balance_polish_iterations &&
-                                 (!options_.local_bus_dispatch_polish ||
-                                  slack_sum(polished_state.p_delta) + slack_sum(polished_state.q_delta) >
-                                      options_.economic_balance_polish_stop_slack);
+                                     options_.max_economic_balance_polish_iterations;
                                  ++polish_iteration) {
                                 output.economic_balance_polish_iterations =
                                     polish_iteration;
@@ -5142,6 +5106,62 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             polished_state = std::move(selected_state);
                             polished_objective = selected_objective;
                             polished_validation = selected_validation;
+                        }
+                        // Finish the original Newton/LP search first. Local
+                        // dispatch must not perturb its candidate directions.
+                        if (options_.local_bus_dispatch_polish) {
+                            AccumulateSeconds local_timer(&output.local_dispatch_seconds);
+                            output.local_dispatch_attempted = true;
+                            output.local_dispatch_objective_before = polished_objective;
+                            output.local_dispatch_objective_after = polished_objective;
+                            output.local_dispatch_cache_hit = static_cast<bool>(local_dispatch_cache_);
+                            if (!local_dispatch_cache_) {
+                                AccumulateSeconds prepare_timer(&output.local_dispatch_preparation_seconds);
+                                local_dispatch_cache_ = std::make_unique<LocalBusDispatchCache>(
+                                    data_, base_state_, commitment_);
+                            }
+                            std::vector<double> local_p, local_q;
+                            network_injections_from_branch_flows(data_, outaged_branch,
+                                polished_state, local_p, local_q);
+                            AcState local_state = make_trial(polished_state);
+                            const auto local = local_dispatch_cache_->improve(
+                                *contingency, local_p, local_q, local_state);
+                            output.local_dispatch_pg_changes = local.active_generation_changes;
+                            output.local_dispatch_qg_changes = local.reactive_generation_changes;
+                            output.local_dispatch_load_changes = local.load_changes;
+                            output.local_dispatch_predicted_gain = local.predicted_native_gain;
+                            if (local.changed()) {
+                                if (local_state.vm != polished_state.vm || local_state.va != polished_state.va ||
+                                    local_state.shunt_bs != polished_state.shunt_bs ||
+                                    local_state.shunt_steps != polished_state.shunt_steps) {
+                                    throw std::runtime_error("fixed-network local dispatch changed network controls");
+                                }
+                                local_state.pf = polished_state.pf; local_state.pt = polished_state.pt;
+                                local_state.qf = polished_state.qf; local_state.qt = polished_state.qt;
+                                local_state.sm_slack = polished_state.sm_slack;
+                                const auto balance = nodal_balance_slack_seed_from_network(
+                                    data_, local_state, local_p, local_q, 0.5, 1e-7);
+                                local_state.p_delta = balance.active; local_state.q_delta = balance.reactive;
+                                const double local_objective = rebuild_contingency_economic_fields(
+                                    data_, base_state_, commitment_, *contingency, local_state);
+                                // This is the FULL independent check, including
+                                // Ohm laws on the preserved branch flows.
+                                const auto local_validation = validate_state(data_,
+                                    ModelMode::ContingencySoft, local_state, commitment_, direct_context);
+                                if (std::isfinite(local_objective) &&
+                                    local_validation.max_residual <= options_.validation_tolerance &&
+                                    local_objective > polished_objective + 1e-9) {
+                                    output.local_dispatch_selected = true;
+                                    output.local_dispatch_objective_after = local_objective;
+                                    polished_state = std::move(local_state);
+                                    polished_objective = local_objective;
+                                    polished_validation = local_validation;
+                                } else {
+                                    output.local_dispatch_rejection_category =
+                                        local_validation.max_residual > options_.validation_tolerance
+                                        ? local_validation.worst_category : "no_verified_objective_gain";
+                                }
+                            }
                         }
                         output.economic_balance_polish_objective_after =
                             polished_objective;

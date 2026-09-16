@@ -102,6 +102,8 @@ struct FastPowerFlowResult {
     int local_dispatch_qg_changes{};
     int local_dispatch_load_changes{};
     double local_dispatch_seconds{};
+    double local_dispatch_preparation_seconds{};
+    bool local_dispatch_cache_hit{};
     double local_dispatch_objective_before{};
     double local_dispatch_objective_after{};
     double local_dispatch_predicted_gain{};
@@ -270,6 +272,8 @@ double rebuild_common_corrective_reference_state(
     const CaseData& data, const AcState& original_base,
     const std::vector<int>& commitment, AcState& state);
 
+class LocalBusDispatchCache;
+
 class FastContingencyPowerFlow {
 public:
     FastContingencyPowerFlow(
@@ -300,6 +304,7 @@ private:
     std::vector<unsigned char> bridge_branch_;
     struct FixedJacobianPredictorCache;
     mutable std::unique_ptr<FixedJacobianPredictorCache> predictor_cache_;
+    mutable std::unique_ptr<LocalBusDispatchCache> local_dispatch_cache_;
 
     FastPowerFlowResult solve_impl(
         const Contingency* contingency,

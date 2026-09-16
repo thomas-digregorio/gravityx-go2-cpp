@@ -78,36 +78,30 @@ void finite_vector(const std::vector<double>& values) {
 
 }  // namespace
 
-LocalBusDispatchResult improve_fixed_network_bus_dispatch(
+LocalBusDispatchCache::LocalBusDispatchCache(
     const CaseData& data, const AcState& original_base,
-    const std::vector<int>& commitment, const Contingency& contingency,
-    const std::vector<double>& network_p, const std::vector<double>& network_q,
-    AcState& candidate, int passes) {
-    const auto ng = data.generators.size(), nd = data.loads.size(), nb = data.buses.size();
-    if (passes < 1 || passes > 2 || commitment.size() != ng ||
+    const std::vector<int>& commitment)
+    : data_(data), original_base_(original_base), commitment_(commitment),
+      lower_g_(data.generators.size()), upper_g_(data.generators.size()),
+      lower_t_(data.loads.size()), upper_t_(data.loads.size()),
+      gen_curves_(data.generators.size()), load_curves_(data.loads.size()) {
+    const auto ng = data.generators.size(), nd = data.loads.size();
+    if (commitment.size() != ng ||
         original_base.pg.size() != ng || original_base.demand_factor.size() != nd ||
-        candidate.pg.size() != ng || candidate.qg.size() != ng ||
-        candidate.demand_factor.size() != nd || network_p.size() != nb || network_q.size() != nb ||
         !std::isfinite(data.delta_ctg) || data.delta_ctg <= 0.0 ||
+        !std::isfinite(data.delta_r_ctg) || data.delta_r_ctg < 0.0 ||
         !std::isfinite(data.p_delta_cost_approx) || data.p_delta_cost_approx < 0.0 ||
         !std::isfinite(data.q_delta_cost_approx) || data.q_delta_cost_approx < 0.0) {
-        throw std::runtime_error("invalid local dispatch dimensions or policy");
+        throw std::runtime_error("invalid local dispatch source dimensions or policy");
     }
     finite_vector(original_base.pg); finite_vector(original_base.demand_factor);
-    finite_vector(candidate.pg); finite_vector(candidate.qg); finite_vector(candidate.demand_factor);
-    finite_vector(network_p); finite_vector(network_q);
-    const int outaged_generator = contingency.type == ContingencyType::Generator
-        ? contingency.component : -1;
-    if (outaged_generator >= static_cast<int>(ng) ||
-        (contingency.type == ContingencyType::Generator && outaged_generator < 0)) {
-        throw std::runtime_error("invalid local dispatch generator outage");
-    }
-    std::vector<double> lower_g(ng), upper_g(ng), lower_t(nd), upper_t(nd);
-    std::vector<std::vector<PwlPoint>> gen_curves(ng), load_curves(nd);
+    auto& lower_g = lower_g_; auto& upper_g = upper_g_;
+    auto& lower_t = lower_t_; auto& upper_t = upper_t_;
+    auto& gen_curves = gen_curves_; auto& load_curves = load_curves_;
     for (std::size_t g = 0; g < ng; ++g) {
         if (commitment[g] != 0 && commitment[g] != 1)
             throw std::runtime_error("local dispatch requires fixed binary commitment");
-        if (commitment[g] == 0 || static_cast<int>(g) == outaged_generator) continue;
+        if (commitment[g] == 0) continue;
         const auto& gen = data.generators[g];
         lower_g[g] = std::max(gen.pmin, original_base.pg[g] - data.delta_r_ctg * gen.prdmaxctg);
         upper_g[g] = std::min(gen.pmax, original_base.pg[g] + data.delta_r_ctg * gen.prumaxctg);
@@ -137,6 +131,38 @@ LocalBusDispatchResult improve_fixed_network_bus_dispatch(
             if (lower_t[l] > upper_t[l]) load_curves[l].clear();
         }
     }
+}
+
+LocalBusDispatchResult improve_fixed_network_bus_dispatch(
+    const CaseData& data, const AcState& original_base,
+    const std::vector<int>& commitment, const Contingency& contingency,
+    const std::vector<double>& network_p, const std::vector<double>& network_q,
+    AcState& candidate, int passes) {
+    const LocalBusDispatchCache fresh(data, original_base, commitment);
+    return fresh.improve(contingency, network_p, network_q, candidate, passes);
+}
+
+LocalBusDispatchResult LocalBusDispatchCache::improve(
+    const Contingency& contingency, const std::vector<double>& network_p,
+    const std::vector<double>& network_q, AcState& candidate, int passes) const {
+    const auto& data = data_;
+    const auto ng = data.generators.size(), nd = data.loads.size(), nb = data.buses.size();
+    if (passes < 1 || passes > 2 || &candidate == &original_base_ ||
+        candidate.pg.size() != ng || candidate.qg.size() != ng ||
+        candidate.demand_factor.size() != nd || network_p.size() != nb || network_q.size() != nb) {
+        throw std::runtime_error("invalid local dispatch candidate, dimensions or policy");
+    }
+    finite_vector(candidate.pg); finite_vector(candidate.qg); finite_vector(candidate.demand_factor);
+    finite_vector(network_p); finite_vector(network_q);
+    const int outaged_generator = contingency.type == ContingencyType::Generator
+        ? contingency.component : -1;
+    if (outaged_generator >= static_cast<int>(ng) ||
+        (contingency.type == ContingencyType::Generator && outaged_generator < 0)) {
+        throw std::runtime_error("invalid local dispatch generator outage");
+    }
+    const auto& lower_g = lower_g_; const auto& upper_g = upper_g_;
+    const auto& lower_t = lower_t_; const auto& upper_t = upper_t_;
+    const auto& gen_curves = gen_curves_; const auto& load_curves = load_curves_;
     auto rp = network_p, rq = network_q;
     for (std::size_t g = 0; g < ng; ++g) {
         rp[data.generators[g].bus] -= candidate.pg[g];
@@ -150,7 +176,7 @@ LocalBusDispatchResult improve_fixed_network_bus_dispatch(
     for (int pass = 0; pass < passes; ++pass) {
         const int changes_before = result.active_generation_changes + result.reactive_generation_changes + result.load_changes;
         for (std::size_t g = 0; g < ng; ++g) {
-            if (gen_curves[g].empty()) continue;
+            if (gen_curves[g].empty() || static_cast<int>(g) == outaged_generator) continue;
             const auto& gen = data.generators[g];
             const int bus = gen.bus;
             const double q = std::clamp(candidate.qg[g] + rq[bus], gen.qmin, gen.qmax);
@@ -237,6 +263,30 @@ void run_local_bus_dispatch_regression() {
     const auto result = improve_fixed_network_bus_dispatch(data, base, {1,0,1}, outage,
         {1.1,-0.8}, {0.1,0.25}, candidate);
     require(result.changed() && result.predicted_native_gain > 0, "local dispatch did not improve fixture");
+    const LocalBusDispatchCache resident(data, base, {1,0,1});
+    for (int trial = 0; trial < 4; ++trial) {
+        auto reference = base;
+        reference.pg[0] = 0.98 + trial * 0.005;
+        reference.demand_factor[0] = 1.0 - trial * 0.005;
+        auto event = outage;
+        if (trial % 2 == 0) reference.pg[2] = reference.qg[2] = 0.0;
+        else { event.type = ContingencyType::Branch; event.component = 0; }
+        auto cached_trial = reference;
+        const std::vector<double> p{trial % 2 == 0 ? 1.1 : 2.1,-0.8}, q{0.1,0.25};
+        const auto expected = improve_fixed_network_bus_dispatch(data, base, {1,0,1}, event, p, q, reference);
+        const auto cached = resident.improve(event, p, q, cached_trial);
+        require(reference.pg == cached_trial.pg && reference.qg == cached_trial.qg &&
+            reference.demand_factor == cached_trial.demand_factor &&
+            expected.predicted_native_gain == cached.predicted_native_gain &&
+            expected.active_generation_changes == cached.active_generation_changes &&
+            expected.reactive_generation_changes == cached.reactive_generation_changes &&
+            expected.load_changes == cached.load_changes,
+            "resident source-bound cache changed a local dispatch result");
+    }
+    bool alias_rejected = false;
+    try { resident.improve(outage, {1.1,-0.8}, {0.1,0.25}, base); }
+    catch (const std::runtime_error&) { alias_rejected = true; }
+    require(alias_rejected, "local dispatch allowed mutation of its original base");
     require(candidate.pg[0] >= 0.97 && candidate.pg[0] <= 1.05,
         "local generation changed original-base ramp anchor");
     require(candidate.pg[0] >= gen.pmin && candidate.qg[0] >= gen.qmin && candidate.qg[0] <= gen.qmax,

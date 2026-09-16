@@ -1114,6 +1114,8 @@ int run_parallel_circuit_regression() {
     budget_result.local_dispatch_qg_changes = 3;
     budget_result.local_dispatch_load_changes = 1;
     budget_result.local_dispatch_seconds = 0.01;
+    budget_result.local_dispatch_preparation_seconds = 0.005;
+    budget_result.local_dispatch_cache_hit = true;
     budget_result.local_dispatch_objective_before = 20.0;
     budget_result.local_dispatch_objective_after = 30.0;
     budget_result.local_dispatch_predicted_gain = 10.0;
@@ -1134,7 +1136,8 @@ int run_parallel_circuit_regression() {
     const auto full_economic = budget_result.to_json();
     for (const auto* key : {"local_dispatch_attempted", "local_dispatch_selected",
             "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",
-            "local_dispatch_seconds", "local_dispatch_objective_before", "local_dispatch_objective_after",
+            "local_dispatch_seconds", "local_dispatch_preparation_seconds", "local_dispatch_cache_hit",
+            "local_dispatch_objective_before", "local_dispatch_objective_after",
             "local_dispatch_predicted_gain", "local_dispatch_rejection_category"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key)) {
             throw std::runtime_error("compact worker log omitted local dispatch evidence");
@@ -1812,12 +1815,43 @@ int run_parallel_circuit_regression() {
         if (!local_result.feasible || !local_result.local_dispatch_attempted ||
             !local_result.local_dispatch_selected || local_check.max_residual > 1e-5 ||
             local_result.local_dispatch_objective_after <= local_result.local_dispatch_objective_before ||
+            local_result.local_dispatch_cache_hit || local_result.local_dispatch_preparation_seconds <= 0.0 ||
+            local_result.economic_balance_polish_iterations != refreshed.economic_balance_polish_iterations ||
+            std::abs(local_result.local_dispatch_objective_before - refreshed.solve.objective) > 1e-8 ||
             std::abs(local_result.local_dispatch_objective_after - local_result.local_dispatch_objective_before -
                 local_result.local_dispatch_predicted_gain) > 1e-6 ||
             local_result.solve.objective < local_result.local_dispatch_objective_after - 1e-8 ||
             local_result.solve.state.pg[0] < refresh_data.generators[0].pmin ||
             frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
             throw std::runtime_error("complete local dispatch tiny solve failed: " + local_result.runtime_profile_json().dump());
+        }
+        auto fully_rebuilt = local_result.solve.state;
+        const double full_objective = gravityx::rebuild_contingency_state_derived_fields(
+            refresh_data, refresh_base.solve.state, {1}, branch_contingency, fully_rebuilt);
+        const auto rebuilt_check = gravityx::validate_state(refresh_data,
+            gravityx::ModelMode::ContingencySoft, fully_rebuilt, {1}, context);
+        if (std::abs(full_objective - local_result.solve.objective) > 1e-6 ||
+            rebuilt_check.max_residual > 1e-5) {
+            throw std::runtime_error("preserved local flows differ from full AC rebuilding");
+        }
+        for (auto field : {&gravityx::AcState::pf, &gravityx::AcState::pt,
+                &gravityx::AcState::qf, &gravityx::AcState::qt, &gravityx::AcState::sm_slack,
+                &gravityx::AcState::p_delta, &gravityx::AcState::q_delta,
+                &gravityx::AcState::gen_lambda, &gravityx::AcState::load_lambda}) {
+            const auto& actual = local_result.solve.state.*field;
+            const auto& expected = fully_rebuilt.*field;
+            if (actual.size() != expected.size()) throw std::runtime_error("local rebuild dimension changed");
+            for (std::size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i]) || std::abs(actual[i] - expected[i]) > 1e-10) {
+                    throw std::runtime_error("local retained-flow rebuilding changed state");
+                }
+            }
+        }
+        const auto second_local = local_solver.solve(branch_contingency);
+        if (!second_local.local_dispatch_cache_hit || second_local.local_dispatch_preparation_seconds != 0.0 ||
+            gravityx::ac_state_to_json(second_local.solve.state) != gravityx::ac_state_to_json(local_result.solve.state) ||
+            second_local.solve.objective != local_result.solve.objective) {
+            throw std::runtime_error("resident local source cache changed the complete tiny solution");
         }
         gravityx::run_voltage_extrapolation_physics_regression(
             refresh_data, {1}, refresh_base.solve.state, branch_contingency, refreshed.solve.state);
@@ -5560,7 +5594,8 @@ int run_contingency_worker(
                          "economic_balance_polish_correction_seconds",
                          "local_dispatch_attempted", "local_dispatch_selected",
                          "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",
-                         "local_dispatch_seconds", "local_dispatch_objective_before", "local_dispatch_objective_after",
+                         "local_dispatch_seconds", "local_dispatch_preparation_seconds", "local_dispatch_cache_hit",
+                         "local_dispatch_objective_before", "local_dispatch_objective_after",
                          "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
                          "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
                          "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",

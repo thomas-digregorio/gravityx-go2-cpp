@@ -707,6 +707,8 @@ int run_component_tests() {
         !cached_economic_options.early_reject_economic_trials ||
         !cached_economic_options.reuse_feasibility_jacobian_for_polish ||
         gravityx::FastPowerFlowOptions{}.reuse_feasibility_jacobian_for_polish ||
+        !cached_economic_options.local_discrete_shunt_polish ||
+        gravityx::FastPowerFlowOptions{}.local_discrete_shunt_polish ||
         gravityx::FastPowerFlowOptions{}.early_reject_economic_trials ||
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
@@ -1127,6 +1129,8 @@ int run_parallel_circuit_regression() {
     budget_result.local_dispatch_objective_before = 20.0;
     budget_result.local_dispatch_objective_after = 30.0;
     budget_result.local_dispatch_predicted_gain = 10.0;
+    budget_result.local_dispatch_shunt_block_changes = 3;
+    budget_result.local_dispatch_shunt_seconds = 0.004;
     budget_result.local_dispatch_rejection_category = "fixture_category";
     budget_result.adaptive_jacobian_refresh_attempts = 2;
     budget_result.adaptive_jacobian_refresh_selected = 1;
@@ -1157,7 +1161,8 @@ int run_parallel_circuit_regression() {
             "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",
             "local_dispatch_seconds", "local_dispatch_preparation_seconds", "local_dispatch_cache_hit",
             "local_dispatch_objective_before", "local_dispatch_objective_after",
-            "local_dispatch_predicted_gain", "local_dispatch_rejection_category"}) {
+            "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
+            "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key)) {
             throw std::runtime_error("compact worker log omitted local dispatch evidence");
         }
@@ -1438,6 +1443,76 @@ int run_parallel_circuit_regression() {
         switched_shunt_reference.qg[0];
     switched_shunt_data.generators[0].qmax =
         switched_shunt_reference.qg[0];
+    {
+        auto local_data = switched_shunt_data;
+        for (std::size_t l = 0; l < local_data.loads.size(); ++l)
+            local_data.loads[l].tmin = local_data.loads[l].tmax = switched_shunt_reference.demand_factor[l];
+        const auto frozen_reference = gravityx::ac_state_to_json(switched_shunt_reference);
+        auto candidate = switched_shunt_reference;
+        candidate.shunt_steps[0][0] = 1; candidate.shunt_bs[0] = 0.02;
+        gravityx::rebuild_base_state_derived_fields(local_data, {1}, candidate);
+        if (gravityx::validate_state(local_data, gravityx::ModelMode::BaseSoft, candidate, {1}).max_residual > 1e-5)
+            throw std::runtime_error("local shunt fixture must begin independently feasible");
+        const auto before = candidate;
+        std::vector<double> net_p(local_data.buses.size(), 0.0), net_q(local_data.buses.size(), 0.0);
+        for (std::size_t i = 0; i < local_data.branches.size(); ++i) {
+            const auto& branch = local_data.branches[i];
+            net_p[branch.from] += candidate.pf[i]; net_p[branch.to] += candidate.pt[i];
+            net_q[branch.from] += candidate.qf[i]; net_q[branch.to] += candidate.qt[i];
+        }
+        for (std::size_t i = 0; i < local_data.shunts.size(); ++i) {
+            const auto& shunt = local_data.shunts[i];
+            net_p[shunt.bus] += shunt.gs * candidate.vm[shunt.bus] * candidate.vm[shunt.bus];
+            net_q[shunt.bus] -= candidate.shunt_bs[i] * candidate.vm[shunt.bus] * candidate.vm[shunt.bus];
+        }
+        // Source-feasible GO2 points may have paid imbalance; do not assume
+        // that the reference's block setting is the economic optimum.
+        double q_mismatch = net_q[0];
+        for (std::size_t g = 0; g < local_data.generators.size(); ++g)
+            if (local_data.generators[g].bus == 0) q_mismatch -= candidate.qg[g];
+        for (std::size_t l = 0; l < local_data.loads.size(); ++l)
+            if (local_data.loads[l].bus == 0)
+                q_mismatch += local_data.loads[l].qd_nominal * candidate.demand_factor[l];
+        int expected_step = before.shunt_steps[0][0];
+        double expected_mismatch = std::abs(q_mismatch);
+        for (int step = 0; step <= 4; ++step) {
+            const double mismatch = std::abs(q_mismatch - before.vm[0] * before.vm[0] *
+                (step * 0.02 - before.shunt_bs[0]));
+            if (mismatch < expected_mismatch) { expected_step = step; expected_mismatch = mismatch; }
+        }
+        gravityx::Contingency geometry; geometry.type = gravityx::ContingencyType::Branch;
+        geometry.component = -1; // Fixed-geometry candidate test; no branch is removed here.
+        gravityx::LocalBusDispatchCache cache(local_data, switched_shunt_reference, {1});
+        const auto result = cache.improve(geometry, net_p, net_q, candidate, 2, true);
+        gravityx::rebuild_base_state_derived_fields(local_data, {1}, candidate);
+        const auto verified = gravityx::validate_state(local_data, gravityx::ModelMode::BaseSoft, candidate, {1});
+        if (!result.changed() || result.shunt_block_changes != 1 || result.predicted_native_gain <= 0.0 ||
+            candidate.shunt_steps[0][0] != expected_step || candidate.shunt_bs[0] != expected_step * 0.02 ||
+            verified.max_residual > 1e-5 ||
+            std::abs(result.predicted_native_gain - local_data.delta_ctg * local_data.q_delta_cost_approx *
+                (std::abs(q_mismatch) - expected_mismatch)) > 1e-8 ||
+            candidate.q_delta[0] >= before.q_delta[0] || candidate.vm != before.vm || candidate.va != before.va ||
+            candidate.pf != before.pf || candidate.qf != before.qf || candidate.pt != before.pt || candidate.qt != before.qt ||
+            candidate.pg != before.pg || candidate.qg != before.qg || candidate.demand_factor != before.demand_factor ||
+            frozen_reference != gravityx::ac_state_to_json(switched_shunt_reference)) {
+            throw std::runtime_error("fixed-voltage shunt candidate failed full AC/source validation: " +
+                nlohmann::json{{"changes", result.shunt_block_changes}, {"gain", result.predicted_native_gain},
+                    {"steps", candidate.shunt_steps}, {"bs", candidate.shunt_bs}, {"validation", verified.to_json()},
+                    {"q_before", before.q_delta}, {"q_after", candidate.q_delta},
+                    {"pg_changed", candidate.pg != before.pg}, {"qg_changed", candidate.qg != before.qg},
+                    {"load_changed", candidate.demand_factor != before.demand_factor},
+                    {"voltage_changed", candidate.vm != before.vm || candidate.va != before.va},
+                    {"flows_changed", candidate.pf != before.pf || candidate.qf != before.qf ||
+                        candidate.pt != before.pt || candidate.qt != before.qt},
+                    {"base_changed", frozen_reference != gravityx::ac_state_to_json(switched_shunt_reference)}}.dump());
+        }
+        for (double mismatch : {-0.005, 0.005}) {
+            auto corrupted = candidate; corrupted.shunt_bs[0] += mismatch;
+            if (gravityx::validate_state(local_data, gravityx::ModelMode::BaseSoft,
+                    corrupted, {1}).max_variable_bound_violation < 0.004999)
+                throw std::runtime_error("independent shunt equality missed a signed block mismatch");
+        }
+    }
     const auto switched_shunt_linear_seed =
         gravityx::solve_linearized_ac_seed(
             switched_shunt_data, switched_shunt_reference, {1}, 0.499999,
@@ -5690,6 +5765,7 @@ int run_contingency_worker(
                          "local_dispatch_seconds", "local_dispatch_preparation_seconds", "local_dispatch_cache_hit",
                          "local_dispatch_objective_before", "local_dispatch_objective_after",
                          "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
+                         "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds",
                          "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
                          "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",
                          "corrective_trial_copy_count", "corrective_trial_control_copy_count",

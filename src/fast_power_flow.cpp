@@ -2980,6 +2980,8 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"local_dispatch_pg_changes", local_dispatch_pg_changes},
         {"local_dispatch_qg_changes", local_dispatch_qg_changes},
         {"local_dispatch_load_changes", local_dispatch_load_changes},
+        {"local_dispatch_shunt_block_changes", local_dispatch_shunt_block_changes},
+        {"local_dispatch_shunt_seconds", local_dispatch_shunt_seconds},
         {"local_dispatch_seconds", local_dispatch_seconds},
         {"local_dispatch_preparation_seconds", local_dispatch_preparation_seconds},
         {"local_dispatch_cache_hit", local_dispatch_cache_hit},
@@ -5181,16 +5183,30 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 polished_state, local_p, local_q);
                             AcState local_state = make_trial(polished_state);
                             const auto local = local_dispatch_cache_->improve(
-                                *contingency, local_p, local_q, local_state);
+                                *contingency, local_p, local_q, local_state, 2,
+                                options_.local_discrete_shunt_polish);
                             output.local_dispatch_pg_changes = local.active_generation_changes;
                             output.local_dispatch_qg_changes = local.reactive_generation_changes;
                             output.local_dispatch_load_changes = local.load_changes;
+                            output.local_dispatch_shunt_block_changes = local.shunt_block_changes;
+                            output.local_dispatch_shunt_seconds = local.shunt_polish_seconds;
                             output.local_dispatch_predicted_gain = local.predicted_native_gain;
                             if (local.changed()) {
                                 if (local_state.vm != polished_state.vm || local_state.va != polished_state.va ||
-                                    local_state.shunt_bs != polished_state.shunt_bs ||
-                                    local_state.shunt_steps != polished_state.shunt_steps) {
+                                    (!options_.local_discrete_shunt_polish &&
+                                     (local_state.shunt_bs != polished_state.shunt_bs ||
+                                      local_state.shunt_steps != polished_state.shunt_steps))) {
                                     throw std::runtime_error("fixed-network local dispatch changed network controls");
+                                }
+                                if (local.shunt_block_changes > 0) {
+                                    // Preserved terminal branch flows remain
+                                    // exact at the same V/angle. Update the
+                                    // local Q injection for changed shunts.
+                                    for (std::size_t s = 0; s < data_.shunts.size(); ++s) {
+                                        const int bus = data_.shunts[s].bus;
+                                        local_q[bus] -= (local_state.shunt_bs[s] - polished_state.shunt_bs[s]) *
+                                            local_state.vm[bus] * local_state.vm[bus];
+                                    }
                                 }
                                 local_state.pf = polished_state.pf; local_state.pt = polished_state.pt;
                                 local_state.qf = polished_state.qf; local_state.qt = polished_state.qt;

@@ -1,6 +1,8 @@
 #include "gravityx/local_bus_dispatch.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -76,6 +78,85 @@ void finite_vector(const std::vector<double>& values) {
         throw std::runtime_error("nonfinite local dispatch input");
 }
 
+// At fixed voltage/angle, changing a shunt block changes ONLY its local
+// reactive injection by -V^2 * delta_b. The one-coordinate cost is monotone
+// in absolute Q mismatch, so its exact integer minimum is at floor/ceil of
+// the zero-mismatch setting, clipped to the immutable source block interval.
+// Two deterministic sweeps are candidate generation, not a claim of a joint
+// discrete optimum. Pg/Qg/load corrections have already finished.
+void polish_shunt_coordinates(const CaseData& data, AcState& candidate,
+                              std::vector<double>& rq, LocalBusDispatchResult& result) {
+    const auto started = std::chrono::steady_clock::now();
+    if (data.shunts.empty()) return;
+    if (candidate.vm.size() != data.buses.size() || rq.size() != data.buses.size() ||
+        candidate.shunt_bs.size() != data.shunts.size() ||
+        candidate.shunt_steps.size() != data.shunts.size()) {
+        throw std::runtime_error("invalid discrete-shunt candidate dimensions");
+    }
+    finite_vector(candidate.vm); finite_vector(candidate.shunt_bs); finite_vector(rq);
+    for (int pass = 0; pass < 2; ++pass) {
+        const int before = result.shunt_block_changes;
+        for (std::size_t s = 0; s < data.shunts.size(); ++s) {
+            const auto& shunt = data.shunts[s];
+            if (!shunt.present || !shunt.dispatchable) continue;
+            const auto& maximum = shunt.block_maximum_steps;
+            const auto& coefficient = shunt.block_susceptance;
+            auto& steps = candidate.shunt_steps[s];
+            if (shunt.bus < 0 || shunt.bus >= static_cast<int>(data.buses.size()) ||
+                maximum.size() != coefficient.size() || steps.size() < maximum.size() ||
+                candidate.vm[shunt.bus] <= 0.0) {
+                throw std::runtime_error("invalid discrete-shunt source or state");
+            }
+            finite_vector(coefficient);
+            const double v2 = candidate.vm[shunt.bus] * candidate.vm[shunt.bus];
+            if (!std::isfinite(v2) || v2 <= 0.0) {
+                throw std::runtime_error("invalid discrete-shunt voltage square");
+            }
+            for (std::size_t block = 0; block < maximum.size(); ++block) {
+                if (maximum[block] < 0 || steps[block] < 0 || steps[block] > maximum[block]) {
+                    throw std::runtime_error("discrete-shunt block outside exact source interval");
+                }
+            }
+            for (std::size_t block = 0; block < maximum.size(); ++block) {
+                const double b = coefficient[block];
+                if (maximum[block] == 0 || std::abs(b) <= 1e-15) continue;
+                double others = 0.0;
+                for (std::size_t j = 0; j < maximum.size(); ++j) {
+                    if (j != block) others += steps[j] * coefficient[j];
+                }
+                const double old_bs = candidate.shunt_bs[s];
+                const double old_mismatch = rq[shunt.bus];
+                const double target = (old_mismatch / v2 + old_bs - others) / b;
+                if (!std::isfinite(target)) continue;
+                const double clipped = std::clamp(target, 0.0, static_cast<double>(maximum[block]));
+                const std::array<int, 2> candidates{
+                    static_cast<int>(std::floor(clipped)), static_cast<int>(std::ceil(clipped))};
+                int chosen = steps[block];
+                double best_gain = 0.0, best_bs = old_bs, best_mismatch = old_mismatch;
+                for (int step : candidates) {
+                    if (step == steps[block]) continue;
+                    const double new_bs = others + step * b;
+                    const double mismatch = old_mismatch - v2 * (new_bs - old_bs);
+                    const double gain = data.delta_ctg * data.q_delta_cost_approx *
+                        (std::abs(old_mismatch) - std::abs(mismatch));
+                    if (std::isfinite(gain) && gain > best_gain + 1e-9) {
+                        chosen = step; best_gain = gain; best_bs = new_bs; best_mismatch = mismatch;
+                    }
+                }
+                if (chosen != steps[block]) {
+                    steps[block] = chosen; candidate.shunt_bs[s] = best_bs;
+                    rq[shunt.bus] = best_mismatch;
+                    result.predicted_native_gain += best_gain;
+                    ++result.shunt_block_changes;
+                }
+            }
+        }
+        if (before == result.shunt_block_changes) break;
+    }
+    result.shunt_polish_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
 }  // namespace
 
 LocalBusDispatchCache::LocalBusDispatchCache(
@@ -137,14 +218,15 @@ LocalBusDispatchResult improve_fixed_network_bus_dispatch(
     const CaseData& data, const AcState& original_base,
     const std::vector<int>& commitment, const Contingency& contingency,
     const std::vector<double>& network_p, const std::vector<double>& network_q,
-    AcState& candidate, int passes) {
+    AcState& candidate, int passes, bool polish_discrete_shunts) {
     const LocalBusDispatchCache fresh(data, original_base, commitment);
-    return fresh.improve(contingency, network_p, network_q, candidate, passes);
+    return fresh.improve(contingency, network_p, network_q, candidate, passes, polish_discrete_shunts);
 }
 
 LocalBusDispatchResult LocalBusDispatchCache::improve(
     const Contingency& contingency, const std::vector<double>& network_p,
-    const std::vector<double>& network_q, AcState& candidate, int passes) const {
+    const std::vector<double>& network_q, AcState& candidate, int passes,
+    bool polish_discrete_shunts) const {
     const auto& data = data_;
     const auto ng = data.generators.size(), nd = data.loads.size(), nb = data.buses.size();
     if (passes < 1 || passes > 2 || &candidate == &original_base_ ||
@@ -213,6 +295,7 @@ LocalBusDispatchResult LocalBusDispatchCache::improve(
         }
         if (changes_before == result.active_generation_changes + result.reactive_generation_changes + result.load_changes) break;
     }
+    if (polish_discrete_shunts) polish_shunt_coordinates(data, candidate, rq, result);
     return result;
 }
 
@@ -220,6 +303,63 @@ void run_local_bus_dispatch_regression() {
     const auto require = [](bool condition, const char* message) {
         if (!condition) throw std::runtime_error(message);
     };
+    // Exhaustive integer oracle, including both signs and ineligible devices.
+    for (double b : {-0.04, -0.01, 0.01, 0.04})
+        for (int n : {0, 1, 4, 8}) for (int original = 0; original <= n; ++original)
+            for (double vm : {0.9, 1.05}) for (double mismatch : {-0.49, -0.033, 0.0, 0.047, 0.49}) {
+        CaseData tiny; tiny.buses.resize(2); tiny.delta_ctg = 0.25; tiny.q_delta_cost_approx = 1000.0;
+        Shunt adjustable; adjustable.bus = 1; adjustable.dispatchable = true;
+        adjustable.steps = {0}; adjustable.block_maximum_steps = {n}; adjustable.block_susceptance = {b};
+        auto fixed = adjustable; fixed.dispatchable = false;
+        auto absent = adjustable; absent.present = false;
+        tiny.shunts = {adjustable, fixed, absent};
+        AcState point; point.vm = {1.0, vm}; point.va = {0.0, -0.02};
+        point.pg = {1.0}; point.qg = {0.1}; point.pf = {0.5}; point.qf = {0.2};
+        point.shunt_bs = {original * b, original * b, original * b};
+        point.shunt_steps = {{original}, {original}, {original}};
+        const auto saved = point;
+        std::vector<double> rq{0.123, mismatch}; LocalBusDispatchResult result;
+        polish_shunt_coordinates(tiny, point, rq, result);
+        double optimum = std::abs(mismatch);
+        for (int step = 0; step <= n; ++step)
+            optimum = std::min(optimum, std::abs(mismatch - vm * vm * (step - original) * b));
+        require(std::abs(std::abs(rq[1]) - optimum) < 1e-12, "discrete shunt differs from exact integer oracle");
+        require(std::abs(point.shunt_bs[0] - point.shunt_steps[0][0] * b) < 1e-14,
+            "discrete shunt lost exact block susceptance");
+        require(std::abs(result.predicted_native_gain - tiny.delta_ctg * tiny.q_delta_cost_approx *
+            (std::abs(mismatch) - std::abs(rq[1]))) < 1e-9, "discrete shunt gain bookkeeping failed");
+        require(point.shunt_steps[0][0] >= 0 && point.shunt_steps[0][0] <= n &&
+            point.shunt_bs[1] == saved.shunt_bs[1] && point.shunt_steps[1] == saved.shunt_steps[1] &&
+            point.shunt_bs[2] == saved.shunt_bs[2] && point.shunt_steps[2] == saved.shunt_steps[2] &&
+            point.vm == saved.vm && point.va == saved.va && point.pg == saved.pg && point.qg == saved.qg &&
+            point.pf == saved.pf && point.qf == saved.qf && rq[0] == 0.123 && tiny.shunts[0].steps[0] == 0,
+            "discrete shunt changed frozen controls, source data, or an ineligible device");
+    }
+    {
+        CaseData tiny; tiny.buses.resize(1); tiny.delta_ctg = 1.0; tiny.q_delta_cost_approx = 1000;
+        Shunt mixed; mixed.bus = 0; mixed.dispatchable = true;
+        mixed.block_maximum_steps = {4, 3, 10}; mixed.block_susceptance = {0.03, -0.02, 0.0};
+        tiny.shunts = {mixed}; AcState point; point.vm = {1.0};
+        point.shunt_steps = {{1, 1, 7}}; point.shunt_bs = {0.01};
+        std::vector<double> rq{0.089}; LocalBusDispatchResult result;
+        polish_shunt_coordinates(tiny, point, rq, result);
+        require(std::abs(rq[0]) <= 0.089 && result.shunt_block_changes > 0 &&
+            point.shunt_steps[0][2] == 7 && std::abs(point.shunt_bs[0] -
+                (0.03 * point.shunt_steps[0][0] - 0.02 * point.shunt_steps[0][1])) < 1e-14,
+            "mixed discrete shunt coordinate pass changed bounds or increased imbalance");
+        for (int mutation = 0; mutation < 5; ++mutation) {
+            auto bad_data = tiny; auto bad = point; auto bad_q = rq; LocalBusDispatchResult bad_result;
+            if (mutation == 0) bad.shunt_steps[0][0] = 5;
+            if (mutation == 1) bad_data.shunts[0].block_maximum_steps[0] = -1;
+            if (mutation == 2) bad_data.shunts[0].block_susceptance.pop_back();
+            if (mutation == 3) bad.vm[0] = std::numeric_limits<double>::quiet_NaN();
+            if (mutation == 4) bad.shunt_bs.clear();
+            bool rejected = false;
+            try { polish_shunt_coordinates(bad_data, bad, bad_q, bad_result); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "invalid discrete-shunt state or source accepted");
+        }
+    }
     // A dense one-dimensional oracle also covers nonconvex source slopes,
     // signed reactive demand, simultaneous P/Q kinks and active slack caps.
     for (const std::vector<PwlPoint>& curve : {

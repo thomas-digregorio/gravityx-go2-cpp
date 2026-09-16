@@ -36,6 +36,7 @@ struct FastPowerFlowOptions {
     // tiny tests to cover the production fallback with both injection paths.
     bool coupled_polish_correction{true};
     bool local_bus_dispatch_polish{false};
+    bool local_discrete_shunt_polish{false};
     // Reject a physically infeasible economic trial at its first proven
     // violation; all potentially accepted trials still complete every check.
     bool early_reject_economic_trials{false};
@@ -85,6 +86,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.controls_only_trial_copy = true;
     options.reuse_polish_branch_flows = true;
     options.local_bus_dispatch_polish = true;
+    options.local_discrete_shunt_polish = true;
     options.early_reject_economic_trials = true;
     options.reuse_feasibility_jacobian_for_polish = true;
     options.max_economic_balance_polish_iterations = 3;
@@ -110,6 +112,8 @@ struct FastPowerFlowResult {
     int local_dispatch_pg_changes{};
     int local_dispatch_qg_changes{};
     int local_dispatch_load_changes{};
+    int local_dispatch_shunt_block_changes{};
+    double local_dispatch_shunt_seconds{};
     double local_dispatch_seconds{};
     double local_dispatch_preparation_seconds{};
     bool local_dispatch_cache_hit{};

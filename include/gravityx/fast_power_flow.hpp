@@ -37,6 +37,9 @@ struct FastPowerFlowOptions {
     bool coupled_polish_correction{true};
     bool local_bus_dispatch_polish{false};
     bool local_discrete_shunt_polish{false};
+    // Qg has no corrective ramp or production-cost term in this formulation.
+    // Reconcile it at the trial's NEW voltages before testing that trial.
+    bool rebalance_trial_reactive_generation{false};
     // Reject a physically infeasible economic trial at its first proven
     // violation; all potentially accepted trials still complete every check.
     bool early_reject_economic_trials{false};
@@ -87,6 +90,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.reuse_polish_branch_flows = true;
     options.local_bus_dispatch_polish = true;
     options.local_discrete_shunt_polish = true;
+    options.rebalance_trial_reactive_generation = true;
     options.early_reject_economic_trials = true;
     options.reuse_feasibility_jacobian_for_polish = true;
     options.max_economic_balance_polish_iterations = 3;
@@ -146,6 +150,9 @@ struct FastPowerFlowResult {
     double outage_update_seconds{};
     double outage_update_rhs_seconds{};
     double economic_balance_polish_seconds{};
+    int economic_trial_qg_recourse_calls{};
+    int economic_trial_qg_changes{};
+    double economic_trial_qg_seconds{};
     bool economic_polish_reused_feasibility_jacobian{};
     double economic_balance_polish_correction_seconds{};
     int economic_balance_polish_flow_reuses{};

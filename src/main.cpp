@@ -709,6 +709,8 @@ int run_component_tests() {
         gravityx::FastPowerFlowOptions{}.reuse_feasibility_jacobian_for_polish ||
         !cached_economic_options.local_discrete_shunt_polish ||
         gravityx::FastPowerFlowOptions{}.local_discrete_shunt_polish ||
+        !cached_economic_options.rebalance_trial_reactive_generation ||
+        gravityx::FastPowerFlowOptions{}.rebalance_trial_reactive_generation ||
         gravityx::FastPowerFlowOptions{}.early_reject_economic_trials ||
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
@@ -1131,6 +1133,9 @@ int run_parallel_circuit_regression() {
     budget_result.local_dispatch_predicted_gain = 10.0;
     budget_result.local_dispatch_shunt_block_changes = 3;
     budget_result.local_dispatch_shunt_seconds = 0.004;
+    budget_result.economic_trial_qg_recourse_calls = 7;
+    budget_result.economic_trial_qg_changes = 12;
+    budget_result.economic_trial_qg_seconds = 0.003;
     budget_result.local_dispatch_rejection_category = "fixture_category";
     budget_result.adaptive_jacobian_refresh_attempts = 2;
     budget_result.adaptive_jacobian_refresh_selected = 1;
@@ -1162,7 +1167,8 @@ int run_parallel_circuit_regression() {
             "local_dispatch_seconds", "local_dispatch_preparation_seconds", "local_dispatch_cache_hit",
             "local_dispatch_objective_before", "local_dispatch_objective_after",
             "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
-            "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds"}) {
+            "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds",
+            "economic_trial_qg_recourse_calls", "economic_trial_qg_changes", "economic_trial_qg_seconds"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key)) {
             throw std::runtime_error("compact worker log omitted local dispatch evidence");
         }
@@ -5766,6 +5772,7 @@ int run_contingency_worker(
                          "local_dispatch_objective_before", "local_dispatch_objective_after",
                          "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
                          "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds",
+                         "economic_trial_qg_recourse_calls", "economic_trial_qg_changes", "economic_trial_qg_seconds",
                          "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
                          "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",
                          "corrective_trial_copy_count", "corrective_trial_control_copy_count",

@@ -2982,6 +2982,9 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"local_dispatch_load_changes", local_dispatch_load_changes},
         {"local_dispatch_shunt_block_changes", local_dispatch_shunt_block_changes},
         {"local_dispatch_shunt_seconds", local_dispatch_shunt_seconds},
+        {"economic_trial_qg_recourse_calls", economic_trial_qg_recourse_calls},
+        {"economic_trial_qg_changes", economic_trial_qg_changes},
+        {"economic_trial_qg_seconds", economic_trial_qg_seconds},
         {"local_dispatch_seconds", local_dispatch_seconds},
         {"local_dispatch_preparation_seconds", local_dispatch_preparation_seconds},
         {"local_dispatch_cache_hit", local_dispatch_cache_hit},
@@ -3386,18 +3389,141 @@ struct EconomicPolishTrial {
     bool rejected_early{};
     double physical_seconds{};
     double economic_seconds{};
+    int qg_changes{};
+    double qg_seconds{};
 };
+
+// Fixed-voltage Q recourse is separable by bus: minimize absolute reactive
+// mismatch over the sum of the committed, available generators' EXACT Q
+// intervals. Qg has no cost or inter-period constraint in this formulation.
+// Branch flows, all P controls, source data and the original base stay fixed.
+// This generates a candidate; the existing complete checker still decides.
+static int reconcile_trial_reactive_generation(
+    const CaseData& data, const std::vector<int>& commitment,
+    const Contingency& contingency, AcState& state) {
+    const auto nb = data.buses.size(), ng = data.generators.size(), nl = data.branches.size();
+    if (commitment.size() != ng || state.qg.size() != ng || state.vm.size() != nb ||
+        state.q_delta.size() != nb || state.qf.size() != nl || state.qt.size() != nl ||
+        state.demand_factor.size() != data.loads.size())
+        throw std::runtime_error("invalid trial reactive recourse dimensions");
+    const int outage = contingency.type == ContingencyType::Generator ? contingency.component : -1;
+    if (outage >= static_cast<int>(ng) ||
+        (contingency.type == ContingencyType::Generator && outage < 0))
+        throw std::runtime_error("invalid trial reactive recourse generator outage");
+    int changes = 0;
+    for (std::size_t i = 0; i < nb; ++i) {
+        const auto& bus = data.buses[i];
+        if (bus.generators.empty()) continue;
+        const auto mismatch = [&]() {
+            double q = 0.0;
+            for (int branch : bus.branches_from) q += state.qf[branch];
+            for (int branch : bus.branches_to) q += state.qt[branch];
+            for (int generator : bus.generators) q -= state.qg[generator];
+            for (int load : bus.loads) q += data.loads[load].qd_nominal * state.demand_factor[load];
+            for (int shunt : bus.shunts)
+                q -= effective_shunt_susceptance(data, state, shunt) * state.vm[i] * state.vm[i];
+            if (!std::isfinite(q)) throw std::runtime_error("nonfinite trial reactive mismatch");
+            return q;
+        };
+        double q = mismatch();
+        const int before = changes;
+        for (int g : bus.generators) {
+            const auto& generator = data.generators[g];
+            if (commitment[g] == 0 || g == outage || !generator.present) continue;
+            if (commitment[g] != 1 || !std::isfinite(generator.qmin) ||
+                !std::isfinite(generator.qmax) || generator.qmin > generator.qmax ||
+                !std::isfinite(state.qg[g]))
+                throw std::runtime_error("invalid trial reactive source bounds or state");
+            const double chosen = std::clamp(state.qg[g] + q, generator.qmin, generator.qmax);
+            const double remaining = q - (chosen - state.qg[g]);
+            if (std::abs(remaining) + 1e-12 < std::abs(q)) {
+                state.qg[g] = chosen; q = remaining; ++changes;
+            }
+        }
+        if (changes != before) {
+            // Recompute from the independent physical summation order, rather
+            // than accumulating roundoff from allocation bookkeeping.
+            state.q_delta[i] = std::min(0.5, std::abs(mismatch()) + 1e-7);
+        }
+    }
+    return changes;
+}
+
+static void run_trial_reactive_recourse_regression() {
+    const auto require = [](bool passed, const char* text) {
+        if (!passed) throw std::runtime_error(std::string("trial Q recourse: ") + text);
+    };
+    // The sum of box intervals is an interval. This is a closed-form oracle
+    // independent of the sequential allocation implementation, including a
+    // strictly positive source QMIN, offline/absent devices and outages.
+    for (int mask = 0; mask < 4; ++mask) for (int outage : {-1, 0, 1})
+        for (double flow : {-2.0, -0.2, 0.0, 0.3, 1.9})
+        for (double reactive_load : {-0.31, 0.31}) for (int seed : {0, 1, 2}) {
+        CaseData fixture; fixture.buses.resize(2); fixture.branches.resize(1);
+        fixture.buses[0].generators = {0, 1, 2, 3};
+        fixture.buses[0].branches_from = {0}; fixture.buses[1].branches_to = {0};
+        fixture.buses[0].loads = {0}; fixture.buses[0].shunts = {0};
+        fixture.generators.resize(4);
+        fixture.generators[0].qmin = -0.2; fixture.generators[0].qmax = 0.4;
+        fixture.generators[1].qmin = 0.1; fixture.generators[1].qmax = 0.9;
+        fixture.generators[2].qmin = -100; fixture.generators[2].qmax = 100;
+        fixture.generators[2].present = false;
+        fixture.generators[3].qmin = -100; fixture.generators[3].qmax = 100;
+        fixture.loads.resize(1); fixture.loads[0].qd_nominal = reactive_load;
+        fixture.shunts.resize(1); fixture.shunts[0].bs = 0.13;
+        const std::vector<int> status{mask & 1, (mask >> 1) & 1, 1, 0};
+        const Contingency event{"tiny-Q-recourse", outage < 0 ? ContingencyType::Branch :
+            ContingencyType::Generator, outage, outage};
+        AcState point; point.vm = {1.03, 1.01}; point.va = {0.0, -0.02};
+        point.pg = {0.7, 0.8, 0.0, 0.0}; point.qg.resize(4, 0.0);
+        point.demand_factor = {0.9}; point.shunt_bs = {0.13}; point.shunt_steps = {{0}};
+        point.pf = {0.2}; point.pt = {-0.19}; point.qf = {flow}; point.qt = {-flow + 0.01};
+        point.sm_slack = {0.0}; point.p_delta = {0.01, 0.02}; point.q_delta = {0.5, 0.31};
+        double lower = 0.0, upper = 0.0;
+        for (int g : {0, 1}) if (status[g] == 1 && g != outage) {
+            const auto& source = fixture.generators[g];
+            point.qg[g] = std::clamp(source.qmin + 0.5 * seed * (source.qmax - source.qmin),
+                source.qmin, source.qmax);
+            lower += source.qmin; upper += source.qmax;
+        }
+        const auto before = point;
+        const double required = flow + reactive_load * point.demand_factor[0] -
+            fixture.shunts[0].bs * point.vm[0] * point.vm[0];
+        const double oracle = std::abs(required - std::clamp(required, lower, upper));
+        reconcile_trial_reactive_generation(fixture, status, event, point);
+        const double actual = std::abs(required - std::accumulate(point.qg.begin(), point.qg.end(), 0.0));
+        require(std::abs(actual - oracle) < 1e-12, "does not minimize the exact aggregate Q interval");
+        for (int g : {0, 1}) {
+            if (status[g] == 0 || g == outage) require(point.qg[g] == 0.0, "changed unavailable generator");
+            else require(point.qg[g] >= fixture.generators[g].qmin &&
+                point.qg[g] <= fixture.generators[g].qmax, "changed exact Q bounds");
+        }
+        require(point.qg[2] == 0.0 && point.qg[3] == 0.0 && point.q_delta[1] == before.q_delta[1] &&
+            point.vm == before.vm && point.va == before.va && point.pg == before.pg &&
+            point.pf == before.pf && point.qf == before.qf && point.pt == before.pt && point.qt == before.qt &&
+            point.p_delta == before.p_delta && point.sm_slack == before.sm_slack &&
+            point.demand_factor == before.demand_factor && point.shunt_bs == before.shunt_bs &&
+            point.shunt_steps == before.shunt_steps, "changed unrelated controls, flows, or unavailable devices");
+    }
+}
 
 static EconomicPolishTrial evaluate_economic_polish_trial(
     const CaseData& data, const AcState& original_base,
     const std::vector<int>& commitment, const Contingency& contingency,
     const ContingencyContext& context, AcState& candidate,
-    double validation_tolerance, bool staged = true, bool early_reject = true) {
+    double validation_tolerance, bool staged = true, bool early_reject = true,
+    bool reactive_recourse = false) {
     EconomicPolishTrial result;
     // The unstaged path is retained solely as a tiny-fixture equivalence oracle.
     if (!staged) {
         result.objective = rebuild_contingency_state_derived_fields(
             data, original_base, commitment, contingency, candidate);
+        if (reactive_recourse) {
+            AccumulateSeconds qg_timer(&result.qg_seconds);
+            result.qg_changes = reconcile_trial_reactive_generation(data, commitment, contingency, candidate);
+            result.objective = rebuild_contingency_state_derived_fields(
+                data, original_base, commitment, contingency, candidate);
+        }
         result.validation = validate_state(
             data, ModelMode::ContingencySoft, candidate, commitment, context);
         result.economics_checked = true;
@@ -3406,6 +3532,10 @@ static EconomicPolishTrial evaluate_economic_polish_trial(
     const auto physical_start = std::chrono::steady_clock::now();
     rebuild_contingency_state_fields(
         data, original_base, commitment, contingency, candidate, 0.5, false);
+    if (reactive_recourse) {
+        AccumulateSeconds qg_timer(&result.qg_seconds);
+        result.qg_changes = reconcile_trial_reactive_generation(data, commitment, contingency, candidate);
+    }
     if (early_reject) {
         auto physical = validate_rebuilt_contingency_feasibility(
             data, candidate, commitment, context, validation_tolerance);
@@ -3442,6 +3572,7 @@ void run_economic_polish_trial_regression(
     require(!data.branches.empty() && !data.generators.empty() && !data.loads.empty(),
             "fixture lacks required components");
     const auto frozen_base = ac_state_to_json(original_base);
+    run_trial_reactive_recourse_regression();
     int physically_rejected = 0, completely_checked = 0, accepted = 0, rejected_early = 0;
     for (auto type : {ContingencyType::Branch, ContingencyType::Generator}) {
         const Contingency outage{"tiny-trial", type, 0, 0};
@@ -3561,6 +3692,46 @@ void run_economic_polish_trial_regression(
     }
     require(physically_rejected > 0 && completely_checked > 0 && accepted > 0 && rejected_early > 0,
             "fixture did not exercise both rejection and complete acceptance");
+    {
+        auto fixture = data;
+        fixture.generators[0].qmin = -1000.0; fixture.generators[0].qmax = 1000.0;
+        const Contingency event{"tiny-fixed-geometry-Q", ContingencyType::Branch, -1, -1};
+        ContingencyContext context; context.borrow_base_state(original_base);
+        auto stale = original_base; stale.qg[0] -= 2.0;
+        auto refreshed = stale, oracle_state = stale;
+        const auto old_trial = evaluate_economic_polish_trial(fixture, original_base,
+            commitment, event, context, stale, 1e-5, true, true, false);
+        const auto new_trial = evaluate_economic_polish_trial(fixture, original_base,
+            commitment, event, context, refreshed, 1e-5, true, true, true);
+        const auto oracle = evaluate_economic_polish_trial(fixture, original_base,
+            commitment, event, context, oracle_state, 1e-5, false, true, true);
+        const auto independently_checked = validate_state(fixture, ModelMode::ContingencySoft,
+            refreshed, commitment, context);
+        require(old_trial.validation.max_reactive_balance_residual > 0.1 &&
+            !old_trial.economics_checked && new_trial.qg_changes > 0 &&
+            new_trial.economics_checked && new_trial.validation.max_residual <= 1e-5 &&
+            independently_checked.max_residual <= 1e-5,
+            "new-voltage Q correction failed the full independent AC gate");
+        require(new_trial.objective == oracle.objective &&
+            ac_state_to_json(refreshed) == ac_state_to_json(oracle_state) &&
+            new_trial.validation.max_residual == independently_checked.max_residual,
+            "Q-corrected staged candidate differs from complete rebuild/check oracle");
+        require(refreshed.vm == stale.vm && refreshed.va == stale.va && refreshed.pg == stale.pg &&
+            refreshed.demand_factor == stale.demand_factor && refreshed.pf == stale.pf &&
+            refreshed.qf == stale.qf && refreshed.pt == stale.pt && refreshed.qt == stale.qt &&
+            refreshed.shunt_bs == stale.shunt_bs && refreshed.shunt_steps == stale.shunt_steps,
+            "Q correction changed controls that affect branch flows");
+        for (int mutation = 0; mutation < 3; ++mutation) {
+            auto bad = refreshed; auto bad_fixture = fixture;
+            if (mutation == 0) bad.q_delta.clear();
+            if (mutation == 1) bad.qg[0] = std::numeric_limits<double>::quiet_NaN();
+            if (mutation == 2) bad_fixture.generators[0].qmin = bad_fixture.generators[0].qmax + 1.0;
+            bool rejected = false;
+            try { reconcile_trial_reactive_generation(bad_fixture, commitment, event, bad); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "invalid Q recourse state/source escaped rejection");
+        }
+    }
     require(frozen_base == ac_state_to_json(original_base), "original base was mutated");
 }
 
@@ -4858,7 +5029,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     const auto trial_check = evaluate_economic_polish_trial(
                                         data_, base_state_, commitment_, *contingency,
                                         *direct_context, candidate, options_.validation_tolerance,
-                                        true, options_.early_reject_economic_trials);
+                                        true, options_.early_reject_economic_trials,
+                                        options_.rebalance_trial_reactive_generation);
+                                    output.economic_trial_qg_recourse_calls += options_.rebalance_trial_reactive_generation;
+                                    output.economic_trial_qg_changes += trial_check.qg_changes;
+                                    output.economic_trial_qg_seconds += trial_check.qg_seconds;
                                     ++output.economic_balance_polish_trial_count;
                                     output.economic_balance_polish_economic_checks += trial_check.economics_checked;
                                     output.economic_balance_polish_physical_rejections += !trial_check.economics_checked;

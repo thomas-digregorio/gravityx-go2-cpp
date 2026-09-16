@@ -225,6 +225,56 @@ double row_violation(const SparseRow& row, const std::vector<double>& value) {
 
 }  // namespace
 
+std::vector<unsigned char> contingency_repair_neighborhood(
+    const CaseData& data, const Contingency& contingency,
+    int depth, std::size_t maximum_control_buses) {
+    if (depth < 0 || maximum_control_buses == 0)
+        throw std::runtime_error("invalid local repair neighborhood options");
+    std::vector<unsigned char> mask(data.buses.size(), 0);
+    std::queue<std::pair<int, int>> pending;
+    std::size_t count = 0;
+    const auto insert = [&](int bus, int distance) {
+        if (bus < 0 || bus >= static_cast<int>(mask.size()))
+            throw std::runtime_error("invalid local repair bus");
+        if (mask[bus] != 0) return;
+        mask[bus] = 1;
+        ++count;
+        pending.emplace(bus, distance);
+    };
+    if (contingency.type == ContingencyType::Generator) {
+        insert(data.generators.at(contingency.component).bus, 0);
+    } else {
+        const auto& branch = data.branches.at(contingency.component);
+        insert(branch.from, 0);
+        insert(branch.to, 0);
+    }
+    const auto neighbors = [&](int bus, const auto& visit) {
+        for (const auto* edges : {&data.buses[bus].branches_from,
+                                  &data.buses[bus].branches_to}) {
+            for (int index : *edges) {
+                const auto& branch = data.branches[index];
+                if (branch.status == 0 || (contingency.type == ContingencyType::Branch &&
+                        index == contingency.component)) continue;
+                visit(branch.from == bus ? branch.to : branch.from);
+            }
+        }
+    };
+    while (!pending.empty()) {
+        if (count > maximum_control_buses) return {};
+        const auto [bus, distance] = pending.front();
+        pending.pop();
+        if (distance >= depth) continue;
+        neighbors(bus, [&](int other) { insert(other, distance + 1); });
+    }
+    if (count > maximum_control_buses) return {};
+    for (int bus = 0; bus < static_cast<int>(mask.size()); ++bus) {
+        if (mask[bus] == 1) neighbors(bus, [&](int other) {
+            if (mask[other] == 0) mask[other] = 2;
+        });
+    }
+    return mask;
+}
+
 nlohmann::json ActiveFeasibilityRepairResult::to_json(
     bool include_state) const {
     nlohmann::json value = {
@@ -239,6 +289,10 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"current_security_rows_only", current_security_rows_only},
         {"include_component_box_rows", include_component_box_rows},
         {"minimize_balance_slack", minimize_balance_slack},
+        {"local_search", local_search},
+        {"local_control_bus_count", local_control_bus_count},
+        {"solver_row_count", solver_row_count},
+        {"solver_column_count", solver_column_count},
         {"row_count", row_count},
         {"column_count", column_count},
         {"nonzero_count", nonzero_count},
@@ -293,7 +347,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     bool include_reactive,
     bool current_security_rows_only,
     bool include_component_box_rows,
-    bool minimize_balance_slack) {
+    bool minimize_balance_slack,
+    const std::vector<unsigned char>* local_bus_mask) {
     const auto wall_start = std::chrono::steady_clock::now();
     ActiveFeasibilityRepairResult output;
     output.balance_slack_limit = balance_slack_limit;
@@ -303,6 +358,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.current_security_rows_only = current_security_rows_only;
     output.include_component_box_rows = include_component_box_rows;
     output.minimize_balance_slack = minimize_balance_slack;
+    output.local_search = local_bus_mask != nullptr;
     output.time_limit_seconds = time_limit_seconds;
     output.state = reference;
     const int nb = static_cast<int>(data.buses.size());
@@ -328,7 +384,11 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             std::chrono::steady_clock::now() - wall_start).count();
         return output;
     }
-    if (!std::isfinite(balance_slack_limit) || balance_slack_limit < 0.0 ||
+    if ((local_bus_mask && (local_bus_mask->size() != data.buses.size() ||
+            !minimize_balance_slack || !include_reactive ||
+            std::any_of(local_bus_mask->begin(), local_bus_mask->end(),
+                [](unsigned char value) { return value > 2; }))) ||
+        !std::isfinite(balance_slack_limit) || balance_slack_limit < 0.0 ||
         balance_slack_limit > 0.5 || !std::isfinite(angle_trust_radius) ||
         angle_trust_radius <= 0.0 ||
         !std::isfinite(voltage_trust_radius) ||
@@ -975,6 +1035,78 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         ++output.branch_security_row_count;
     }
 
+    // Restrict this candidate search only. Full-size rows are retained below
+    // for an independent audit after expanding the solver point. Boundary
+    // controls are fixed; their changed injections still have source-capped,
+    // penalized imbalance columns. No nonlinear constraint is omitted from
+    // the caller's final acceptance check.
+    if (local_bus_mask) {
+        const auto fix_zero = [&](int column) {
+            lower[column] = upper[column] = 0.0;
+        };
+        const auto fix_slack = [&](int positive, int negative, double balance) {
+            if (!std::isfinite(balance) || std::abs(balance) > balance_slack_limit)
+                return false;
+            lower[positive] = upper[positive] = std::max(0.0, balance);
+            lower[negative] = upper[negative] = std::max(0.0, -balance);
+            return true;
+        };
+        for (int bus = 0; bus < nb; ++bus) {
+            if ((*local_bus_mask)[bus] == 1) {
+                ++output.local_control_bus_count;
+                continue;
+            }
+            if (output.state.vm[bus] < data.buses[bus].vmin ||
+                output.state.vm[bus] > data.buses[bus].vmax) {
+                output.status = "local_fixed_voltage_outside_source_bounds";
+                output.wall_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall_start).count();
+                return output;
+            }
+            if (angle_index[bus] >= 0) {
+                fix_zero(angle_up_offset + angle_index[bus]);
+                fix_zero(angle_down_offset + angle_index[bus]);
+            }
+            fix_zero(voltage_up_offset + bus);
+            fix_zero(voltage_down_offset + bus);
+            for (int gen : data.buses[bus].generators) {
+                fix_zero(generator_up_offset + gen);
+                fix_zero(generator_down_offset + gen);
+                fix_zero(reactive_generator_up_offset + gen);
+                fix_zero(reactive_generator_down_offset + gen);
+            }
+            for (int load : data.buses[bus].loads) {
+                fix_zero(load_up_offset + load);
+                fix_zero(load_down_offset + load);
+            }
+            if ((*local_bus_mask)[bus] == 0 &&
+                (!fix_slack(p_positive_offset + bus, p_negative_offset + bus,
+                    current_active_balance[bus]) ||
+                 !fix_slack(q_positive_offset + bus, q_negative_offset + bus,
+                    current_reactive_balance[bus]))) {
+                output.status = "local_fixed_imbalance_outside_source_cap";
+                output.wall_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall_start).count();
+                return output;
+            }
+        }
+    }
+
+    std::vector<HighsInt> column_map(static_cast<std::size_t>(column_count), -1);
+    std::vector<double> compact_lower, compact_upper, compact_cost;
+    if (local_bus_mask) {
+        for (HighsInt column = 0; column < column_count; ++column) {
+            if (lower[column] == upper[column]) continue;
+            column_map[column] = static_cast<HighsInt>(compact_lower.size());
+            compact_lower.push_back(lower[column]);
+            compact_upper.push_back(upper[column]);
+            compact_cost.push_back(cost[column]);
+        }
+    }
+    const auto& solver_lower = local_bus_mask ? compact_lower : lower;
+    const auto& solver_upper = local_bus_mask ? compact_upper : upper;
+    const auto& solver_cost = local_bus_mask ? compact_cost : cost;
+    const HighsInt solver_columns = static_cast<HighsInt>(solver_lower.size());
     std::vector<double> row_lower;
     std::vector<double> row_upper;
     std::vector<HighsInt> starts;
@@ -986,16 +1118,40 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     starts.push_back(0);
     for (auto& row : rows) {
         normalize(row);
-        row_lower.push_back(row.lower);
-        row_upper.push_back(row.upper);
+        const auto initial_nonzeros = indices.size();
+        double constant = 0.0;
         for (const auto& [column, coefficient] : row.entries) {
-            indices.push_back(column);
+            if (local_bus_mask && column_map[column] < 0) {
+                constant += coefficient * lower[column];
+                continue;
+            }
+            indices.push_back(local_bus_mask ? column_map[column] : column);
             values.push_back(coefficient);
         }
+        if (local_bus_mask && indices.size() == initial_nonzeros) {
+            if (!std::isfinite(constant) || constant < row.lower - 1e-8 ||
+                constant > row.upper + 1e-8) {
+                output.status = "local_fixed_row_infeasible";
+                output.wall_seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wall_start).count();
+                return output;
+            }
+            continue;
+        }
+        row_lower.push_back(row.lower - constant);
+        row_upper.push_back(row.upper - constant);
         starts.push_back(static_cast<HighsInt>(indices.size()));
     }
     output.row_count = static_cast<int>(rows.size());
     output.nonzero_count = static_cast<int>(indices.size());
+    output.solver_row_count = static_cast<int>(row_lower.size());
+    output.solver_column_count = static_cast<int>(solver_columns);
+    if (solver_columns == 0) {
+        output.status = "local_no_free_columns";
+        output.wall_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - wall_start).count();
+        return output;
+    }
 
     Highs highs;
     const char* highs_log = std::getenv("GRAVITYX_HIGHS_LOG");
@@ -1007,12 +1163,21 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     // elastic columns before HiGHS installs the user basis, defeating the
     // purpose of the start within this deliberately short solve.  All ordinary
     // active-repair solves retain the existing presolve-on behavior.
-    output.presolve_enabled = !minimize_balance_slack;
+    output.presolve_enabled = !minimize_balance_slack || local_bus_mask;
     highs.setOptionValue(
         "presolve", output.presolve_enabled ? "on" : "off");
     highs.setOptionValue("run_crossover", "off");
     highs.setOptionValue("small_matrix_value", 1e-12);
-    highs.setOptionValue("time_limit", time_limit_seconds);
+    const double construction_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - wall_start).count();
+    const double solver_seconds = local_bus_mask
+        ? time_limit_seconds - construction_seconds : time_limit_seconds;
+    if (solver_seconds <= 0.0) {
+        output.status = "local_construction_budget_exhausted";
+        output.wall_seconds = construction_seconds;
+        return output;
+    }
+    highs.setOptionValue("time_limit", solver_seconds);
     highs.setOptionValue("primal_feasibility_tolerance", 1e-8);
     highs.setOptionValue("dual_feasibility_tolerance", 1e-8);
     highs.setOptionValue("ipm_optimality_tolerance", 1e-6);
@@ -1044,12 +1209,12 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
                 "simplex_iteration_limit", output.simplex_iteration_limit);
         }
     }
-    if (highs.addVars(column_count, lower.data(), upper.data()) !=
+    if (highs.addVars(solver_columns, solver_lower.data(), solver_upper.data()) !=
             HighsStatus::kOk ||
         highs.changeColsCost(
-            0, column_count - 1, cost.data()) != HighsStatus::kOk ||
+            0, solver_columns - 1, solver_cost.data()) != HighsStatus::kOk ||
         highs.addRows(
-            static_cast<HighsInt>(rows.size()), row_lower.data(),
+            static_cast<HighsInt>(row_lower.size()), row_lower.data(),
             row_upper.data(), static_cast<HighsInt>(indices.size()),
             starts.data(), indices.data(), values.data()) != HighsStatus::kOk) {
         output.status = "model_construction_failed";
@@ -1058,7 +1223,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         return output;
     }
 
-    if (minimize_balance_slack) {
+    if (minimize_balance_slack && !local_bus_mask) {
         output.primal_start_attempted = true;
         std::vector<double> primal_start(
             static_cast<std::size_t>(column_count), 0.0);
@@ -1159,10 +1324,18 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.objective = info.objective_function_value;
     output.status = highs.modelStatusToString(model_status);
     const bool shape_valid = solution.value_valid &&
-        solution.col_value.size() == static_cast<std::size_t>(column_count);
+        solution.col_value.size() == static_cast<std::size_t>(solver_columns);
     std::vector<double> candidate_values;
     if (shape_valid) {
-        candidate_values = solution.col_value;
+        if (local_bus_mask) {
+            candidate_values = lower;
+            for (HighsInt column = 0; column < column_count; ++column) {
+                if (column_map[column] >= 0)
+                    candidate_values[column] = solution.col_value[column_map[column]];
+            }
+        } else {
+            candidate_values = solution.col_value;
+        }
         output.finite_solution_values = true;
         for (HighsInt column = 0; column < column_count; ++column) {
             const double value = candidate_values[column];
@@ -1279,6 +1452,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     output.accepted_feasible_nonoptimal =
         (feasible_nonoptimal || independently_feasible) && !optimal;
     output.success = optimal || feasible_nonoptimal || independently_feasible;
+    if (local_bus_mask) output.success = output.success && independently_feasible;
     if (output.success) {
         for (int bus = 0; bus < nb; ++bus) {
             const int index = angle_index[bus];

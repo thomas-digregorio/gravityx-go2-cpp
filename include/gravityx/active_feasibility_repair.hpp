@@ -22,6 +22,10 @@ struct ActiveFeasibilityRepairResult {
     bool current_security_rows_only{};
     bool include_component_box_rows{true};
     bool minimize_balance_slack{};
+    bool local_search{};
+    int local_control_bus_count{};
+    int solver_row_count{};
+    int solver_column_count{};
     int row_count{};
     int column_count{};
     int nonzero_count{};
@@ -75,6 +79,17 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     bool include_reactive = true,
     bool current_security_rows_only = false,
     bool include_component_box_rows = true,
-    bool minimize_balance_slack = false);
+    bool minimize_balance_slack = false,
+    // Optional search restriction, NOT a reduced acceptance model. 1 permits
+    // local controls and imbalance, 2 permits only boundary imbalance, and
+    // 0 fixes all controls and signed imbalance to the reference. Returned
+    // candidates still require the complete original nonlinear validator.
+    const std::vector<unsigned char>* local_bus_mask = nullptr);
+
+// Source topology only, with a one-hop fixed-control boundary. Empty means
+// the requested neighborhood exceeds the bounded work limit.
+std::vector<unsigned char> contingency_repair_neighborhood(
+    const CaseData& data, const Contingency& contingency,
+    int depth = 3, std::size_t maximum_control_buses = 512);
 
 }  // namespace gravityx

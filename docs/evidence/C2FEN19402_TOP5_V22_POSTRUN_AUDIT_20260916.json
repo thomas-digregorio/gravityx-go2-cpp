@@ -1,0 +1,223 @@
+{
+  "audit_kind": "read_only_audit_after_serialization_deadline_failure",
+  "new_solver_or_evaluator_run": false,
+  "benchmark_pass": false,
+  "certified_within_deadline": false,
+  "run_status_sha256": "54ad2c4de698a96007f2cfac734c94b23a34b7d000f91efbb71a02c39207d0a6",
+  "recorded_run_seconds": 300.34548729999733,
+  "native_reused_feasibility_jacobian_tasks": 699,
+  "max_native_residual": 9.99358967618269e-6,
+  "base_detail_copy_count": 47,
+  "base_detail_sha256": "405ea531ed3d6b53c37e2f98ce53583f67c792644fb9dfc1c5450363dfcf8b27",
+  "base_objective": 214720.19371528292,
+  "components": {
+    "total_bus_cost": {
+      "aggregate": 51820.45722857325,
+      "base": 500.72347505993014,
+      "contingency_mean": 51319.73375351332
+    },
+    "total_bus_imag_cost": {
+      "aggregate": 36956.506801864896,
+      "base": 198.06354146383674,
+      "contingency_mean": 36758.44326040106
+    },
+    "total_bus_real_cost": {
+      "aggregate": 14863.950426708354,
+      "base": 302.6599335960933,
+      "contingency_mean": 14561.290493112261
+    },
+    "total_gen_cost": {
+      "aggregate": 238743.68687545403,
+      "base": 119373.36617742732,
+      "contingency_mean": 119370.32069802671
+    },
+    "total_gen_energy_cost": {
+      "aggregate": 237208.7452689342,
+      "base": 118605.86617773431,
+      "contingency_mean": 118602.8790911999
+    },
+    "total_gen_on_cost": {
+      "aggregate": 1534.941606519833,
+      "base": 767.4999996930001,
+      "contingency_mean": 767.441606826833
+    },
+    "total_gen_sd_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_gen_su_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_line_cost": {
+      "aggregate": 2879.9008061895247,
+      "base": 1749.8523430979103,
+      "contingency_mean": 1130.0484630916142
+    },
+    "total_line_limit_cost": {
+      "aggregate": 2879.9008061895247,
+      "base": 1749.8523430979103,
+      "contingency_mean": 1130.0484630916142
+    },
+    "total_line_switch_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_load_benefit": {
+      "aggregate": 672680.6145160871,
+      "base": 336344.13571086805,
+      "contingency_mean": 336336.47880521906
+    },
+    "total_xfmr_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_xfmr_limit_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_xfmr_switch_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    }
+  },
+  "contingency_count": 6579,
+  "contingency_mean_objective": 164516.37589058737,
+  "control_metrics": {
+    "gen_pow_imag_delta_to_prior": {
+      "base": 10.578964674107688,
+      "contingency_max": 4.642185109794946,
+      "contingency_mean": 0.054555206090644126
+    },
+    "gen_pow_real_delta_to_prior": {
+      "base": 0.8329800332627082,
+      "contingency_max": 0.8333333330048607,
+      "contingency_mean": 0.06480625833680571
+    },
+    "line_switch_down_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "line_switch_up_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "load_pow_real_delta_to_prior": {
+      "base": 0.41522980941897325,
+      "contingency_max": 0.4166666665077954,
+      "contingency_mean": 0.03924831599118876
+    },
+    "swsh_b_delta_to_prior": {
+      "base": 0.044016666700000096,
+      "contingency_max": 4.0,
+      "contingency_mean": 0.00536506054617723
+    },
+    "xfmr_phi_delta_to_prior": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "xfmr_switch_down_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "xfmr_switch_up_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "xfmr_tau_delta_to_prior": {
+      "base": 0.09499999999999997,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    }
+  },
+  "model_json": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\.data\\final_19402\\scenario_095\\model.json",
+  "penalty_metrics": {
+    "max_bus_pow_imag_over": {
+      "base": 1.3150562677921585e-05,
+      "contingency_max": 0.49999992304732555,
+      "contingency_mean": 0.04245703906791985
+    },
+    "max_bus_pow_imag_under": {
+      "base": 0.0001578250506657497,
+      "contingency_max": 0.5000026258900379,
+      "contingency_mean": 0.04210431614809597
+    },
+    "max_bus_pow_real_over": {
+      "base": 4.0244965120894705e-05,
+      "contingency_max": 0.49992663737238097,
+      "contingency_mean": 0.04027681476189023
+    },
+    "max_bus_pow_real_under": {
+      "base": 0.0001365235008166099,
+      "contingency_max": 0.4999787211867351,
+      "contingency_mean": 0.0507335100713831
+    },
+    "max_line_viol": {
+      "base": 0.23507275805728267,
+      "contingency_max": 0.32681431639644165,
+      "contingency_mean": 0.23311695972677307
+    },
+    "max_xfmr_viol": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "sum_bus_pow_imag_over": {
+      "base": 0.00018039541998036466,
+      "contingency_max": 17.156221531014186,
+      "contingency_mean": 0.23056331745358363
+    },
+    "sum_bus_pow_imag_under": {
+      "base": 0.002196367078536381,
+      "contingency_max": 24.30036023610694,
+      "contingency_mean": 0.21053800184766955
+    },
+    "sum_bus_pow_real_over": {
+      "base": 0.0016024324246893336,
+      "contingency_max": 21.085883169470623,
+      "contingency_mean": 0.06687770734294593
+    },
+    "sum_bus_pow_real_under": {
+      "base": 0.002029486779916554,
+      "contingency_max": 21.152922504589885,
+      "contingency_mean": 0.10785777864429538
+    }
+  },
+  "reconstructed_objective": 379236.5696058703,
+  "reported_objective": 379236.5696058703,
+  "run_dir": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\top5_cold_20260915\\v22_s095\\C2FEN19402_s095_cold",
+  "state": {
+    "base_method": "direct_sparse_ipopt_fixed_commitment_economic",
+    "base_optimization_performed": true,
+    "commitment_binary": true,
+    "commitment_changes_from_source": 0,
+    "committed_unit_count": 921,
+    "generator_count": 921,
+    "generator_dispatch_mw": 109174.18170188939,
+    "generator_reactive_dispatch_mvar": -35779.662998907035,
+    "generators_with_reactive_dispatch_change": 914,
+    "generators_with_real_dispatch_change": 921,
+    "load_served_mw": 107555.64334019087,
+    "loads_at_tmax": 0,
+    "loads_at_tmin": 0,
+    "loads_with_quantity_change": 12267,
+    "shutdown_count": 0,
+    "source_all_generators_online": true,
+    "source_committed_unit_count": 921,
+    "source_generator_dispatch_mw": 136074.3799467,
+    "source_generator_reactive_dispatch_mvar": -27523.99442291,
+    "source_load_mw": 133590.40199355,
+    "startup_count": 0
+  }
+}

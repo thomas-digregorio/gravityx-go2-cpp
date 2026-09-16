@@ -10,6 +10,9 @@
 
 namespace gravityx {
 
+// Tiny deterministic regression of numerical reconstruction, without a case solve.
+void run_active_repair_canonicalization_regression();
+
 struct ActiveFeasibilityRepairResult {
     bool success{};
     bool accepted_feasible_nonoptimal{};

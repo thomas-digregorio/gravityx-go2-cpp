@@ -223,7 +223,64 @@ double row_violation(const SparseRow& row, const std::vector<double>& value) {
     return std::max({0.0, row.lower - activity, activity - row.upper});
 }
 
+// Reconstruct the signed pair atomically. Roundoff at an active bound must
+// not erase a valid 0.5 slack and manufacture a 0.5 row violation. Project
+// only discrepancies within the existing solver primal tolerance onto the
+// EXACT column bounds; the unchanged complete 1e-7 row audit still follows.
+bool canonicalize_balance_row(const SparseRow& row,
+    const std::vector<double>& lower, const std::vector<double>& upper,
+    int positive, int negative, std::vector<double>& values) {
+    double activity = 0.0, positive_coefficient = 0.0, negative_coefficient = 0.0;
+    for (const auto& [column, coefficient] : row.entries) {
+        if (column == positive) positive_coefficient += coefficient;
+        else if (column == negative) negative_coefficient += coefficient;
+        else activity += coefficient * values[column];
+    }
+    if (!(positive_coefficient < 0.0 && negative_coefficient > 0.0)) return false;
+    const double required = row.lower - activity;
+    if (!std::isfinite(required)) return false;
+    const double p = required <= 0.0 ? required / positive_coefficient : 0.0;
+    const double q = required > 0.0 ? required / negative_coefficient : 0.0;
+    constexpr double kExistingSolverPrimalTolerance = 1e-8;
+    const auto in_roundoff_range = [&](int column, double value) {
+        return std::isfinite(value) && value >= lower[column] - kExistingSolverPrimalTolerance &&
+            value <= upper[column] + kExistingSolverPrimalTolerance;
+    };
+    if (!in_roundoff_range(positive, p) || !in_roundoff_range(negative, q)) return false;
+    values[positive] = std::clamp(p, lower[positive], upper[positive]);
+    values[negative] = std::clamp(q, lower[negative], upper[negative]);
+    return true;
+}
+
 }  // namespace
+
+void run_active_repair_canonicalization_regression() {
+    const auto require = [](bool ok, const char* message) {
+        if (!ok) throw std::runtime_error(std::string("balance canonicalization: ") + message);
+    };
+    const std::vector<double> lower{0.0, 0.0}, upper{0.5, 0.5};
+    for (const double sign : {-1.0, 1.0}) {
+        SparseRow row{sign * (0.5 + 2.1e-11), sign * (0.5 + 2.1e-11), {{0, -1.0}, {1, 1.0}}};
+        std::vector<double> values{0.5, 0.0};
+        require(canonicalize_balance_row(row, lower, upper, 0, 1, values),
+            "active-bound roundoff discarded a valid pair");
+        require(values[0] >= 0.0 && values[0] <= 0.5 && values[1] >= 0.0 && values[1] <= 0.5 &&
+            row_violation(row, values) <= 1e-7, "projection changed source bounds or row audit");
+    }
+    SparseRow invalid{-0.5001, -0.5001, {{0, -1.0}, {1, 1.0}}};
+    std::vector<double> values{0.5, 0.0};
+    const auto original = values;
+    require(!canonicalize_balance_row(invalid, lower, upper, 0, 1, values) && values == original,
+        "genuine violation was accepted or failure corrupted the original pair");
+    invalid.lower = invalid.upper = std::numeric_limits<double>::quiet_NaN();
+    require(!canonicalize_balance_row(invalid, lower, upper, 0, 1, values) && values == original,
+        "nonfinite reconstruction accepted or corrupted the original pair");
+    SparseRow fixed{-0.25 - 2e-11, -0.25 - 2e-11, {{0, -1.0}, {1, 1.0}}};
+    const std::vector<double> fixed_bounds{0.25, 0.0};
+    require(canonicalize_balance_row(fixed, fixed_bounds, fixed_bounds, 0, 1, values) &&
+        values == fixed_bounds && row_violation(fixed, values) < 1e-7,
+        "fixed out-of-neighborhood balance was changed");
+}
 
 std::vector<unsigned char> contingency_repair_neighborhood(
     const CaseData& data, const Contingency& contingency,
@@ -1381,46 +1438,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             bool canonicalized = true;
             const auto canonicalize_balance = [&] (
                 int row_index, int positive_column, int negative_column) {
-                candidate_values[positive_column] = 0.0;
-                candidate_values[negative_column] = 0.0;
-                double activity = 0.0;
-                double positive_coefficient = 0.0;
-                double negative_coefficient = 0.0;
-                for (const auto& [column, coefficient] :
-                     rows[row_index].entries) {
-                    activity += coefficient * candidate_values[column];
-                    if (column == positive_column) {
-                        positive_coefficient = coefficient;
-                    } else if (column == negative_column) {
-                        negative_coefficient = coefficient;
-                    }
-                }
-                const double required_change =
-                    rows[row_index].lower - activity;
-                if (required_change <= 0.0) {
-                    if (positive_coefficient >= 0.0) {
-                        return false;
-                    }
-                    const double value =
-                        required_change / positive_coefficient;
-                    if (value < lower[positive_column] - 1e-12 ||
-                        value > upper[positive_column] + 1e-12) {
-                        return false;
-                    }
-                    candidate_values[positive_column] = value;
-                } else {
-                    if (negative_coefficient <= 0.0) {
-                        return false;
-                    }
-                    const double value =
-                        required_change / negative_coefficient;
-                    if (value < lower[negative_column] - 1e-12 ||
-                        value > upper[negative_column] + 1e-12) {
-                        return false;
-                    }
-                    candidate_values[negative_column] = value;
-                }
-                return true;
+                return canonicalize_balance_row(rows[row_index], lower, upper,
+                    positive_column, negative_column, candidate_values);
             };
             for (int bus = 0; canonicalized && bus < nb; ++bus) {
                 const int active_row = include_reactive ? 2 * bus : bus;

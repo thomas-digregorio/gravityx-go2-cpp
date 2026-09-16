@@ -503,6 +503,7 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 }
 
 int run_component_tests() {
+    gravityx::run_active_repair_canonicalization_regression();
     gravityx::run_fast_power_flow_topology_cache_regression();
     gravityx::run_outage_inverse_row_cache_regression();
     gravityx::run_adaptive_jacobian_policy_regression();
@@ -4165,6 +4166,16 @@ int run_sparse_ac_economic_json(
     return refinement.selected_validation.max_residual <= 1e-5 ? 0 : 1;
 }
 
+struct ExpandedRepairTrustPolicy {
+    double scale{1.0};
+    bool accept(double before, double after) {
+        if (std::isfinite(after) && after + 1e-10 < before) return true;
+        scale *= 0.25;
+        return false;
+    }
+    bool can_retry() const { return scale >= 1.0 / 1024.0; }
+};
+
 // Last bounded attempt before the expensive full-network fallback. Called
 // only after every existing fast route failed, so passing paths are unchanged.
 // A larger search neighborhood/trust region is NOT a larger acceptance set:
@@ -4198,15 +4209,19 @@ std::optional<gravityx::FastPowerFlowResult> bounded_expanded_local_repair(
         // never import a prior-run solution or change the source ramp anchor.
         auto checked = screen.screen_candidate(outage, initial);
         if (checked.feasible && std::isfinite(checked.solve.objective)) return checked;
-        for (int round = 0; round < 4 && remaining() > 0.03; ++round) {
+        ExpandedRepairTrustPolicy trust;
+        int accepted_rounds = 0;
+        for (int round = 0; round < 12 && trust.can_retry() && remaining() > 0.03; ++round) {
             const double before = checked.validation.max_residual;
             const auto repair = gravityx::solve_linearized_active_feasibility_repair(
                 data, checked.solve.state, base.commitment, context,
-                0.5, 0.15, std::min(2.0, remaining()), 0.05,
+                0.5, 0.15 * trust.scale, std::min(2.0, remaining()), 0.05 * trust.scale,
                 true, false, false, true, &mask);
             auto record = repair.to_json(false);
             record["depth"] = depth;
             record["round"] = round;
+            record["accepted_rounds_before"] = accepted_rounds;
+            record["trust_scale"] = trust.scale;
             record["residual_before"] = before;
             if (!repair.success) {
                 trace.push_back(std::move(record));
@@ -4216,14 +4231,31 @@ std::optional<gravityx::FastPowerFlowResult> bounded_expanded_local_repair(
             record["nonlinear_feasible"] = candidate.feasible;
             record["nonlinear_residual"] = candidate.validation.max_residual;
             record["native_objective"] = candidate.solve.objective;
-            trace.push_back(std::move(record));
             if (!std::isfinite(candidate.validation.max_residual) ||
-                !std::isfinite(candidate.solve.objective)) break;
+                !std::isfinite(candidate.solve.objective)) {
+                record["rejected_nonfinite"] = true;
+                trace.push_back(std::move(record));
+                break;
+            }
             if (!best || candidate.validation.max_residual < best->validation.max_residual)
                 best = candidate;
-            if (candidate.feasible) return candidate;
-            if (candidate.validation.max_residual + 1e-10 >= before) break;
-            checked = std::move(candidate);
+            if (candidate.feasible) {
+                record["selected_as_next_reference"] = true;
+                trace.push_back(std::move(record));
+                return candidate;
+            }
+            const bool improving = trust.accept(before, candidate.validation.max_residual);
+            record["selected_as_next_reference"] = improving;
+            record["next_trust_scale"] = trust.scale;
+            record["retry_same_reference"] = !improving && trust.can_retry();
+            trace.push_back(std::move(record));
+            // Do not throw away a nearly feasible point after an overshoot.
+            // Re-linearize at that same point with a smaller search radius.
+            // Acceptance still uses the complete unchanged nonlinear model.
+            if (improving) {
+                checked = std::move(candidate);
+                ++accepted_rounds;
+            }
         }
     }
     return best;
@@ -5940,6 +5972,15 @@ void run_exact_parallel_peer_regression(
             !local_first.result.at("expanded_local_repair_attempted").get<bool>(),
             "disabled priority probes ran before the local candidate path");
         {
+            ExpandedRepairTrustPolicy policy;
+            require(!policy.accept(5e-4, 0.03) && policy.scale == 0.25 && policy.can_retry(),
+                "overshooting repair did not shrink and retry");
+            require(policy.accept(5e-4, 1e-4) && policy.scale == 0.25,
+                "improving repair changed trust scale or was rejected");
+            require(!policy.accept(1e-4, 1e-4) && policy.scale == 0.0625,
+                "stagnant repair did not shrink trust radius");
+            for (int i = 0; i < 8; ++i) policy.accept(1e-4, std::numeric_limits<double>::infinity());
+            require(!policy.can_retry(), "non-improving trust retries were unbounded");
             gravityx::FastPowerFlowOptions options;
             gravityx::FastContingencyPowerFlow screen(data, base.state, commitment, options);
             auto disturbed = base.state;
@@ -5961,7 +6002,7 @@ void run_exact_parallel_peer_regression(
             }
             const auto repaired = bounded_expanded_local_repair(data, base, second,
                 disturbed, screen, trace);
-            require(repaired && repaired->feasible && !trace.empty() && trace.size() <= 8,
+            require(repaired && repaired->feasible && !trace.empty() && trace.size() <= 24,
                 "expanded local repair did not repair the tiny infeasible point");
             gravityx::ContingencyContext context;
             context.borrow_base_state(base.state); context.outaged_branch = second.component;

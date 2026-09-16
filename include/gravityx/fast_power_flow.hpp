@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,6 +36,9 @@ struct FastPowerFlowOptions {
     // tiny tests to cover the production fallback with both injection paths.
     bool coupled_polish_correction{true};
     bool local_bus_dispatch_polish{false};
+    // Reject a physically infeasible economic trial at its first proven
+    // violation; all potentially accepted trials still complete every check.
+    bool early_reject_economic_trials{false};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -78,6 +82,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.controls_only_trial_copy = true;
     options.reuse_polish_branch_flows = true;
     options.local_bus_dispatch_polish = true;
+    options.early_reject_economic_trials = true;
     options.max_economic_balance_polish_iterations = 3;
     options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
@@ -170,6 +175,8 @@ struct FastPowerFlowResult {
     int economic_balance_polish_backtracking_attempts{};
     int economic_balance_polish_trial_count{};
     int economic_balance_polish_physical_rejections{};
+    int economic_balance_polish_early_rejections{};
+    std::map<std::string, int> economic_balance_polish_rejection_witnesses;
     int economic_balance_polish_economic_checks{};
     double economic_balance_polish_physical_check_seconds{};
     double economic_balance_polish_economic_check_seconds{};

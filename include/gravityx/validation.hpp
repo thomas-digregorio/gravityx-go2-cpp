@@ -57,6 +57,24 @@ ValidationReport validate_rebuilt_contingency_trial_until_rejected(
     int preferred_balance_bus = -1,
     int preferred_branch = -1);
 
+struct RebuiltTrialFeasibility {
+    ValidationReport report;
+    // A partial report is a rejection witness, never an acceptance certificate.
+    bool rejected_early{};
+};
+
+// Stop only at a STRICT violation > tolerance, without the merit-ranking
+// cushion. Otherwise complete every physical check. Callers must still
+// rebuild/check economics and Ohm laws before accepting the candidate.
+RebuiltTrialFeasibility validate_rebuilt_contingency_feasibility(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency,
+    double tolerance);
+
+void run_strict_trial_rejection_regression();
+
 // Predictor iteration selection also needs the exact identity of the
 // dominant physical residual (for example, whether a variable-bound maximum
 // is a branch apparent-power slack).  Preserve that routing information while

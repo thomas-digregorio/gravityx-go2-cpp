@@ -508,6 +508,7 @@ int run_component_tests() {
     gravityx::run_adaptive_jacobian_policy_regression();
     gravityx::run_voltage_extrapolation_policy_regression();
     gravityx::run_corrective_trial_copy_regression();
+    gravityx::run_strict_trial_rejection_regression();
     {
         gravityx::Branch a;
         a.from = 0; a.to = 1; a.x = 0.1; a.tap = 1.0;
@@ -703,6 +704,8 @@ int run_component_tests() {
     cached_economic_options.fixed_jacobian_time_limit_seconds = 7.0;
     gravityx::enable_cached_economic_polish(cached_economic_options);
     if (!cached_economic_options.economic_balance_polish ||
+        !cached_economic_options.early_reject_economic_trials ||
+        gravityx::FastPowerFlowOptions{}.early_reject_economic_trials ||
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
         cached_economic_options.max_economic_linearized_phase_two_rounds != 0 ||
@@ -1091,6 +1094,8 @@ int run_parallel_circuit_regression() {
     gravityx::FastPowerFlowResult budget_result;
     budget_result.economic_balance_polish_trial_count = 7;
     budget_result.economic_balance_polish_physical_rejections = 3;
+    budget_result.economic_balance_polish_early_rejections = 3;
+    budget_result.economic_balance_polish_rejection_witnesses = {{"flow_limit", 2}, {"reactive_balance", 1}};
     budget_result.economic_balance_polish_economic_checks = 4;
     budget_result.economic_balance_polish_physical_check_seconds = 0.125;
     budget_result.economic_balance_polish_economic_check_seconds = 0.5;
@@ -1134,6 +1139,12 @@ int run_parallel_circuit_regression() {
     budget_result.voltage_extrapolation_best_after = 0.1;
     const auto compact_economic = budget_result.economic_summary_json();
     const auto full_economic = budget_result.to_json();
+    if (compact_economic.at("economic_balance_polish_rejection_witnesses") !=
+            full_economic.at("economic_balance_polish_rejection_witnesses") ||
+        compact_economic.at("economic_balance_polish_rejection_witnesses").at("flow_limit") != 2 ||
+        compact_economic.at("economic_balance_polish_rejection_witnesses").at("reactive_balance") != 1) {
+        throw std::runtime_error("compact worker log omitted rejection-witness categories");
+    }
     for (const auto* key : {"local_dispatch_attempted", "local_dispatch_selected",
             "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",
             "local_dispatch_seconds", "local_dispatch_preparation_seconds", "local_dispatch_cache_hit",
@@ -1145,6 +1156,7 @@ int run_parallel_circuit_regression() {
     }
     for (const auto* key : {"economic_balance_polish_trial_count",
                            "economic_balance_polish_physical_rejections",
+                           "economic_balance_polish_early_rejections",
                            "economic_balance_polish_economic_checks",
                            "economic_balance_polish_physical_check_seconds",
                            "economic_balance_polish_economic_check_seconds",
@@ -1691,6 +1703,20 @@ int run_parallel_circuit_regression() {
         gravityx::FastContingencyPowerFlow refresh_solver(
             refresh_data, refresh_base.solve.state, {1}, refresh_options);
         const auto refreshed = refresh_solver.solve(branch_contingency);
+        auto full_scan_options = refresh_options;
+        full_scan_options.early_reject_economic_trials = false;
+        gravityx::FastContingencyPowerFlow full_scan_solver(
+            refresh_data, refresh_base.solve.state, {1}, full_scan_options);
+        const auto full_scan = full_scan_solver.solve(branch_contingency);
+        if (refreshed.feasible != full_scan.feasible ||
+            refreshed.solve.objective != full_scan.solve.objective ||
+            gravityx::ac_state_to_json(refreshed.solve.state) != gravityx::ac_state_to_json(full_scan.solve.state) ||
+            refreshed.economic_balance_polish_iterations != full_scan.economic_balance_polish_iterations ||
+            refreshed.economic_balance_polish_trial_count != full_scan.economic_balance_polish_trial_count ||
+            refreshed.economic_balance_polish_physical_rejections != full_scan.economic_balance_polish_physical_rejections ||
+            full_scan.economic_balance_polish_early_rejections != 0) {
+            throw std::runtime_error("strict early rejection changed a complete tiny corrective solve");
+        }
         auto full_copy_options = refresh_options;
         full_copy_options.controls_only_trial_copy = false;
         gravityx::FastContingencyPowerFlow full_copy_solver(
@@ -5583,6 +5609,8 @@ int run_contingency_worker(
                          "economic_balance_polish_backtracking_attempts",
                          "economic_balance_polish_trial_count",
                          "economic_balance_polish_physical_rejections",
+                         "economic_balance_polish_early_rejections",
+                         "economic_balance_polish_rejection_witnesses",
                          "economic_balance_polish_economic_checks",
                          "economic_balance_polish_physical_check_seconds",
                          "economic_balance_polish_economic_check_seconds",

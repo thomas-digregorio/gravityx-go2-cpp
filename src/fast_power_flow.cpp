@@ -3025,6 +3025,8 @@ nlohmann::json FastPowerFlowResult::economic_summary_json() const {
         {"economic_balance_polish_backtracking_attempts", economic_balance_polish_backtracking_attempts},
         {"economic_balance_polish_trial_count", economic_balance_polish_trial_count},
         {"economic_balance_polish_physical_rejections", economic_balance_polish_physical_rejections},
+        {"economic_balance_polish_early_rejections", economic_balance_polish_early_rejections},
+        {"economic_balance_polish_rejection_witnesses", economic_balance_polish_rejection_witnesses},
         {"economic_balance_polish_economic_checks", economic_balance_polish_economic_checks},
         {"economic_balance_polish_physical_check_seconds", economic_balance_polish_physical_check_seconds},
         {"economic_balance_polish_economic_check_seconds", economic_balance_polish_economic_check_seconds},
@@ -3089,6 +3091,8 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          economic_balance_polish_backtracking_attempts},
         {"economic_balance_polish_trial_count", economic_balance_polish_trial_count},
         {"economic_balance_polish_physical_rejections", economic_balance_polish_physical_rejections},
+        {"economic_balance_polish_early_rejections", economic_balance_polish_early_rejections},
+        {"economic_balance_polish_rejection_witnesses", economic_balance_polish_rejection_witnesses},
         {"economic_balance_polish_economic_checks", economic_balance_polish_economic_checks},
         {"economic_balance_polish_physical_check_seconds", economic_balance_polish_physical_check_seconds},
         {"economic_balance_polish_economic_check_seconds", economic_balance_polish_economic_check_seconds},
@@ -3373,6 +3377,7 @@ struct EconomicPolishTrial {
     double objective{-std::numeric_limits<double>::infinity()};
     ValidationReport validation;
     bool economics_checked{};
+    bool rejected_early{};
     double physical_seconds{};
     double economic_seconds{};
 };
@@ -3381,7 +3386,7 @@ static EconomicPolishTrial evaluate_economic_polish_trial(
     const CaseData& data, const AcState& original_base,
     const std::vector<int>& commitment, const Contingency& contingency,
     const ContingencyContext& context, AcState& candidate,
-    double validation_tolerance, bool staged = true) {
+    double validation_tolerance, bool staged = true, bool early_reject = true) {
     EconomicPolishTrial result;
     // The unstaged path is retained solely as a tiny-fixture equivalence oracle.
     if (!staged) {
@@ -3395,11 +3400,19 @@ static EconomicPolishTrial evaluate_economic_polish_trial(
     const auto physical_start = std::chrono::steady_clock::now();
     rebuild_contingency_state_fields(
         data, original_base, commitment, contingency, candidate, 0.5, false);
-    result.validation = validate_rebuilt_contingency_trial(
-        data, candidate, commitment, context);
+    if (early_reject) {
+        auto physical = validate_rebuilt_contingency_feasibility(
+            data, candidate, commitment, context, validation_tolerance);
+        result.validation = std::move(physical.report);
+        result.rejected_early = physical.rejected_early;
+    } else {
+        result.validation = validate_rebuilt_contingency_trial(
+            data, candidate, commitment, context);
+    }
     result.physical_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - physical_start).count();
-    if (!(result.validation.max_residual <= validation_tolerance)) return result;
+    if (result.rejected_early ||
+        !(result.validation.max_residual <= validation_tolerance)) return result;
 
     // Nothing is accepted on the shortened physical report. Complete all
     // omitted PWL and Ohm-law checks after deterministic economic rebuilding.
@@ -3423,7 +3436,7 @@ void run_economic_polish_trial_regression(
     require(!data.branches.empty() && !data.generators.empty() && !data.loads.empty(),
             "fixture lacks required components");
     const auto frozen_base = ac_state_to_json(original_base);
-    int physically_rejected = 0, completely_checked = 0, accepted = 0;
+    int physically_rejected = 0, completely_checked = 0, accepted = 0, rejected_early = 0;
     for (auto type : {ContingencyType::Branch, ContingencyType::Generator}) {
         const Contingency outage{"tiny-trial", type, 0, 0};
         ContingencyContext context;
@@ -3454,17 +3467,30 @@ void run_economic_polish_trial_regression(
                     trial.shunt_bs.at(0) = step * shunt.block_susceptance.at(0);
                 }
             }
-            auto full_state = trial, staged_state = trial;
+            auto full_state = trial, staged_state = trial, legacy_state = trial;
             auto control_state = copy_corrective_trial(trial, true);
             const auto full = evaluate_economic_polish_trial(fixture, original_base,
                 commitment, outage, context, full_state, 1e-5, false);
             const auto staged = evaluate_economic_polish_trial(fixture, original_base,
                 commitment, outage, context, staged_state, 1e-5, true);
+            const auto legacy = evaluate_economic_polish_trial(fixture, original_base,
+                commitment, outage, context, legacy_state, 1e-5, true, false);
             const auto control = evaluate_economic_polish_trial(fixture, original_base,
                 commitment, outage, context, control_state, 1e-5, true);
             require(control.validation.to_json() == staged.validation.to_json() &&
-                    control.economics_checked == staged.economics_checked,
+                    control.economics_checked == staged.economics_checked &&
+                    control.rejected_early == staged.rejected_early,
                     "controls-only copy changed a physical decision");
+            require(legacy.economics_checked == staged.economics_checked &&
+                    (legacy.validation.max_residual <= 1e-5) ==
+                        (staged.validation.max_residual <= 1e-5),
+                    "strict early rejection changed the legacy physical decision");
+            if (staged.rejected_early) {
+                ++rejected_early;
+                require(!staged.economics_checked && staged.validation.max_residual > 1e-5 &&
+                        !staged.validation.worst_category.empty(),
+                        "partial report lacked a strict rejection witness");
+            }
             if (control.economics_checked) {
                 require(control.objective == staged.objective &&
                         ac_state_to_json(control_state) == ac_state_to_json(staged_state),
@@ -3485,6 +3511,10 @@ void run_economic_polish_trial_regression(
             require(full_pass == staged_pass, "staging changed feasibility decision");
             if (staged.economics_checked) {
                 ++completely_checked;
+                require(!staged.rejected_early && legacy.objective == staged.objective &&
+                        legacy.validation.to_json() == staged.validation.to_json() &&
+                        ac_state_to_json(legacy_state) == ac_state_to_json(staged_state),
+                        "early rejection changed a fully checked legacy candidate");
                 require(ac_state_to_json(full_state) == ac_state_to_json(staged_state),
                         "staging changed the rebuilt state");
                 require(full.objective == staged.objective, "staging changed objective arithmetic");
@@ -3523,7 +3553,7 @@ void run_economic_polish_trial_regression(
             require(rejected, "nonfinite control escaped the physical checker");
         }
     }
-    require(physically_rejected > 0 && completely_checked > 0 && accepted > 0,
+    require(physically_rejected > 0 && completely_checked > 0 && accepted > 0 && rejected_early > 0,
             "fixture did not exercise both rejection and complete acceptance");
     require(frozen_base == ac_state_to_json(original_base), "original base was mutated");
 }
@@ -4805,10 +4835,16 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         data_, components, candidate.va);
                                     const auto trial_check = evaluate_economic_polish_trial(
                                         data_, base_state_, commitment_, *contingency,
-                                        *direct_context, candidate, options_.validation_tolerance);
+                                        *direct_context, candidate, options_.validation_tolerance,
+                                        true, options_.early_reject_economic_trials);
                                     ++output.economic_balance_polish_trial_count;
                                     output.economic_balance_polish_economic_checks += trial_check.economics_checked;
                                     output.economic_balance_polish_physical_rejections += !trial_check.economics_checked;
+                                    output.economic_balance_polish_early_rejections += trial_check.rejected_early;
+                                    if (!trial_check.economics_checked) {
+                                        ++output.economic_balance_polish_rejection_witnesses[
+                                            trial_check.validation.worst_category];
+                                    }
                                     output.economic_balance_polish_physical_check_seconds += trial_check.physical_seconds;
                                     output.economic_balance_polish_economic_check_seconds += trial_check.economic_seconds;
                                     const double candidate_objective = trial_check.objective;

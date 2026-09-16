@@ -270,6 +270,8 @@ nlohmann::json ValidationReport::to_json() const {
     };
 }
 
+enum class TrialRejectionRule { CannotImproveMerit, StrictlyInfeasible };
+
 static ValidationReport validate_state_impl(
     const CaseData& data,
     ModelMode mode,
@@ -281,7 +283,9 @@ static ValidationReport validate_state_impl(
     double incumbent_max_residual =
         std::numeric_limits<double>::infinity(),
     int preferred_balance_bus = -1,
-    int preferred_branch = -1) {
+    int preferred_branch = -1,
+    TrialRejectionRule rejection_rule = TrialRejectionRule::CannotImproveMerit,
+    bool* rejected_early = nullptr) {
     const std::size_t nb = data.buses.size();
     const std::size_t ng = data.generators.size();
     const std::size_t nd = data.loads.size();
@@ -340,8 +344,12 @@ static ValidationReport validate_state_impl(
 
     ValidationReport report;
     const auto rejection_proven = [&]() {
-        return std::isfinite(incumbent_max_residual) &&
-            report.max_residual + 1e-10 >= incumbent_max_residual;
+        const bool proven = std::isfinite(incumbent_max_residual) &&
+            (rejection_rule == TrialRejectionRule::StrictlyInfeasible
+                ? report.max_residual > incumbent_max_residual
+                : report.max_residual + 1e-10 >= incumbent_max_residual);
+        if (proven && rejected_early != nullptr) *rejected_early = true;
+        return proven;
     };
 
     const auto validate_balance_bus = [&](std::size_t i) {
@@ -752,6 +760,23 @@ ValidationReport validate_rebuilt_contingency_predictor(
         contingency, true, true);
 }
 
+RebuiltTrialFeasibility validate_rebuilt_contingency_feasibility(
+    const CaseData& data,
+    const AcState& state,
+    const std::vector<int>& fixed_status,
+    const ContingencyContext& contingency,
+    double tolerance) {
+    if (!std::isfinite(tolerance) || tolerance < 0.0) {
+        throw std::runtime_error("invalid strict trial feasibility tolerance");
+    }
+    RebuiltTrialFeasibility result;
+    result.report = validate_state_impl(
+        data, ModelMode::ContingencySoft, state, fixed_status,
+        contingency, true, false, tolerance, -1, -1,
+        TrialRejectionRule::StrictlyInfeasible, &result.rejected_early);
+    return result;
+}
+
 ValidationReport validate_rebuilt_contingency_economic_and_ohms(
     const CaseData& data,
     const AcState& state,
@@ -822,6 +847,82 @@ ValidationReport validate_rebuilt_contingency_economic_and_ohms(
         validate_branch_ohms(report, branch, state, i, true);
     }
     return report;
+}
+
+void run_strict_trial_rejection_regression() {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) throw std::runtime_error(message);
+    };
+    // Two disconnected reference buses expose exact boundary residuals and
+    // a later violation without needing a full network solve or PWL curves.
+    CaseData data;
+    data.buses.resize(2);
+    for (int i = 0; i < 2; ++i) {
+        data.buses[i].source_key = "strict-rejection-" + std::to_string(i);
+        data.buses[i].index = i;
+        data.buses[i].type = 3;
+        data.buses[i].vmin = 0.9;
+        data.buses[i].vmax = 1.1;
+    }
+    AcState base;
+    base.vm = {1.0, 1.0}; base.va = {0.0, 0.0};
+    base.p_delta = {0.0, 0.0}; base.q_delta = {0.0, 0.0};
+    ContingencyContext context;
+    context.borrow_base_state(base);
+    constexpr double tolerance = 1e-5;
+    for (double first : {0.0, tolerance - 0.5e-10,
+            std::nextafter(tolerance, 0.0), tolerance,
+            std::nextafter(tolerance, std::numeric_limits<double>::infinity()),
+            tolerance + 0.5e-10}) {
+        for (double last : {0.0, tolerance * 0.5, tolerance * 2.0}) {
+            auto candidate = base;
+            candidate.va = {first, last};
+            const auto original = validate_rebuilt_contingency_trial(data, candidate, {}, context);
+            const auto strict = validate_rebuilt_contingency_feasibility(
+                data, candidate, {}, context, tolerance);
+            const bool rejected = original.max_residual > tolerance;
+            require(strict.rejected_early == rejected &&
+                (strict.report.max_residual > tolerance) == rejected,
+                "strict physical rejection changed a boundary decision");
+            if (!rejected) require(strict.report.to_json() == original.to_json(),
+                "potentially accepted trial did not complete all physical checks");
+            require(candidate.va == std::vector<double>({first, last}),
+                "strict checker mutated the candidate");
+        }
+    }
+    auto candidate = base;
+    candidate.va = {tolerance - 0.5e-10, 2.0 * tolerance};
+    const auto merit = validate_rebuilt_contingency_trial_until_rejected(
+        data, candidate, {}, context, tolerance);
+    const auto strict = validate_rebuilt_contingency_feasibility(
+        data, candidate, {}, context, tolerance);
+    require(merit.max_residual <= tolerance && strict.rejected_early &&
+        strict.report.max_residual > tolerance,
+        "fixture failed to distinguish merit rejection from strict feasibility");
+    for (double invalid : {-1.0, std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+        bool rejected = false;
+        try { validate_rebuilt_contingency_feasibility(data, base, {}, context, invalid); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "invalid feasibility threshold was accepted");
+    }
+    require(!validate_rebuilt_contingency_feasibility(data, base, {}, context, 0.0).rejected_early,
+        "zero-residual point was rejected at exact zero tolerance");
+    candidate.va = {1e-12, 0.0};
+    require(validate_rebuilt_contingency_feasibility(data, candidate, {}, context, 0.0).rejected_early,
+        "positive residual escaped exact zero tolerance");
+    // The global finiteness/dimension guards precede early rejection.
+    candidate.va = {2.0 * tolerance, std::numeric_limits<double>::quiet_NaN()};
+    bool rejected = false;
+    try { validate_rebuilt_contingency_feasibility(data, candidate, {}, context, tolerance); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "early rejection bypassed a nonfinite-state guard");
+    candidate = base; candidate.vm.pop_back();
+    rejected = false;
+    try { validate_rebuilt_contingency_feasibility(data, candidate, {}, context, tolerance); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "early rejection bypassed a dimension guard");
+    require(base.va == std::vector<double>({0.0, 0.0}), "strict checker changed its original base");
 }
 
 }  // namespace gravityx

@@ -162,3 +162,25 @@ certificates or objective audits; those are verification records, not vector
 backups. V20/V22/V24 candidate vectors and every other scenario's protected
 solutions remain untouched. This supersedes earlier V23 full-vector retention
 statements; V25 is now the protected accepted scenario-095 set.
+
+## Failed V26 work-deadline payload cleanup
+
+V26 failed in Code2 after 295.2568164000004 seconds, with 6,428/6,579
+contingencies on time. Its compact timeout archive was checked against the
+unchanged status hash and pushed in `7095c57` before cleanup. It has no final
+official certificate or accepted score. V25's successful certificate and
+all 6,580 root solution vectors were checked and protected.
+
+After exact local containment, ancestor/subtree reparse checks, and absence
+of relevant Windows/native workers, the existing failed-Code2-timeout helper
+removed only
+`runs/top5_cold_20260915/v26_s095/C2FEN19402_s095_cold/**/solution_*.txt`.
+All 12,901 text entries were removed; zero remain. The status hash stayed
+unchanged. C: free bytes rose from 42,515,759,104 to 54,015,488,000, a net
+recovery of **10.7099571228 GiB**, leaving about **50.31 GiB free**. The
+21.445-GiB sum of removed lengths double-counts hard links.
+
+V26 logs, status, partial official detail records and committed archive
+remain. Its deleted exact partial vectors cannot be recovered from these
+records. V25's 6,580 vectors, other retained scenario outputs, raw cases,
+source code, Git history and unrelated files were not deleted.

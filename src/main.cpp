@@ -2519,7 +2519,8 @@ int run_parallel_circuit_regression() {
             data, fast_result.solve.state, {1}, branch_context,
             0.5, 0.05, 5.0, 0.02, true, false, true, true, &all);
         if (!oracle.success || !compact.success || !compact.local_search ||
-            !compact.presolve_enabled || compact.primal_start_attempted ||
+            !compact.presolve_enabled || compact.simplex_iteration_limit != 10000 ||
+            oracle.simplex_iteration_limit != 1000 || compact.primal_start_attempted ||
             compact.primal_basis_attempted || compact.maximum_linearized_violation > 1e-7 ||
             compact.maximum_column_violation > 1e-7 ||
             std::abs(compact.objective - oracle.objective) > 1e-5 ||
@@ -4156,6 +4157,11 @@ bool solve_loaded_contingency(
     double quality_seed_seconds = 0.0;
     bool local_repair_selected = false;
     double local_repair_seconds = 0.0;
+    bool local_feasible_incumbent_used = false;
+    double local_polish_seconds = 0.0;
+    double local_incumbent_objective = 0.0;
+    double local_polished_objective = 0.0;
+    int local_polish_predictor_iterations = 0;
     nlohmann::json local_repair_trace = nlohmann::json::array();
     auto complete = [&](nlohmann::json output,
                         gravityx::AcState state,
@@ -4173,6 +4179,13 @@ bool solve_loaded_contingency(
         output["local_repair_selected"] = local_repair_selected;
         output["local_repair_seconds"] = local_repair_seconds;
         output["local_repair_trace"] = local_repair_trace;
+        output["local_feasible_incumbent_used"] = local_feasible_incumbent_used;
+        output["local_polish_seconds"] = local_polish_seconds;
+        output["local_incumbent_objective"] = local_feasible_incumbent_used
+            ? nlohmann::json(local_incumbent_objective) : nlohmann::json(nullptr);
+        output["local_polished_objective"] = local_feasible_incumbent_used
+            ? nlohmann::json(local_polished_objective) : nlohmann::json(nullptr);
+        output["local_polish_predictor_iterations"] = local_polish_predictor_iterations;
         output["exact_parallel_model_match"] = exact_parallel_model_match;
         output["exact_parallel_seed_attempted"] = exact_parallel_seed_attempted;
         output["exact_parallel_seed_accepted"] = exact_parallel_seed_accepted;
@@ -4302,6 +4315,15 @@ bool solve_loaded_contingency(
         if (!rolling_seed_fast_screen_selected && !quality_seed_selected && local_contingency_repair) {
             const auto started = std::chrono::steady_clock::now();
             auto checked = fast_power_flow->screen_candidate(*match, base.state);
+            std::optional<gravityx::FastPowerFlowResult> local_incumbent;
+            const auto retain_local_incumbent = [&]() {
+                if (checked.feasible && std::isfinite(checked.solve.objective) &&
+                    (!local_incumbent || checked.solve.objective > local_incumbent->solve.objective + 1e-9)) {
+                    local_incumbent = checked;
+                    return true;
+                }
+                return false;
+            };
             const auto qualified = [&] {
                 return checked.feasible && std::isfinite(checked.solve.objective) &&
                     checked.solve.objective >= *quality_seed_objective_floor;
@@ -4310,6 +4332,7 @@ bool solve_loaded_contingency(
                 fast_result = std::move(checked);
                 local_repair_selected = true;
             } else {
+                retain_local_incumbent();
                 const auto mask = gravityx::contingency_repair_neighborhood(data, *match);
                 for (int round = 0; !mask.empty() && round < 2; ++round) {
                     const double elapsed = std::chrono::duration<double>(
@@ -4329,12 +4352,33 @@ bool solve_loaded_contingency(
                     trace["nonlinear_residual"] = checked.validation.max_residual;
                     trace["native_objective"] = checked.solve.objective;
                     trace["quality_accepted"] = qualified();
+                    trace["incumbent_improved"] = retain_local_incumbent();
                     local_repair_trace.push_back(std::move(trace));
                     if (qualified()) {
                         fast_result = std::move(checked);
                         local_repair_selected = true;
                         break;
                     }
+                }
+                if (!local_repair_selected && local_incumbent) {
+                    // A work-quality floor is not a feasibility constraint.
+                    // Keep the best verified state for THIS exact outage and
+                    // start the existing bounded cleanup from it. The direct
+                    // incumbent guard enters cleanup at predictor iteration
+                    // zero, or retains this state if factors are unavailable.
+                    local_feasible_incumbent_used = true;
+                    local_incumbent_objective = local_incumbent->solve.objective;
+                    const auto polish_start = std::chrono::steady_clock::now();
+                    auto polished = fast_power_flow->solve(*match, local_incumbent->solve.state);
+                    local_polish_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - polish_start).count();
+                    local_polish_predictor_iterations = polished.fixed_jacobian_predictor_iterations;
+                    if (polished.feasible && std::isfinite(polished.solve.objective) &&
+                        polished.solve.objective > local_incumbent->solve.objective + 1e-9)
+                        local_incumbent = std::move(polished);
+                    local_polished_objective = local_incumbent->solve.objective;
+                    fast_result = std::move(local_incumbent);
+                    local_repair_selected = true;
                 }
             }
             local_repair_seconds = std::chrono::duration<double>(
@@ -4674,7 +4718,8 @@ bool solve_loaded_contingency(
                 : quality_seed_selected
                 ? "quality_gated_within_run_seed"
                 : local_repair_selected
-                ? (local_repair_trace.empty() ? "quality_gated_cold_base" : "quality_gated_local_contingency_lp")
+                ? (local_feasible_incumbent_used ? "local_feasible_incumbent_with_cached_polish"
+                    : local_repair_trace.empty() ? "quality_gated_cold_base" : "quality_gated_local_contingency_lp")
                 : fast_result->economic_balance_polish_selected
                 ? "resident_fixed_jacobian_economic_balance_polish"
                 : bounded_fast_postlinear_newton_selected
@@ -5718,10 +5763,15 @@ void run_exact_parallel_peer_regression(
             local.result.at("local_repair_selected").get<bool>() &&
             local.result.at("first_screen").is_null(),
             "local/base quality candidate did not pass the complete worker acceptance path");
-        const auto local_rejected = check({}, prior_objective + 1e6, true);
-        require(!local_rejected.result.at("local_repair_selected").get<bool>() &&
-            !local_rejected.result.at("first_screen").is_null(),
-            "local repair bypassed native-cost acceptance or global fallback");
+        const auto below_floor = check({}, prior_objective + 1e6, true);
+        require(below_floor.result.at("local_repair_selected").get<bool>() &&
+            below_floor.result.at("local_feasible_incumbent_used").get<bool>() &&
+            below_floor.result.at("first_screen").is_null() &&
+            below_floor.result.at("local_polish_predictor_iterations") == 0 &&
+            below_floor.result.at("local_polished_objective").get<double>() >=
+                below_floor.result.at("local_incumbent_objective").get<double>() - 1e-9 &&
+            below_floor.result.at("solution_method") == "local_feasible_incumbent_with_cached_polish",
+            "verified local incumbent was lost or re-entered global feasibility search");
         auto several = quality_bank;
         several.resize(5, quality_bank.front());
         for (std::size_t i = 0; i < several.size(); ++i) several[i].label = "tiny-seed-" + std::to_string(i);
@@ -6095,7 +6145,9 @@ int run_contingency_worker(
                     "exact_parallel_seed_label", "quality_seed_enabled", "quality_seed_objective_floor",
                     "quality_seed_probes", "quality_seed_verified", "quality_seed_cost_rejections",
                     "quality_seed_selected", "quality_seed_seconds", "local_repair_enabled",
-                    "local_repair_selected", "local_repair_seconds", "local_repair_trace"}) {
+                    "local_repair_selected", "local_repair_seconds", "local_repair_trace",
+                    "local_feasible_incumbent_used", "local_polish_seconds", "local_incumbent_objective",
+                    "local_polished_objective", "local_polish_predictor_iterations"}) {
                 if (details.contains(key)) result_summary[key] = details.at(key);
             }
             if (details.contains("fast_screen") && details.at("fast_screen").is_object()) {

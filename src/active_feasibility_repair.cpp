@@ -1204,7 +1204,12 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
             // hard safety cap.
             highs.setOptionValue(
                 "primal_simplex_bound_perturbation_multiplier", 0.0);
-            output.simplex_iteration_limit = 1000;
+            // Local LPs are small, cold/presolved models, not the inherited
+            // full-model diagonal-basis path. V30 hit 1,000 pivots before its
+            // measured time budget in many otherwise useful local attempts.
+            // Keep the global safeguard unchanged and let local feasibility
+            // use its remaining (construction-inclusive) short wall budget.
+            output.simplex_iteration_limit = local_bus_mask ? 10000 : 1000;
             highs.setOptionValue(
                 "simplex_iteration_limit", output.simplex_iteration_limit);
         }

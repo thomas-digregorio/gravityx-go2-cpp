@@ -184,3 +184,25 @@ V26 logs, status, partial official detail records and committed archive
 remain. Its deleted exact partial vectors cannot be recovered from these
 records. V25's 6,580 vectors, other retained scenario outputs, raw cases,
 source code, Git history and unrelated files were not deleted.
+
+## Superseded V25 payload cleanup after accepted V27/095
+
+The independently audited V27/095 result improved the accepted objective to
+382016.64361338085 in 295.39416020000135 seconds. Its complete certificate,
+source hashes, native checks and all 6,580 root vectors were verified, and
+its compact archive/audit were pushed in `c6bcb2a` before pruning V25.
+
+After checking old/new archive and status hashes, exact local containment,
+all ancestor/subtree reparse points and absence of active Windows/native
+workers, only
+`runs/top5_cold_20260915/v25_s095/C2FEN19402_s095_cold/**/solution_*.txt`
+was removed. The helper deleted 13,206 entries; zero remain. The V25
+certificate, logs and audits remain, as do all 6,580 new V27/095 root vectors.
+C: free bytes increased from 41,211,498,496 to 52,962,840,576: a net
+**10.9442901611 GiB** recovered. Apparent lengths of 21.953 GiB include hard
+links and are not physical recovered bytes.
+
+The deleted exact V25 vectors cannot be recovered from its certificates.
+This supersedes earlier V25 full-vector-retention statements. Source data,
+code, Git history, unrelated files, other scenarios' complete reference
+solutions and the newer V27/095 full vectors remain protected.

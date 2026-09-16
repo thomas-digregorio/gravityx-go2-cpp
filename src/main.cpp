@@ -713,7 +713,7 @@ int run_component_tests() {
         gravityx::FastPowerFlowOptions{}.rebalance_trial_reactive_generation ||
         !cached_economic_options.branch_aware_economic_backtracking ||
         gravityx::FastPowerFlowOptions{}.branch_aware_economic_backtracking ||
-        !cached_economic_options.coupled_feasibility_priority ||
+        cached_economic_options.coupled_feasibility_priority ||
         gravityx::FastPowerFlowOptions{}.coupled_feasibility_priority ||
         gravityx::FastPowerFlowOptions{}.early_reject_economic_trials ||
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
@@ -3791,7 +3791,49 @@ struct BasePoint {
 struct CorrectiveSeed {
     std::string label;
     gravityx::AcState state;
+    // Ranking hint only: the NEW outage must be rebuilt, rescored and fully
+    // validated before this point can be accepted. Never a transferred proof.
+    double objective{-std::numeric_limits<double>::infinity()};
 };
+
+double quality_seed_floor_from_reference(double reference_objective) {
+    if (!std::isfinite(reference_objective))
+        throw std::runtime_error("nonfinite within-run seed quality reference");
+    // A work-allocation threshold, NOT a feasibility or optimality tolerance.
+    return reference_objective - 0.01 * std::max(1.0, std::abs(reference_objective));
+}
+
+void trim_corrective_seed_bank(std::vector<CorrectiveSeed>& bank, bool keep_quality) {
+    constexpr std::size_t maximum = 16, recent = 12;
+    if (!keep_quality) { if (bank.size() > maximum) bank.resize(maximum); return; }
+    while (bank.size() > maximum) {
+        auto discard = bank.end() - 1;
+        for (auto item = bank.begin() + recent; item != bank.end(); ++item) {
+            if (item->objective < discard->objective) discard = item;
+        }
+        bank.erase(discard);
+    }
+}
+
+gravityx::AcState translate_quality_seed(
+    const gravityx::CaseData& data, const gravityx::Contingency& target,
+    const CorrectiveSeed& seed) {
+    auto candidate = seed.state;
+    if (target.type != gravityx::ContingencyType::Generator ||
+        candidate.pg.size() != data.generators.size() ||
+        candidate.qg.size() != data.generators.size()) return candidate;
+    const auto prior = std::find_if(data.contingencies.begin(), data.contingencies.end(),
+        [&](const auto& event) { return event.label == seed.label; });
+    if (prior != data.contingencies.end() && prior->type == gravityx::ContingencyType::Generator &&
+        data.generators.at(prior->component).bus == data.generators.at(target.component).bus) {
+        candidate.pg[prior->component] = candidate.pg[target.component];
+        candidate.qg[prior->component] = candidate.qg[target.component];
+        candidate.pg[target.component] = candidate.qg[target.component] = 0.0;
+    }
+    // Unit-specific source bounds, ramps and the full AC equations are still
+    // checked for the NEW outage by screen_candidate. This is only a proposal.
+    return candidate;
+}
 
 const CorrectiveSeed* find_exact_parallel_seed(
     const gravityx::CaseData& data,
@@ -3979,8 +4021,12 @@ bool solve_loaded_contingency(
     const std::vector<CorrectiveSeed>* corrective_seed_bank = nullptr,
     std::optional<ContingencyComputation>* completed_computation = nullptr,
     bool persist_result = true,
-    bool exact_parallel_seed = false) {
+    bool exact_parallel_seed = false,
+    std::optional<double> quality_seed_objective_floor = std::nullopt) {
     reject_onedrive(output_path);
+    if (quality_seed_objective_floor && (!std::isfinite(*quality_seed_objective_floor) ||
+            !fast_only || fast_power_flow == nullptr))
+        throw std::runtime_error("quality seed policy requires a finite floor and fast-only solver");
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
         [&label](const gravityx::Contingency& item) { return item.label == label; });
@@ -4013,10 +4059,21 @@ bool solve_loaded_contingency(
     bool exact_parallel_seed_attempted = false;
     bool exact_parallel_seed_accepted = false;
     double exact_parallel_seed_screen_seconds = 0.0;
+    int quality_seed_probes = 0, quality_seed_verified = 0, quality_seed_cost_rejections = 0;
+    bool quality_seed_selected = false;
+    double quality_seed_seconds = 0.0;
     auto complete = [&](nlohmann::json output,
                         gravityx::AcState state,
                         bool persist_full_state = false) {
         output["first_screen"] = first_screen_diagnostics;
+        output["quality_seed_enabled"] = quality_seed_objective_floor.has_value();
+        output["quality_seed_objective_floor"] = quality_seed_objective_floor
+            ? nlohmann::json(*quality_seed_objective_floor) : nlohmann::json(nullptr);
+        output["quality_seed_probes"] = quality_seed_probes;
+        output["quality_seed_verified"] = quality_seed_verified;
+        output["quality_seed_cost_rejections"] = quality_seed_cost_rejections;
+        output["quality_seed_selected"] = quality_seed_selected;
+        output["quality_seed_seconds"] = quality_seed_seconds;
         output["exact_parallel_model_match"] = exact_parallel_model_match;
         output["exact_parallel_seed_attempted"] = exact_parallel_seed_attempted;
         output["exact_parallel_seed_accepted"] = exact_parallel_seed_accepted;
@@ -4111,7 +4168,39 @@ bool solve_loaded_contingency(
                     *rolling_corrective_seed_label;
             }
         }
-        if (!rolling_seed_fast_screen_selected) {
+        if (!rolling_seed_fast_screen_selected && quality_seed_objective_floor &&
+            corrective_seed_bank != nullptr) {
+            const auto started = std::chrono::steady_clock::now();
+            std::vector<const CorrectiveSeed*> ranked;
+            for (const auto& seed : *corrective_seed_bank) {
+                if (seed.label != label && std::isfinite(seed.objective) &&
+                    seed.objective >= *quality_seed_objective_floor) ranked.push_back(&seed);
+            }
+            std::stable_sort(ranked.begin(), ranked.end(), [](const auto* left, const auto* right) {
+                if (left->objective != right->objective) return left->objective > right->objective;
+                return left->label < right->label;
+            });
+            for (const auto* seed : ranked) {
+                if (quality_seed_probes >= 3) break;
+                ++quality_seed_probes;
+                const auto candidate = translate_quality_seed(data, *match, *seed);
+                auto checked = fast_power_flow->screen_candidate(*match, candidate);
+                if (!checked.feasible || !std::isfinite(checked.solve.objective)) continue;
+                ++quality_seed_verified;
+                if (checked.solve.objective < *quality_seed_objective_floor) {
+                    ++quality_seed_cost_rejections;
+                    continue;
+                }
+                if (!quality_seed_selected || checked.solve.objective > fast_result->solve.objective + 1e-9) {
+                    fast_result = std::move(checked);
+                    selected_direct_seed_label = seed->label;
+                    quality_seed_selected = true;
+                }
+            }
+            quality_seed_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        }
+        if (!rolling_seed_fast_screen_selected && !quality_seed_selected) {
             fast_result = base.common_corrective_reference
                 ? fast_power_flow->solve(*match, *base.common_corrective_reference)
                 : fast_power_flow->solve(*match);
@@ -4442,6 +4531,8 @@ bool solve_loaded_contingency(
             const std::string solution_method =
                 exact_parallel_seed_accepted
                 ? "exact_parallel_peer_direct_screen"
+                : quality_seed_selected
+                ? "quality_gated_within_run_seed"
                 : fast_result->economic_balance_polish_selected
                 ? "resident_fixed_jacobian_economic_balance_polish"
                 : bounded_fast_postlinear_newton_selected
@@ -5416,6 +5507,98 @@ void run_exact_parallel_peer_regression(
         nonmatch.result.value("exact_parallel_seed_accepted", true)) {
         throw std::runtime_error("unmatched branch was treated as an exact peer");
     }
+    {
+        const auto require = [](bool condition, const char* message) {
+            if (!condition) throw std::runtime_error(std::string("quality seed: ") + message);
+        };
+        require(std::abs(quality_seed_floor_from_reference(10.0) - 9.9) < 1e-12 &&
+            std::abs(quality_seed_floor_from_reference(-10.0) + 10.1) < 1e-12 &&
+            quality_seed_floor_from_reference(0.0) == -0.01,
+            "wrong positive/negative/zero reference policy");
+        for (double invalid : {std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::quiet_NaN()}) {
+            bool rejected = false;
+            try { quality_seed_floor_from_reference(invalid); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "nonfinite reference was accepted");
+        }
+        auto quality_bank = bank;
+        quality_bank[0].objective = prior_objective;
+        const auto frozen_seed = gravityx::ac_state_to_json(quality_bank[0].state);
+        const auto check = [&](const std::vector<CorrectiveSeed>& inputs, double floor) {
+            gravityx::FastPowerFlowOptions options;
+            gravityx::enable_cached_economic_polish(options);
+            options.fixed_jacobian_minimum_bus_count = 0;
+            options.fixed_jacobian_screen_only = true;
+            gravityx::FastContingencyPowerFlow fast(data, base.state, commitment, options);
+            std::optional<ContingencyComputation> result;
+            const bool success = solve_loaded_contingency(data, base, second.label,
+                "component-quality-seed-no-write.json", 0, nullptr, false, &fast,
+                true, false, false, nullptr, nullptr, nullptr, &inputs, &result,
+                false, false, floor);
+            require(success && result && result->result.value("success", false), "tiny worker path failed");
+            gravityx::ContingencyContext context; context.borrow_base_state(base.state);
+            context.outaged_branch = second.component;
+            require(gravityx::validate_state(data, gravityx::ModelMode::ContingencySoft,
+                    result->state, commitment, context).max_residual <= 1e-5,
+                "returned result failed complete physical validation");
+            require(gravityx::ac_state_to_json(base.state) == frozen_base, "quality gate changed base anchor");
+            return std::move(*result);
+        };
+        const auto accepted = check(quality_bank, prior_objective - 1.0);
+        require(accepted.result.at("quality_seed_selected").get<bool>() &&
+            accepted.result.at("quality_seed_probes") == 1 &&
+            accepted.result.at("quality_seed_verified") == 1 &&
+            accepted.result.at("first_screen").is_null() &&
+            accepted.result.at("solution_method") == "quality_gated_within_run_seed" &&
+            gravityx::ac_state_to_json(quality_bank[0].state) == frozen_seed,
+            "verified high-quality seed was not accepted immutably");
+        auto dishonest_hint = quality_bank;
+        dishonest_hint[0].objective = prior_objective + 2e6;
+        const auto rescored = check(dishonest_hint, prior_objective + 1e6);
+        require(!rescored.result.at("quality_seed_selected").get<bool>() &&
+            rescored.result.at("quality_seed_cost_rejections") == 1 &&
+            !rescored.result.at("first_screen").is_null(),
+            "old ranking score replaced new-outage objective verification");
+        auto invalid_state = quality_bank;
+        invalid_state[0].state = broken;
+        const auto rejected = check(invalid_state, prior_objective - 1.0);
+        require(!rejected.result.at("quality_seed_selected").get<bool>() &&
+            rejected.result.at("quality_seed_verified") == 0 &&
+            !rejected.result.at("first_screen").is_null(), "infeasible seed bypassed fallback");
+        auto unqualified = quality_bank;
+        unqualified[0].objective = -std::numeric_limits<double>::infinity();
+        require(check(unqualified, prior_objective - 1.0).result.at("quality_seed_probes") == 0,
+            "unqualified score consumed a priority probe");
+        auto several = quality_bank;
+        several.resize(5, quality_bank.front());
+        for (std::size_t i = 0; i < several.size(); ++i) several[i].label = "tiny-seed-" + std::to_string(i);
+        require(check(several, prior_objective - 1.0).result.at("quality_seed_probes") == 3,
+            "quality probes exceeded the bounded work policy");
+        std::vector<CorrectiveSeed> recent;
+        for (int i = 0; i < 17; ++i) recent.push_back({std::to_string(i), {}, -double(i)});
+        recent.back().objective = 100.0;
+        auto old_policy = recent;
+        trim_corrective_seed_bank(recent, true); trim_corrective_seed_bank(old_policy, false);
+        require(recent.size() == 16 && recent.front().label == "0" &&
+            recent[11].label == "11" && recent.back().label == "16" &&
+            old_policy.size() == 16 && old_policy.back().label == "15",
+            "recent/best retention changed the default or discarded the best point");
+        auto gen_data = data;
+        gen_data.generators.push_back(data.generators.front());
+        const gravityx::Contingency old_gen{"old-generator", gravityx::ContingencyType::Generator, 1, 0};
+        const gravityx::Contingency new_gen{"new-generator", gravityx::ContingencyType::Generator, 2, 1};
+        gen_data.contingencies = {old_gen, new_gen};
+        CorrectiveSeed gen_seed{old_gen.label, {}, 1.0};
+        gen_seed.state.pg = {0.0, 1.0}; gen_seed.state.qg = {0.0, 0.2};
+        const auto translated = translate_quality_seed(gen_data, new_gen, gen_seed);
+        require(translated.pg == std::vector<double>({1.0, 0.0}) &&
+            translated.qg == std::vector<double>({0.2, 0.0}) && gen_seed.state.pg[1] == 1.0,
+            "same-bus generator proposal lost injection or mutated its seed");
+        gen_data.generators[1].bus = (gen_data.generators[0].bus + 1) % gen_data.buses.size();
+        require(translate_quality_seed(gen_data, new_gen, gen_seed).pg == gen_seed.state.pg,
+            "different-bus outage incorrectly transferred generation");
+    }
 }
 
 int run_contingency_worker(
@@ -5502,6 +5685,13 @@ int run_contingency_worker(
             data, base.state, base.commitment, fast_options);
     }
     std::vector<CorrectiveSeed> corrective_seed_bank;
+    std::optional<double> quality_seed_objective_floor;
+    if (fast_only && cached_economic_contingency_polish) {
+        auto reference = base.state;
+        const double reference_objective = gravityx::rebuild_common_corrective_reference_state(
+            data, base.state, base.commitment, reference);
+        quality_seed_objective_floor = quality_seed_floor_from_reference(reference_objective);
+    }
     std::unordered_map<std::string, int> branch_outage_components;
     for (const auto& contingency : data.contingencies) {
         if (contingency.type == gravityx::ContingencyType::Branch) {
@@ -5608,7 +5798,8 @@ int run_contingency_worker(
                 ? &rolling_corrective_seed->label : nullptr,
             (linearized_fallback || fast_only)
                 ? &corrective_seed_bank : nullptr,
-            &completed_computation, !remove_output_after_result, exact_parallel_seed_found);
+            &completed_computation, !remove_output_after_result, exact_parallel_seed_found,
+            quality_seed_objective_floor);
         const double solve_call_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - solve_call_start).count();
         double result_read_seconds = 0.0;
@@ -5680,13 +5871,9 @@ int run_contingency_worker(
                 corrective_seed_bank.insert(
                     corrective_seed_bank.begin(),
                     CorrectiveSeed{
-                        label, std::move(completed_computation->state)});
-                constexpr std::size_t kMaximumCorrectiveSeedBankSize = 16;
-                if (corrective_seed_bank.size() >
-                    kMaximumCorrectiveSeedBankSize) {
-                    corrective_seed_bank.resize(
-                        kMaximumCorrectiveSeedBankSize);
-                }
+                        label, std::move(completed_computation->state),
+                        result_json.at("solve").at("objective").get<double>()});
+                trim_corrective_seed_bank(corrective_seed_bank, quality_seed_objective_floor.has_value());
                 rolling_corrective_seed_updated = true;
             }
         }
@@ -5753,7 +5940,9 @@ int run_contingency_worker(
             const auto& details = completed_computation->result;
             for (const char* key : {"exact_parallel_model_match", "exact_parallel_seed_attempted",
                     "exact_parallel_seed_accepted", "exact_parallel_seed_screen_seconds",
-                    "exact_parallel_seed_label"}) {
+                    "exact_parallel_seed_label", "quality_seed_enabled", "quality_seed_objective_floor",
+                    "quality_seed_probes", "quality_seed_verified", "quality_seed_cost_rejections",
+                    "quality_seed_selected", "quality_seed_seconds"}) {
                 if (details.contains(key)) result_summary[key] = details.at(key);
             }
             if (details.contains("fast_screen") && details.at("fast_screen").is_object()) {

@@ -98,7 +98,9 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     // Q recourse testable but restore the faster V25 production behavior.
     options.rebalance_trial_reactive_generation = false;
     options.branch_aware_economic_backtracking = true;
-    options.coupled_feasibility_priority = true;
+    // V28's extra coupled probes worsened the 006 work deadline. Preserve
+    // the tested opt-in for diagnosis, but do not enable it in production.
+    options.coupled_feasibility_priority = false;
     options.early_reject_economic_trials = true;
     options.reuse_feasibility_jacobian_for_polish = true;
     options.max_economic_balance_polish_iterations = 3;

@@ -880,6 +880,7 @@ def finalize_serial_evaluation_shard(
     record: dict[str, Any],
 ) -> dict[str, Any]:
     """Validate one completed unchanged-vendor serial evaluation shard."""
+    finalization_started = time.perf_counter()
     summary_path = record["solution_dir"] / "eval_summary.json"
     if not summary_path.is_file():
         raise RuntimeError(
@@ -909,6 +910,7 @@ def finalize_serial_evaluation_shard(
         **record,
         "summary": normalized,
         "certificate": certificate,
+        "finalization_wall_seconds": time.perf_counter() - finalization_started,
     }
 
 
@@ -1120,6 +1122,7 @@ def merge_serial_evaluation_shards(
                 "evaluator_reported_wall_seconds": record.get(
                     "evaluator_reported_wall_seconds"
                 ),
+                "finalization_wall_seconds": record.get("finalization_wall_seconds"),
                 "static_case_cache": record.get("static_case_cache"),
                 "complete_label_set": bool(
                     record["certificate"]["complete_label_set"]
@@ -1383,7 +1386,10 @@ class StreamingSerialEvaluation:
         completion_order_tail_sizes: list[int] | None = None,
         persistent_evaluator_processes: bool = False,
         evaluator_below_normal_priority: bool = False,
+        prepare_persistent_pool_early: bool = False,
     ) -> None:
+        if prepare_persistent_pool_early and not persistent_evaluator_processes:
+            raise ValueError("early evaluator preparation requires persistent processes")
         if maximum_processes < 0:
             raise ValueError(
                 "initial streaming evaluation processes cannot be negative"
@@ -1430,6 +1436,7 @@ class StreamingSerialEvaluation:
         self.vendor_evaluator_reference = vendor_evaluator_reference
         self.persistent_evaluator_processes = persistent_evaluator_processes
         self.evaluator_below_normal_priority = evaluator_below_normal_priority
+        self.prepare_persistent_pool_early = prepare_persistent_pool_early
         groups = completion_order_shard_groups(
             self.labels,
             shard_count,
@@ -1483,6 +1490,13 @@ class StreamingSerialEvaluation:
         self.first_process_started: float | None = None
         self.last_process_finished: float | None = None
         self.screen_idle_promotion_events: list[dict[str, int]] = []
+        if self.prepare_persistent_pool_early:
+            try:
+                with self.lock:
+                    self._ensure_persistent_workers_locked()
+            except Exception:
+                self.abort()
+                raise
 
     def _abort_locked(self) -> None:
         self.aborted = True
@@ -1551,12 +1565,17 @@ class StreamingSerialEvaluation:
     def _ensure_persistent_workers_locked(self) -> None:
         if not self.persistent_evaluator_processes:
             return
-        # Preserve the initial pool, but do not import extra evaluators merely
-        # because the concurrency cap rose when no shards need those workers.
-        target = min(self.maximum_processes, max(
-            self.initial_maximum_processes,
-            len(self.running_records) + len(self.ready_records),
-        ))
+        # Optional early preparation imports the whole eventual pool inside
+        # the timed run, but never increases actual evaluation concurrency.
+        # Otherwise create additional workers only when shards need them.
+        target = (
+            self.post_screen_maximum_processes
+            if self.prepare_persistent_pool_early
+            else min(self.maximum_processes, max(
+                self.initial_maximum_processes,
+                len(self.running_records) + len(self.ready_records),
+            ))
+        )
         while len(self.persistent_workers) < target:
             if time.perf_counter() >= self.deadline:
                 self._abort_locked()
@@ -1942,6 +1961,7 @@ class StreamingSerialEvaluation:
                         for worker in self.persistent_workers
                     ],
                     "persistent_evaluator_startup_mode": "nonblocking_handshake",
+                    "persistent_evaluator_pool_prepared_early": self.prepare_persistent_pool_early,
                 }
             )
             write_json(
@@ -1950,6 +1970,28 @@ class StreamingSerialEvaluation:
             )
             return summary, metadata
         finally:
+            # Diagnostic only: this snapshot neither certifies pending work nor
+            # changes the deadline. Preserve the exact queue/finalization gate
+            # when finish fails, instead of reporting an undifferentiated timeout.
+            with self.lock:
+                progress = {
+                    "diagnostic_only": True, "aborted": self.aborted,
+                    "completed_labels": len(self.completed_labels),
+                    "prepared_shards": len(self.records),
+                    "queued_shards": len(self.ready_records),
+                    "running_shards": len(self.running_records),
+                    "finalization_submitted": len(self.finalization_futures),
+                    "finalization_completed": sum(f.done() and not f.cancelled()
+                        and f.exception() is None for f in self.finalization_futures.values()),
+                    "seconds_to_evaluation_deadline": self.deadline - time.perf_counter(),
+                    "startup": [{"worker_id": w.worker_id, "ready": w.ready,
+                        "startup_seconds": w.startup_seconds, "tasks": w.task_count}
+                        for w in self.persistent_workers],
+                }
+            try:
+                write_json(self.internal_dir / "streaming_evaluation_progress.json", progress)
+            except OSError as error:
+                print(f"Could not save evaluator diagnostic snapshot: {error}", file=sys.stderr)
             self._shutdown_evaluator_executor(not self.aborted)
             self._shutdown_finalization_executor(not self.aborted)
 
@@ -2985,6 +3027,7 @@ def main() -> int:
     parser.add_argument(
         "--streaming-persistent-evaluator-processes", action="store_true"
     )
+    parser.add_argument("--prepare-evaluator-pool-early", action="store_true")
     parser.add_argument(
         "--streaming-evaluator-below-normal-priority", action="store_true"
     )
@@ -3035,6 +3078,8 @@ def main() -> int:
     parser.add_argument("--fallback-schedule-profile", type=Path)
     args = parser.parse_args()
 
+    if args.prepare_evaluator_pool_early and not args.streaming_persistent_evaluator_processes:
+        parser.error("--prepare-evaluator-pool-early requires persistent evaluators")
     if (
         args.streaming_persistent_evaluator_processes
         and not persistent_evaluator_protocol_markers_present(args.evaluator)
@@ -3445,6 +3490,7 @@ def main() -> int:
         "streaming_persistent_evaluator_processes": (
             args.streaming_persistent_evaluator_processes
         ),
+        "prepare_evaluator_pool_early": args.prepare_evaluator_pool_early,
         "streaming_evaluator_below_normal_priority": (
             args.streaming_evaluator_below_normal_priority
         ),
@@ -3764,6 +3810,7 @@ def main() -> int:
             streaming_evaluation_tail_shard_sizes,
             args.streaming_persistent_evaluator_processes,
             args.streaming_evaluator_below_normal_priority,
+            args.prepare_evaluator_pool_early,
         )
         run_status["streaming_evaluation_prepared"] = True
         checkpoint()
@@ -5128,6 +5175,7 @@ def main() -> int:
             if args.vendor_evaluator_reference is not None
             else "native_vendor_parser_and_equations"
         ),
+        "prepare_evaluator_pool_early": args.prepare_evaluator_pool_early,
         "official_evaluation_certificate": evaluation_certificate,
         "total_wall_seconds": total_wall,
         "contingency_count": len(records),

@@ -125,6 +125,8 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
     if profile:
         command += ["--fast-screen-heavy-profile", str(REPO / profile),
                     "--fast-screen-heavy-workers", "4"]
+    if config.get("prepare_evaluator_pool_early", False):
+        command.append("--prepare-evaluator-pool-early")
     return command
 
 

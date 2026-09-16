@@ -66,13 +66,14 @@ class EvaluatorStartupTests(unittest.TestCase):
         self.evaluator = root / "tiny_evaluator.py"
         self.evaluator.write_text("import sys\nsys.stdin.read()\n")
 
-    def manager(self, deadline=None):
+    def manager(self, deadline=None, early=False):
         m = StreamingSerialEvaluation(
             Path(sys.executable), self.evaluator, self.case, self.output,
             self.output / "internal", ["CTG_A", "CTG_B"], 2, 1,
             deadline if deadline is not None else time.perf_counter() + 10.0,
             post_screen_maximum_processes=2, completion_order_groups=True,
-            persistent_evaluator_processes=True)
+            persistent_evaluator_processes=True,
+            prepare_persistent_pool_early=early)
         self.addCleanup(m.abort)
         return m
 
@@ -145,6 +146,39 @@ class EvaluatorStartupTests(unittest.TestCase):
             m.mark_completed("CTG_A")
         constructor.assert_not_called()
         self.assertTrue(m.aborted)
+
+    @mock.patch("run_experiment.PersistentEvaluatorProcess", DelayedWorker)
+    @mock.patch("run_experiment.finalize_serial_evaluation_shard", side_effect=lambda record: record)
+    def test_early_pool_preparation_does_not_increase_evaluation_concurrency(self, finalize):
+        m = self.manager(early=True)
+        self.assertEqual(len(m.persistent_workers), 2)
+        self.assertEqual(m.maximum_processes, 1)
+        self.assertFalse(m.completed_labels)
+        self.assertFalse(m.running_records)
+        for w in m.persistent_workers:
+            w.release.set()
+        for f in m.persistent_startup_futures.values():
+            f.result(timeout=1.0)
+        m.mark_completed("CTG_A")
+        m.mark_completed("CTG_B")
+        # A finished first tiny evaluation may be collected during the second
+        # mark, but the configured in-flight evaluation cap remains one.
+        self.assertLessEqual(len(m.running_records), 1)
+        self.assertEqual(m.maximum_processes, 1)
+        self.assertEqual(len(m.persistent_workers), 2)
+
+    @mock.patch("run_experiment.PersistentEvaluatorProcess")
+    def test_expired_early_pool_does_not_create_processes(self, constructor):
+        with self.assertRaises(CompetitionTimeout):
+            self.manager(deadline=time.perf_counter() - 1.0, early=True)
+        constructor.assert_not_called()
+
+    def test_early_pool_requires_persistent_protocol(self):
+        with self.assertRaisesRegex(ValueError, "requires persistent"):
+            StreamingSerialEvaluation(Path(sys.executable), self.evaluator,
+                self.case, self.output, self.output / "internal", ["CTG_A"],
+                1, 1, time.perf_counter() + 1,
+                prepare_persistent_pool_early=True)
 
     def test_real_process_without_ready_is_terminated_at_deadline(self):
         m = self.manager(deadline=time.perf_counter() + 0.2)

@@ -128,6 +128,18 @@ class ReliabilityAuditTests(unittest.TestCase):
         self.assertEqual(after, before + ["--base-pwl-epigraph"])
         self.assertIn("--validated-source-base", after)
 
+    def test_early_evaluator_pool_changes_only_explicit_timed_preparation(self):
+        config = {"python": "python", "data_repository": "data", "source_root": "sources",
+                  "vendor_evaluator": "evaluator", "total_time_limit": 300,
+                  "minimum_free_space_gib": 30}
+        before = arguments(config, "19402", "095", Path("run"))
+        config["prepare_evaluator_pool_early"] = True
+        after = arguments(config, "19402", "095", Path("run"))
+        self.assertEqual(after, before + ["--prepare-evaluator-pool-early"])
+        self.assertNotIn("--base-json", after)
+        self.assertIn("--validated-source-base", after)
+        self.assertEqual(after[after.index("--total-time-limit") + 1], "300")
+
     def test_exact_hessian_requires_epigraph_and_preserves_cold_limits(self):
         config = {"python": "python", "data_repository": "data", "source_root": "sources",
                   "vendor_evaluator": "evaluator", "total_time_limit": 300,

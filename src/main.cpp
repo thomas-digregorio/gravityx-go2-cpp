@@ -713,6 +713,8 @@ int run_component_tests() {
         gravityx::FastPowerFlowOptions{}.rebalance_trial_reactive_generation ||
         !cached_economic_options.branch_aware_economic_backtracking ||
         gravityx::FastPowerFlowOptions{}.branch_aware_economic_backtracking ||
+        !cached_economic_options.coupled_feasibility_priority ||
+        gravityx::FastPowerFlowOptions{}.coupled_feasibility_priority ||
         gravityx::FastPowerFlowOptions{}.early_reject_economic_trials ||
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
@@ -1138,6 +1140,11 @@ int run_parallel_circuit_regression() {
     budget_result.economic_trial_qg_recourse_calls = 7;
     budget_result.economic_trial_qg_changes = 12;
     budget_result.economic_trial_qg_seconds = 0.003;
+    budget_result.coupled_feasibility_priority_trials = 3;
+    budget_result.coupled_feasibility_priority_selected = 1;
+    budget_result.coupled_feasibility_priority_seconds = 0.01;
+    budget_result.coupled_feasibility_priority_before = 2.0;
+    budget_result.coupled_feasibility_priority_after = 0.3;
     budget_result.economic_branch_aware_steps = 9;
     budget_result.economic_branch_steps_above_half = 4;
     budget_result.economic_branch_step_witnesses = {{"sm_slack", 8}, {"pf", 1}};
@@ -1174,6 +1181,9 @@ int run_parallel_circuit_regression() {
             "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
             "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds",
             "economic_trial_qg_recourse_calls", "economic_trial_qg_changes", "economic_trial_qg_seconds",
+            "coupled_feasibility_priority_trials", "coupled_feasibility_priority_selected",
+            "coupled_feasibility_priority_seconds", "coupled_feasibility_priority_before",
+            "coupled_feasibility_priority_after",
             "economic_branch_aware_steps", "economic_branch_steps_above_half", "economic_branch_step_witnesses"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key)) {
             throw std::runtime_error("compact worker log omitted local dispatch evidence");
@@ -1746,6 +1756,7 @@ int run_parallel_circuit_regression() {
     branch_contingency.type = gravityx::ContingencyType::Branch;
     branch_contingency.source_index = 1;
     branch_contingency.component = 0;
+    gravityx::run_coupled_feasibility_priority_regression(data, solve.state, {1}, branch_contingency);
     {
         gravityx::FastPowerFlowOptions cached_options;
         gravityx::enable_cached_economic_polish(cached_options);
@@ -5779,6 +5790,9 @@ int run_contingency_worker(
                          "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
                          "local_dispatch_shunt_block_changes", "local_dispatch_shunt_seconds",
                          "economic_trial_qg_recourse_calls", "economic_trial_qg_changes", "economic_trial_qg_seconds",
+                         "coupled_feasibility_priority_trials", "coupled_feasibility_priority_selected",
+                         "coupled_feasibility_priority_seconds", "coupled_feasibility_priority_before",
+                         "coupled_feasibility_priority_after",
                          "economic_branch_aware_steps", "economic_branch_steps_above_half", "economic_branch_step_witnesses",
                          "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
                          "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",

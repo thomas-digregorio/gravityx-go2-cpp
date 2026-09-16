@@ -2985,6 +2985,11 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"economic_trial_qg_recourse_calls", economic_trial_qg_recourse_calls},
         {"economic_trial_qg_changes", economic_trial_qg_changes},
         {"economic_trial_qg_seconds", economic_trial_qg_seconds},
+        {"coupled_feasibility_priority_trials", coupled_feasibility_priority_trials},
+        {"coupled_feasibility_priority_selected", coupled_feasibility_priority_selected},
+        {"coupled_feasibility_priority_seconds", coupled_feasibility_priority_seconds},
+        {"coupled_feasibility_priority_before", coupled_feasibility_priority_before},
+        {"coupled_feasibility_priority_after", coupled_feasibility_priority_after},
         {"economic_branch_aware_steps", economic_branch_aware_steps},
         {"economic_branch_steps_above_half", economic_branch_steps_above_half},
         {"economic_branch_step_witnesses", economic_branch_step_witnesses},
@@ -4066,6 +4071,68 @@ FastPowerFlowResult FastContingencyPowerFlow::screen_candidate(
 
 FastPowerFlowResult FastContingencyPowerFlow::solve_base() const {
     return solve_impl(nullptr);
+}
+
+void run_coupled_feasibility_priority_regression(
+    const CaseData& source, const AcState& base,
+    const std::vector<int>& commitment, const Contingency& contingency) {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) throw std::runtime_error(std::string("coupled priority: ") + message);
+    };
+    require(source.buses.size() > 1 && source.buses.size() < 20, "requires a tiny fixture");
+    const auto frozen_base = ac_state_to_json(base);
+    auto fixture = source;
+    // Fixture construction only: isolate balance restoration from thermal
+    // congestion. No benchmark input is altered by this regression.
+    for (auto& branch : fixture.branches) branch.rate_a = branch.rate_c = 10.0;
+    auto reference = base;
+    rebuild_base_state_derived_fields(fixture, commitment, reference);
+    const auto frozen_reference = ac_state_to_json(reference);
+    FastPowerFlowOptions options;
+    options.fixed_jacobian_minimum_bus_count = 0;
+    options.fixed_jacobian_screen_only = true;
+    options.coupled_feasibility_priority = true;
+    options.capture_diagnostics = true;
+    auto original_options = options;
+    original_options.coupled_feasibility_priority = false;
+    int attempted = 0, selected = 0, complete = 0;
+    for (double angle_change : {-0.2, -0.12, -0.04, 0.04, 0.12, 0.2}) {
+        auto initial = reference;
+        initial.va.back() += angle_change;
+        const auto frozen_initial = ac_state_to_json(initial);
+        FastContingencyPowerFlow priority(fixture, reference, commitment, options);
+        FastContingencyPowerFlow original(fixture, reference, commitment, original_options);
+        const auto candidate = priority.solve(contingency, initial);
+        const auto oracle = original.solve(contingency, initial);
+        const auto direct_probe = priority.screen_candidate(contingency, initial);
+        require(oracle.coupled_feasibility_priority_trials == 0 &&
+            direct_probe.coupled_feasibility_priority_trials == 0,
+            "opt-out or direct-only path ran priority optimization");
+        require(!oracle.feasible || candidate.feasible, "tiny feasible oracle lost its feasible solution");
+        attempted += candidate.coupled_feasibility_priority_trials;
+        selected += candidate.coupled_feasibility_priority_selected;
+        if (candidate.coupled_feasibility_priority_selected > 0) {
+            require(candidate.coupled_feasibility_priority_after <= options.validation_tolerance ||
+                candidate.coupled_feasibility_priority_after <=
+                    0.5 * candidate.coupled_feasibility_priority_before,
+                "selected priority step lacked sufficient nonlinear reduction");
+        }
+        if (candidate.feasible) {
+            ++complete;
+            ContingencyContext context; context.borrow_base_state(reference);
+            if (contingency.type == ContingencyType::Branch) context.outaged_branch = contingency.component;
+            else context.outaged_generator = contingency.component;
+            const auto checked = validate_state(fixture, ModelMode::ContingencySoft,
+                candidate.solve.state, commitment, context);
+            require(checked.max_residual <= options.validation_tolerance,
+                "priority result failed complete independent validation");
+        }
+        require(ac_state_to_json(initial) == frozen_initial &&
+            ac_state_to_json(reference) == frozen_reference,
+            "priority candidate changed its immutable source or initial state");
+    }
+    require(attempted > 0 && selected > 0 && complete > 0, "fixture did not exercise priority acceptance");
+    require(ac_state_to_json(base) == frozen_base, "regression changed the calling fixture base");
 }
 
 FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
@@ -6111,6 +6178,36 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                 };
                 const auto try_damped_corrections = [&]
                     (FixedJacobianPredictorCache& cache) {
+                    if (options_.coupled_feasibility_priority &&
+                        (predictor_validation.worst_category == "active_balance" ||
+                         predictor_validation.worst_category == "reactive_balance")) {
+                        AccumulateSeconds priority_timer(&output.coupled_feasibility_priority_seconds);
+                        // Existing cached factors only. This is a proposal,
+                        // not a replacement for the nonlinear acceptance gate.
+                        for (double damping : {1.0, 0.5, 0.25}) {
+                            auto trial = make_trial(correction_reference);
+                            ++output.coupled_feasibility_priority_trials;
+                            if (!cache.apply_correction(data_, p_spec, q_spec,
+                                    p_network, q_network, trial.vm, trial.va, damping)) continue;
+                            const auto checked = project_trial_reactive_and_validate(trial);
+                            const double before = predictor_validation.max_residual;
+                            const double after = checked.max_residual;
+                            if (std::isfinite(before) && std::isfinite(after) &&
+                                after + 1e-10 < selected_validation.max_residual &&
+                                (after <= options_.validation_tolerance || after <= 0.5 * before)) {
+                                selected_correction = std::move(trial);
+                                selected_validation = checked;
+                                selected_damping = damping;
+                                selected_correction_mode = "priority_coupled_balance";
+                                ++output.coupled_feasibility_priority_selected;
+                                output.coupled_feasibility_priority_before = before;
+                                output.coupled_feasibility_priority_after = after;
+                                return;
+                            }
+                        }
+                        // A weak/failed trial never displaces the incumbent;
+                        // use the original deterministic search below.
+                    }
                     const auto try_local_reactive =
                         [&](double damping) {
                         auto trial = make_trial(correction_reference);

@@ -41,6 +41,9 @@ struct FastPowerFlowOptions {
     // Reconcile it at the trial's NEW voltages before testing that trial.
     bool rebalance_trial_reactive_generation{false};
     bool branch_aware_economic_backtracking{false};
+    // Try a resident coupled Newton direction before decoupled/coordinate
+    // searches, but only keep a fully checked substantial balance reduction.
+    bool coupled_feasibility_priority{false};
     // Reject a physically infeasible economic trial at its first proven
     // violation; all potentially accepted trials still complete every check.
     bool early_reject_economic_trials{false};
@@ -95,6 +98,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     // Q recourse testable but restore the faster V25 production behavior.
     options.rebalance_trial_reactive_generation = false;
     options.branch_aware_economic_backtracking = true;
+    options.coupled_feasibility_priority = true;
     options.early_reject_economic_trials = true;
     options.reuse_feasibility_jacobian_for_polish = true;
     options.max_economic_balance_polish_iterations = 3;
@@ -157,6 +161,11 @@ struct FastPowerFlowResult {
     int economic_trial_qg_recourse_calls{};
     int economic_trial_qg_changes{};
     double economic_trial_qg_seconds{};
+    int coupled_feasibility_priority_trials{};
+    int coupled_feasibility_priority_selected{};
+    double coupled_feasibility_priority_seconds{};
+    double coupled_feasibility_priority_before{};
+    double coupled_feasibility_priority_after{};
     int economic_branch_aware_steps{};
     int economic_branch_steps_above_half{};
     std::map<std::string, int> economic_branch_step_witnesses;
@@ -271,6 +280,9 @@ void run_outage_inverse_row_cache_regression();
 void run_adaptive_jacobian_policy_regression();
 void run_voltage_extrapolation_policy_regression();
 void run_corrective_trial_copy_regression();
+void run_coupled_feasibility_priority_regression(
+    const CaseData& data, const AcState& base,
+    const std::vector<int>& commitment, const Contingency& contingency);
 void run_polish_flow_injection_regression(
     const CaseData& data, const AcState& original_base);
 void run_voltage_extrapolation_physics_regression(

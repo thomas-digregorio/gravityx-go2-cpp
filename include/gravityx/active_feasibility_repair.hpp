@@ -26,6 +26,9 @@ struct ActiveFeasibilityRepairResult {
     int local_control_bus_count{};
     int solver_row_count{};
     int solver_column_count{};
+    int evaluated_branch_derivatives{};
+    int fixed_branch_derivatives_skipped{};
+    double branch_derivative_seconds{};
     int row_count{};
     int column_count{};
     int nonzero_count{};
@@ -84,7 +87,9 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     // local controls and imbalance, 2 permits only boundary imbalance, and
     // 0 fixes all controls and signed imbalance to the reference. Returned
     // candidates still require the complete original nonlinear validator.
-    const std::vector<unsigned char>* local_bus_mask = nullptr);
+    const std::vector<unsigned char>* local_bus_mask = nullptr,
+    // False is the full-derivative oracle for tiny component comparisons.
+    bool omit_fixed_derivatives = true);
 
 // Source topology only, with a one-hop fixed-control boundary. Empty means
 // the requested neighborhood exceeds the bounded work limit.

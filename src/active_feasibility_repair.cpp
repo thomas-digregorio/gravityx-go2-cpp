@@ -293,6 +293,9 @@ nlohmann::json ActiveFeasibilityRepairResult::to_json(
         {"local_control_bus_count", local_control_bus_count},
         {"solver_row_count", solver_row_count},
         {"solver_column_count", solver_column_count},
+        {"evaluated_branch_derivatives", evaluated_branch_derivatives},
+        {"fixed_branch_derivatives_skipped", fixed_branch_derivatives_skipped},
+        {"branch_derivative_seconds", branch_derivative_seconds},
         {"row_count", row_count},
         {"column_count", column_count},
         {"nonzero_count", nonzero_count},
@@ -348,7 +351,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
     bool current_security_rows_only,
     bool include_component_box_rows,
     bool minimize_balance_slack,
-    const std::vector<unsigned char>* local_bus_mask) {
+    const std::vector<unsigned char>* local_bus_mask,
+    bool omit_fixed_derivatives) {
     const auto wall_start = std::chrono::steady_clock::now();
     ActiveFeasibilityRepairResult output;
     output.balance_slack_limit = balance_slack_limit;
@@ -515,6 +519,7 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         }
     }
 
+    const auto derivative_started = std::chrono::steady_clock::now();
     std::vector<AngleFlowDerivative> derivative(
         static_cast<std::size_t>(nl));
     std::vector<VoltageFlowDerivative> voltage_derivative(
@@ -526,6 +531,17 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
         if (i == outaged_branch || data.branches[i].status == 0) {
             continue;
         }
+        if (local_bus_mask && omit_fixed_derivatives &&
+            (*local_bus_mask)[data.branches[i].from] != 1 &&
+            (*local_bus_mask)[data.branches[i].to] != 1) {
+            // Both endpoint voltage/angle increments are exactly zero in
+            // this search. Their derivatives therefore multiply zero. Keep
+            // the actual terminal flows and all constant constraint checks;
+            // only avoid unnecessary finite-difference evaluations.
+            ++output.fixed_branch_derivatives_skipped;
+            continue;
+        }
+        ++output.evaluated_branch_derivatives;
         derivative[i] = angle_flow_derivative(data.branches[i], output.state);
         voltage_derivative[i] = voltage_flow_derivative(
             data.branches[i], output.state);
@@ -566,6 +582,8 @@ ActiveFeasibilityRepairResult solve_linearized_active_feasibility_repair(
                 voltage_scale[shunt.bus], derivative_magnitude));
     }
 
+    output.branch_derivative_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - derivative_started).count();
     const int angle_up_offset = 0;
     const int angle_down_offset = angle_up_offset + angle_count;
     const int voltage_variable_count = include_reactive ? nb : 0;

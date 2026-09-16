@@ -2570,6 +2570,78 @@ int run_parallel_circuit_regression() {
             0.5, 0.05, 5.0, 0.02, true, false, true, true, &fixed);
         if (constant_row.success || constant_row.status != "local_fixed_row_infeasible")
             throw std::runtime_error("local compression discarded an infeasible constant row");
+        // Add a zero-injection tail to the tiny fixture. The final two
+        // branches have fixed endpoints: optimized assembly must agree with
+        // evaluating every finite difference and then substituting zero.
+        auto extended = data;
+        const int original_buses = static_cast<int>(extended.buses.size());
+        int source_bus = 0;
+        for (const auto& bus : extended.buses) source_bus = std::max(source_bus, bus.bus_i);
+        for (int offset = 0; offset < 3; ++offset) {
+            gravityx::Bus bus;
+            bus.bus_i = ++source_bus; bus.index = bus.bus_i; bus.type = 1;
+            bus.source_key = "tiny-fixed-tail-" + std::to_string(offset);
+            bus.vmin = data.buses.back().vmin; bus.vmax = data.buses.back().vmax;
+            const int to = static_cast<int>(extended.buses.size());
+            extended.bus_position[bus.bus_i] = to;
+            extended.buses.push_back(bus);
+            gravityx::Branch edge;
+            edge.index = static_cast<int>(extended.branches.size()) + 1;
+            edge.from = to - 1; edge.to = to;
+            edge.r = 0.01; edge.x = 0.1; edge.tap = 1.0;
+            edge.angmin = -1.0; edge.angmax = 1.0;
+            edge.rate_a = edge.rate_b = edge.rate_c = 10.0;
+            const int index = static_cast<int>(extended.branches.size());
+            extended.branches.push_back(edge);
+            extended.buses[edge.from].branches_from.push_back(index);
+            extended.buses[edge.to].branches_to.push_back(index);
+        }
+        const auto extend_state = [&](gravityx::AcState state) {
+            state.vm.resize(extended.buses.size(), state.vm.back());
+            state.va.resize(extended.buses.size(), state.va.back());
+            state.p_delta.resize(extended.buses.size(), 0.0);
+            state.q_delta.resize(extended.buses.size(), 0.0);
+            for (auto* flows : {&state.pf, &state.pt, &state.qf, &state.qt, &state.sm_slack})
+                flows->resize(extended.branches.size(), 0.0);
+            return state;
+        };
+        const auto extended_base = extend_state(solve.state);
+        auto extended_reference = extend_state(fast_result.solve.state);
+        gravityx::ContingencyContext extended_context;
+        extended_context.borrow_base_state(extended_base);
+        extended_context.outaged_branch = branch_context.outaged_branch;
+        gravityx::rebuild_contingency_state_derived_fields(extended, extended_base,
+            {1}, branch_contingency, extended_reference);
+        std::vector<unsigned char> tail_mask(extended.buses.size(), 0);
+        std::fill(tail_mask.begin(), tail_mask.begin() + original_buses, 1);
+        tail_mask[original_buses] = 2;
+        const auto complete_derivatives = gravityx::solve_linearized_active_feasibility_repair(
+            extended, extended_reference, {1}, extended_context,
+            0.5, 0.05, 5.0, 0.02, true, false, false, true, &tail_mask, false);
+        const auto omitted_derivatives = gravityx::solve_linearized_active_feasibility_repair(
+            extended, extended_reference, {1}, extended_context,
+            0.5, 0.05, 5.0, 0.02, true, false, false, true, &tail_mask, true);
+        if (!complete_derivatives.success || !omitted_derivatives.success ||
+            complete_derivatives.fixed_branch_derivatives_skipped != 0 ||
+            omitted_derivatives.fixed_branch_derivatives_skipped != 2 ||
+            omitted_derivatives.evaluated_branch_derivatives + 2 !=
+                complete_derivatives.evaluated_branch_derivatives ||
+            omitted_derivatives.solver_column_count != complete_derivatives.solver_column_count ||
+            omitted_derivatives.solver_row_count != complete_derivatives.solver_row_count ||
+            std::abs(omitted_derivatives.objective - complete_derivatives.objective) > 1e-6)
+            throw std::runtime_error("fixed-endpoint derivative omission differs from full-derivative oracle");
+        auto complete_point = complete_derivatives.state;
+        auto omitted_point = omitted_derivatives.state;
+        gravityx::rebuild_contingency_state_derived_fields(extended, extended_base,
+            {1}, branch_contingency, complete_point);
+        gravityx::rebuild_contingency_state_derived_fields(extended, extended_base,
+            {1}, branch_contingency, omitted_point);
+        const auto complete_check = gravityx::validate_state(extended,
+            gravityx::ModelMode::ContingencySoft, complete_point, {1}, extended_context);
+        const auto omitted_check = gravityx::validate_state(extended,
+            gravityx::ModelMode::ContingencySoft, omitted_point, {1}, extended_context);
+        if (std::abs(complete_check.max_residual - omitted_check.max_residual) > 1e-8)
+            throw std::runtime_error("derivative omission changed the full nonlinear check");
         if (frozen != gravityx::ac_state_to_json(fast_result.solve.state) ||
             frozen_base != gravityx::ac_state_to_json(solve.state))
             throw std::runtime_error("local repair changed input or original ramp anchor");
@@ -4113,7 +4185,8 @@ bool solve_loaded_contingency(
     bool persist_result = true,
     bool exact_parallel_seed = false,
     std::optional<double> quality_seed_objective_floor = std::nullopt,
-    bool local_contingency_repair = false) {
+    bool local_contingency_repair = false,
+    bool priority_quality_seeds = true) {
     reject_onedrive(output_path);
     if (quality_seed_objective_floor && (!std::isfinite(*quality_seed_objective_floor) ||
             !fast_only || fast_power_flow == nullptr))
@@ -4167,7 +4240,7 @@ bool solve_loaded_contingency(
                         gravityx::AcState state,
                         bool persist_full_state = false) {
         output["first_screen"] = first_screen_diagnostics;
-        output["quality_seed_enabled"] = quality_seed_objective_floor.has_value();
+        output["quality_seed_enabled"] = quality_seed_objective_floor.has_value() && priority_quality_seeds;
         output["quality_seed_objective_floor"] = quality_seed_objective_floor
             ? nlohmann::json(*quality_seed_objective_floor) : nlohmann::json(nullptr);
         output["quality_seed_probes"] = quality_seed_probes;
@@ -4280,7 +4353,7 @@ bool solve_loaded_contingency(
                     *rolling_corrective_seed_label;
             }
         }
-        if (!rolling_seed_fast_screen_selected && quality_seed_objective_floor &&
+        if (!rolling_seed_fast_screen_selected && priority_quality_seeds && quality_seed_objective_floor &&
             corrective_seed_bank != nullptr) {
             const auto started = std::chrono::steady_clock::now();
             std::vector<const CorrectiveSeed*> ranked;
@@ -5713,7 +5786,7 @@ void run_exact_parallel_peer_regression(
         quality_bank[0].objective = prior_objective;
         const auto frozen_seed = gravityx::ac_state_to_json(quality_bank[0].state);
         const auto check = [&](const std::vector<CorrectiveSeed>& inputs, double floor,
-                               bool local_repair = false) {
+                               bool local_repair = false, bool priority_seeds = true) {
             gravityx::FastPowerFlowOptions options;
             gravityx::enable_cached_economic_polish(options);
             options.fixed_jacobian_minimum_bus_count = 0;
@@ -5723,7 +5796,7 @@ void run_exact_parallel_peer_regression(
             const bool success = solve_loaded_contingency(data, base, second.label,
                 "component-quality-seed-no-write.json", 0, nullptr, false, &fast,
                 true, false, false, nullptr, nullptr, nullptr, &inputs, &result,
-                false, false, floor, local_repair);
+                false, false, floor, local_repair, priority_seeds);
             require(success && result && result->result.value("success", false), "tiny worker path failed");
             gravityx::ContingencyContext context; context.borrow_base_state(base.state);
             context.outaged_branch = second.component;
@@ -5772,6 +5845,11 @@ void run_exact_parallel_peer_regression(
                 below_floor.result.at("local_incumbent_objective").get<double>() - 1e-9 &&
             below_floor.result.at("solution_method") == "local_feasible_incumbent_with_cached_polish",
             "verified local incumbent was lost or re-entered global feasibility search");
+        const auto local_first = check(quality_bank, prior_objective - 1.0, true, false);
+        require(!local_first.result.at("quality_seed_enabled").get<bool>() &&
+            local_first.result.at("quality_seed_probes") == 0 &&
+            local_first.result.at("local_repair_selected").get<bool>(),
+            "disabled priority probes ran before the local candidate path");
         auto several = quality_bank;
         several.resize(5, quality_bank.front());
         for (std::size_t i = 0; i < several.size(); ++i) several[i].label = "tiny-seed-" + std::to_string(i);
@@ -6001,7 +6079,8 @@ int run_contingency_worker(
             (linearized_fallback || fast_only)
                 ? &corrective_seed_bank : nullptr,
             &completed_computation, !remove_output_after_result, exact_parallel_seed_found,
-            quality_seed_objective_floor, fast_only && cached_economic_contingency_polish);
+            quality_seed_objective_floor, fast_only && cached_economic_contingency_polish,
+            !(fast_only && cached_economic_contingency_polish));
         const double solve_call_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - solve_call_start).count();
         double result_read_seconds = 0.0;

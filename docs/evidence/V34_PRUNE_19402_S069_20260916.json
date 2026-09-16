@@ -1,0 +1,18 @@
+{
+  "family": "19402",
+  "scenario": "069",
+  "execute": true,
+  "pruned_run": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\reliability_v33_20260916\\19402_s069\\C2FEN19402_s069_cold",
+  "retained_run": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\reliability_v34_20260916\\19402_s069\\C2FEN19402_s069_cold",
+  "pruned_objective": 888739.2736124059,
+  "retained_objective": 888780.0934678924,
+  "pruned_archive": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\reliability_v33_20260916\\19402_s069\\C2FEN19402_s069_cold.evidence.json",
+  "pruned_archive_sha256": "563122ef5b1f59303c3dd6d88bf7b931008fe260b7023eabb2c4cfa5e16aadc2",
+  "retained_archive": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\reliability_v34_20260916\\19402_s069\\C2FEN19402_s069_cold.evidence.json",
+  "retained_archive_sha256": "aaac4462dab239bdfc670fe962009d9962d7065738cc3cc8295fef40fedc1683",
+  "payload_entries": 13288,
+  "apparent_bytes": 23738020436,
+  "free_bytes_before": 30077681664,
+  "free_bytes_after": 41902927872,
+  "reclaimed_physical_bytes": 11825246208
+}

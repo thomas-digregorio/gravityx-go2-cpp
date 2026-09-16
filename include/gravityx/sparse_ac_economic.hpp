@@ -24,8 +24,10 @@ struct SparseAcEconomicResult {
     bool solver_initialized{};
     bool candidate_returned{};
     bool candidate_verified{};
+    bool incumbent_verified{};
     bool best_intermediate_found{};
     bool improved{};
+    bool common_corrective_reference{};
     int application_status{-99};
     int solver_return_status{-99};
     int iterations{-1};
@@ -64,6 +66,17 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
     const std::vector<int>& commitment,
     const SolveResult& incumbent,
     const SparseAcEconomicOptions& options = {});
+
+// Starts from this run's verified base, which remains the immutable anchor
+// for every corrective bound. No actual outage is solved or certified here.
+SparseAcEconomicResult solve_sparse_common_corrective_reference(
+    const CaseData& data, const std::vector<int>& commitment,
+    const SolveResult& original_base,
+    const SparseAcEconomicOptions& options = {});
+
+void run_sparse_ac_corrective_reference_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& original_base);
 
 // Tiny-fixture checks of equivalent costs, unchanged physical rows/bounds,
 // and the new analytic cost Jacobian. Does not solve a production case.

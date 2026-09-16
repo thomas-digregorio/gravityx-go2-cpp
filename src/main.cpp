@@ -1042,6 +1042,8 @@ int run_parallel_circuit_regression() {
     sparse_ac_options.acceptable_tolerance = 1e-5;
     gravityx::run_sparse_ac_pwl_epigraph_regression(
         data, {1}, source_base.solve.state);
+    gravityx::run_sparse_ac_corrective_reference_regression(
+        data, {1}, source_base.solve.state);
     const auto sparse_ac_economic =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, {1}, source_base.solve, sparse_ac_options);
@@ -1073,6 +1075,15 @@ int run_parallel_circuit_regression() {
         epigraph_economic.selected.objective + 1e-9 < source_base.solve.objective) {
         throw std::runtime_error("epigraph economic tiny solve failed: " +
                                  epigraph_economic.to_json(false).dump());
+    }
+    const auto original_base_json = gravityx::ac_state_to_json(source_base.solve.state);
+    const auto common_reference = gravityx::solve_sparse_common_corrective_reference(
+        data, {1}, source_base.solve, epigraph_options);
+    if (!common_reference.solver_initialized ||
+        !common_reference.common_corrective_reference ||
+        common_reference.selected_validation.max_residual > 1e-5 ||
+        original_base_json != gravityx::ac_state_to_json(source_base.solve.state)) {
+        throw std::runtime_error("common corrective tiny solve failed or mutated base");
     }
     auto inactive_branch_data = data;
     inactive_branch_data.branches[0].status = 0;
@@ -1465,6 +1476,29 @@ int run_parallel_circuit_regression() {
         throw std::runtime_error(
             "validated fast power-flow contingency regression failed: "
             + fast_result.failure_reason);
+    }
+    {
+        gravityx::FastPowerFlowOptions reference_options;
+        gravityx::enable_cached_economic_polish(reference_options);
+        reference_options.fixed_jacobian_minimum_bus_count = 0;
+        reference_options.fixed_jacobian_screen_only = true;
+        reference_options.fixed_jacobian_linearization_state = &common_reference.selected.state;
+        gravityx::FastContingencyPowerFlow reference_solver(
+            data, source_base.solve.state, {1}, reference_options);
+        const auto reference_outage = reference_solver.solve(
+            branch_contingency, common_reference.selected.state);
+        gravityx::ContingencyContext original_context;
+        original_context.borrow_base_state(source_base.solve.state);
+        original_context.outaged_branch = branch_contingency.component;
+        const auto original_check = gravityx::validate_state(
+            data, gravityx::ModelMode::ContingencySoft,
+            reference_outage.solve.state, {1}, original_context);
+        if (!reference_outage.feasible || original_check.max_residual > 1e-5 ||
+            (reference_outage.common_reference_base_candidate_verified &&
+             reference_outage.solve.objective + 1e-8 <
+                 reference_outage.common_reference_base_candidate_objective)) {
+            throw std::runtime_error("shared-reference outage lost original context/incumbent");
+        }
     }
     {
         // A small generator outage is already feasible with source-allowed
@@ -2136,7 +2170,8 @@ int run_validated_source_base_json(
     double economic_refinement_seconds = 0.0,
     double sparse_economic_refinement_seconds = 0.0,
     double sparse_ac_economic_refinement_seconds = 0.0,
-    bool base_pwl_epigraph = false) {
+    bool base_pwl_epigraph = false,
+    double common_corrective_reference_seconds = 0.0) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto command_start = std::chrono::steady_clock::now();
@@ -3049,6 +3084,50 @@ int run_validated_source_base_json(
             "sparse_ac_economic_refinement_complete",
             sparse_ac_economic_refinement_json);
     }
+    nlohmann::json common_corrective_reference = nullptr;
+    if (success && common_corrective_reference_seconds > 0.0) {
+        const auto reference_start = std::chrono::steady_clock::now();
+        const auto original_base_json = gravityx::ac_state_to_json(selected_solve.state);
+        nlohmann::json attempt = {
+            {"available", false}, {"counted_as_contingency", false},
+            {"requested_total_seconds", common_corrective_reference_seconds},
+        };
+        log_base_phase("common_corrective_reference_start", attempt);
+        try {
+            gravityx::SparseAcEconomicOptions options;
+            options.time_limit_seconds = common_corrective_reference_seconds;
+            options.pwl_epigraph = true;
+            const auto reference = gravityx::solve_sparse_common_corrective_reference(
+                data, commitment, selected_solve, options);
+            const bool available = reference.improved &&
+                std::isfinite(reference.selected.objective) &&
+                reference.selected_validation.max_residual <= options.acceptable_tolerance;
+            attempt = reference.to_json(available);
+            attempt["available"] = available;
+        } catch (const std::exception& error) {
+            attempt["status"] = "exception_preserved_original_base";
+            attempt["error"] = error.what();
+        }
+        // This reference is a candidate, never a replacement base/ramp anchor.
+        if (original_base_json != gravityx::ac_state_to_json(selected_solve.state)) {
+            throw std::runtime_error("common corrective construction mutated original base");
+        }
+        attempt["generated_from_current_base"] = true;
+        attempt["base_anchor_unchanged"] = true;
+        attempt["counted_as_contingency"] = false;
+        attempt["requested_total_seconds"] = common_corrective_reference_seconds;
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - reference_start).count();
+        attempt["total_wall_seconds"] = seconds;
+        wall_seconds += seconds;
+        log_base_phase("common_corrective_reference_complete", {
+            {"available", attempt.value("available", false)},
+            {"wall_seconds", seconds},
+            {"selected_objective", attempt.contains("selected")
+                ? attempt["selected"].value("objective", 0.0) : 0.0},
+        });
+        common_corrective_reference = std::move(attempt);
+    }
     gravityx::IbrResult result;
     result.success = success;
     result.wall_seconds = wall_seconds;
@@ -3069,6 +3148,7 @@ int run_validated_source_base_json(
         sparse_economic_refinement_json;
     output["sparse_ac_economic_refinement"] =
         sparse_ac_economic_refinement_json;
+    output["common_corrective_reference"] = common_corrective_reference;
     write_json_file(output_path, output);
     std::cout << nlohmann::json({
         {"output", output_path},
@@ -3085,6 +3165,7 @@ int run_validated_source_base_json(
 struct BasePoint {
     std::vector<int> commitment;
     gravityx::AcState state;
+    std::optional<gravityx::AcState> common_corrective_reference;
 };
 
 struct CorrectiveSeed {
@@ -3105,10 +3186,25 @@ BasePoint load_base_point(const std::string& base_result_path) {
     if (!base_json.contains("commitment") || !base_json.contains("selected_state")) {
         throw std::runtime_error("base IBR result lacks commitment or selected_state");
     }
-    return {
+    BasePoint result{
         base_json.at("commitment").get<std::vector<int>>(),
         gravityx::ac_state_from_json(base_json.at("selected_state")),
+        std::nullopt,
     };
+    if (base_json.contains("common_corrective_reference") &&
+        base_json.at("common_corrective_reference").is_object()) {
+        const auto& reference = base_json.at("common_corrective_reference");
+        if (reference.value("available", false)) {
+            if (!reference.value("generated_from_current_base", false) ||
+                !reference.value("base_anchor_unchanged", false) ||
+                reference.value("counted_as_contingency", true)) {
+                throw std::runtime_error("common corrective reference has invalid provenance");
+            }
+            result.common_corrective_reference = gravityx::ac_state_from_json(
+                reference.at("selected").at("state"));
+        }
+    }
+    return result;
 }
 
 int run_sparse_economic_refinement_json(
@@ -3356,8 +3452,12 @@ bool solve_loaded_contingency(
             }
         }
         if (!rolling_seed_fast_screen_selected) {
-            fast_result = fast_power_flow->solve(*match);
+            fast_result = base.common_corrective_reference
+                ? fast_power_flow->solve(*match, *base.common_corrective_reference)
+                : fast_power_flow->solve(*match);
             first_screen_diagnostics = {
+                {"common_corrective_reference_used",
+                 base.common_corrective_reference.has_value()},
                 {"seconds", fast_result->wall_seconds},
                 {"predictor_iterations", fast_result->fixed_jacobian_predictor_iterations},
                 {"predictor_budget_seconds", fast_result->effective_predictor_time_limit_seconds},
@@ -4615,6 +4715,18 @@ int run_contingency_worker(
     std::unique_ptr<gravityx::FastContingencyPowerFlow> fast_power_flow;
     gravityx::FastPowerFlowOptions fast_options;
     if (fast_power_flow_screen) {
+        if (base.common_corrective_reference) {
+            gravityx::ContingencyContext reference_context;
+            reference_context.borrow_base_state(base.state);
+            const auto reference_validation = gravityx::validate_state(
+                data, gravityx::ModelMode::ContingencySoft,
+                *base.common_corrective_reference, base.commitment, reference_context);
+            if (reference_validation.max_residual > 1e-5) {
+                throw std::runtime_error("shared corrective reference failed independent validation");
+            }
+            fast_options.fixed_jacobian_linearization_state =
+                &*base.common_corrective_reference;
+        }
         fast_options.fixed_jacobian_screen_only =
             fast_only && data.buses.size() >= 16000;
         fast_options.economic_balance_polish =
@@ -4650,6 +4762,10 @@ int run_contingency_worker(
             data, base.state, base.commitment, fast_options);
     }
     std::vector<CorrectiveSeed> corrective_seed_bank;
+    if (base.common_corrective_reference) {
+        corrective_seed_bank.push_back({
+            "within_run_common_corrective_reference", *base.common_corrective_reference});
+    }
     std::cout << "GRAVITYX_WORKER_READY" << std::endl;
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -4887,6 +5003,9 @@ int run_contingency_worker(
                          "economic_direct_candidate_verified",
                          "economic_direct_incumbent_selected",
                          "economic_direct_candidate_objective",
+                         "common_reference_base_candidate_verified",
+                         "common_reference_base_candidate_selected",
+                         "common_reference_base_candidate_objective",
                          "economic_balance_polish_selected",
                          "economic_balance_polish_iterations",
                          "economic_balance_polish_backtracking_attempts",
@@ -4995,7 +5114,7 @@ int main(int argc, char** argv) {
             }
             return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
-        if ((argc >= 4 && argc <= 10) &&
+        if ((argc >= 4 && argc <= 11) &&
             std::string(argv[1]) == "validated-source-base-json") {
             bool allow_exact_fallback = true;
             bool allow_large_base_newton_restart = true;
@@ -5003,6 +5122,7 @@ int main(int argc, char** argv) {
             double sparse_economic_refinement_seconds = 0.0;
             double sparse_ac_economic_refinement_seconds = 0.0;
             bool base_pwl_epigraph = false;
+            double common_corrective_reference_seconds = 0.0;
             for (int i = 4; i < argc; ++i) {
                 const std::string option = argv[i];
                 if (option == "fast-only") {
@@ -5011,6 +5131,16 @@ int main(int argc, char** argv) {
                     base_pwl_epigraph = true;
                 } else if (option == "robust-contingency-seed") {
                     allow_large_base_newton_restart = false;
+                } else if (option.rfind("common-corrective-reference-seconds=", 0) == 0) {
+                    const auto value = option.substr(
+                        std::string("common-corrective-reference-seconds=").size());
+                    std::size_t parsed = 0;
+                    common_corrective_reference_seconds = std::stod(value, &parsed);
+                    if (parsed != value.size() ||
+                        !std::isfinite(common_corrective_reference_seconds) ||
+                        common_corrective_reference_seconds <= 0.0) {
+                        throw std::runtime_error("common corrective reference budget must be positive and finite");
+                    }
                 } else if (option.rfind(
                                "economic-refinement-seconds=", 0) == 0) {
                     economic_refinement_seconds = std::stod(
@@ -5057,7 +5187,7 @@ int main(int argc, char** argv) {
                 economic_refinement_seconds,
                 sparse_economic_refinement_seconds,
                 sparse_ac_economic_refinement_seconds,
-                base_pwl_epigraph);
+                base_pwl_epigraph, common_corrective_reference_seconds);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;

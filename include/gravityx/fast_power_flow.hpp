@@ -22,6 +22,9 @@ struct FastPowerFlowOptions {
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
+    // Linearization only. Source corrective bounds and every validator keep
+    // using the constructor's immutable base_state, never this candidate.
+    const AcState* fixed_jacobian_linearization_state{};
     bool fixed_jacobian_screen_only{false};
     // Explicit cooperative override. Infinity selects the class policy for
     // first-stage screens; ordinary repair calls remain unbounded here.
@@ -95,6 +98,9 @@ struct FastPowerFlowResult {
     bool economic_direct_candidate_verified{};
     bool economic_direct_incumbent_selected{};
     double economic_direct_candidate_objective{};
+    bool common_reference_base_candidate_verified{};
+    bool common_reference_base_candidate_selected{};
+    double common_reference_base_candidate_objective{};
     bool economic_balance_polish_threshold_passed{};
     double economic_balance_polish_objective_threshold{};
     bool economic_balance_polish_selected{};
@@ -177,6 +183,12 @@ double rebuild_contingency_state_derived_fields(
     const Contingency& contingency,
     AcState& state,
     double balance_slack_upper = 0.5);
+
+// Candidate generation only: original corrective bounds/cost interval and
+// ratings, with no component removed. This is never a source contingency.
+double rebuild_common_corrective_reference_state(
+    const CaseData& data, const AcState& original_base,
+    const std::vector<int>& commitment, AcState& state);
 
 class FastContingencyPowerFlow {
 public:

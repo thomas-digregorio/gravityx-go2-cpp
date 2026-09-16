@@ -2366,6 +2366,9 @@ nlohmann::json FastPowerFlowResult::economic_summary_json() const {
         {"economic_direct_candidate_verified", economic_direct_candidate_verified},
         {"economic_direct_incumbent_selected", economic_direct_incumbent_selected},
         {"economic_direct_candidate_objective", economic_direct_candidate_objective},
+        {"common_reference_base_candidate_verified", common_reference_base_candidate_verified},
+        {"common_reference_base_candidate_selected", common_reference_base_candidate_selected},
+        {"common_reference_base_candidate_objective", common_reference_base_candidate_objective},
         {"economic_balance_polish_selected", economic_balance_polish_selected},
         {"economic_balance_polish_iterations", economic_balance_polish_iterations},
         {"economic_balance_polish_backtracking_attempts", economic_balance_polish_backtracking_attempts},
@@ -2413,6 +2416,9 @@ nlohmann::json FastPowerFlowResult::to_json() const {
         {"economic_direct_candidate_verified", economic_direct_candidate_verified},
         {"economic_direct_incumbent_selected", economic_direct_incumbent_selected},
         {"economic_direct_candidate_objective", economic_direct_candidate_objective},
+        {"common_reference_base_candidate_verified", common_reference_base_candidate_verified},
+        {"common_reference_base_candidate_selected", common_reference_base_candidate_selected},
+        {"common_reference_base_candidate_objective", common_reference_base_candidate_objective},
         {"economic_balance_polish_threshold_passed",
          economic_balance_polish_threshold_passed},
         {"economic_balance_polish_objective_threshold",
@@ -2698,6 +2704,18 @@ double rebuild_contingency_state_derived_fields(
         balance_slack_upper, true);
 }
 
+double rebuild_common_corrective_reference_state(
+    const CaseData& data, const AcState& original_base,
+    const std::vector<int>& commitment, AcState& state) {
+    // The -1 component means no removal to the flow/economic rebuilders.
+    // This internal candidate is not added to data.contingencies or counted
+    // in the source label set or official scenario objective.
+    const Contingency no_outage{
+        "internal-common-corrective-reference", ContingencyType::Branch, -1, -1};
+    return rebuild_contingency_state_fields(
+        data, original_base, commitment, no_outage, state, 0.5, true);
+}
+
 ValidatedSourceBaseResult build_validated_source_base(
     const CaseData& data,
     std::vector<int> commitment,
@@ -2830,6 +2848,16 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
         base_state_.pg.size() != data_.generators.size()) {
         throw std::runtime_error("fast power flow base state has wrong dimensions");
     }
+    if (options_.fixed_jacobian_linearization_state != nullptr) {
+        const auto& reference = *options_.fixed_jacobian_linearization_state;
+        if (reference.vm.size() != data_.buses.size() ||
+            reference.va.size() != data_.buses.size() ||
+            reference.pg.size() != data_.generators.size() ||
+            reference.qg.size() != data_.generators.size() ||
+            reference.demand_factor.size() != data_.loads.size()) {
+            throw std::runtime_error("fast power flow linearization has wrong dimensions");
+        }
+    }
     if (!std::isfinite(options_.balance_cleanup_fraction) ||
         options_.balance_cleanup_fraction <= 0.0 ||
         options_.balance_cleanup_fraction > 1.0) {
@@ -2857,7 +2885,31 @@ FastPowerFlowResult FastContingencyPowerFlow::solve(
 FastPowerFlowResult FastContingencyPowerFlow::solve(
     const Contingency& contingency,
     const AcState& initial_state) const {
-    return solve_impl(&contingency, &initial_state);
+    const auto start = std::chrono::steady_clock::now();
+    auto result = solve_impl(&contingency, &initial_state);
+    if (options_.fixed_jacobian_linearization_state != nullptr) {
+        // The common reference is only another cold-within-run candidate.
+        // Retain a better direct application of the original base as well.
+        const auto original = solve_impl(&contingency, &base_state_, true);
+        result.common_reference_base_candidate_verified = original.feasible;
+        if (original.feasible) {
+            result.common_reference_base_candidate_objective = original.solve.objective;
+            if (!result.feasible || original.solve.objective > result.solve.objective + 1e-9) {
+                result.solve = original.solve;
+                result.validation = original.validation;
+                result.feasible = result.converged = true;
+                result.direct_candidate_selected = true;
+                result.fixed_jacobian_predictor_selected = false;
+                result.economic_balance_polish_selected = false;
+                result.common_reference_base_candidate_selected = true;
+                result.failure_reason.clear();
+            }
+        }
+    }
+    result.wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    result.solve.wall_seconds = result.wall_seconds;
+    return result;
 }
 
 FastPowerFlowResult FastContingencyPowerFlow::screen_candidate(
@@ -3176,7 +3228,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             predictor_load_reactive_upper[load_index] = reactive;
             continue;
         }
-        const double prior = predictor_load_power_preferred[load_index];
+        // The supplied candidate may be a common within-run reference or
+        // another corrective state. It must not become a new ramp anchor.
+        const double prior = base_mode
+            ? predictor_load_power_preferred[load_index]
+            : load.pd_nominal * base_state_.demand_factor[load_index];
         const double factor_lower = std::max(
             load.tmin,
             (prior - data_.delta_r_ctg * load.prdmaxctg) /
@@ -3280,9 +3336,11 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
         static_cast<std::size_t>(nb) >= options_.fixed_jacobian_minimum_bus_count &&
         options_.enable_fixed_jacobian_predictor) {
         output.fixed_jacobian_predictor_attempted = true;
+        const AcState& linearization_state = options_.fixed_jacobian_linearization_state
+            ? *options_.fixed_jacobian_linearization_state : base_state_;
         if (!predictor_cache_) {
             predictor_cache_ = std::make_unique<FixedJacobianPredictorCache>(
-                data_, base_state_, commitment_);
+                data_, linearization_state, commitment_);
             output.fixed_jacobian_predictor_preparation_seconds =
                 predictor_cache_->preparation_seconds;
         }
@@ -3292,7 +3350,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             // outage. In particular, transformer searches do not prepare the
             // line-only update below before their first correction.
             predictor_cache_->configure_branch_outage_update(
-                data_, base_state_, -1);
+                data_, linearization_state, -1);
         }
         if (predictor_cache_ && predictor_cache_->valid) {
             AcState predictor_state = initial_state;
@@ -4244,7 +4302,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     !data_.branches[outaged_branch].transformer) {
                     branch_outage_low_rank_update =
                         predictor_cache_->configure_branch_outage_update(
-                            data_, base_state_, outaged_branch);
+                            data_, linearization_state, outaged_branch);
                     if (options_.capture_diagnostics) {
                         output.fixed_jacobian_predictor_trace.back()[
                             "branch_outage_low_rank_prepared"] =

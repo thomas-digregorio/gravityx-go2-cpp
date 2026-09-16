@@ -128,6 +128,23 @@ class ReliabilityAuditTests(unittest.TestCase):
         self.assertEqual(after, before + ["--base-pwl-epigraph"])
         self.assertIn("--validated-source-base", after)
 
+    def test_common_corrective_reference_is_explicit_and_cold(self):
+        config = {"python": "python", "data_repository": "data", "source_root": "sources",
+                  "vendor_evaluator": "evaluator", "total_time_limit": 300,
+                  "minimum_free_space_gib": 30}
+        before = arguments(config, "19402", "095", Path("run"))
+        config["common_corrective_reference_seconds"] = 30
+        after = arguments(config, "19402", "095", Path("run"))
+        self.assertEqual(after, before + ["--common-corrective-reference-seconds", "30.0"])
+        self.assertIn("--validated-source-base", after)
+        self.assertEqual(after[after.index("--total-time-limit") + 1], "300")
+        self.assertNotIn("--skip-evaluation", after)
+        self.assertNotIn("--base-json", after)
+        for invalid in (-1, float("nan"), float("inf")):
+            config["common_corrective_reference_seconds"] = invalid
+            with self.assertRaises(ValueError):
+                arguments(config, "19402", "095", Path("run"))
+
     def test_predictor_handoff_budget_is_explicit_hash_bound_and_not_a_measurement(self):
         profile = {"schema_version": 4, "case_sha256": "case", "heavy_threshold_seconds": 10,
                    "contingencies": [{"label": "a", "measured_solver_wall_seconds": 20}],

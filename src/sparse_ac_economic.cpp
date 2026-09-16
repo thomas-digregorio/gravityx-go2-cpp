@@ -87,6 +87,59 @@ std::pair<double, double> base_load_bounds(
     return {lower, upper};
 }
 
+std::pair<double, double> corrective_pg_bounds(
+    const Generator& generator, int commitment, double original_pg,
+    double delta_r_ctg) {
+    if (commitment == 0) {
+        return {0.0, 0.0};
+    }
+    const double lower = std::max(
+        generator.pmin, original_pg - delta_r_ctg * generator.prdmaxctg);
+    const double upper = std::min(
+        generator.pmax, original_pg + delta_r_ctg * generator.prumaxctg);
+    if (lower > upper + 1e-12) {
+        throw std::runtime_error("empty corrective generator interval: " +
+                                 generator.source_key);
+    }
+    return {lower, upper};
+}
+
+std::pair<double, double> corrective_load_bounds(
+    const Load& load, double original_factor, double delta_r_ctg) {
+    if (std::abs(load.pd_nominal) <= 1e-12) {
+        return {load.tmin, load.tmax};
+    }
+    const double previous = load.pd_nominal * original_factor;
+    // Deliberately matches the independent source-semantics checker.
+    const double lower = std::max(
+        load.tmin, (previous - delta_r_ctg * load.prdmaxctg) / load.pd_nominal);
+    const double upper = std::min(
+        load.tmax, (previous + delta_r_ctg * load.prumaxctg) / load.pd_nominal);
+    if (lower > upper + 1e-12) {
+        throw std::runtime_error("empty corrective load interval: " + load.source_key);
+    }
+    return {lower, upper};
+}
+
+double rebuild_economic_candidate(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState* original_base, AcState& state) {
+    return original_base != nullptr
+        ? rebuild_common_corrective_reference_state(data, *original_base, commitment, state)
+        : rebuild_base_state_derived_fields(data, commitment, state);
+}
+
+ValidationReport validate_economic_candidate(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState* original_base, const AcState& state) {
+    if (original_base != nullptr) {
+        ContingencyContext context;
+        context.borrow_base_state(*original_base);
+        return validate_state(data, ModelMode::ContingencySoft, state, commitment, context);
+    }
+    return validate_state(data, ModelMode::BaseSoft, state, commitment);
+}
+
 std::pair<double, double> pwl_value_slope(
     const std::vector<PwlPoint>& points,
     double power) {
@@ -265,10 +318,14 @@ public:
         std::vector<int> commitment,
         const AcState& start,
         double verification_tolerance,
-        bool pwl_epigraph = false)
+        bool pwl_epigraph = false,
+        const AcState* original_corrective_base = nullptr)
         : data_(data),
           commitment_(std::move(commitment)),
           start_state_(start),
+          original_corrective_base_(original_corrective_base),
+          interval_duration_(original_corrective_base != nullptr
+              ? data.delta_ctg : data.delta),
           verification_tolerance_(verification_tolerance),
           nb_(static_cast<int>(data.buses.size())),
           ng_(static_cast<int>(data.generators.size())),
@@ -329,9 +386,10 @@ public:
             2 * static_cast<int>(active_branches_.size());
         for (int branch : active_branches_) {
             const auto& item = data_.branches[branch];
-            const double source_delta =
-                data_.buses[item.from].va_start -
-                data_.buses[item.to].va_start;
+            const double source_delta = original_corrective_base_ != nullptr
+                ? original_corrective_base_->va[item.from] -
+                    original_corrective_base_->va[item.to]
+                : data_.buses[item.from].va_start - data_.buses[item.to].va_start;
             if (source_delta >= item.angmin &&
                 source_delta <= item.angmax) {
                 angle_branches_.push_back(branch);
@@ -437,7 +495,7 @@ public:
             if (commitment_[i] == 0 || generator_epigraph_column_[i] >= 0) {
                 continue;
             }
-            gradient[pg_offset_ + i] = data_.delta *
+            gradient[pg_offset_ + i] = interval_duration_ *
                 pwl_value_slope(
                     generator_points_[i], x[pg_offset_ + i]).second /
                 objective_scale_;
@@ -447,18 +505,18 @@ public:
                 continue;
             }
             const auto& load = data_.loads[i];
-            gradient[demand_offset_ + i] = -data_.delta * load.pd_nominal *
+            gradient[demand_offset_ + i] = -interval_duration_ * load.pd_nominal *
                 pwl_value_slope(
                     load_points_[i],
                     load.pd_nominal * x[demand_offset_ + i]).second /
                 objective_scale_;
         }
         const double p_penalty =
-            data_.delta * data_.p_delta_cost_approx / objective_scale_;
+            interval_duration_ * data_.p_delta_cost_approx / objective_scale_;
         const double q_penalty =
-            data_.delta * data_.q_delta_cost_approx / objective_scale_;
+            interval_duration_ * data_.q_delta_cost_approx / objective_scale_;
         const double sm_penalty =
-            data_.delta * data_.sm_cost_approx / objective_scale_;
+            interval_duration_ * data_.sm_cost_approx / objective_scale_;
         std::fill(
             gradient + p_delta_offset_,
             gradient + p_delta_offset_ + nb_, p_penalty);
@@ -469,7 +527,7 @@ public:
             gradient + sm_offset_,
             gradient + sm_offset_ + nl_, sm_penalty);
         for (const auto& [column, scale] : epigraph_weights_) {
-            gradient[column] = data_.delta * scale / objective_scale_;
+            gradient[column] = interval_duration_ * scale / objective_scale_;
         }
         return true;
     }
@@ -555,11 +613,10 @@ public:
                 candidate.status = 0;
                 candidate.iterations = static_cast<int>(iteration);
                 candidate.state = state_from_x(current_x);
-                candidate.objective = rebuild_base_state_derived_fields(
-                    data_, commitment_, candidate.state);
-                const auto validation = validate_state(
-                    data_, ModelMode::BaseSoft,
-                    candidate.state, commitment_);
+                candidate.objective = rebuild_economic_candidate(
+                    data_, commitment_, original_corrective_base_, candidate.state);
+                const auto validation = validate_economic_candidate(
+                    data_, commitment_, original_corrective_base_, candidate.state);
                 if (std::isfinite(candidate.objective) &&
                     validation.max_residual <= verification_tolerance_) {
                     ++intermediate_verified_candidates_;
@@ -704,8 +761,10 @@ private:
             if (commitment_[i] != 0 && commitment_[i] != 1) {
                 throw std::runtime_error("sparse AC commitment is not binary");
             }
-            const auto bounds = base_pg_bounds(
-                data_.generators[i], commitment_[i], data_.delta_r);
+            const auto bounds = original_corrective_base_ != nullptr
+                ? corrective_pg_bounds(data_.generators[i], commitment_[i],
+                    original_corrective_base_->pg[i], data_.delta_r_ctg)
+                : base_pg_bounds(data_.generators[i], commitment_[i], data_.delta_r);
             x_lower_[pg_offset_ + i] = bounds.first;
             x_upper_[pg_offset_ + i] = bounds.second;
             x_lower_[qg_offset_ + i] = commitment_[i]
@@ -725,7 +784,10 @@ private:
             }
         }
         for (int i = 0; i < nd_; ++i) {
-            const auto bounds = base_load_bounds(data_.loads[i], data_.delta_r);
+            const auto bounds = original_corrective_base_ != nullptr
+                ? corrective_load_bounds(data_.loads[i],
+                    original_corrective_base_->demand_factor[i], data_.delta_r_ctg)
+                : base_load_bounds(data_.loads[i], data_.delta_r);
             x_lower_[demand_offset_ + i] = bounds.first;
             x_upper_[demand_offset_ + i] = bounds.second;
             start_x_[demand_offset_ + i] = std::clamp(
@@ -803,28 +865,28 @@ private:
                 continue;
             }
             if (generator_epigraph_column_[i] < 0) {
-                objective += data_.delta * pwl_value_slope(
+                objective += interval_duration_ * pwl_value_slope(
                     generator_points_[i], x[pg_offset_ + i]).first;
             }
-            objective += data_.delta * data_.generators[i].oncost;
+            objective += interval_duration_ * data_.generators[i].oncost;
         }
         for (int i = 0; i < nd_; ++i) {
             if (load_epigraph_column_[i] < 0) {
-                objective -= data_.delta * pwl_value_slope(
+                objective -= interval_duration_ * pwl_value_slope(
                     load_points_[i],
                     data_.loads[i].pd_nominal * x[demand_offset_ + i]).first;
             }
         }
         for (const auto& [column, scale] : epigraph_weights_) {
-            objective += data_.delta * scale * x[column];
+            objective += interval_duration_ * scale * x[column];
         }
-        objective += data_.delta * data_.p_delta_cost_approx *
+        objective += interval_duration_ * data_.p_delta_cost_approx *
             std::accumulate(
                 x + p_delta_offset_, x + p_delta_offset_ + nb_, 0.0);
-        objective += data_.delta * data_.q_delta_cost_approx *
+        objective += interval_duration_ * data_.q_delta_cost_approx *
             std::accumulate(
                 x + q_delta_offset_, x + q_delta_offset_ + nb_, 0.0);
-        objective += data_.delta * data_.sm_cost_approx *
+        objective += interval_duration_ * data_.sm_cost_approx *
             std::accumulate(x + sm_offset_, x + sm_offset_ + nl_, 0.0);
         return objective / objective_scale_;
     }
@@ -887,7 +949,9 @@ private:
             const double to_rating_voltage = branch.transformer
                 ? 1.0 + slack
                 : x[vm_offset_ + branch.to] + slack;
-            const double rating_squared = branch.rate_a * branch.rate_a;
+            const double rating = original_corrective_base_ != nullptr
+                ? branch.rate_c : branch.rate_a;
+            const double rating_squared = rating * rating;
             constraints[thermal_row_offset_ + 2 * position] =
                 flow.flow[0] * flow.flow[0] +
                 flow.flow[1] * flow.flow[1] -
@@ -1023,7 +1087,9 @@ private:
         const double slack = x == nullptr ? 0.0 : x[sm_offset_ + branch_index];
         const auto flow = evaluate_branch(
             coefficients_[branch_index], vm_from, vm_to, va_from - va_to);
-        const double rating_squared = branch.rate_a * branch.rate_a;
+        const double rating = original_corrective_base_ != nullptr
+            ? branch.rate_c : branch.rate_a;
+        const double rating_squared = rating * rating;
         for (int side = 0; side < 2; ++side) {
             const int active_component = side == 0 ? 0 : 2;
             const int reactive_component = active_component + 1;
@@ -1160,6 +1226,8 @@ private:
     const CaseData& data_;
     std::vector<int> commitment_;
     AcState start_state_;
+    const AcState* original_corrective_base_{};
+    double interval_duration_{};
     double verification_tolerance_{};
     int nb_{};
     int ng_{};
@@ -1343,12 +1411,135 @@ void run_sparse_ac_pwl_epigraph_regression(
     }
 }
 
+void run_sparse_ac_corrective_reference_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& original_base) {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) {
+            throw std::runtime_error(std::string("corrective reference regression: ") + message);
+        }
+    };
+    require(!data.generators.empty() && !data.loads.empty(), "fixture lacks controls");
+    const auto frozen_base = ac_state_to_json(original_base);
+    auto fixture = data;
+    fixture.delta = 1.75;
+    fixture.delta_ctg = 0.25;
+    fixture.delta_r_ctg = 0.125;
+    auto& generator = fixture.generators[0];
+    generator.pmin = std::min(0.2, 0.5 * original_base.pg[0]);
+    generator.pg_prev = original_base.pg[0] + 0.4;
+    generator.prdmaxctg = 0.16;
+    generator.prumaxctg = 0.24;
+    auto& load = fixture.loads[0];
+    load.tmin = 0.5;
+    load.tmax = 1.5;
+    load.pd_prev = load.pd_nominal * (original_base.demand_factor[0] + 0.3);
+    load.prdmaxctg = 0.04;
+    load.prumaxctg = 0.08;
+    for (auto& branch : fixture.branches) {
+        branch.rate_c = 1.5 * branch.rate_a;
+    }
+    AcState start = original_base;
+    const double native_objective = rebuild_common_corrective_reference_state(
+        fixture, original_base, commitment, start);
+    SparseAcEconomicNlp model(fixture, commitment, start, 1e-5, true, &original_base);
+    Ipopt::Index n, m, entries, h;
+    Ipopt::TNLP::IndexStyleEnum style;
+    model.get_nlp_info(n, m, entries, h, style);
+    std::vector<double> x(n), lo(n), hi(n), gl(m), gu(m), g(m);
+    model.get_bounds_info(n, lo.data(), hi.data(), m, gl.data(), gu.data());
+    model.get_starting_point(n, true, x.data(), false, nullptr, nullptr,
+                             m, false, nullptr);
+    const int nb = static_cast<int>(fixture.buses.size());
+    const int ng = static_cast<int>(fixture.generators.size());
+    const int pg_column = 2 * nb;
+    const int demand_column = 2 * nb + 2 * ng;
+    require(generator.pmin > 0.0 &&
+            std::abs(lo[pg_column] - std::max(generator.pmin,
+                original_base.pg[0] - 0.125 * 0.16)) < 1e-12 &&
+            std::abs(hi[pg_column] - std::min(generator.pmax,
+                original_base.pg[0] + 0.125 * 0.24)) < 1e-12,
+            "generator bounds/PMIN do not use original base and corrective ramps");
+    require(std::abs(lo[demand_column] - std::max(load.tmin,
+                original_base.demand_factor[0] - 0.125 * 0.04 / load.pd_nominal)) < 1e-12 &&
+            std::abs(hi[demand_column] - std::min(load.tmax,
+                original_base.demand_factor[0] + 0.125 * 0.08 / load.pd_nominal)) < 1e-12,
+            "load bounds do not use original base and corrective ramps");
+    require(corrective_pg_bounds(generator, 0, original_base.pg[0], 0.125) ==
+                std::pair<double, double>{0.0, 0.0}, "uncommitted generator made available");
+    double objective = 0.0;
+    model.eval_f(n, x.data(), true, objective);
+    const double objective_scale = std::max({1.0, fixture.p_delta_cost_approx,
+        fixture.q_delta_cost_approx, fixture.sm_cost_approx});
+    require(std::abs(-objective * objective_scale - native_objective) < 1e-7,
+            "reference objective differs from independent corrective rebuild");
+    model.eval_g(n, x.data(), true, m, g.data());
+    int active_position = 0;
+    for (std::size_t i = 0; i < fixture.branches.size(); ++i) {
+        const auto& branch = fixture.branches[i];
+        if (branch.status == 0) continue;
+        const double limit = branch.rate_c * (branch.transformer
+            ? 1.0 + start.sm_slack[i] : start.vm[branch.from] + start.sm_slack[i]);
+        const double expected = start.pf[i] * start.pf[i] + start.qf[i] * start.qf[i]
+            - limit * limit;
+        require(std::abs(g[4 * nb + 2 * active_position] - expected) < 1e-10,
+                "reference does not use source corrective thermal rating");
+        ++active_position;
+    }
+    // Moving a candidate does not move any original-base-dependent bound.
+    auto shifted = start;
+    shifted.pg[0] += 0.01;
+    shifted.demand_factor[0] += 0.005;
+    SparseAcEconomicNlp shifted_model(
+        fixture, commitment, shifted, 1e-5, true, &original_base);
+    std::vector<double> shifted_lo(n), shifted_hi(n), shifted_gl(m), shifted_gu(m);
+    shifted_model.get_bounds_info(n, shifted_lo.data(), shifted_hi.data(), m,
+                                  shifted_gl.data(), shifted_gu.data());
+    require(lo == shifted_lo && hi == shifted_hi && gl == shifted_gl && gu == shifted_gu,
+            "candidate changed the corrective bound anchor");
+    auto invalid = start;
+    invalid.pg[0] = hi[pg_column] + 0.01;
+    rebuild_common_corrective_reference_state(fixture, original_base, commitment, invalid);
+    require(validate_economic_candidate(fixture, commitment, &original_base, invalid)
+                .max_residual > 1e-5, "out-of-ramp candidate accepted");
+
+    std::vector<Ipopt::Index> jr(entries), jc(entries);
+    std::vector<double> values(entries), gradient(n);
+    model.eval_jac_g(n, x.data(), true, m, entries, jr.data(), jc.data(), nullptr);
+    model.eval_jac_g(n, x.data(), true, m, entries, nullptr, nullptr, values.data());
+    model.eval_grad_f(n, x.data(), true, gradient.data());
+    constexpr double step = 1e-6;
+    for (int column = 0; column < n; ++column) {
+        auto lower = x, upper = x;
+        lower[column] -= step;
+        upper[column] += step;
+        std::vector<double> lower_g(m), upper_g(m), analytic(m, 0.0);
+        model.eval_g(n, lower.data(), true, m, lower_g.data());
+        model.eval_g(n, upper.data(), true, m, upper_g.data());
+        for (int entry = 0; entry < entries; ++entry) {
+            if (jc[entry] == column) analytic[jr[entry]] += values[entry];
+        }
+        for (int row = 0; row < m; ++row) {
+            require(std::abs(analytic[row] - (upper_g[row] - lower_g[row]) /
+                (2.0 * step)) < 1e-5, "corrective constraint Jacobian mismatch");
+        }
+        double lower_f = 0.0, upper_f = 0.0;
+        model.eval_f(n, lower.data(), true, lower_f);
+        model.eval_f(n, upper.data(), true, upper_f);
+        require(std::abs(gradient[column] - (upper_f - lower_f) /
+                (2.0 * step)) < 1e-7, "corrective objective gradient mismatch");
+    }
+    require(frozen_base == ac_state_to_json(original_base), "original base mutated");
+}
+
 nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
     nlohmann::json result = {
         {"attempted", attempted},
         {"solver_initialized", solver_initialized},
         {"candidate_returned", candidate_returned},
         {"candidate_verified", candidate_verified},
+        {"incumbent_verified", incumbent_verified},
+        {"common_corrective_reference", common_corrective_reference},
         {"best_intermediate_found", best_intermediate_found},
         {"improved", improved},
         {"application_status", application_status},
@@ -1384,11 +1575,12 @@ nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
     return result;
 }
 
-SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
+static SparseAcEconomicResult solve_sparse_ac_economic_impl(
     const CaseData& data,
     const std::vector<int>& commitment,
     const SolveResult& incumbent,
-    const SparseAcEconomicOptions& options) {
+    const SparseAcEconomicOptions& options,
+    const AcState* original_corrective_base) {
     if (!std::isfinite(options.time_limit_seconds) ||
         options.time_limit_seconds <= 0.0 ||
         !std::isfinite(options.tolerance) || options.tolerance <= 0.0 ||
@@ -1399,17 +1591,20 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
     const auto wall_start = std::chrono::steady_clock::now();
     SparseAcEconomicResult output;
     output.attempted = true;
+    output.common_corrective_reference = original_corrective_base != nullptr;
     output.selected = incumbent;
     output.selected.status = 0;
-    output.selected.objective = rebuild_base_state_derived_fields(
-        data, commitment, output.selected.state);
-    output.selected_validation = validate_state(
-        data, ModelMode::BaseSoft, output.selected.state, commitment);
+    output.selected.objective = rebuild_economic_candidate(
+        data, commitment, original_corrective_base, output.selected.state);
+    output.selected_validation = validate_economic_candidate(
+        data, commitment, original_corrective_base, output.selected.state);
+    output.incumbent_verified = std::isfinite(output.selected.objective) &&
+        output.selected_validation.max_residual <= options.acceptable_tolerance;
     output.incumbent_objective = output.selected.objective;
 
     auto* raw_problem = new SparseAcEconomicNlp(
         data, commitment, output.selected.state,
-        options.acceptable_tolerance, options.pwl_epigraph);
+        options.acceptable_tolerance, options.pwl_epigraph, original_corrective_base);
     Ipopt::SmartPtr<Ipopt::TNLP> problem = raw_problem;
     output.variable_count = raw_problem->variable_count();
     output.constraint_count = raw_problem->constraint_count();
@@ -1478,8 +1673,9 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
             raw_problem->best_intermediate().objective;
         output.best_intermediate_max_residual =
             raw_problem->best_intermediate_validation().max_residual;
-        if (raw_problem->best_intermediate().objective >
-            output.selected.objective + 1e-9) {
+        if (output.selected_validation.max_residual > options.acceptable_tolerance ||
+            raw_problem->best_intermediate().objective >
+                output.selected.objective + 1e-9) {
             output.improved = true;
             output.selected = raw_problem->best_intermediate();
             output.selected_validation =
@@ -1493,15 +1689,16 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
         candidate.status = 0;
         candidate.iterations = output.iterations;
         candidate.state = raw_problem->final_state();
-        candidate.objective = rebuild_base_state_derived_fields(
-            data, commitment, candidate.state);
-        const auto validation = validate_state(
-            data, ModelMode::BaseSoft, candidate.state, commitment);
+        candidate.objective = rebuild_economic_candidate(
+            data, commitment, original_corrective_base, candidate.state);
+        const auto validation = validate_economic_candidate(
+            data, commitment, original_corrective_base, candidate.state);
         output.candidate_objective = candidate.objective;
-        output.candidate_verified = validation.max_residual <=
-            options.acceptable_tolerance;
+        output.candidate_verified = std::isfinite(candidate.objective) &&
+            validation.max_residual <= options.acceptable_tolerance;
         if (output.candidate_verified &&
-            candidate.objective > output.selected.objective + 1e-9) {
+            (output.selected_validation.max_residual > options.acceptable_tolerance ||
+             candidate.objective > output.selected.objective + 1e-9)) {
             output.improved = true;
             output.selected = std::move(candidate);
             output.selected_validation = validation;
@@ -1512,6 +1709,24 @@ SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
         std::chrono::steady_clock::now() - wall_start).count();
     output.selected.wall_seconds = output.wall_seconds;
     return output;
+}
+
+SparseAcEconomicResult solve_sparse_fixed_commitment_ac_economic(
+    const CaseData& data, const std::vector<int>& commitment,
+    const SolveResult& incumbent, const SparseAcEconomicOptions& options) {
+    return solve_sparse_ac_economic_impl(data, commitment, incumbent, options, nullptr);
+}
+
+SparseAcEconomicResult solve_sparse_common_corrective_reference(
+    const CaseData& data, const std::vector<int>& commitment,
+    const SolveResult& original_base, const SparseAcEconomicOptions& options) {
+    const auto validation = validate_state(
+        data, ModelMode::BaseSoft, original_base.state, commitment);
+    if (validation.max_residual > options.acceptable_tolerance) {
+        throw std::runtime_error("common corrective reference requires a verified base");
+    }
+    return solve_sparse_ac_economic_impl(
+        data, commitment, original_base, options, &original_base.state);
 }
 
 }  // namespace gravityx

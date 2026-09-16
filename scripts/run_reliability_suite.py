@@ -109,6 +109,11 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
         command.append("--cached-economic-contingency-polish")
     if config.get("base_pwl_epigraph", False):
         command.append("--base-pwl-epigraph")
+    reference_seconds = float(config.get("common_corrective_reference_seconds", 0.0))
+    if not math.isfinite(reference_seconds) or reference_seconds < 0.0:
+        raise ValueError("common corrective reference budget must be finite and nonnegative")
+    if reference_seconds > 0.0:
+        command += ["--common-corrective-reference-seconds", str(reference_seconds)]
     if profile:
         command += ["--fast-screen-heavy-profile", str(REPO / profile),
                     "--fast-screen-heavy-workers", "4"]

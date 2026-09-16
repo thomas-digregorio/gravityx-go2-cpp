@@ -2854,6 +2854,7 @@ def main() -> int:
         "--base-sparse-ac-economic-refinement-seconds", type=float, default=0.0
     )
     parser.add_argument("--base-pwl-epigraph", action="store_true")
+    parser.add_argument("--common-corrective-reference-seconds", type=float, default=0.0)
     parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
     parser.add_argument(
@@ -2961,6 +2962,10 @@ def main() -> int:
         (
             "--base-sparse-ac-economic-refinement-seconds",
             args.base_sparse_ac_economic_refinement_seconds,
+        ),
+        (
+            "--common-corrective-reference-seconds",
+            args.common_corrective_reference_seconds,
         ),
     ):
         if not math.isfinite(value) or value < 0.0:
@@ -3230,6 +3235,7 @@ def main() -> int:
             args.base_sparse_ac_economic_refinement_seconds
         ),
         "base_pwl_epigraph": args.base_pwl_epigraph,
+        "common_corrective_reference_seconds": args.common_corrective_reference_seconds,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (
@@ -3352,6 +3358,11 @@ def main() -> int:
                 )
             if args.base_pwl_epigraph:
                 base_arguments.append("pwl-epigraph")
+            if args.common_corrective_reference_seconds > 0.0:
+                base_arguments.append(
+                    "common-corrective-reference-seconds="
+                    f"{args.common_corrective_reference_seconds:.17g}"
+                )
         else:
             base_arguments = [
                 "run-ibr-json", to_wsl(args.case_json), to_wsl(base_json), "0"
@@ -4781,6 +4792,7 @@ def main() -> int:
             args.base_sparse_ac_economic_refinement_seconds
         ),
         "base_pwl_epigraph": args.base_pwl_epigraph,
+        "common_corrective_reference_seconds": args.common_corrective_reference_seconds,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
         "defer_fallback_until_screen_complete": (

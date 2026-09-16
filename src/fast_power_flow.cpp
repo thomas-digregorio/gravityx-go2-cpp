@@ -289,6 +289,9 @@ void network_injections(
     const std::vector<double>& va,
     std::vector<double>& p,
     std::vector<double>& q) {
+    if (ybus.size() != vm.size() || va.size() != vm.size()) {
+        throw std::runtime_error("network-injection dimensions do not match");
+    }
     p.assign(vm.size(), 0.0);
     q.assign(vm.size(), 0.0);
     for (int i = 0; i < static_cast<int>(vm.size()); ++i) {
@@ -330,6 +333,22 @@ void network_injections_from_branch_flows(
         p[shunt.bus] += shunt.gs * vm2;
         q[shunt.bus] -= effective_shunt_susceptance(data, state, static_cast<int>(i)) * vm2;
     }
+}
+
+// After a decoupled angle update the accepted incumbent's flows are stale for
+// the raw trial. Build the polish-local Y-bus lazily, then recompute injections
+// at the updated controls. Shunts/topology stay fixed throughout this polish.
+void updated_polish_network_injections(
+    const CaseData& data, int outaged_branch, const AcState& state,
+    YRows& ybus, FastPowerFlowResult& profile,
+    std::vector<double>& p, std::vector<double>& q) {
+    if (ybus.empty()) {
+        AccumulateSeconds ybus_timer(&profile.economic_balance_polish_ybus_seconds);
+        ybus = build_ybus(data, outaged_branch, &state);
+        ++profile.economic_balance_polish_ybus_builds;
+    }
+    AccumulateSeconds injection_timer(&profile.economic_balance_polish_injection_seconds);
+    network_injections(ybus, state.vm, state.va, p, q);
 }
 
 double mismatch_norm(
@@ -1499,6 +1518,23 @@ void run_polish_flow_injection_regression(const CaseData& data, const AcState& o
                     throw std::runtime_error("branch-flow injection differs from complex-admittance oracle");
                 }
             }
+            // Exercise the fallback with missing derived fields and changed
+            // voltages: reusing incumbent flows here would be incorrect.
+            auto updated = copy_corrective_trial(state, true, nullptr);
+            YRows lazy_ybus;
+            FastPowerFlowResult profile;
+            for (int update = 0; update < 2; ++update) {
+                updated.va[1] += 0.015;
+                updated.vm[1] -= 0.003;
+                network_injections(build_ybus(fixture, outage, &updated), updated.vm,
+                    updated.va, expected_p, expected_q);
+                updated_polish_network_injections(fixture, outage, updated,
+                    lazy_ybus, profile, actual_p, actual_q);
+                if (profile.economic_balance_polish_ybus_builds != 1 ||
+                    actual_p != expected_p || actual_q != expected_q) {
+                    throw std::runtime_error("lazy fallback injection differs from fresh complex oracle");
+                }
+            }
         }
         state.pf.clear();
         bool rejected = false;
@@ -1511,6 +1547,12 @@ void run_polish_flow_injection_regression(const CaseData& data, const AcState& o
     if (ac_state_to_json(original_base) != frozen_base) {
         throw std::runtime_error("flow-injection oracle mutated its source base");
     }
+    bool empty_ybus_rejected = false;
+    try {
+        std::vector<double> p, q;
+        network_injections({}, original_base.vm, original_base.va, p, q);
+    } catch (const std::runtime_error&) { empty_ybus_rejected = true; }
+    if (!empty_ybus_rejected) throw std::runtime_error("empty admittance matrix was silently accepted");
 }
 
 void run_voltage_extrapolation_policy_regression() {
@@ -4669,6 +4711,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
 
                                 const auto correction_started = std::chrono::steady_clock::now();
                                 bool corrected =
+                                    options_.coupled_polish_correction &&
                                     predictor_cache_->apply_correction(
                                         data_, p_spec, q_spec,
                                         polish_p_network, polish_q_network,
@@ -4685,10 +4728,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                                 polish_p_network,
                                                 raw_trial.va);
                                     if (active_corrected) {
-                                        network_injections(
-                                            polish_ybus, raw_trial.vm,
-                                            raw_trial.va, polish_p_network,
-                                            polish_q_network);
+                                        updated_polish_network_injections(data_, outaged_branch,
+                                            raw_trial, polish_ybus, output,
+                                            polish_p_network, polish_q_network);
                                     }
                                     const bool reactive_corrected =
                                         predictor_cache_

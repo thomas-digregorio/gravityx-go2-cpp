@@ -1728,6 +1728,50 @@ int run_parallel_circuit_regression() {
             refreshed.solve.state.shutdown != complex_injection.solve.state.shutdown) {
             throw std::runtime_error("polish injection oracle failed independent checks or changed discrete controls");
         }
+        auto decoupled_options = refresh_options;
+        decoupled_options.coupled_polish_correction = false;
+        gravityx::FastContingencyPowerFlow decoupled_solver(
+            refresh_data, refresh_base.solve.state, {1}, decoupled_options);
+        const auto decoupled = decoupled_solver.solve(branch_contingency);
+        decoupled_options.reuse_polish_branch_flows = false;
+        gravityx::FastContingencyPowerFlow decoupled_oracle_solver(
+            refresh_data, refresh_base.solve.state, {1}, decoupled_options);
+        const auto decoupled_oracle = decoupled_oracle_solver.solve(branch_contingency);
+        for (const auto* result : {&decoupled, &decoupled_oracle}) {
+            const auto check = gravityx::validate_state(refresh_data,
+                gravityx::ModelMode::ContingencySoft, result->solve.state, {1}, context);
+            if (!result->feasible || !std::isfinite(check.max_residual) ||
+                check.max_residual > 1e-5 ||
+                result->economic_balance_polish_ybus_builds != 1 ||
+                !std::isfinite(result->solve.objective)) {
+                throw std::runtime_error("complete decoupled polish regression did not pass");
+            }
+        }
+        if (decoupled.economic_balance_polish_flow_reuses <= 0 ||
+            decoupled_oracle.economic_balance_polish_flow_reuses != 0 ||
+            std::abs(decoupled.solve.objective - decoupled_oracle.solve.objective) > 1e-6) {
+            throw std::runtime_error("decoupled polish did not exercise lazy Y-bus or changed objective");
+        }
+        for (auto field : {&gravityx::AcState::vm, &gravityx::AcState::va,
+                &gravityx::AcState::pg, &gravityx::AcState::qg, &gravityx::AcState::demand_factor,
+                &gravityx::AcState::pf, &gravityx::AcState::pt, &gravityx::AcState::qf,
+                &gravityx::AcState::qt, &gravityx::AcState::sm_slack, &gravityx::AcState::p_delta,
+                &gravityx::AcState::q_delta, &gravityx::AcState::gen_lambda, &gravityx::AcState::load_lambda,
+                &gravityx::AcState::shunt_bs, &gravityx::AcState::commitment,
+                &gravityx::AcState::startup, &gravityx::AcState::shutdown}) {
+            const auto& fresh = decoupled.solve.state.*field;
+            const auto& oracle = decoupled_oracle.solve.state.*field;
+            if (fresh.size() != oracle.size()) throw std::runtime_error("decoupled polish changed dimensions");
+            for (std::size_t i = 0; i < fresh.size(); ++i) {
+                if (!std::isfinite(fresh[i]) || !std::isfinite(oracle[i]) ||
+                    std::abs(fresh[i] - oracle[i]) > 1e-10) {
+                    throw std::runtime_error("decoupled polish changed reconstructed state");
+                }
+            }
+        }
+        if (decoupled.solve.state.shunt_steps != decoupled_oracle.solve.state.shunt_steps) {
+            throw std::runtime_error("decoupled polish changed discrete shunt steps");
+        }
         if (!refreshed.feasible || independent.max_residual > 1e-5 ||
             refreshed.adaptive_jacobian_refresh_attempts != 1 ||
             refreshed.adaptive_jacobian_refresh_selected != 1 ||

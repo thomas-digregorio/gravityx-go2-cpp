@@ -31,6 +31,9 @@ struct FastPowerFlowOptions {
     // Sum freshly validated terminal flows for polish injections. False keeps
     // the complex-admittance oracle; neither path is an acceptance check.
     bool reuse_polish_branch_flows{false};
+    // Disabling this uses the existing decoupled correction directly, allowing
+    // tiny tests to cover the production fallback with both injection paths.
+    bool coupled_polish_correction{true};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};

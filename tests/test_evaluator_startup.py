@@ -1,5 +1,6 @@
 """Tiny startup/teardown fixtures, never a full GO2 solve or evaluation."""
 import concurrent.futures
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -9,7 +10,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from run_experiment import CompetitionTimeout, StreamingSerialEvaluation
+from run_experiment import CompetitionTimeout, StreamingSerialEvaluation, PersistentEvaluatorProcess
 
 
 class DelayedWorker:
@@ -43,7 +44,7 @@ class DelayedWorker:
         self.terminated = True
         self.release.set()
 
-    def stop(self):
+    def stop(self, deadline=None):
         self.terminate()
 
 
@@ -201,6 +202,79 @@ class EvaluatorStartupTests(unittest.TestCase):
             m._launch_ready_locked()
         self.assertTrue(m.aborted)
         self.assertEqual(m.persistent_workers[0].process.returncode, 7)
+
+    def test_idle_shutdown_is_parallel_and_uses_same_absolute_deadline(self):
+        m = self.manager()
+        barrier = threading.Barrier(3, timeout=2.0)
+        deadlines = []
+        class Worker:
+            ready = True
+            def terminate(self): pass
+            def stop(self, deadline):
+                deadlines.append(deadline)
+                barrier.wait()
+        m.persistent_workers = [Worker() for _ in range(3)]
+        m._shutdown_evaluator_executor(True)
+        self.assertEqual(deadlines, [m.deadline] * 3)
+        self.assertGreaterEqual(m.evaluator_shutdown_seconds, 0.0)
+        # The second cleanup is idempotent and cannot re-enter the barrier.
+        m._shutdown_evaluator_executor(True)
+
+    def test_one_shutdown_error_does_not_skip_other_worker_cleanup(self):
+        m = self.manager()
+        stopped = []
+        class Worker:
+            ready = True
+            def terminate(self): pass
+            def __init__(self, index): self.index = index
+            def stop(self, deadline):
+                stopped.append(self.index)
+                if self.index == 1: raise RuntimeError("tiny shutdown failure")
+        m.persistent_workers = [Worker(i) for i in range(3)]
+        with self.assertRaisesRegex(RuntimeError, "tiny shutdown failure"):
+            m._shutdown_evaluator_executor(True)
+        self.assertEqual(sorted(stopped), [0, 1, 2])
+        self.assertTrue(m.evaluator_executor_shutdown)
+
+    def real_idle_worker(self, after_input):
+        self.evaluator.write_text(
+            "import sys, time\n"
+            "print('GRAVITYX_EVALUATOR_READY', flush=True)\n"
+            "sys.stdin.readline()\n" + after_input)
+        worker = PersistentEvaluatorProcess(0, Path(sys.executable), self.evaluator,
+            os.environ.copy(), self.output / "idle-worker.log")
+        self.addCleanup(worker.terminate)
+        return worker
+
+    def test_real_shutdown_drains_output_and_preserves_success(self):
+        worker = self.real_idle_worker("print('tiny shutdown message', flush=True)\n")
+        worker.stop(time.perf_counter() + 2.0)
+        self.assertEqual(worker.process.returncode, 0)
+        self.assertIn("tiny shutdown message", worker.log_path.read_text())
+        self.assertIn("GRAVITYX_EVALUATOR_SHUTDOWN", worker.log_path.read_text())
+        worker.stop(time.perf_counter() + 2.0)
+
+    def test_real_unresponsive_shutdown_is_bounded_and_terminated(self):
+        worker = self.real_idle_worker("time.sleep(30)\n")
+        with self.assertRaises(CompetitionTimeout):
+            worker.stop(time.perf_counter() + 0.1)
+        self.assertIsNotNone(worker.process.poll())
+        self.assertTrue(worker.log_handle.closed)
+
+    def test_real_failed_worker_exit_is_not_success(self):
+        worker = self.real_idle_worker("raise SystemExit(7)\n")
+        with self.assertRaisesRegex(RuntimeError, "status 7"):
+            worker.stop(time.perf_counter() + 2.0)
+        self.assertEqual(worker.process.returncode, 7)
+
+    def test_exit_failure_observed_before_stop_is_still_failure(self):
+        worker = self.real_idle_worker("raise SystemExit(7)\n")
+        worker.process.stdin.write('{}\n')
+        worker.process.stdin.flush()
+        worker.process.wait(timeout=2.0)
+        with self.assertRaisesRegex(RuntimeError, "status 7"):
+            worker.stop(time.perf_counter() + 2.0)
+        self.assertTrue(worker.log_handle.closed)
 
 
 if __name__ == "__main__":

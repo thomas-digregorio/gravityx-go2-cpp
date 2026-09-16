@@ -1339,25 +1339,47 @@ class PersistentEvaluatorProcess:
         if not self.log_handle.closed:
             self.log_handle.close()
 
-    def stop(self) -> None:
+    def stop(self, deadline: float | None = None) -> None:
+        """Drain and join one idle worker under a shared absolute deadline."""
+        started = time.perf_counter()
+        shutdown_deadline = deadline if deadline is not None else started + 2.0
         if self.process.poll() is None:
             try:
-                assert self.process.stdin is not None
-                self.process.stdin.write('{"stop":true}\n')
-                self.process.stdin.flush()
-                self.process.stdin.close()
-                assert self.process.stdout is not None
-                for line in self.process.stdout:
-                    self.log_handle.write(line)
-                returncode = self.process.wait(timeout=2.0)
+                remaining = shutdown_deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    raise CompetitionTimeout("persistent evaluator shutdown reached its deadline")
+                # communicate bounds BOTH stdout draining and process wait.
+                # Reading stdout first could wait forever before timed wait().
+                output, _ = self.process.communicate('{"stop":true}\n', timeout=remaining)
+                if output:
+                    self.log_handle.write(output)
+                returncode = self.process.returncode
                 if returncode != 0:
                     raise RuntimeError(
                         "persistent official evaluator stopped with status "
                         f"{returncode}: worker={self.worker_id}"
                     )
+            except subprocess.TimeoutExpired as error:
+                self.terminate()
+                raise CompetitionTimeout(
+                    f"persistent evaluator shutdown reached its deadline: worker={self.worker_id}"
+                ) from error
             except Exception:
                 self.terminate()
                 raise
+        # poll() may already have observed a failed exit before stop began.
+        # That must fail closed just like an exit observed by communicate().
+        if self.process.returncode != 0:
+            self.terminate()
+            raise RuntimeError(
+                "persistent official evaluator stopped with status "
+                f"{self.process.returncode}: worker={self.worker_id}"
+            )
+        if not self.log_handle.closed:
+            self.log_handle.write("GRAVITYX_EVALUATOR_SHUTDOWN " + json.dumps({
+                "worker_id": self.worker_id, "wall_seconds": time.perf_counter() - started,
+                "returncode": self.process.returncode,
+            }) + "\n")
         for stream in (self.process.stdin, self.process.stdout):
             if stream is not None and not stream.closed:
                 stream.close()
@@ -1540,21 +1562,37 @@ class StreamingSerialEvaluation:
         if self.evaluator_executor_shutdown:
             return
         self.evaluator_executor_shutdown = True
-        if self.persistent_evaluator_processes:
-            for future in self.persistent_startup_futures.values():
-                future.cancel()
-            for worker in self.persistent_workers:
-                # A startup reader owns stdout until the ready handshake.
-                # Never race it by reading the shutdown response on this thread.
-                if self.aborted or not worker.ready:
-                    worker.terminate()
-                else:
-                    worker.stop()
-        if self.evaluator_executor is not None:
-            self.evaluator_executor.shutdown(
-                wait=wait,
-                cancel_futures=not wait,
-            )
+        shutdown_started = time.perf_counter()
+        errors = []
+        try:
+            if self.persistent_evaluator_processes:
+                for future in self.persistent_startup_futures.values():
+                    future.cancel()
+                if self.persistent_workers:
+                    # These are independent idle processes, not more evaluator
+                    # tasks. Stop all of them before waiting on any one exit.
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=len(self.persistent_workers),
+                        thread_name_prefix="evaluator-shutdown",
+                    ) as executor:
+                        futures = []
+                        for worker in self.persistent_workers:
+                            # An unfinished startup reader still owns stdout.
+                            if self.aborted or not worker.ready:
+                                futures.append(executor.submit(worker.terminate))
+                            else:
+                                futures.append(executor.submit(worker.stop, self.deadline))
+                        for future in concurrent.futures.as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception as error:
+                                errors.append(error)
+            if errors:
+                raise errors[0]
+        finally:
+            if self.evaluator_executor is not None:
+                self.evaluator_executor.shutdown(wait=wait, cancel_futures=not wait)
+            self.evaluator_shutdown_seconds = time.perf_counter() - shutdown_started
 
     def abort(self) -> None:
         with self.lock:
@@ -1992,8 +2030,16 @@ class StreamingSerialEvaluation:
                 write_json(self.internal_dir / "streaming_evaluation_progress.json", progress)
             except OSError as error:
                 print(f"Could not save evaluator diagnostic snapshot: {error}", file=sys.stderr)
-            self._shutdown_evaluator_executor(not self.aborted)
-            self._shutdown_finalization_executor(not self.aborted)
+            try:
+                self._shutdown_evaluator_executor(not self.aborted)
+            finally:
+                self._shutdown_finalization_executor(not self.aborted)
+                progress["evaluator_shutdown_seconds"] = getattr(self, "evaluator_shutdown_seconds", None)
+                progress["seconds_to_evaluation_deadline_after_shutdown"] = self.deadline - time.perf_counter()
+                try:
+                    write_json(self.internal_dir / "streaming_evaluation_progress.json", progress)
+                except OSError as error:
+                    print(f"Could not save evaluator shutdown snapshot: {error}", file=sys.stderr)
 
 
 def ordered(case: dict[str, Any], group: str) -> list[dict[str, Any]]:

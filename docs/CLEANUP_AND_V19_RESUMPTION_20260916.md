@@ -132,3 +132,33 @@ Its deleted exact outputs cannot be independently re-evaluated without
 recreating them. V20/V22 candidate vectors, V23's new accepted set, every
 other scenario's retained solutions, raw sources, code and Git history were
 untouched. This supersedes earlier V21 full-vector retention statements.
+
+## Superseded V23 payload cleanup after accepted V25
+
+V25 passed in 295.47726110000076 s with objective 381248.30942716985,
+improving on V23's 379236.3363775767. Its independent objective audit,
+exact native source-label set, complete official coverage, zero official
+infeasibility and residual/deadline gates passed. All 6,580 V25 root vectors
+are retained at `runs/top5_cold_20260915/v25_s095/C2FEN19402_s095_cold`.
+The result and compact provenance were committed and pushed before pruning.
+
+After verifying old/new archive and status hashes, absence of active relevant
+Python/native workers, the exact contained target, and no ancestor/subtree
+reparse points, only
+`runs/top5_cold_20260915/v23_s095/C2FEN19402_s095_cold/**/solution_*.txt`
+was deleted with the existing guarded PowerShell helper. All 13,206 entries
+were removed; zero matching old payloads remain. The old status hash is
+unchanged and its certificate, worker logs, official details and audit remain.
+Code, Git history, source inputs, unrelated files and all V25 vectors remain.
+
+C: free bytes changed from 43,280,080,896 to 55,023,595,520: a measured net
+recovery of **10.9370002747 GiB**, leaving **51.2447166443 GiB free**. The
+21.953-GiB sum of removed file lengths double-counts hard links and is not a
+physical-space recovery figure. Across the cleanup operations recorded here,
+118,626 solution-text directory entries have been removed, including links.
+
+The deleted exact V23 solution texts cannot be recovered from retained
+certificates or objective audits; those are verification records, not vector
+backups. V20/V22/V24 candidate vectors and every other scenario's protected
+solutions remain untouched. This supersedes earlier V23 full-vector retention
+statements; V25 is now the protected accepted scenario-095 set.

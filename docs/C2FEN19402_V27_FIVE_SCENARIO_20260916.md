@@ -105,3 +105,13 @@ three V27 Code2-timeout runs' disposable solution texts may be pruned using
 the guarded policy. Their logs, failed-state JSON, partial official records
 and timeout provenance must remain. That pruning loses exact re-evaluation
 of deleted partial vectors, not any accepted scenario result or algorithm.
+
+That guarded cleanup is complete. The three timeout runs' 9,663 solution-text
+entries were removed, recovering 8.2671051025 GiB; their status hashes and
+diagnostics remain unchanged. The superseded original 077 payload was also
+archived, verified and pruned, recovering 10.9777221680 GiB. The protected
+complete sets are now old-reference 006/010/069 plus V27 077/095. Their full
+vectors remain available; old exact 077 and failed partial vectors cannot be
+recreated from certificates alone. Detailed paths, guards, archive hashes
+and physical-space readings are recorded in
+`docs/CLEANUP_AND_V19_RESUMPTION_20260916.md`.

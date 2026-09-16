@@ -206,3 +206,58 @@ The deleted exact V25 vectors cannot be recovered from its certificates.
 This supersedes earlier V25 full-vector-retention statements. Source data,
 code, Git history, unrelated files, other scenarios' complete reference
 solutions and the newer V27/095 full vectors remain protected.
+
+## V27 failed 006/010/069 payload cleanup
+
+All three timed out in Code2. Their individual zero-diagnostic provenance
+archives, hashes, exact coverage and failure report were pushed in `81c3740`
+before deleting any payloads. The previous verified full references were
+checked: 006 retained 6,694 root vectors, 010 retained 6,694, and 069 retained
+6,621, with complete official certificates and zero reported infeasibility.
+V27/077 and V27/095 also remained intact with 6,585 and 6,580 root vectors.
+
+The same exact-path, containment, no-OneDrive, ancestor/subtree no-reparse,
+archive/status hash, and no-active-worker checks passed before applying the
+existing failed-Code2-timeout helper. Only solution text files were deleted:
+
+| Run below `runs/top5_cold_20260915/` | Removed entries | Apparent GiB, includes hard links |
+|---|---:|---:|
+| v27_s006/C2FEN19402_s006_cold | 1919 | 3.291 |
+| v27_s010/C2FEN19402_s010_cold | 3160 | 5.420 |
+| v27_s069/C2FEN19402_s069_cold | 4584 | 7.625 |
+
+Zero matching payloads remain in these three targets. Their original status
+hashes are unchanged. C: free bytes rose from 31,981,330,432 to
+40,858,066,944: a net **8.2671051025 GiB** recovered. Logs, failed-state JSON,
+partial official records and committed timeout archives remain. These runs
+never had complete official certificates. Deleted partial vectors cannot be
+recovered from the retained records.
+
+## Superseded original 077 reference payload cleanup
+
+V27/077 passed in 177.62342740000167 seconds with objective
+373417.7496024141 and complete independent verification. The superseded
+campaign reference was archived separately before pruning:
+`docs/evidence/C2FEN19402_BASELINE_S077_PREPRUNE_20260916.json`, SHA256
+`3d814ca8b4c1770b25799e1b4260f360ccd91811205d87b02b49c99912624f7a`.
+Archive diagnostics were zero, and it was pushed in `6aba067`. Its status
+hash is `0838946948483b11bdefa1d00daf2d69c0c613c9fb041c15be6265a7de028db0`.
+The replacement V27/077 archive/status hashes, full certificate and 6,585
+root vectors were checked again.
+
+After the same contained-path, no-reparse and no-active-worker checks, only
+`runs/reliability_20260915/frozen_a1bebd5_19402_s077/C2FEN19402_s077_cold/**/solution_*.txt`
+was pruned. It removed 13,216 entries; zero matching old payloads remain.
+The old complete certificate, logs, audit/provenance and official details
+remain, but they cannot recreate its deleted exact vectors. V27/077 retains
+all 6,585 full root vectors and is now the protected 077 campaign solution.
+
+C: free bytes rose from 40,849,612,800 to 52,636,852,224, a net recovery of
+**10.9777221680 GiB**. Apparent deleted lengths of 21.998 GiB include links.
+Across the V26, V25, three failed V27 and old-077 cleanup operations in this
+iteration, net recovery totaled **40.8990745544 GiB**, with 48,986 text-file
+directory entries removed. About **49.0 GiB** was free after retaining the
+new experiments; recovery total is not the net free-space change across
+intervening runs. Code, Git history, sources, environments and unrelated
+files remain untouched. Earlier original-077 full-retention statements are
+superseded; 006/010/069 retain their earlier complete reference vectors.

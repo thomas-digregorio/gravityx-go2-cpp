@@ -5,6 +5,7 @@
 #include "gravityx/active_feasibility_repair.hpp"
 #include "gravityx/fast_power_flow.hpp"
 #include "gravityx/linearized_ac_seed.hpp"
+#include "gravityx/local_bus_dispatch.hpp"
 #include "gravityx/state_io.hpp"
 
 #include <algorithm>
@@ -2971,6 +2972,16 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"outage_update_basis_cache_bytes", outage_update_basis_cache_bytes},
         {"outage_update_seconds", outage_update_seconds},
         {"outage_update_rhs_seconds", outage_update_rhs_seconds},
+        {"local_dispatch_attempted", local_dispatch_attempted},
+        {"local_dispatch_selected", local_dispatch_selected},
+        {"local_dispatch_pg_changes", local_dispatch_pg_changes},
+        {"local_dispatch_qg_changes", local_dispatch_qg_changes},
+        {"local_dispatch_load_changes", local_dispatch_load_changes},
+        {"local_dispatch_seconds", local_dispatch_seconds},
+        {"local_dispatch_objective_before", local_dispatch_objective_before},
+        {"local_dispatch_objective_after", local_dispatch_objective_after},
+        {"local_dispatch_predicted_gain", local_dispatch_predicted_gain},
+        {"local_dispatch_rejection_category", local_dispatch_rejection_category},
         {"economic_balance_polish_seconds", economic_balance_polish_seconds},
         {"economic_balance_polish_correction_seconds", economic_balance_polish_correction_seconds},
         {"economic_balance_polish_flow_reuses", economic_balance_polish_flow_reuses},
@@ -4560,6 +4571,41 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         double polished_objective = predictor_objective;
                         ValidationReport polished_validation =
                             predictor_validation;
+                        if (options_.local_bus_dispatch_polish) {
+                            AccumulateSeconds local_timer(&output.local_dispatch_seconds);
+                            output.local_dispatch_attempted = true;
+                            output.local_dispatch_objective_before = polished_objective;
+                            output.local_dispatch_objective_after = polished_objective;
+                            std::vector<double> local_p, local_q;
+                            network_injections_from_branch_flows(data_, outaged_branch,
+                                polished_state, local_p, local_q);
+                            AcState local_state = make_trial(polished_state);
+                            const auto local = improve_fixed_network_bus_dispatch(data_,
+                                base_state_, commitment_, *contingency, local_p, local_q, local_state);
+                            output.local_dispatch_pg_changes = local.active_generation_changes;
+                            output.local_dispatch_qg_changes = local.reactive_generation_changes;
+                            output.local_dispatch_load_changes = local.load_changes;
+                            output.local_dispatch_predicted_gain = local.predicted_native_gain;
+                            if (local.changed()) {
+                                const double local_objective = rebuild_contingency_state_derived_fields(
+                                    data_, base_state_, commitment_, *contingency, local_state);
+                                const auto local_validation = validate_state(data_,
+                                    ModelMode::ContingencySoft, local_state, commitment_, direct_context);
+                                if (std::isfinite(local_objective) &&
+                                    local_validation.max_residual <= options_.validation_tolerance &&
+                                    local_objective > polished_objective + 1e-9) {
+                                    output.local_dispatch_selected = true;
+                                    output.local_dispatch_objective_after = local_objective;
+                                    polished_state = std::move(local_state);
+                                    polished_objective = local_objective;
+                                    polished_validation = local_validation;
+                                } else {
+                                    output.local_dispatch_rejection_category =
+                                        local_validation.max_residual > options_.validation_tolerance
+                                        ? local_validation.worst_category : "no_verified_objective_gain";
+                                }
+                            }
+                        }
                         bool outage_update_ready = true;
                         if (outaged_branch >= 0) {
                             outage_update_ready =
@@ -4596,7 +4642,10 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 0.00390625, 0.001953125};
                             for (int polish_iteration = 1;
                                  polish_iteration <=
-                                     options_.max_economic_balance_polish_iterations;
+                                     options_.max_economic_balance_polish_iterations &&
+                                 (!options_.local_bus_dispatch_polish ||
+                                  slack_sum(polished_state.p_delta) + slack_sum(polished_state.q_delta) >
+                                      options_.economic_balance_polish_stop_slack);
                                  ++polish_iteration) {
                                 output.economic_balance_polish_iterations =
                                     polish_iteration;

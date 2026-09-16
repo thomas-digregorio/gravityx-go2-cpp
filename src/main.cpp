@@ -3,6 +3,7 @@
 #include "gravityx/algorithm.hpp"
 #include "gravityx/case_data.hpp"
 #include "gravityx/fast_power_flow.hpp"
+#include "gravityx/local_bus_dispatch.hpp"
 #include "gravityx/linearized_ac_seed.hpp"
 #include "gravityx/solution_writer.hpp"
 #include "gravityx/sparse_ac_economic.hpp"
@@ -988,6 +989,7 @@ int run_component_tests() {
         throw std::runtime_error(
             "component test failed: bounded solution precision");
     }
+    gravityx::run_local_bus_dispatch_regression();
     std::cout << "component tests passed\n";
     return 0;
 }
@@ -1106,6 +1108,16 @@ int run_parallel_circuit_regression() {
     budget_result.economic_balance_polish_ybus_builds = 1;
     budget_result.economic_balance_polish_injection_seconds = 0.02;
     budget_result.economic_balance_polish_ybus_seconds = 0.04;
+    budget_result.local_dispatch_attempted = true;
+    budget_result.local_dispatch_selected = true;
+    budget_result.local_dispatch_pg_changes = 2;
+    budget_result.local_dispatch_qg_changes = 3;
+    budget_result.local_dispatch_load_changes = 1;
+    budget_result.local_dispatch_seconds = 0.01;
+    budget_result.local_dispatch_objective_before = 20.0;
+    budget_result.local_dispatch_objective_after = 30.0;
+    budget_result.local_dispatch_predicted_gain = 10.0;
+    budget_result.local_dispatch_rejection_category = "fixture_category";
     budget_result.adaptive_jacobian_refresh_attempts = 2;
     budget_result.adaptive_jacobian_refresh_selected = 1;
     budget_result.adaptive_jacobian_refresh_seconds = 0.3;
@@ -1120,6 +1132,14 @@ int run_parallel_circuit_regression() {
     budget_result.voltage_extrapolation_best_after = 0.1;
     const auto compact_economic = budget_result.economic_summary_json();
     const auto full_economic = budget_result.to_json();
+    for (const auto* key : {"local_dispatch_attempted", "local_dispatch_selected",
+            "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",
+            "local_dispatch_seconds", "local_dispatch_objective_before", "local_dispatch_objective_after",
+            "local_dispatch_predicted_gain", "local_dispatch_rejection_category"}) {
+        if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key)) {
+            throw std::runtime_error("compact worker log omitted local dispatch evidence");
+        }
+    }
     for (const auto* key : {"economic_balance_polish_trial_count",
                            "economic_balance_polish_physical_rejections",
                            "economic_balance_polish_economic_checks",
@@ -1656,6 +1676,9 @@ int run_parallel_circuit_regression() {
         const auto frozen_base = gravityx::ac_state_to_json(refresh_base.solve.state);
         gravityx::FastPowerFlowOptions refresh_options;
         gravityx::enable_cached_economic_polish(refresh_options);
+        // This existing group is the V14/V16 copy/injection/decoupled oracle.
+        // A separate comparison below exercises the new local economic pass.
+        refresh_options.local_bus_dispatch_polish = false;
         refresh_options.fixed_jacobian_minimum_bus_count = 0;
         refresh_options.fixed_jacobian_screen_only = true;
         // Force one probe on this tiny fixture instead of constructing a slow
@@ -1778,6 +1801,23 @@ int run_parallel_circuit_regression() {
             refreshed.adaptive_jacobian_refresh_best_after > refreshed.adaptive_jacobian_refresh_best_before ||
             frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
             throw std::runtime_error("adaptive refresh tiny outage failed: " + refreshed.to_json().dump());
+        }
+        auto local_options = refresh_options;
+        local_options.local_bus_dispatch_polish = true;
+        gravityx::FastContingencyPowerFlow local_solver(
+            refresh_data, refresh_base.solve.state, {1}, local_options);
+        const auto local_result = local_solver.solve(branch_contingency);
+        const auto local_check = gravityx::validate_state(refresh_data,
+            gravityx::ModelMode::ContingencySoft, local_result.solve.state, {1}, context);
+        if (!local_result.feasible || !local_result.local_dispatch_attempted ||
+            !local_result.local_dispatch_selected || local_check.max_residual > 1e-5 ||
+            local_result.local_dispatch_objective_after <= local_result.local_dispatch_objective_before ||
+            std::abs(local_result.local_dispatch_objective_after - local_result.local_dispatch_objective_before -
+                local_result.local_dispatch_predicted_gain) > 1e-6 ||
+            local_result.solve.objective < local_result.local_dispatch_objective_after - 1e-8 ||
+            local_result.solve.state.pg[0] < refresh_data.generators[0].pmin ||
+            frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
+            throw std::runtime_error("complete local dispatch tiny solve failed: " + local_result.runtime_profile_json().dump());
         }
         gravityx::run_voltage_extrapolation_physics_regression(
             refresh_data, {1}, refresh_base.solve.state, branch_contingency, refreshed.solve.state);
@@ -5518,6 +5558,10 @@ int run_contingency_worker(
                          "outage_update_basis_cache_bytes", "outage_update_seconds",
                          "outage_update_rhs_seconds", "economic_balance_polish_seconds",
                          "economic_balance_polish_correction_seconds",
+                         "local_dispatch_attempted", "local_dispatch_selected",
+                         "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",
+                         "local_dispatch_seconds", "local_dispatch_objective_before", "local_dispatch_objective_after",
+                         "local_dispatch_predicted_gain", "local_dispatch_rejection_category",
                          "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
                          "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",
                          "corrective_trial_copy_count", "corrective_trial_control_copy_count",

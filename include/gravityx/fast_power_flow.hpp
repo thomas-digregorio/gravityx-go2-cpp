@@ -34,6 +34,7 @@ struct FastPowerFlowOptions {
     // Disabling this uses the existing decoupled correction directly, allowing
     // tiny tests to cover the production fallback with both injection paths.
     bool coupled_polish_correction{true};
+    bool local_bus_dispatch_polish{false};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -76,6 +77,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.bounded_voltage_extrapolation = true;
     options.controls_only_trial_copy = true;
     options.reuse_polish_branch_flows = true;
+    options.local_bus_dispatch_polish = true;
     options.max_economic_balance_polish_iterations = 3;
     options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
@@ -94,6 +96,16 @@ inline bool needs_contingency_economic_cleanup(
 }
 
 struct FastPowerFlowResult {
+    bool local_dispatch_attempted{};
+    bool local_dispatch_selected{};
+    int local_dispatch_pg_changes{};
+    int local_dispatch_qg_changes{};
+    int local_dispatch_load_changes{};
+    double local_dispatch_seconds{};
+    double local_dispatch_objective_before{};
+    double local_dispatch_objective_after{};
+    double local_dispatch_predicted_gain{};
+    std::string local_dispatch_rejection_category;
     bool converged{};
     bool feasible{};
     bool direct_candidate_attempted{};

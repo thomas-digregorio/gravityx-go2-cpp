@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <list>
 #include <map>
 #include <numeric>
 #include <queue>
@@ -29,6 +30,87 @@ using Triplet = Eigen::Triplet<double>;
 using YRows = std::vector<std::map<int, Complex>>;
 
 constexpr double kAllocationTolerance = 1e-7;
+
+class AccumulateSeconds {
+public:
+    explicit AccumulateSeconds(double* output)
+        : output_(output), start_(std::chrono::steady_clock::now()) {}
+    ~AccumulateSeconds() {
+        if (output_ != nullptr) *output_ += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_).count();
+    }
+private:
+    double* output_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+// J^{-1}E depends only on this immutable factorization and selector rows, not
+// on the branch coefficients or candidate operating point. Each fixed-Jacobian
+// object owns separate bounded caches for its full/P/Q factorizations.
+class OutageInverseRowCache {
+public:
+    explicit OutageInverseRowCache(std::size_t capacity = 8) : capacity_(capacity) {}
+
+    template <typename Factorization>
+    std::shared_ptr<const Eigen::MatrixXd> get(
+        int dimension, const std::vector<int>& rows, Factorization& factorization,
+        bool enabled, FastPowerFlowResult* diagnostics = nullptr) {
+        if (dimension <= 0 || rows.empty() || rows.size() > 4 ||
+            std::any_of(rows.begin(), rows.end(), [dimension](int row) {
+                return row < 0 || row >= dimension;
+            })) throw std::runtime_error("invalid outage inverse-row selector");
+        // Production factors are never refactorized in place after cache
+        // construction. A different factorization object always invalidates.
+        if (owner_ != &factorization || dimension_ != dimension) {
+            entries_.clear();
+            owner_ = &factorization;
+            dimension_ = dimension;
+        }
+        if (enabled) {
+            for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+                if (it->rows == rows) {
+                    if (diagnostics) ++diagnostics->outage_update_basis_cache_hits;
+                    entries_.splice(entries_.begin(), entries_, it);
+                    return entries_.front().inverse_rows;
+                }
+            }
+        }
+        if (diagnostics) {
+            ++diagnostics->outage_update_basis_cache_misses;
+            diagnostics->outage_update_rhs_columns += static_cast<int>(rows.size());
+        }
+        std::shared_ptr<Eigen::MatrixXd> inverse;
+        {
+            AccumulateSeconds timer(diagnostics ? &diagnostics->outage_update_rhs_seconds : nullptr);
+            Eigen::MatrixXd selector = Eigen::MatrixXd::Zero(dimension, rows.size());
+            for (std::size_t i = 0; i < rows.size(); ++i) selector(rows[i], i) = 1.0;
+            inverse = std::make_shared<Eigen::MatrixXd>(factorization.solve(selector));
+        }
+        if (factorization.info() != Eigen::Success || !inverse->allFinite()) return {};
+        if (enabled && capacity_ > 0) {
+            entries_.push_front({rows, inverse});
+            while (entries_.size() > capacity_) entries_.pop_back();
+        }
+        return inverse;
+    }
+
+    std::size_t bytes() const {
+        std::size_t result = 0;
+        for (const auto& entry : entries_) result += entry.inverse_rows->size() * sizeof(double);
+        return result;
+    }
+    std::size_t size() const { return entries_.size(); }
+
+private:
+    struct Entry {
+        std::vector<int> rows;
+        std::shared_ptr<const Eigen::MatrixXd> inverse_rows;
+    };
+    std::size_t capacity_;
+    const void* owner_{};
+    int dimension_{};
+    std::list<Entry> entries_;
+};
 
 void add_admittance(YRows& rows, int row, int column, Complex value) {
     rows[row][column] += value;
@@ -1106,6 +1188,63 @@ void run_fast_power_flow_topology_cache_regression() {
     }
 }
 
+void run_outage_inverse_row_cache_regression() {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) throw std::runtime_error(std::string("outage inverse cache regression: ") + message);
+    };
+    Eigen::Matrix4d dense;
+    dense << 4.0, 0.2, 0.0, 0.1,
+             0.1, 3.0, 0.3, 0.0,
+             0.0, 0.4, 5.0, 0.2,
+             0.1, 0.0, 0.3, 2.0;
+    SparseMatrix matrix = dense.sparseView();
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> factorization;
+    factorization.compute(matrix);
+    require(factorization.info() == Eigen::Success, "tiny factorization failed");
+    OutageInverseRowCache cache(2);
+    FastPowerFlowResult diagnostics;
+    const auto first = cache.get(4, {0, 2}, factorization, true, &diagnostics);
+    const auto again = cache.get(4, {0, 2}, factorization, true, &diagnostics);
+    const auto uncached = cache.get(4, {0, 2}, factorization, false, &diagnostics);
+    require(first && first == again && uncached && (*first - *uncached).norm() == 0.0,
+            "cache did not reuse an identical solve");
+    Eigen::MatrixXd selector = Eigen::MatrixXd::Zero(4, 2);
+    selector(0, 0) = selector(2, 1) = 1.0;
+    require((matrix * *first - selector).norm() < 1e-12, "cached inverse columns have residual");
+    // Same selector, different branch derivative: only J^{-1}E is reused.
+    Eigen::Matrix<double, 2, 4> change;
+    change << 0.1, -0.03, 0.05, 0.0, 0.0, 0.04, -0.1, 0.02;
+    for (double scale : {1.0, 0.6}) {
+        const Eigen::MatrixXd difference = scale * change;
+        const Eigen::MatrixXd update = *again *
+            (Eigen::Matrix2d::Identity() + difference * *again).inverse();
+        const Eigen::Vector4d rhs(0.3, -0.2, 0.4, 0.1);
+        Eigen::VectorXd answer = factorization.solve(rhs);
+        answer -= update * (difference * answer);
+        const Eigen::Matrix4d altered = dense + selector * difference;
+        require((altered * answer - rhs).norm() < 1e-12,
+                "cached Woodbury solve changed the updated equation");
+    }
+    cache.get(4, {1}, factorization, true, &diagnostics);
+    cache.get(4, {3}, factorization, true, &diagnostics);
+    require(cache.size() == 2 && cache.bytes() == 8 * sizeof(double), "LRU bound failed");
+    const int misses = diagnostics.outage_update_basis_cache_misses;
+    const auto evicted = cache.get(4, {0, 2}, factorization, true, &diagnostics);
+    require(diagnostics.outage_update_basis_cache_misses == misses + 1 &&
+            (*evicted - *first).norm() == 0.0, "evicted basis was not safely reconstructed");
+    SparseMatrix other_matrix = (2.0 * dense).sparseView();
+    Eigen::SparseLU<SparseMatrix, Eigen::COLAMDOrdering<int>> other_factorization;
+    other_factorization.compute(other_matrix);
+    const auto other = cache.get(4, {0, 2}, other_factorization, true, &diagnostics);
+    require(cache.size() == 1 && (*other - 0.5 * *first).norm() < 1e-12,
+            "basis escaped its factorization owner");
+    bool invalid_rejected = false;
+    try { cache.get(4, {4}, other_factorization, true); }
+    catch (const std::runtime_error&) { invalid_rejected = true; }
+    require(invalid_rejected && diagnostics.outage_update_basis_cache_hits == 1,
+            "invalid selector or cache-hit accounting failed");
+}
+
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     struct LowRankUpdate {
         bool enabled{};
@@ -1132,12 +1271,17 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     LowRankUpdate full_outage_update;
     LowRankUpdate active_outage_update;
     LowRankUpdate reactive_outage_update;
+    bool cache_inverse_rows{true};
+    OutageInverseRowCache full_inverse_rows;
+    OutageInverseRowCache active_inverse_rows;
+    OutageInverseRowCache reactive_inverse_rows;
 
     FixedJacobianPredictorCache(
         const CaseData& data,
         const AcState& reference_state,
         const std::vector<int>& commitment,
-        int outaged_branch = -1) {
+        int outaged_branch = -1,
+        bool use_inverse_row_cache = true) : cache_inverse_rows(use_inverse_row_cache) {
         const auto started = std::chrono::steady_clock::now();
         const int nb = static_cast<int>(data.buses.size());
         std::vector<bool> slack(static_cast<std::size_t>(nb), false);
@@ -1326,7 +1470,10 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     static bool prepare_low_rank_update(
         const SparseMatrix& difference,
         Factorization& base_factorization,
-        LowRankUpdate& update) {
+        LowRankUpdate& update,
+        OutageInverseRowCache& inverse_cache,
+        bool use_inverse_row_cache,
+        FastPowerFlowResult* diagnostics) {
         update = {};
         const int dimension = difference.rows();
         if (dimension <= 0 || difference.cols() != dimension) {
@@ -1361,32 +1508,29 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             return true;
         }
         update.difference_rows = Eigen::MatrixXd::Zero(rank, dimension);
-        Eigen::MatrixXd row_selector = Eigen::MatrixXd::Zero(dimension, rank);
         for (int position = 0; position < rank; ++position) {
             const int row = changed_rows[position];
-            row_selector(row, position) = 1.0;
             for (RowSparseMatrix::InnerIterator entry(row_difference, row);
                  entry; ++entry) {
                 update.difference_rows(position, entry.col()) = entry.value();
             }
         }
-        const Eigen::MatrixXd inverse_rows =
-            base_factorization.solve(row_selector);
-        if (base_factorization.info() != Eigen::Success ||
-            !inverse_rows.allFinite()) {
+        const auto inverse_rows = inverse_cache.get(
+            dimension, changed_rows, base_factorization, use_inverse_row_cache, diagnostics);
+        if (!inverse_rows) {
             update = {};
             return false;
         }
         const Eigen::MatrixXd small_system =
             Eigen::MatrixXd::Identity(rank, rank) +
-            update.difference_rows * inverse_rows;
+            update.difference_rows * *inverse_rows;
         Eigen::FullPivLU<Eigen::MatrixXd> small_factorization(small_system);
         small_factorization.setThreshold(1e-10);
         if (!small_factorization.isInvertible()) {
             update = {};
             return false;
         }
-        update.correction = inverse_rows * small_factorization.inverse();
+        update.correction = *inverse_rows * small_factorization.inverse();
         if (!update.correction.allFinite()) {
             update = {};
             return false;
@@ -1397,7 +1541,9 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     bool configure_branch_outage_update(
         const CaseData& data,
         const AcState& reference_state,
-        int outaged_branch) {
+        int outaged_branch,
+        FastPowerFlowResult* diagnostics = nullptr) {
+        AccumulateSeconds timer(diagnostics ? &diagnostics->outage_update_seconds : nullptr);
         full_outage_update = {};
         active_outage_update = {};
         reactive_outage_update = {};
@@ -1408,6 +1554,7 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         if (outaged_branch >= static_cast<int>(data.branches.size())) {
             return false;
         }
+        if (diagnostics) ++diagnostics->outage_update_requests;
         const auto& branch = data.branches[outaged_branch];
         if (branch.status == 0 || branch.from == branch.to ||
             std::abs(branch.tap) <= 1e-12) {
@@ -1558,12 +1705,16 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
             reactive_difference_entries.end());
 
         const bool full_ready = prepare_low_rank_update(
-            full_difference, factorization, full_outage_update);
+            full_difference, factorization, full_outage_update,
+            full_inverse_rows, cache_inverse_rows, diagnostics);
         const bool active_ready = prepare_low_rank_update(
-            active_difference, active_factorization, active_outage_update);
+            active_difference, active_factorization, active_outage_update,
+            active_inverse_rows, cache_inverse_rows, diagnostics);
         const bool reactive_ready = prepare_low_rank_update(
             reactive_difference, reactive_factorization,
-            reactive_outage_update);
+            reactive_outage_update, reactive_inverse_rows, cache_inverse_rows, diagnostics);
+        if (diagnostics) diagnostics->outage_update_basis_cache_bytes =
+            full_inverse_rows.bytes() + active_inverse_rows.bytes() + reactive_inverse_rows.bytes();
         if (!full_ready || !active_ready || !reactive_ready) {
             full_outage_update = {};
             active_outage_update = {};
@@ -2358,8 +2509,23 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
     }
 };
 
-nlohmann::json FastPowerFlowResult::economic_summary_json() const {
+nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
     return {
+        {"fixed_jacobian_predictor_preparation_seconds", fixed_jacobian_predictor_preparation_seconds},
+        {"outage_update_requests", outage_update_requests},
+        {"outage_update_basis_cache_hits", outage_update_basis_cache_hits},
+        {"outage_update_basis_cache_misses", outage_update_basis_cache_misses},
+        {"outage_update_rhs_columns", outage_update_rhs_columns},
+        {"outage_update_basis_cache_bytes", outage_update_basis_cache_bytes},
+        {"outage_update_seconds", outage_update_seconds},
+        {"outage_update_rhs_seconds", outage_update_rhs_seconds},
+        {"economic_balance_polish_seconds", economic_balance_polish_seconds},
+        {"economic_balance_polish_correction_seconds", economic_balance_polish_correction_seconds},
+    };
+}
+
+nlohmann::json FastPowerFlowResult::economic_summary_json() const {
+    auto result = nlohmann::json{
         {"failure_reason", failure_reason},
         {"wall_seconds", wall_seconds},
         {"economic_balance_polish_attempted", economic_balance_polish_attempted},
@@ -2384,10 +2550,12 @@ nlohmann::json FastPowerFlowResult::economic_summary_json() const {
         {"economic_balance_polish_reactive_slack_before", economic_balance_polish_reactive_slack_before},
         {"economic_balance_polish_reactive_slack_after", economic_balance_polish_reactive_slack_after},
     };
+    result.update(runtime_profile_json());
+    return result;
 }
 
 nlohmann::json FastPowerFlowResult::to_json() const {
-    return {
+    auto result = nlohmann::json{
         {"converged", converged},
         {"feasible", feasible},
         {"direct_candidate_attempted", direct_candidate_attempted},
@@ -2496,6 +2664,8 @@ nlohmann::json FastPowerFlowResult::to_json() const {
         {"failure_reason", failure_reason},
         {"validation", validation.to_json()},
     };
+    result.update(runtime_profile_json());
+    return result;
 }
 
 nlohmann::json ValidatedSourceBaseResult::to_json() const {
@@ -3466,7 +3636,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             ? *options_.fixed_jacobian_linearization_state : base_state_;
         if (!predictor_cache_) {
             predictor_cache_ = std::make_unique<FixedJacobianPredictorCache>(
-                data_, linearization_state, commitment_);
+                data_, linearization_state, commitment_, -1, options_.cache_outage_inverse_rows);
             output.fixed_jacobian_predictor_preparation_seconds =
                 predictor_cache_->preparation_seconds;
         }
@@ -3476,7 +3646,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             // outage. In particular, transformer searches do not prepare the
             // line-only update below before their first correction.
             predictor_cache_->configure_branch_outage_update(
-                data_, linearization_state, -1);
+                data_, linearization_state, -1, &output);
         }
         if (predictor_cache_ && predictor_cache_->valid) {
             AcState predictor_state = initial_state;
@@ -3848,6 +4018,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     if (options_.economic_balance_polish &&
                         output.economic_balance_polish_threshold_passed &&
                         options_.max_economic_balance_polish_iterations > 0) {
+                        AccumulateSeconds polish_timer(&output.economic_balance_polish_seconds);
                         output.economic_balance_polish_attempted = true;
                         const auto slack_sum = [](const std::vector<double>& values) {
                             return std::accumulate(
@@ -3868,7 +4039,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (outaged_branch >= 0) {
                             outage_update_ready =
                                 predictor_cache_->configure_branch_outage_update(
-                                    data_, polished_state, outaged_branch);
+                                    data_, polished_state, outaged_branch, &output);
                         }
                         if (!outage_update_ready) {
                             output.economic_balance_polish_trace.push_back({
@@ -3999,6 +4170,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 }
                                 rebuild_specs();
 
+                                const auto correction_started = std::chrono::steady_clock::now();
                                 bool corrected =
                                     predictor_cache_->apply_correction(
                                         data_, p_spec, q_spec,
@@ -4030,6 +4202,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     corrected = active_corrected ||
                                         reactive_corrected;
                                 }
+                                output.economic_balance_polish_correction_seconds +=
+                                    std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        correction_started).count();
                                 if (!corrected) {
                                     output.economic_balance_polish_trace.push_back({
                                         {"iteration", polish_iteration},
@@ -4429,7 +4604,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     !data_.branches[outaged_branch].transformer) {
                     branch_outage_low_rank_update =
                         predictor_cache_->configure_branch_outage_update(
-                            data_, linearization_state, outaged_branch);
+                            data_, linearization_state, outaged_branch, &output);
                     if (options_.capture_diagnostics) {
                         output.fixed_jacobian_predictor_trace.back()[
                             "branch_outage_low_rank_prepared"] =
@@ -5673,7 +5848,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     contingency_predictor_cache =
                         std::make_unique<FixedJacobianPredictorCache>(
                             data_, correction_reference, commitment_,
-                            outaged_branch);
+                            outaged_branch, options_.cache_outage_inverse_rows);
                     output.fixed_jacobian_predictor_preparation_seconds +=
                         contingency_predictor_cache->preparation_seconds;
                     if (options_.capture_diagnostics) {
@@ -5693,7 +5868,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             contingency_predictor_cache =
                                 std::make_unique<FixedJacobianPredictorCache>(
                                     data_, correction_reference, commitment_,
-                                    outaged_branch);
+                                    outaged_branch, options_.cache_outage_inverse_rows);
                             output.fixed_jacobian_predictor_preparation_seconds +=
                                 contingency_predictor_cache->preparation_seconds;
                             if (options_.capture_diagnostics) {

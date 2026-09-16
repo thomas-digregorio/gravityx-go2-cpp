@@ -19,6 +19,8 @@ double default_fixed_jacobian_screen_seconds(
 struct FastPowerFlowOptions {
     bool distributed_balance_polish{true};
     bool enable_fixed_jacobian_predictor{true};
+    // Only factorization-derived unit-vector solves; never prior solutions.
+    bool cache_outage_inverse_rows{true};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -92,6 +94,15 @@ struct FastPowerFlowResult {
         std::numeric_limits<double>::infinity()};
     int fixed_jacobian_predictor_iterations{};
     double fixed_jacobian_predictor_preparation_seconds{};
+    int outage_update_requests{};
+    int outage_update_basis_cache_hits{};
+    int outage_update_basis_cache_misses{};
+    int outage_update_rhs_columns{};
+    std::size_t outage_update_basis_cache_bytes{};
+    double outage_update_seconds{};
+    double outage_update_rhs_seconds{};
+    double economic_balance_polish_seconds{};
+    double economic_balance_polish_correction_seconds{};
     ValidationReport fixed_jacobian_predictor_validation;
     nlohmann::json fixed_jacobian_predictor_trace = nlohmann::json::array();
     bool economic_balance_polish_attempted{};
@@ -157,6 +168,7 @@ struct FastPowerFlowResult {
 
     nlohmann::json to_json() const;
     nlohmann::json economic_summary_json() const;
+    nlohmann::json runtime_profile_json() const;
 };
 
 struct ValidatedSourceBaseResult {
@@ -174,6 +186,7 @@ ValidatedSourceBaseResult build_validated_source_base(
     double validation_tolerance = 1e-5);
 
 void run_fast_power_flow_topology_cache_regression();
+void run_outage_inverse_row_cache_regression();
 
 void run_economic_polish_trial_regression(
     const CaseData& data, const std::vector<int>& commitment,

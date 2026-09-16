@@ -497,6 +497,7 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 
 int run_component_tests() {
     gravityx::run_fast_power_flow_topology_cache_regression();
+    gravityx::run_outage_inverse_row_cache_regression();
     {
         gravityx::Branch branch;
         branch.from = 0;
@@ -1036,13 +1037,29 @@ int run_parallel_circuit_regression() {
     budget_result.economic_balance_polish_economic_checks = 4;
     budget_result.economic_balance_polish_physical_check_seconds = 0.125;
     budget_result.economic_balance_polish_economic_check_seconds = 0.5;
+    budget_result.fixed_jacobian_predictor_preparation_seconds = 0.25;
+    budget_result.outage_update_requests = 2;
+    budget_result.outage_update_basis_cache_hits = 3;
+    budget_result.outage_update_basis_cache_misses = 3;
+    budget_result.outage_update_rhs_columns = 8;
+    budget_result.outage_update_basis_cache_bytes = 4096;
+    budget_result.outage_update_seconds = 0.2;
+    budget_result.outage_update_rhs_seconds = 0.1;
+    budget_result.economic_balance_polish_seconds = 0.6;
+    budget_result.economic_balance_polish_correction_seconds = 0.12;
     const auto compact_economic = budget_result.economic_summary_json();
     const auto full_economic = budget_result.to_json();
     for (const auto* key : {"economic_balance_polish_trial_count",
                            "economic_balance_polish_physical_rejections",
                            "economic_balance_polish_economic_checks",
                            "economic_balance_polish_physical_check_seconds",
-                           "economic_balance_polish_economic_check_seconds"}) {
+                           "economic_balance_polish_economic_check_seconds",
+                           "fixed_jacobian_predictor_preparation_seconds",
+                           "outage_update_requests", "outage_update_basis_cache_hits",
+                           "outage_update_basis_cache_misses", "outage_update_rhs_columns",
+                           "outage_update_basis_cache_bytes", "outage_update_seconds",
+                           "outage_update_rhs_seconds", "economic_balance_polish_seconds",
+                           "economic_balance_polish_correction_seconds"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key) ||
             compact_economic.at(key).get<double>() <= 0.0) {
             throw std::runtime_error("compact worker log omitted economic timing evidence");
@@ -1501,6 +1518,31 @@ int run_parallel_circuit_regression() {
     branch_contingency.type = gravityx::ContingencyType::Branch;
     branch_contingency.source_index = 1;
     branch_contingency.component = 0;
+    {
+        gravityx::FastPowerFlowOptions cached_options;
+        gravityx::enable_cached_economic_polish(cached_options);
+        cached_options.fixed_jacobian_minimum_bus_count = 0;
+        cached_options.fixed_jacobian_screen_only = true;
+        auto uncached_options = cached_options;
+        uncached_options.cache_outage_inverse_rows = false;
+        gravityx::FastContingencyPowerFlow cached_solver(data, solve.state, {1}, cached_options);
+        gravityx::FastContingencyPowerFlow uncached_solver(data, solve.state, {1}, uncached_options);
+        const auto cached = cached_solver.solve(branch_contingency);
+        const auto uncached = uncached_solver.solve(branch_contingency);
+        const auto reused = cached_solver.solve(branch_contingency);
+        if (!cached.feasible || !uncached.feasible || !reused.feasible ||
+            reused.outage_update_basis_cache_hits <= 0 ||
+            uncached.outage_update_basis_cache_hits != 0 ||
+            uncached.outage_update_basis_cache_bytes != 0 ||
+            cached.outage_update_rhs_columns <= 0 ||
+            gravityx::ac_state_to_json(cached.solve.state) != gravityx::ac_state_to_json(uncached.solve.state) ||
+            gravityx::ac_state_to_json(reused.solve.state) != gravityx::ac_state_to_json(cached.solve.state) ||
+            cached.solve.objective != uncached.solve.objective ||
+            reused.validation.max_residual > 1e-5) {
+            throw std::runtime_error("resident outage cache changed a tiny cold result: " +
+                cached.runtime_profile_json().dump() + " reused=" + reused.runtime_profile_json().dump());
+        }
+    }
     gravityx::FastContingencyPowerFlow fast_screen(
         data, solve.state, {1});
     const auto fast_result = fast_screen.solve(branch_contingency);
@@ -5049,6 +5091,12 @@ int run_contingency_worker(
                          "economic_balance_polish_economic_checks",
                          "economic_balance_polish_physical_check_seconds",
                          "economic_balance_polish_economic_check_seconds",
+                         "fixed_jacobian_predictor_preparation_seconds",
+                         "outage_update_requests", "outage_update_basis_cache_hits",
+                         "outage_update_basis_cache_misses", "outage_update_rhs_columns",
+                         "outage_update_basis_cache_bytes", "outage_update_seconds",
+                         "outage_update_rhs_seconds", "economic_balance_polish_seconds",
+                         "economic_balance_polish_correction_seconds",
                          "economic_balance_polish_objective_before",
                          "economic_balance_polish_objective_after",
                          "economic_balance_polish_active_slack_before",

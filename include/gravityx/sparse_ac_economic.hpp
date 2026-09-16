@@ -17,6 +17,7 @@ struct SparseAcEconomicOptions {
     double acceptable_tolerance{1e-5};
     int print_level{};
     bool pwl_epigraph{false};
+    bool exact_hessian{false};
 };
 
 struct SparseAcEconomicResult {
@@ -34,6 +35,9 @@ struct SparseAcEconomicResult {
     int variable_count{};
     int constraint_count{};
     int jacobian_nonzero_count{};
+    bool exact_hessian_enabled{};
+    int hessian_nonzero_count{};
+    int hessian_evaluations{};
     bool pwl_epigraph_enabled{};
     int pwl_epigraph_curve_count{};
     int pwl_epigraph_row_count{};
@@ -81,6 +85,11 @@ void run_sparse_ac_corrective_reference_regression(
 // Tiny-fixture checks of equivalent costs, unchanged physical rows/bounds,
 // and the new analytic cost Jacobian. Does not solve a production case.
 void run_sparse_ac_pwl_epigraph_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& start);
+
+// Finite differences of the complete Lagrangian gradient on tiny fixtures.
+void run_sparse_ac_exact_hessian_regression(
     const CaseData& data, const std::vector<int>& commitment,
     const AcState& start);
 

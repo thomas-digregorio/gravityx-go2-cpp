@@ -1044,6 +1044,8 @@ int run_parallel_circuit_regression() {
         data, {1}, source_base.solve.state);
     gravityx::run_sparse_ac_corrective_reference_regression(
         data, {1}, source_base.solve.state);
+    gravityx::run_sparse_ac_exact_hessian_regression(
+        data, {1}, source_base.solve.state);
     const auto sparse_ac_economic =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, {1}, source_base.solve, sparse_ac_options);
@@ -1075,6 +1077,17 @@ int run_parallel_circuit_regression() {
         epigraph_economic.selected.objective + 1e-9 < source_base.solve.objective) {
         throw std::runtime_error("epigraph economic tiny solve failed: " +
                                  epigraph_economic.to_json(false).dump());
+    }
+    auto exact_options = epigraph_options;
+    exact_options.exact_hessian = true;
+    const auto exact_economic = gravityx::solve_sparse_fixed_commitment_ac_economic(
+        data, {1}, source_base.solve, exact_options);
+    if (!exact_economic.solver_initialized || !exact_economic.candidate_returned ||
+        !exact_economic.exact_hessian_enabled || exact_economic.hessian_nonzero_count <= 0 ||
+        exact_economic.hessian_evaluations <= 0 ||
+        exact_economic.selected_validation.max_residual > 1e-5 ||
+        exact_economic.selected.objective + 1e-9 < source_base.solve.objective) {
+        throw std::runtime_error("exact Hessian tiny solve failed: " + exact_economic.to_json(false).dump());
     }
     const auto original_base_json = gravityx::ac_state_to_json(source_base.solve.state);
     const auto common_reference = gravityx::solve_sparse_common_corrective_reference(
@@ -2171,7 +2184,8 @@ int run_validated_source_base_json(
     double sparse_economic_refinement_seconds = 0.0,
     double sparse_ac_economic_refinement_seconds = 0.0,
     bool base_pwl_epigraph = false,
-    double common_corrective_reference_seconds = 0.0) {
+    double common_corrective_reference_seconds = 0.0,
+    bool base_exact_hessian = false) {
     reject_onedrive(path);
     reject_onedrive(output_path);
     const auto command_start = std::chrono::steady_clock::now();
@@ -3053,6 +3067,7 @@ int run_validated_source_base_json(
         try {
             gravityx::SparseAcEconomicOptions options;
             options.pwl_epigraph = base_pwl_epigraph;
+            options.exact_hessian = base_exact_hessian;
             options.time_limit_seconds =
                 sparse_ac_economic_refinement_seconds;
             const auto refinement =
@@ -3097,6 +3112,7 @@ int run_validated_source_base_json(
             gravityx::SparseAcEconomicOptions options;
             options.time_limit_seconds = common_corrective_reference_seconds;
             options.pwl_epigraph = true;
+            options.exact_hessian = base_exact_hessian;
             const auto reference = gravityx::solve_sparse_common_corrective_reference(
                 data, commitment, selected_solve, options);
             const bool available = reference.improved &&
@@ -5114,7 +5130,7 @@ int main(int argc, char** argv) {
             }
             return run_ibr_json(argv[2], argv[3], print_level, source_status_only);
         }
-        if ((argc >= 4 && argc <= 11) &&
+        if ((argc >= 4 && argc <= 12) &&
             std::string(argv[1]) == "validated-source-base-json") {
             bool allow_exact_fallback = true;
             bool allow_large_base_newton_restart = true;
@@ -5122,6 +5138,7 @@ int main(int argc, char** argv) {
             double sparse_economic_refinement_seconds = 0.0;
             double sparse_ac_economic_refinement_seconds = 0.0;
             bool base_pwl_epigraph = false;
+            bool base_exact_hessian = false;
             double common_corrective_reference_seconds = 0.0;
             for (int i = 4; i < argc; ++i) {
                 const std::string option = argv[i];
@@ -5129,6 +5146,8 @@ int main(int argc, char** argv) {
                     allow_exact_fallback = false;
                 } else if (option == "pwl-epigraph") {
                     base_pwl_epigraph = true;
+                } else if (option == "exact-hessian") {
+                    base_exact_hessian = true;
                 } else if (option == "robust-contingency-seed") {
                     allow_large_base_newton_restart = false;
                 } else if (option.rfind("common-corrective-reference-seconds=", 0) == 0) {
@@ -5181,13 +5200,16 @@ int main(int argc, char** argv) {
             if (base_pwl_epigraph && sparse_ac_economic_refinement_seconds <= 0.0) {
                 throw std::runtime_error("pwl-epigraph requires a positive sparse AC stage");
             }
+            if (base_exact_hessian && !base_pwl_epigraph) {
+                throw std::runtime_error("exact-hessian requires pwl-epigraph");
+            }
             return run_validated_source_base_json(
                 argv[2], argv[3], allow_exact_fallback,
                 allow_large_base_newton_restart,
                 economic_refinement_seconds,
                 sparse_economic_refinement_seconds,
                 sparse_ac_economic_refinement_seconds,
-                base_pwl_epigraph, common_corrective_reference_seconds);
+                base_pwl_epigraph, common_corrective_reference_seconds, base_exact_hessian);
         }
         if ((argc == 6 || argc == 7) && std::string(argv[1]) == "solve-contingency") {
             const int print_level = argc == 7 ? std::stoi(argv[6]) : 0;

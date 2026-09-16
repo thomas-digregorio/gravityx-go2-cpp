@@ -128,6 +128,22 @@ class ReliabilityAuditTests(unittest.TestCase):
         self.assertEqual(after, before + ["--base-pwl-epigraph"])
         self.assertIn("--validated-source-base", after)
 
+    def test_exact_hessian_requires_epigraph_and_preserves_cold_limits(self):
+        config = {"python": "python", "data_repository": "data", "source_root": "sources",
+                  "vendor_evaluator": "evaluator", "total_time_limit": 300,
+                  "minimum_free_space_gib": 30, "base_pwl_epigraph": True}
+        before = arguments(config, "19402", "095", Path("run"))
+        config["base_exact_hessian"] = True
+        after = arguments(config, "19402", "095", Path("run"))
+        self.assertEqual(after, before + ["--base-exact-hessian"])
+        self.assertEqual(after[after.index("--total-time-limit") + 1], "300")
+        self.assertNotIn("--base-json", after)
+        self.assertNotIn("--skip-evaluation", after)
+        self.assertNotIn("--common-corrective-reference-seconds", after)
+        config["base_pwl_epigraph"] = False
+        with self.assertRaises(ValueError):
+            arguments(config, "19402", "095", Path("run"))
+
     def test_common_corrective_reference_is_explicit_and_cold(self):
         config = {"python": "python", "data_repository": "data", "source_root": "sources",
                   "vendor_evaluator": "evaluator", "total_time_limit": 300,

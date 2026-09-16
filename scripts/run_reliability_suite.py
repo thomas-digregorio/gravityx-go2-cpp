@@ -109,6 +109,10 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
         command.append("--cached-economic-contingency-polish")
     if config.get("base_pwl_epigraph", False):
         command.append("--base-pwl-epigraph")
+    if config.get("base_exact_hessian", False):
+        if not config.get("base_pwl_epigraph", False):
+            raise ValueError("exact Hessian requires the checked PWL epigraph")
+        command.append("--base-exact-hessian")
     reference_seconds = float(config.get("common_corrective_reference_seconds", 0.0))
     if not math.isfinite(reference_seconds) or reference_seconds < 0.0:
         raise ValueError("common corrective reference budget must be finite and nonnegative")

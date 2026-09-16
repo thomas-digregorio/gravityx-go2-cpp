@@ -2854,6 +2854,7 @@ def main() -> int:
         "--base-sparse-ac-economic-refinement-seconds", type=float, default=0.0
     )
     parser.add_argument("--base-pwl-epigraph", action="store_true")
+    parser.add_argument("--base-exact-hessian", action="store_true")
     parser.add_argument("--common-corrective-reference-seconds", type=float, default=0.0)
     parser.add_argument("--robust-contingency-base", action="store_true")
     parser.add_argument("--two-stage-contingency-screen", action="store_true")
@@ -2977,6 +2978,8 @@ def main() -> int:
         args.base_sparse_ac_economic_refinement_seconds <= 0.0
     ):
         parser.error("--base-pwl-epigraph requires a positive validated-source sparse AC stage")
+    if args.base_exact_hessian and not args.base_pwl_epigraph:
+        parser.error("--base-exact-hessian requires --base-pwl-epigraph")
     if (args.linearized_contingency_only and
             not args.linearized_contingency_fallback):
         parser.error(
@@ -3235,6 +3238,7 @@ def main() -> int:
             args.base_sparse_ac_economic_refinement_seconds
         ),
         "base_pwl_epigraph": args.base_pwl_epigraph,
+        "base_exact_hessian": args.base_exact_hessian,
         "common_corrective_reference_seconds": args.common_corrective_reference_seconds,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,
@@ -3358,6 +3362,8 @@ def main() -> int:
                 )
             if args.base_pwl_epigraph:
                 base_arguments.append("pwl-epigraph")
+            if args.base_exact_hessian:
+                base_arguments.append("exact-hessian")
             if args.common_corrective_reference_seconds > 0.0:
                 base_arguments.append(
                     "common-corrective-reference-seconds="
@@ -4792,6 +4798,7 @@ def main() -> int:
             args.base_sparse_ac_economic_refinement_seconds
         ),
         "base_pwl_epigraph": args.base_pwl_epigraph,
+        "base_exact_hessian": args.base_exact_hessian,
         "common_corrective_reference_seconds": args.common_corrective_reference_seconds,
         "robust_contingency_base": args.robust_contingency_base,
         "two_stage_contingency_screen": args.two_stage_contingency_screen,

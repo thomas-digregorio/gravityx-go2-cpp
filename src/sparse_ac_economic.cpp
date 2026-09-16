@@ -229,7 +229,7 @@ BranchCoefficients branch_coefficients(const Branch& branch) {
         (-b * tr - g * ti) / tm2};
     result.term[1] = {
         -from_b_self, 0.0,
-        (b * tr - g * ti) / tm2,
+        (b * tr + g * ti) / tm2,
         (-g * tr + b * ti) / tm2};
     result.term[2] = {
         0.0, g + branch.g_to,
@@ -268,6 +268,33 @@ BranchEvaluation evaluate_branch(
             angle * vm_from * vm_to;
         result.derivative[component][3] =
             -result.derivative[component][2];
+    }
+    return result;
+}
+
+using FlowHessians = std::array<std::array<std::array<double, 4>, 4>, 4>;
+
+FlowHessians branch_flow_hessians(
+    const BranchCoefficients& coefficients, double vf, double vt, double angle) {
+    FlowHessians result{};
+    const double cosine = std::cos(angle), sine = std::sin(angle);
+    for (int k = 0; k < 4; ++k) {
+        const auto& term = coefficients.term[k];
+        const double cross = term.cross_cos * cosine + term.cross_sin * sine;
+        const double first = -term.cross_cos * sine + term.cross_sin * cosine;
+        auto& h = result[k];
+        h[0][0] = 2.0 * term.vf2;
+        h[1][1] = 2.0 * term.vt2;
+        h[1][0] = cross;
+        h[2][0] = vt * first;
+        h[3][0] = -vt * first;
+        h[2][1] = vf * first;
+        h[3][1] = -vf * first;
+        h[2][2] = h[3][3] = -vf * vt * cross;
+        h[3][2] = vf * vt * cross;
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < i; ++j) h[j][i] = h[i][j];
+        }
     }
     return result;
 }
@@ -319,7 +346,8 @@ public:
         const AcState& start,
         double verification_tolerance,
         bool pwl_epigraph = false,
-        const AcState* original_corrective_base = nullptr)
+        const AcState* original_corrective_base = nullptr,
+        bool exact_hessian = false)
         : data_(data),
           commitment_(std::move(commitment)),
           start_state_(start),
@@ -327,6 +355,7 @@ public:
           interval_duration_(original_corrective_base != nullptr
               ? data.delta_ctg : data.delta),
           verification_tolerance_(verification_tolerance),
+          exact_hessian_(exact_hessian),
           nb_(static_cast<int>(data.buses.size())),
           ng_(static_cast<int>(data.generators.size())),
           nd_(static_cast<int>(data.loads.size())),
@@ -372,6 +401,10 @@ public:
             pwl_original_curve_count_ = nd_ + static_cast<int>(
                 std::count(commitment_.begin(), commitment_.end(), 1));
         }
+        if (exact_hessian_ && (!pwl_epigraph || pwl_original_curve_count_ != 0)) {
+            throw std::runtime_error(
+                "exact Hessian requires all source curves to pass the smooth PWL epigraph check");
+        }
         ybus_ = build_ybus(data_, start_state_);
         coefficients_.reserve(nl_);
         for (const auto& branch : data_.branches) {
@@ -407,6 +440,7 @@ public:
         constraint_count_ = epigraph_row_offset_ +
             static_cast<int>(epigraph_rows_.size());
         build_jacobian_structure();
+        if (exact_hessian_) build_hessian_structure();
         std::vector<double> initial_constraints(constraint_count_);
         evaluate_constraints(start_x_.data(), initial_constraints.data());
         initial_constraint_violation_ = constraint_violation(
@@ -422,7 +456,7 @@ public:
         n = variable_count_;
         m = constraint_count_;
         nnz_jac_g = static_cast<Ipopt::Index>(jacobian_rows_.size());
-        nnz_h_lag = 0;
+        nnz_h_lag = static_cast<Ipopt::Index>(hessian_rows_.size());
         index_style = C_STYLE;
         return true;
     }
@@ -568,18 +602,28 @@ public:
     }
 
     bool eval_h(
-        Ipopt::Index,
-        const Ipopt::Number*,
+        Ipopt::Index n,
+        const Ipopt::Number* x,
         bool,
-        Ipopt::Number,
-        Ipopt::Index,
-        const Ipopt::Number*,
+        Ipopt::Number, // The checked epigraph objective is linear: its Hessian is zero.
+        Ipopt::Index m,
+        const Ipopt::Number* lambda,
         bool,
-        Ipopt::Index,
-        Ipopt::Index*,
-        Ipopt::Index*,
-        Ipopt::Number*) override {
-        return false;
+        Ipopt::Index entries,
+        Ipopt::Index* rows,
+        Ipopt::Index* columns,
+        Ipopt::Number* values) override {
+        if (!exact_hessian_ || n != variable_count_ || m != constraint_count_ ||
+            entries != static_cast<Ipopt::Index>(hessian_rows_.size())) return false;
+        if (values == nullptr) {
+            std::copy(hessian_rows_.begin(), hessian_rows_.end(), rows);
+            std::copy(hessian_columns_.begin(), hessian_columns_.end(), columns);
+            return true;
+        }
+        ++hessian_evaluations_;
+        fill_hessian_values(x, lambda, values);
+        return std::all_of(values, values + entries,
+                           [](double value) { return std::isfinite(value); });
     }
 
     bool intermediate_callback(
@@ -679,6 +723,10 @@ public:
     int jacobian_nonzero_count() const {
         return static_cast<int>(jacobian_rows_.size());
     }
+    int hessian_nonzero_count() const {
+        return static_cast<int>(hessian_rows_.size());
+    }
+    int hessian_evaluations() const { return hessian_evaluations_; }
     int solver_return_status() const { return solver_return_status_; }
     double scaled_objective() const { return scaled_objective_; }
     double initial_constraint_violation() const {
@@ -1192,6 +1240,101 @@ private:
         }
     }
 
+    void build_hessian_structure() {
+        std::map<std::pair<int, int>, int> positions;
+        const auto entry = [&](int first, int second) {
+            const auto key = std::make_pair(std::max(first, second), std::min(first, second));
+            const auto [it, inserted] = positions.emplace(key, static_cast<int>(positions.size()));
+            if (inserted) {
+                hessian_rows_.push_back(key.first);
+                hessian_columns_.push_back(key.second);
+            }
+            return it->second;
+        };
+        for (int bus = 0; bus < nb_; ++bus) {
+            hessian_vm_diagonal_.push_back(entry(vm_offset_ + bus, vm_offset_ + bus));
+        }
+        for (int branch_index : active_branches_) {
+            const auto& branch = data_.branches[branch_index];
+            HessianBranch pattern;
+            pattern.columns = {vm_offset_ + branch.from, vm_offset_ + branch.to,
+                               va_offset_ + branch.from, va_offset_ + branch.to,
+                               sm_offset_ + branch_index};
+            pattern.entries.fill(-1);
+            int slot = 0;
+            for (int i = 0; i < 5; ++i) {
+                for (int j = 0; j <= i; ++j, ++slot) {
+                    // Slack-angle curvature is identically zero. Transformer
+                    // rating slack has no voltage cross term either.
+                    if (i == 4 && j != 4 && (j >= 2 || branch.transformer)) continue;
+                    pattern.entries[slot] = entry(pattern.columns[i], pattern.columns[j]);
+                    // T' H T: a self-loop maps two local off-diagonal terms
+                    // onto one global diagonal and must count both.
+                    pattern.weights[slot] = i != j && pattern.columns[i] == pattern.columns[j]
+                        ? 2.0 : 1.0;
+                }
+            }
+            hessian_branch_patterns_.push_back(pattern);
+        }
+    }
+
+    void fill_hessian_values(const double* x, const double* lambda, double* values) const {
+        std::fill(values, values + hessian_rows_.size(), 0.0);
+        for (int i = 0; i < static_cast<int>(data_.shunts.size()); ++i) {
+            const auto& shunt = data_.shunts[i];
+            const int row = 4 * shunt.bus;
+            values[hessian_vm_diagonal_[shunt.bus]] += 2.0 * (
+                (lambda[row] - lambda[row + 1]) * shunt.gs -
+                (lambda[row + 2] - lambda[row + 3]) *
+                    effective_shunt_susceptance(data_, start_state_, i));
+        }
+        for (int position = 0; position < static_cast<int>(active_branches_.size()); ++position) {
+            const int branch_index = active_branches_[position];
+            const auto& branch = data_.branches[branch_index];
+            const auto& pattern = hessian_branch_patterns_[position];
+            const double vf = x[pattern.columns[0]], vt = x[pattern.columns[1]];
+            const double angle = x[pattern.columns[2]] - x[pattern.columns[3]];
+            const auto flow = evaluate_branch(coefficients_[branch_index], vf, vt, angle);
+            const auto second = branch_flow_hessians(coefficients_[branch_index], vf, vt, angle);
+            const std::array<double, 4> balance_weight = {
+                lambda[4 * branch.from] - lambda[4 * branch.from + 1],
+                lambda[4 * branch.from + 2] - lambda[4 * branch.from + 3],
+                lambda[4 * branch.to] - lambda[4 * branch.to + 1],
+                lambda[4 * branch.to + 2] - lambda[4 * branch.to + 3]};
+            std::array<std::array<double, 5>, 5> local{};
+            for (int i = 0; i < 4; ++i) {
+                for (int j = 0; j <= i; ++j) {
+                    for (int k = 0; k < 4; ++k) local[i][j] += balance_weight[k] * second[k][i][j];
+                }
+            }
+            const double rating = original_corrective_base_ != nullptr ? branch.rate_c : branch.rate_a;
+            for (int side = 0; side < 2; ++side) {
+                const double weight = 2.0 * lambda[thermal_row_offset_ + 2 * position + side];
+                const int p = 2 * side, q = p + 1;
+                for (int i = 0; i < 4; ++i) {
+                    for (int j = 0; j <= i; ++j) {
+                        local[i][j] += weight * (
+                            flow.derivative[p][i] * flow.derivative[p][j] + flow.flow[p] * second[p][i][j] +
+                            flow.derivative[q][i] * flow.derivative[q][j] + flow.flow[q] * second[q][i][j]);
+                    }
+                }
+                local[4][4] -= weight * rating * rating;
+                if (!branch.transformer) {
+                    local[side][side] -= weight * rating * rating;
+                    local[4][side] -= weight * rating * rating;
+                }
+            }
+            int slot = 0;
+            for (int i = 0; i < 5; ++i) {
+                for (int j = 0; j <= i; ++j, ++slot) {
+                    if (pattern.entries[slot] >= 0) {
+                        values[pattern.entries[slot]] += pattern.weights[slot] * local[i][j];
+                    }
+                }
+            }
+        }
+    }
+
     double constraint_violation(
         const double* x,
         const double* constraints) const {
@@ -1229,6 +1372,7 @@ private:
     const AcState* original_corrective_base_{};
     double interval_duration_{};
     double verification_tolerance_{};
+    bool exact_hessian_{};
     int nb_{};
     int ng_{};
     int nd_{};
@@ -1272,6 +1416,16 @@ private:
     std::vector<int> reference_buses_;
     std::vector<Ipopt::Index> jacobian_rows_;
     std::vector<Ipopt::Index> jacobian_columns_;
+    struct HessianBranch {
+        std::array<int, 5> columns{};
+        std::array<int, 15> entries{};
+        std::array<double, 15> weights{};
+    };
+    std::vector<Ipopt::Index> hessian_rows_;
+    std::vector<Ipopt::Index> hessian_columns_;
+    std::vector<int> hessian_vm_diagonal_;
+    std::vector<HessianBranch> hessian_branch_patterns_;
+    int hessian_evaluations_{};
     std::vector<double> final_x_;
     int solver_return_status_{-99};
     double scaled_objective_{};
@@ -1532,6 +1686,141 @@ void run_sparse_ac_corrective_reference_regression(
     require(frozen_base == ac_state_to_json(original_base), "original base mutated");
 }
 
+void run_sparse_ac_exact_hessian_regression(
+    const CaseData& data, const std::vector<int>& commitment, const AcState& start) {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) throw std::runtime_error(std::string("exact Hessian regression: ") + message);
+    };
+    require(data.buses.size() >= 2 && data.branches.size() >= 2, "fixture too small");
+    auto fixture = data;
+    fixture.delta = 1.75;
+    fixture.delta_ctg = 0.25;
+    fixture.branches[0].tap = 1.07;
+    fixture.branches[0].shift = 0.13;
+    fixture.branches[0].g_fr = 0.023;
+    fixture.branches[0].b_fr = -0.017;
+    fixture.branches[0].g_to = 0.009;
+    fixture.branches[0].b_to = 0.021;
+    fixture.branches[1].transformer = true;
+    fixture.branches[1].tap = 0.93;
+    fixture.branches[1].shift = -0.17;
+    fixture.branches[1].g_fr = 0.019;
+    fixture.branches[1].b_fr = 0.031;
+    fixture.branches[1].g_to = -0.007;
+    fixture.branches[1].b_to = -0.023;
+    for (auto& branch : fixture.branches) branch.rate_c = 1.7 * branch.rate_a;
+    Shunt shunt;
+    shunt.bus = 0;
+    shunt.gs = 0.037;
+    shunt.bs = -0.051;
+    fixture.shunts.push_back(shunt);
+    for (const auto& branch : fixture.branches) {
+        const Complex series = 1.0 / Complex(branch.r, branch.x);
+        const Complex from_shunt(branch.g_fr, branch.b_fr), to_shunt(branch.g_to, branch.b_to);
+        const double tap2 = branch.tap * branch.tap;
+        const Complex rotation = std::polar(1.0, branch.shift);
+        const Complex yff = branch.transformer ? series / tap2 + from_shunt
+                                               : (series + from_shunt) / tap2;
+        const Complex yft = -series * rotation / branch.tap;
+        const Complex ytf = -series * std::conj(rotation) / branch.tap;
+        const Complex ytt = series + to_shunt;
+        const Complex vf = std::polar(0.97, 0.07), vt = std::polar(1.04, -0.11);
+        const Complex sf = vf * std::conj(yff * vf + yft * vt);
+        const Complex st = vt * std::conj(ytf * vf + ytt * vt);
+        const auto analytic = evaluate_branch(branch_coefficients(branch), 0.97, 1.04, 0.18);
+        const std::array<double, 4> complex_power = {sf.real(), sf.imag(), st.real(), st.imag()};
+        for (int k = 0; k < 4; ++k) {
+            require(std::abs(analytic.flow[k] - complex_power[k]) < 1e-12,
+                    "terminal power differs from complex-admittance calculation");
+        }
+    }
+    // Derivative probes need not be physically feasible, and never solve a
+    // production case. Mutations here affect this copied tiny fixture only.
+    for (int topology = 0; topology < 3; ++topology) {
+        auto topology_data = fixture;
+        if (topology == 1) topology_data.branches[1].to = topology_data.branches[1].from;
+        if (topology == 2) topology_data.branches[1].status = 0;
+        for (bool corrective : {false, true}) {
+            SparseAcEconomicNlp model(topology_data, commitment, start, 1e-5,
+                                       true, corrective ? &start : nullptr, true);
+            SparseAcEconomicNlp approximate(topology_data, commitment, start, 1e-5,
+                                             true, corrective ? &start : nullptr, false);
+            Ipopt::Index n, m, nj, nh;
+            Ipopt::TNLP::IndexStyleEnum style;
+            model.get_nlp_info(n, m, nj, nh, style);
+            require(nh > 0, "empty Hessian pattern");
+            std::vector<double> x(n), lo(n), hi(n), gl(m), gu(m);
+            model.get_starting_point(n, true, x.data(), false, nullptr, nullptr, m, false, nullptr);
+            model.get_bounds_info(n, lo.data(), hi.data(), m, gl.data(), gu.data());
+            std::vector<double> old_lo(n), old_hi(n), old_gl(m), old_gu(m);
+            approximate.get_bounds_info(n, old_lo.data(), old_hi.data(), m, old_gl.data(), old_gu.data());
+            require(lo == old_lo && hi == old_hi && gl == old_gl && gu == old_gu,
+                    "derivative option changed bounds");
+            x[0] = 0.97; x[1] = 1.04;
+            x[topology_data.buses.size()] = 0.07;
+            x[topology_data.buses.size() + 1] = -0.11;
+            std::vector<double> g(m), old_g(m);
+            model.eval_g(n, x.data(), true, m, g.data());
+            approximate.eval_g(n, x.data(), true, m, old_g.data());
+            require(g == old_g, "derivative option changed constraint values");
+            std::vector<Ipopt::Index> jr(nj), jc(nj), hr(nh), hc(nh);
+            model.eval_jac_g(n, nullptr, false, m, nj, jr.data(), jc.data(), nullptr);
+            model.eval_h(n, nullptr, false, 1.3, m, nullptr, false, nh, hr.data(), hc.data(), nullptr);
+            std::map<std::pair<int, int>, int> unique;
+            for (int e = 0; e < nh; ++e) {
+                require(hr[e] >= hc[e] && hr[e] < n && hc[e] >= 0, "invalid lower-triangle coordinate");
+                require(unique.emplace(std::make_pair(hr[e], hc[e]), e).second, "duplicate Hessian coordinate");
+            }
+            for (int probe = 0; probe < 3; ++probe) {
+                std::vector<double> lambda(m), h(nh), dense(n * n, 0.0);
+                for (int row = 0; row < m; ++row) {
+                    lambda[row] = probe == 2 ? 0.0 : 0.37 * std::sin(0.71 * (row + 1));
+                    if (probe == 1 && row < 4 * static_cast<int>(topology_data.buses.size())) lambda[row] = 0.0;
+                }
+                require(model.eval_h(n, x.data(), true, 1.3, m, lambda.data(), true,
+                        nh, nullptr, nullptr, h.data()), "Hessian evaluation failed");
+                for (int e = 0; e < nh; ++e) {
+                    dense[hr[e] * n + hc[e]] += h[e];
+                    if (hr[e] != hc[e]) dense[hc[e] * n + hr[e]] += h[e];
+                }
+                const auto lagrangian_gradient = [&](const std::vector<double>& point) {
+                    std::vector<double> gradient(n), jac(nj);
+                    model.eval_grad_f(n, point.data(), true, gradient.data());
+                    model.eval_jac_g(n, point.data(), true, m, nj, nullptr, nullptr, jac.data());
+                    for (double& value : gradient) value *= 1.3;
+                    for (int e = 0; e < nj; ++e) gradient[jc[e]] += lambda[jr[e]] * jac[e];
+                    return gradient;
+                };
+                constexpr double step = 1e-6;
+                for (int column = 0; column < n; ++column) {
+                    auto lower = x, upper = x;
+                    lower[column] -= step; upper[column] += step;
+                    const auto left = lagrangian_gradient(lower), right = lagrangian_gradient(upper);
+                    for (int row = 0; row < n; ++row) {
+                        const double finite_difference = (right[row] - left[row]) / (2.0 * step);
+                        const double exact = dense[row * n + column];
+                        if (std::abs(exact - finite_difference) > 2e-5 + 2e-7 * std::abs(exact)) {
+                            throw std::runtime_error("exact Hessian finite difference mismatch at " +
+                                std::to_string(row) + "," + std::to_string(column) + ": " +
+                                std::to_string(exact) + " vs " + std::to_string(finite_difference));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (bool epigraph : {false, true}) {
+        auto nonsmooth = data;
+        nonsmooth.generators[0].ncost = 3;
+        nonsmooth.generators[0].cost = {0.0, 0.0, 1.0, 10.0, 2.0, 5.0};
+        bool rejected = false;
+        try {
+            SparseAcEconomicNlp invalid(nonsmooth, commitment, start, 1e-5, epigraph, nullptr, true);
+        } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "exact Hessian accepted unchecked nonsmooth source costs");
+    }
+}
+
 nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
     nlohmann::json result = {
         {"attempted", attempted},
@@ -1548,6 +1837,9 @@ nlohmann::json SparseAcEconomicResult::to_json(bool include_state) const {
         {"variable_count", variable_count},
         {"constraint_count", constraint_count},
         {"jacobian_nonzero_count", jacobian_nonzero_count},
+        {"exact_hessian_enabled", exact_hessian_enabled},
+        {"hessian_nonzero_count", hessian_nonzero_count},
+        {"hessian_evaluations", hessian_evaluations},
         {"pwl_epigraph_enabled", pwl_epigraph_enabled},
         {"pwl_epigraph_curve_count", pwl_epigraph_curve_count},
         {"pwl_epigraph_row_count", pwl_epigraph_row_count},
@@ -1604,11 +1896,14 @@ static SparseAcEconomicResult solve_sparse_ac_economic_impl(
 
     auto* raw_problem = new SparseAcEconomicNlp(
         data, commitment, output.selected.state,
-        options.acceptable_tolerance, options.pwl_epigraph, original_corrective_base);
+        options.acceptable_tolerance, options.pwl_epigraph, original_corrective_base,
+        options.exact_hessian);
     Ipopt::SmartPtr<Ipopt::TNLP> problem = raw_problem;
     output.variable_count = raw_problem->variable_count();
     output.constraint_count = raw_problem->constraint_count();
     output.jacobian_nonzero_count = raw_problem->jacobian_nonzero_count();
+    output.exact_hessian_enabled = options.exact_hessian;
+    output.hessian_nonzero_count = raw_problem->hessian_nonzero_count();
     output.pwl_epigraph_enabled = options.pwl_epigraph;
     output.pwl_epigraph_curve_count = raw_problem->pwl_epigraph_curve_count();
     output.pwl_epigraph_row_count = raw_problem->pwl_epigraph_row_count();
@@ -1622,7 +1917,7 @@ static SparseAcEconomicResult solve_sparse_ac_economic_impl(
     application->Options()->SetStringValue(
         "linear_solver", "mumps");
     application->Options()->SetStringValue(
-        "hessian_approximation", "limited-memory");
+        "hessian_approximation", options.exact_hessian ? "exact" : "limited-memory");
     application->Options()->SetStringValue(
         "mu_strategy", "adaptive");
     application->Options()->SetStringValue(
@@ -1650,6 +1945,7 @@ static SparseAcEconomicResult solve_sparse_ac_economic_impl(
         output.status = "Ipopt initialization failed";
     }
     output.solver_return_status = raw_problem->solver_return_status();
+    output.hessian_evaluations = raw_problem->hessian_evaluations();
     output.scaled_solver_objective = raw_problem->scaled_objective();
     output.candidate_constraint_violation =
         raw_problem->final_constraint_violation();

@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "algorithm_revision": "0e67268bde491487207661fb719ad274b630c41b",
+  "experiment": "v17_s095",
+  "cold_source_start": true,
+  "full_run_repetitions": 1,
+  "completed_contingencies": 6477,
+  "required_contingencies": 6579,
+  "missing_completed_contingencies": 102,
+  "total_wall_seconds": 296.48433989999467,
+  "base_algorithm_wall_seconds": 51.102870572,
+  "error": "fast-screen worker 4 reached the end-to-end work deadline",
+  "complete_official_score": null,
+  "qualified": false,
+  "native_terminal_records": 6477,
+  "missing_local_dispatch_metric_records": 0,
+  "root_solution_file_entries_before_prune": 6499,
+  "max_native_residual": 9.989966141821238e-6,
+  "method_counts": {
+    "resident_fixed_jacobian_economic_balance_polish": 5825,
+    "exact_parallel_peer_direct_screen": 648,
+    "bounded_fast_newton_rescue": 4
+  },
+  "local_dispatch": {
+    "attempted": 5825,
+    "selected": 5825,
+    "parallel_nested_seconds_not_wall_time": 203.125703083,
+    "pg_changes": 2252875,
+    "qg_changes": 2175046,
+    "load_factor_changes": 71076781,
+    "summed_predicted_native_gain": 254971277.43702352,
+    "summed_rebuilt_native_gain": 254971277.43692136,
+    "reported_rejections": 0
+  },
+  "other_parallel_nested_phase_aggregates": {
+    "polish_seconds_including_local_dispatch": 1478.136497,
+    "polish_iterations": 11913,
+    "polish_trials": 36932,
+    "physical_rejections": 21396,
+    "physical_check_seconds": 678.212627999,
+    "predictor_preparation_seconds": 559.086355631,
+    "tasks_by_polish_iteration_count": {"0": 783, "1": 2228, "2": 713, "3": 2753}
+  },
+  "matched_native_comparison_not_a_complete_score_or_controlled_timing_sample": {
+    "labels": 6477,
+    "v16_summed_worker_seconds": 5112.537167592,
+    "v17_summed_worker_seconds": 5413.003530535,
+    "v16_mean_native_objective": 144528.5387521601,
+    "v17_mean_native_objective": 161049.494131731
+  },
+  "partial_official_comparison_not_a_complete_score": {
+    "unique_v17_detail_labels_including_base": 5290,
+    "infeasible_detail_labels": 0,
+    "matched_contingency_labels": 5289,
+    "base_objective": 214720.1938620892,
+    "v16_matched_mean_objective": 125927.11513342659,
+    "v17_matched_mean_objective": 146058.93454034152,
+    "v16_matched_mean_bus_penalty": 89904.7008699441,
+    "v17_matched_mean_bus_penalty": 69781.45260594781,
+    "nonrandom_incomplete_set_do_not_extrapolate": true
+  },
+  "archive_sha256": "485805f937098c16fe213d0dcd3a40adb8daaec3b06c44efab7f76ef64b79809",
+  "status_sha256": "3fac8ecac7e3edc1921515190ebacc16b358f4c55729ebf005d86840156aa63f",
+  "best_complete_study_incumbent_remains": "v16_s095"
+}

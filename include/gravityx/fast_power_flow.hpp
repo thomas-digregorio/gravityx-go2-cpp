@@ -106,6 +106,11 @@ struct FastPowerFlowResult {
     bool economic_balance_polish_selected{};
     int economic_balance_polish_iterations{};
     int economic_balance_polish_backtracking_attempts{};
+    int economic_balance_polish_trial_count{};
+    int economic_balance_polish_physical_rejections{};
+    int economic_balance_polish_economic_checks{};
+    double economic_balance_polish_physical_check_seconds{};
+    double economic_balance_polish_economic_check_seconds{};
     double economic_balance_polish_objective_before{};
     double economic_balance_polish_objective_after{};
     double economic_balance_polish_active_slack_before{};
@@ -169,6 +174,10 @@ ValidatedSourceBaseResult build_validated_source_base(
     double validation_tolerance = 1e-5);
 
 void run_fast_power_flow_topology_cache_regression();
+
+void run_economic_polish_trial_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& original_base);
 
 double rebuild_base_state_derived_fields(
     const CaseData& data,

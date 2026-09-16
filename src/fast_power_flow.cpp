@@ -2429,6 +2429,11 @@ nlohmann::json FastPowerFlowResult::to_json() const {
          economic_balance_polish_iterations},
         {"economic_balance_polish_backtracking_attempts",
          economic_balance_polish_backtracking_attempts},
+        {"economic_balance_polish_trial_count", economic_balance_polish_trial_count},
+        {"economic_balance_polish_physical_rejections", economic_balance_polish_physical_rejections},
+        {"economic_balance_polish_economic_checks", economic_balance_polish_economic_checks},
+        {"economic_balance_polish_physical_check_seconds", economic_balance_polish_physical_check_seconds},
+        {"economic_balance_polish_economic_check_seconds", economic_balance_polish_economic_check_seconds},
         {"economic_balance_polish_objective_before",
          economic_balance_polish_objective_before},
         {"economic_balance_polish_objective_after",
@@ -2702,6 +2707,122 @@ double rebuild_contingency_state_derived_fields(
     return rebuild_contingency_state_fields(
         data, base_state, commitment, contingency, state,
         balance_slack_upper, true);
+}
+
+struct EconomicPolishTrial {
+    double objective{-std::numeric_limits<double>::infinity()};
+    ValidationReport validation;
+    bool economics_checked{};
+    double physical_seconds{};
+    double economic_seconds{};
+};
+
+static EconomicPolishTrial evaluate_economic_polish_trial(
+    const CaseData& data, const AcState& original_base,
+    const std::vector<int>& commitment, const Contingency& contingency,
+    const ContingencyContext& context, AcState& candidate,
+    double validation_tolerance, bool staged = true) {
+    EconomicPolishTrial result;
+    // The unstaged path is retained solely as a tiny-fixture equivalence oracle.
+    if (!staged) {
+        result.objective = rebuild_contingency_state_derived_fields(
+            data, original_base, commitment, contingency, candidate);
+        result.validation = validate_state(
+            data, ModelMode::ContingencySoft, candidate, commitment, context);
+        result.economics_checked = true;
+        return result;
+    }
+    const auto physical_start = std::chrono::steady_clock::now();
+    rebuild_contingency_state_fields(
+        data, original_base, commitment, contingency, candidate, 0.5, false);
+    result.validation = validate_rebuilt_contingency_trial(
+        data, candidate, commitment, context);
+    result.physical_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - physical_start).count();
+    if (!(result.validation.max_residual <= validation_tolerance)) return result;
+
+    // Nothing is accepted on the shortened physical report. Complete all
+    // omitted PWL and Ohm-law checks after deterministic economic rebuilding.
+    const auto economic_start = std::chrono::steady_clock::now();
+    result.objective = rebuild_contingency_economic_fields(
+        data, original_base, commitment, contingency, candidate);
+    result.validation = validate_rebuilt_contingency_economic_and_ohms(
+        data, candidate, commitment, context, result.validation);
+    result.economics_checked = true;
+    result.economic_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - economic_start).count();
+    return result;
+}
+
+void run_economic_polish_trial_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& original_base) {
+    const auto require = [](bool condition, const char* message) {
+        if (!condition) throw std::runtime_error(std::string("staged economic trial regression: ") + message);
+    };
+    require(!data.branches.empty() && !data.generators.empty() && !data.loads.empty(),
+            "fixture lacks required components");
+    const auto frozen_base = ac_state_to_json(original_base);
+    int physically_rejected = 0, completely_checked = 0, accepted = 0;
+    for (auto type : {ContingencyType::Branch, ContingencyType::Generator}) {
+        const Contingency outage{"tiny-trial", type, 0, 0};
+        ContingencyContext context;
+        context.borrow_base_state(original_base);
+        context.outaged_branch = type == ContingencyType::Branch ? 0 : -1;
+        context.outaged_generator = type == ContingencyType::Generator ? 0 : -1;
+        for (int mutation = 0; mutation < 7; ++mutation) {
+            auto fixture = data;
+            fixture.generators[0].pmin = 0.1;
+            auto trial = original_base;
+            if (mutation == 1) trial.vm[0] = fixture.buses[0].vmax + 0.1;
+            if (mutation == 2) trial.pg[0] = fixture.generators[0].pmax + 0.1;
+            if (mutation == 3) trial.demand_factor[0] = fixture.loads[0].tmax + 0.1;
+            if (mutation == 4) {
+                for (auto& branch : fixture.branches) branch.rate_c *= 0.0001;
+            }
+            if (mutation == 5) trial.vm[0] = fixture.buses[0].vmax + 0.5e-5;
+            if (mutation == 6) trial.qg[0] = fixture.generators[0].qmax + 0.1;
+            auto full_state = trial, staged_state = trial;
+            const auto full = evaluate_economic_polish_trial(fixture, original_base,
+                commitment, outage, context, full_state, 1e-5, false);
+            const auto staged = evaluate_economic_polish_trial(fixture, original_base,
+                commitment, outage, context, staged_state, 1e-5, true);
+            const bool full_pass = full.validation.max_residual <= 1e-5;
+            const bool staged_pass = staged.validation.max_residual <= 1e-5;
+            require(full_pass == staged_pass, "staging changed feasibility decision");
+            if (staged.economics_checked) {
+                ++completely_checked;
+                require(ac_state_to_json(full_state) == ac_state_to_json(staged_state),
+                        "staging changed the rebuilt state");
+                require(full.objective == staged.objective, "staging changed objective arithmetic");
+                const std::array<double ValidationReport::*, 12> metrics = {
+                    &ValidationReport::max_variable_bound_violation,
+                    &ValidationReport::max_pwl_sum_residual,
+                    &ValidationReport::max_pwl_power_residual,
+                    &ValidationReport::max_reference_angle_residual,
+                    &ValidationReport::max_generator_residual,
+                    &ValidationReport::max_load_ramp_violation,
+                    &ValidationReport::max_active_balance_residual,
+                    &ValidationReport::max_reactive_balance_residual,
+                    &ValidationReport::max_ohms_residual,
+                    &ValidationReport::max_angle_violation,
+                    &ValidationReport::max_flow_limit_violation,
+                    &ValidationReport::max_residual};
+                for (auto metric : metrics) {
+                    require(full.validation.*metric == staged.validation.*metric,
+                            "completed staged validation omitted a residual category");
+                }
+                if (staged_pass) ++accepted;
+            } else {
+                ++physically_rejected;
+                require(!full_pass && !std::isfinite(staged.objective),
+                        "incomplete physical trial could be accepted");
+            }
+        }
+    }
+    require(physically_rejected > 0 && completely_checked > 0 && accepted > 0,
+            "fixture did not exercise both rejection and complete acceptance");
+    require(frozen_base == ac_state_to_json(original_base), "original base was mutated");
 }
 
 double rebuild_common_corrective_reference_state(
@@ -3950,15 +4071,16 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     }
                                     normalize_source_reference_angles(
                                         data_, components, candidate.va);
-                                    const double candidate_objective =
-                                        rebuild_contingency_state_derived_fields(
-                                            data_, base_state_, commitment_,
-                                            *contingency, candidate);
-                                    const auto candidate_validation =
-                                        validate_state(
-                                            data_, ModelMode::ContingencySoft,
-                                            candidate, commitment_,
-                                            direct_context);
+                                    const auto trial_check = evaluate_economic_polish_trial(
+                                        data_, base_state_, commitment_, *contingency,
+                                        *direct_context, candidate, options_.validation_tolerance);
+                                    ++output.economic_balance_polish_trial_count;
+                                    output.economic_balance_polish_economic_checks += trial_check.economics_checked;
+                                    output.economic_balance_polish_physical_rejections += !trial_check.economics_checked;
+                                    output.economic_balance_polish_physical_check_seconds += trial_check.physical_seconds;
+                                    output.economic_balance_polish_economic_check_seconds += trial_check.economic_seconds;
+                                    const double candidate_objective = trial_check.objective;
+                                    const auto& candidate_validation = trial_check.validation;
                                     trial_active_slack =
                                         slack_sum(candidate.p_delta);
                                     trial_reactive_slack =

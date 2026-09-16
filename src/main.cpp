@@ -1046,6 +1046,8 @@ int run_parallel_circuit_regression() {
         data, {1}, source_base.solve.state);
     gravityx::run_sparse_ac_exact_hessian_regression(
         data, {1}, source_base.solve.state);
+    gravityx::run_economic_polish_trial_regression(
+        data, {1}, source_base.solve.state);
     const auto sparse_ac_economic =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, {1}, source_base.solve, sparse_ac_options);
@@ -5025,6 +5027,11 @@ int run_contingency_worker(
                          "economic_balance_polish_selected",
                          "economic_balance_polish_iterations",
                          "economic_balance_polish_backtracking_attempts",
+                         "economic_balance_polish_trial_count",
+                         "economic_balance_polish_physical_rejections",
+                         "economic_balance_polish_economic_checks",
+                         "economic_balance_polish_physical_check_seconds",
+                         "economic_balance_polish_economic_check_seconds",
                          "economic_balance_polish_objective_before",
                          "economic_balance_polish_objective_after",
                          "economic_balance_polish_active_slack_before",

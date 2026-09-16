@@ -1,0 +1,215 @@
+{
+  "base_detail_copy_count": 47,
+  "base_detail_sha256": "ad0b4d3ba9d04871b95603e87bf9eb7836fc6cf754e23acf9ef37e764cef361f",
+  "base_objective": 203695.59278757338,
+  "components": {
+    "total_bus_cost": {
+      "aggregate": 75472.96846674601,
+      "base": 100.46700713785026,
+      "contingency_mean": 75372.50145960816
+    },
+    "total_bus_imag_cost": {
+      "aggregate": 31668.106318765556,
+      "base": 50.062566591790166,
+      "contingency_mean": 31618.043752173766
+    },
+    "total_bus_real_cost": {
+      "aggregate": 43804.86214798045,
+      "base": 50.40444054606011,
+      "contingency_mean": 43754.45770743439
+    },
+    "total_gen_cost": {
+      "aggregate": 291384.0315672072,
+      "base": 145696.527360588,
+      "contingency_mean": 145687.5042066192
+    },
+    "total_gen_energy_cost": {
+      "aggregate": 289770.75849648437,
+      "base": 144889.86069424398,
+      "contingency_mean": 144880.89780224042
+    },
+    "total_gen_on_cost": {
+      "aggregate": 1613.273070722787,
+      "base": 806.6666663440001,
+      "contingency_mean": 806.6064043787869
+    },
+    "total_gen_sd_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_gen_su_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_line_cost": {
+      "aggregate": 16833.71772717565,
+      "base": 8450.466661668384,
+      "contingency_mean": 8383.25106550727
+    },
+    "total_line_limit_cost": {
+      "aggregate": 16833.71772717565,
+      "base": 8450.466661668383,
+      "contingency_mean": 8383.25106550727
+    },
+    "total_line_switch_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    },
+    "total_load_benefit": {
+      "aggregate": 715778.0850629443,
+      "base": 357943.0538169676,
+      "contingency_mean": 357835.0312459767
+    },
+    "total_xfmr_cost": {
+      "aggregate": 0.0684259749080926,
+      "base": 0.0,
+      "contingency_mean": 0.0684259749080926
+    },
+    "total_xfmr_limit_cost": {
+      "aggregate": 0.0684259749080926,
+      "base": 0.0,
+      "contingency_mean": 0.0684259749080926
+    },
+    "total_xfmr_switch_cost": {
+      "aggregate": 0.0,
+      "base": 0.0,
+      "contingency_mean": 0.0
+    }
+  },
+  "contingency_count": 6693,
+  "contingency_mean_objective": 128391.70608826712,
+  "control_metrics": {
+    "gen_pow_imag_delta_to_prior": {
+      "base": 6.680365579309117,
+      "contingency_max": 3.831423643970836,
+      "contingency_mean": 0.15201727968540021
+    },
+    "gen_pow_real_delta_to_prior": {
+      "base": 0.8327092029129499,
+      "contingency_max": 0.8333333330497954,
+      "contingency_mean": 0.21261278099429365
+    },
+    "line_switch_down_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "line_switch_up_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "load_pow_real_delta_to_prior": {
+      "base": 0.4137994567950636,
+      "contingency_max": 0.4166666665161909,
+      "contingency_mean": 0.28016079063089466
+    },
+    "swsh_b_delta_to_prior": {
+      "base": 4.440892098500626e-16,
+      "contingency_max": 2.4243333333,
+      "contingency_mean": 0.01769428507388316
+    },
+    "xfmr_phi_delta_to_prior": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "xfmr_switch_down_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "xfmr_switch_up_actual": {
+      "base": 0.0,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    },
+    "xfmr_tau_delta_to_prior": {
+      "base": 0.09499999999999997,
+      "contingency_max": 0.0,
+      "contingency_mean": 0.0
+    }
+  },
+  "model_json": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\.data\\final_19402\\scenario_006\\model.json",
+  "penalty_metrics": {
+    "max_bus_pow_imag_over": {
+      "base": 2.454600906531823e-06,
+      "contingency_max": 0.500001882150956,
+      "contingency_mean": 0.029449196050025245
+    },
+    "max_bus_pow_imag_under": {
+      "base": 0.0002011504688681498,
+      "contingency_max": 0.5000044259537355,
+      "contingency_mean": 0.020440557663449075
+    },
+    "max_bus_pow_real_over": {
+      "base": 2.9861979436329733e-05,
+      "contingency_max": 0.5000000172381953,
+      "contingency_mean": 0.017215785307538867
+    },
+    "max_bus_pow_real_under": {
+      "base": 4.1932611391626295e-05,
+      "contingency_max": 0.5000021737882108,
+      "contingency_mean": 0.032121655167904245
+    },
+    "max_line_viol": {
+      "base": 0.4634316840123507,
+      "contingency_max": 0.4680231646062931,
+      "contingency_mean": 0.46061729474584256
+    },
+    "max_xfmr_viol": {
+      "base": 0.0,
+      "contingency_max": 0.4205175150729161,
+      "contingency_mean": 0.0001256589018595297
+    },
+    "sum_bus_pow_imag_over": {
+      "base": 3.637533906271454e-05,
+      "contingency_max": 28.952811886066115,
+      "contingency_mean": 0.21511580585752377
+    },
+    "sum_bus_pow_imag_under": {
+      "base": 0.0005643754602790676,
+      "contingency_max": 28.785345122547117,
+      "contingency_mean": 0.16430071932032803
+    },
+    "sum_bus_pow_real_over": {
+      "base": 0.00020545107665257984,
+      "contingency_max": 72.04755804238455,
+      "contingency_mean": 0.2057740543099641
+    },
+    "sum_bus_pow_real_under": {
+      "base": 0.0003994022101420828,
+      "contingency_max": 112.91291573320805,
+      "contingency_mean": 0.3192794383892699
+    }
+  },
+  "reconstructed_objective": 332087.2988758405,
+  "reported_objective": 332087.2988758405,
+  "run_dir": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\top5_cold_20260915\\v32_s006\\C2FEN19402_s006_cold",
+  "state": {
+    "base_method": "direct_sparse_ipopt_fixed_commitment_economic",
+    "base_optimization_performed": true,
+    "commitment_binary": true,
+    "commitment_changes_from_source": 0,
+    "committed_unit_count": 968,
+    "generator_count": 968,
+    "generator_dispatch_mw": 131283.35120451954,
+    "generator_reactive_dispatch_mvar": -35808.8484198439,
+    "generators_with_reactive_dispatch_change": 964,
+    "generators_with_real_dispatch_change": 968,
+    "load_served_mw": 128932.27695304585,
+    "loads_at_tmax": 0,
+    "loads_at_tmin": 0,
+    "loads_with_quantity_change": 12744,
+    "shutdown_count": 0,
+    "source_all_generators_online": true,
+    "source_committed_unit_count": 968,
+    "source_generator_dispatch_mw": 158531.57748618,
+    "source_generator_reactive_dispatch_mvar": -25869.284323300002,
+    "source_load_mw": 155304.99782779,
+    "startup_count": 0
+  }
+}

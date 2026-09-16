@@ -4165,6 +4165,70 @@ int run_sparse_ac_economic_json(
     return refinement.selected_validation.max_residual <= 1e-5 ? 0 : 1;
 }
 
+// Last bounded attempt before the expensive full-network fallback. Called
+// only after every existing fast route failed, so passing paths are unchanged.
+// A larger search neighborhood/trust region is NOT a larger acceptance set:
+// the source bounds, immutable ramp anchor and complete nonlinear check stay.
+std::optional<gravityx::FastPowerFlowResult> bounded_expanded_local_repair(
+    const gravityx::CaseData& data, const BasePoint& base,
+    const gravityx::Contingency& outage, const gravityx::AcState& initial,
+    gravityx::FastContingencyPowerFlow& screen, nlohmann::json& trace,
+    double budget_seconds = 16.0) {
+    if (!std::isfinite(budget_seconds) || budget_seconds < 0.0)
+        throw std::runtime_error("invalid expanded local repair budget");
+    const auto started = std::chrono::steady_clock::now();
+    const auto remaining = [&]() {
+        return budget_seconds - std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+    };
+    gravityx::ContingencyContext context;
+    context.borrow_base_state(base.state);
+    if (outage.type == gravityx::ContingencyType::Generator)
+        context.outaged_generator = outage.component;
+    else context.outaged_branch = outage.component;
+    std::optional<gravityx::FastPowerFlowResult> best;
+    for (int depth : {4, 6}) {
+        if (remaining() <= 0.03) break;
+        const auto mask = gravityx::contingency_repair_neighborhood(data, outage, depth, 2048);
+        if (mask.empty()) {
+            trace.push_back({{"depth", depth}, {"skipped", "neighborhood_work_cap"}});
+            continue;
+        }
+        // Restart each wider neighborhood from the same within-run point;
+        // never import a prior-run solution or change the source ramp anchor.
+        auto checked = screen.screen_candidate(outage, initial);
+        if (checked.feasible && std::isfinite(checked.solve.objective)) return checked;
+        for (int round = 0; round < 4 && remaining() > 0.03; ++round) {
+            const double before = checked.validation.max_residual;
+            const auto repair = gravityx::solve_linearized_active_feasibility_repair(
+                data, checked.solve.state, base.commitment, context,
+                0.5, 0.15, std::min(2.0, remaining()), 0.05,
+                true, false, false, true, &mask);
+            auto record = repair.to_json(false);
+            record["depth"] = depth;
+            record["round"] = round;
+            record["residual_before"] = before;
+            if (!repair.success) {
+                trace.push_back(std::move(record));
+                break;
+            }
+            auto candidate = screen.screen_candidate(outage, repair.state);
+            record["nonlinear_feasible"] = candidate.feasible;
+            record["nonlinear_residual"] = candidate.validation.max_residual;
+            record["native_objective"] = candidate.solve.objective;
+            trace.push_back(std::move(record));
+            if (!std::isfinite(candidate.validation.max_residual) ||
+                !std::isfinite(candidate.solve.objective)) break;
+            if (!best || candidate.validation.max_residual < best->validation.max_residual)
+                best = candidate;
+            if (candidate.feasible) return candidate;
+            if (candidate.validation.max_residual + 1e-10 >= before) break;
+            checked = std::move(candidate);
+        }
+    }
+    return best;
+}
+
 bool solve_loaded_contingency(
     const gravityx::CaseData& data,
     const BasePoint& base,
@@ -4236,6 +4300,9 @@ bool solve_loaded_contingency(
     double local_polished_objective = 0.0;
     int local_polish_predictor_iterations = 0;
     nlohmann::json local_repair_trace = nlohmann::json::array();
+    bool expanded_local_repair_attempted = false, expanded_local_repair_selected = false;
+    double expanded_local_repair_seconds = 0.0;
+    nlohmann::json expanded_local_repair_trace = nlohmann::json::array();
     auto complete = [&](nlohmann::json output,
                         gravityx::AcState state,
                         bool persist_full_state = false) {
@@ -4259,6 +4326,10 @@ bool solve_loaded_contingency(
         output["local_polished_objective"] = local_feasible_incumbent_used
             ? nlohmann::json(local_polished_objective) : nlohmann::json(nullptr);
         output["local_polish_predictor_iterations"] = local_polish_predictor_iterations;
+        output["expanded_local_repair_attempted"] = expanded_local_repair_attempted;
+        output["expanded_local_repair_selected"] = expanded_local_repair_selected;
+        output["expanded_local_repair_seconds"] = expanded_local_repair_seconds;
+        output["expanded_local_repair_trace"] = expanded_local_repair_trace;
         output["exact_parallel_model_match"] = exact_parallel_model_match;
         output["exact_parallel_seed_attempted"] = exact_parallel_seed_attempted;
         output["exact_parallel_seed_accepted"] = exact_parallel_seed_accepted;
@@ -4784,9 +4855,26 @@ bool solve_loaded_contingency(
                 }
             }
         }
+        if (fast_only && local_contingency_repair && !fast_result->feasible) {
+            expanded_local_repair_attempted = true;
+            const auto started = std::chrono::steady_clock::now();
+            auto repaired = bounded_expanded_local_repair(data, base, *match, base.state,
+                *fast_power_flow, expanded_local_repair_trace);
+            expanded_local_repair_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            if (repaired && (repaired->feasible ||
+                    repaired->validation.max_residual + 1e-12 < fast_result->validation.max_residual)) {
+                repaired->wall_seconds = fast_result->wall_seconds + expanded_local_repair_seconds;
+                repaired->solve.wall_seconds = repaired->wall_seconds;
+                expanded_local_repair_selected = repaired->feasible;
+                fast_result = std::move(repaired);
+            }
+        }
         if (fast_result->feasible) {
             const std::string solution_method =
-                exact_parallel_seed_accepted
+                expanded_local_repair_selected
+                ? "bounded_expanded_local_feasibility_repair"
+                : exact_parallel_seed_accepted
                 ? "exact_parallel_peer_direct_screen"
                 : quality_seed_selected
                 ? "quality_gated_within_run_seed"
@@ -5848,8 +5936,49 @@ void run_exact_parallel_peer_regression(
         const auto local_first = check(quality_bank, prior_objective - 1.0, true, false);
         require(!local_first.result.at("quality_seed_enabled").get<bool>() &&
             local_first.result.at("quality_seed_probes") == 0 &&
-            local_first.result.at("local_repair_selected").get<bool>(),
+            local_first.result.at("local_repair_selected").get<bool>() &&
+            !local_first.result.at("expanded_local_repair_attempted").get<bool>(),
             "disabled priority probes ran before the local candidate path");
+        {
+            gravityx::FastPowerFlowOptions options;
+            gravityx::FastContingencyPowerFlow screen(data, base.state, commitment, options);
+            auto disturbed = base.state;
+            disturbed.vm.back() = data.buses.back().vmax + 0.01;
+            const auto frozen_initial = gravityx::ac_state_to_json(disturbed);
+            require(!screen.screen_candidate(second, disturbed).feasible,
+                "expanded-repair fixture must start infeasible");
+            nlohmann::json trace = nlohmann::json::array();
+            require(!bounded_expanded_local_repair(data, base, second, disturbed,
+                    screen, trace, 0.0).has_value() && trace.empty(),
+                "zero expanded-repair budget performed work");
+            for (double budget : {-1.0, std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::quiet_NaN()}) {
+                bool rejected = false;
+                try { bounded_expanded_local_repair(data, base, second, disturbed,
+                    screen, trace, budget); }
+                catch (const std::runtime_error&) { rejected = true; }
+                require(rejected, "invalid expanded-repair budget accepted");
+            }
+            const auto repaired = bounded_expanded_local_repair(data, base, second,
+                disturbed, screen, trace);
+            require(repaired && repaired->feasible && !trace.empty() && trace.size() <= 8,
+                "expanded local repair did not repair the tiny infeasible point");
+            gravityx::ContingencyContext context;
+            context.borrow_base_state(base.state); context.outaged_branch = second.component;
+            require(gravityx::validate_state(data, gravityx::ModelMode::ContingencySoft,
+                    repaired->solve.state, commitment, context).max_residual <= 1e-5,
+                "expanded-repair result failed independent validation");
+            require(gravityx::ac_state_to_json(disturbed) == frozen_initial &&
+                    gravityx::ac_state_to_json(base.state) == frozen_base,
+                "expanded repair changed initial point or original ramp anchor");
+            for (const auto& attempt : trace) {
+                require(attempt.at("local_control_bus_count").get<int>() <= 2048 &&
+                    attempt.at("balance_slack_limit") == 0.5 &&
+                    attempt.at("maximum_linearized_violation").get<double>() <= 1e-7 &&
+                    attempt.at("maximum_column_violation").get<double>() <= 1e-7,
+                    "expanded repair lost work/source/expanded-row audit bounds");
+            }
+        }
         auto several = quality_bank;
         several.resize(5, quality_bank.front());
         for (std::size_t i = 0; i < several.size(); ++i) several[i].label = "tiny-seed-" + std::to_string(i);
@@ -6226,7 +6355,9 @@ int run_contingency_worker(
                     "quality_seed_selected", "quality_seed_seconds", "local_repair_enabled",
                     "local_repair_selected", "local_repair_seconds", "local_repair_trace",
                     "local_feasible_incumbent_used", "local_polish_seconds", "local_incumbent_objective",
-                    "local_polished_objective", "local_polish_predictor_iterations"}) {
+                    "local_polished_objective", "local_polish_predictor_iterations",
+                    "expanded_local_repair_attempted", "expanded_local_repair_selected",
+                    "expanded_local_repair_seconds", "expanded_local_repair_trace"}) {
                 if (details.contains(key)) result_summary[key] = details.at(key);
             }
             if (details.contains("fast_screen") && details.at("fast_screen").is_object()) {

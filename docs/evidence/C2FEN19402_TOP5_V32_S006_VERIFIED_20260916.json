@@ -1,0 +1,1454 @@
+{
+  "created_at_utc": "2026-09-16T14:02:08.972443+00:00",
+  "diagnostics": [],
+  "run_count": 1,
+  "run_status_glob": "v32_s006/C2FEN19402_s006_cold/run_status.json",
+  "runs": [
+    {
+      "adjacent_json": [
+        {
+          "bytes": 419868,
+          "content": {
+            "infeas": 0.0,
+            "infeas_all_cases": {
+              "count": 6694,
+              "json_bytes": 127185,
+              "omitted": true,
+              "sha256": "9a31a6058142ecd01ab54ff216938b407c6033b7e902ce90d6b178c6b5d2add0",
+              "type": "dict"
+            },
+            "infeas_cumulative": 0.0,
+            "num_ctg": 6693,
+            "obj": 332087.2988758405,
+            "obj_all_cases": {
+              "count": 6694,
+              "json_bytes": 212143,
+              "omitted": true,
+              "sha256": "ca104e088deb21a155e356c5b5260354d90b7716e115b98c395f302cf751cbda",
+              "type": "dict"
+            },
+            "obj_cumulative": 332087.2988758405,
+            "solutions_exist": true
+          },
+          "name": "eval_summary.json",
+          "sha256": "ecfb773d1a376667c01925e846f45a27fd55d1a577a31d3f3c51b6dc462696d8"
+        },
+        {
+          "bytes": 645804,
+          "content": {
+            "accepted_feasible_nonconverged_count": 0,
+            "base": {
+              "artifact": "internal/base.json",
+              "base_method": "direct_sparse_ipopt_fixed_commitment_economic",
+              "base_validation": {
+                "max_active_balance_residual": 0.0,
+                "max_angle_violation": 0.0,
+                "max_flow_limit_violation": 3.552713678800501e-15,
+                "max_generator_residual": 0.0,
+                "max_load_ramp_violation": 0.0,
+                "max_ohms_residual": 0.0,
+                "max_pwl_power_residual": 2.0382792242469003e-15,
+                "max_pwl_sum_residual": 0.0,
+                "max_reactive_balance_residual": 0.0,
+                "max_reference_angle_residual": 6.755779110705852e-25,
+                "max_residual": 3.552713678800501e-15,
+                "max_variable_bound_violation": 0.0,
+                "worst_category": "flow_limit",
+                "worst_identity": "branch:12094"
+              },
+              "commitment_count": 968,
+              "complete_state_and_commitment_in_artifact": true,
+              "sha256": "d87018232d6724dc8290237e46324efe6ea764209d4bc31131874ec01c8fcb2b",
+              "success": true,
+              "wall_seconds": 51.580673753
+            },
+            "base_algorithm_wall_seconds": 51.580673753,
+            "base_economic_refinement_seconds": 0.0,
+            "base_exact_executable": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\.build-native\\gravityx_go2",
+            "base_exact_executable_sha256": "bbf9f3f8ce1c8259a79b8fbfba8868847e455de312bd4925387589f468ee138f",
+            "base_exact_hessian": true,
+            "base_process_wall_seconds": 58.213887600002636,
+            "base_pwl_epigraph": true,
+            "base_sparse_ac_economic_refinement_seconds": 40.0,
+            "base_sparse_economic_refinement_seconds": 10.0,
+            "cached_economic_contingency_polish": true,
+            "common_corrective_reference_seconds": 0.0,
+            "compact_final_summary": true,
+            "competition_timing": {
+              "code1_time_limit_seconds": 300.0,
+              "code1_within_limit": true,
+              "code2_seconds_per_contingency": 2.0,
+              "code2_time_limit_seconds": 13386.0,
+              "code2_within_limit": true,
+              "contingency_count": 6693,
+              "division": 1,
+              "timing_semantics": "Code1 and Code2 are separate wall-clock stages"
+            },
+            "contingencies": null,
+            "contingency_count": 6693,
+            "contingency_execution_mode": "parallel fast-only sparse-Newton screen followed by HiGHS sequential-linearized contingency fallback queue",
+            "contingency_ipopt_iterations_sum": 905,
+            "contingency_model_preparation_seconds_sum": 0.0,
+            "contingency_parallel_wall_seconds": 199.56362889999582,
+            "contingency_schedule": null,
+            "contingency_schedule_artifact": "run_status.json#contingency_schedule",
+            "contingency_schedule_mode": "dynamic affinity groups with low-disturbance seed first within globally difficult-first groups, then fallback- or drained-bulk-triggered parallel group splitting, then descending timing-profiled heavy group work, then 4-worker heavy lane, then deterministic label order",
+            "contingency_solver_seconds_sum": 2669.397724152,
+            "contingency_worker_process_seconds_sum": 4780.718503599994,
+            "contingency_workers": {
+              "count": 28,
+              "json_bytes": 92526,
+              "omitted": true,
+              "sha256": "b08893d8e2974f8405496af2b6656e33635d587a71db580dad1692f3b37acd29",
+              "type": "list"
+            },
+            "defer_fallback_until_screen_complete": false,
+            "detailed_artifacts": {
+              "base_result": "internal/base.json",
+              "corrective_worker_logs": "internal/worker_logs",
+              "fast_screen_worker_logs": "internal/fast_screen_worker_logs",
+              "official_evaluation_certificate": "internal/official_evaluation_certificate.json",
+              "official_evaluation_shards": "internal/streaming_serial_evaluation_shards",
+              "official_solution_pattern": "solution_*.txt",
+              "run_status_and_schedule": "run_status.json"
+            },
+            "direct_outage_candidate_accepted_count": 0,
+            "economic_contingency_polish": false,
+            "end_to_end_timing": {
+              "evaluation_reserve_seconds": 3.0,
+              "finalization_reserve_seconds": 2.0,
+              "measurement_boundary": "normalized-case loading through referenced official evaluator equations and result serialization",
+              "time_limit_seconds": 300.0,
+              "within_limit": true
+            },
+            "evaluation_processes": 1,
+            "evaluation_tail_wall_seconds": 5.789561500001582,
+            "evaluation_wall_seconds": 178.4651201000015,
+            "evaluator_linear_algebra_threads": 1,
+            "evaluator_parser_mode": "canonical_binary_numeric_with_line_and_string_fallback_and_in_memory_summary_with_referenced_vendor_equations",
+            "exact_parallel_outage_reuse": true,
+            "exact_unpublished_gravityx_binary": false,
+            "fast_power_flow_accepted_count": 0,
+            "fast_power_flow_screen": true,
+            "fast_screen_affinity_schedule": true,
+            "fast_screen_executable": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\.build-native\\gravityx_go2",
+            "fast_screen_executable_sha256": "bbf9f3f8ce1c8259a79b8fbfba8868847e455de312bd4925387589f468ee138f",
+            "fast_screen_fallback_count": 0,
+            "fast_screen_parallel_wall_seconds": 199.29479639999772,
+            "fast_screen_records": null,
+            "fast_workers": 24,
+            "finished_at_utc": "2026-09-16T14:01:25.706721+00:00",
+            "framework_faithful": true,
+            "git_revision": "234b8adf39f8464b6796ccf4af0eed8b5e874221",
+            "input_hashes": {
+              "con_sha256": "9059f78af875ee1b186f64f458504d0490614a7eeb090cba6d5f10c07b4b9179",
+              "json_sha256": "973115f663f48c3492611aab6d76f28bd6945dc71ebb54590b6b3b767858be7f",
+              "normalized_case_sha256": "66504eaef8cbed2d6f85a9621ee6aaf0a9c8ecbb52ecf090df33c66cc7af5b22",
+              "raw_sha256": "f38517e37b60ac223514c210d800f4c7d3fd8536eaecfe74372fd84006c73999"
+            },
+            "ipopt_acceptable_options": null,
+            "ipopt_acceptable_termination": false,
+            "ipopt_fallback_count": 0,
+            "linearized_contingency_accepted_count": 0,
+            "linearized_contingency_fallback": true,
+            "linearized_contingency_only": false,
+            "longest_first_schedule": false,
+            "max_independent_contingency_residual": 9.952236352528399e-06,
+            "method": "C++ source commitment with verified sparse HiGHS preconditioning and direct sparse Ipopt fixed-commitment AC base economics, parallel sparse-Newton screening, and isolated resident Ipopt fallback",
+            "mixed_build_fast_screen": false,
+            "native_repair_log": true,
+            "official_evaluation": {
+              "count": 8,
+              "json_bytes": 339500,
+              "omitted": true,
+              "sha256": "db691e9fc2400f9ea35f099cbe847ab6d4d5f1c58dc36280c418573cf935f04e",
+              "type": "dict"
+            },
+            "official_evaluation_certificate": {
+              "complete_label_set": true,
+              "detail_storage": "validated_shards",
+              "evaluator_parser_mode": "canonical_binary_numeric_with_line_and_string_fallback_and_in_memory_summary_with_referenced_vendor_equations",
+              "evaluator_path": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\scripts\\fast_official_evaluator.py",
+              "evaluator_sha256": "08d9f9933ef91ca3565a9f49cdaa9d1b0747ec2bf2ba38dc93735ed7b3df5b54",
+              "expected_contingency_count": 6693,
+              "expected_detail_count": 6694,
+              "infeasible_labels": [],
+              "mpiexec_path": null,
+              "mpiexec_sha256": null,
+              "objective_from_details": 332087.2988758405,
+              "observed_detail_count": 6694,
+              "observed_physical_shard_detail_count": 6740,
+              "observed_unique_detail_count": 6694,
+              "parallel_mode": "overlapped_serial_shards",
+              "parallel_processes": 12,
+              "python_path": "C:\\Users\\thoma\\Documents\\goc2-ac-score-check\\evaluator-venv\\Scripts\\python.exe",
+              "repaired_vendor_mpi_bookkeeping_fields": [],
+              "reported_infeasibility": 0.0,
+              "reported_objective": 332087.2988758405,
+              "schema_version": 2,
+              "serial_evaluation_shards": {
+                "active_shards": 47,
+                "aggregate_certificate": {
+                  "complete_label_set": true,
+                  "detail_storage": "validated_shards",
+                  "expected_contingency_count": 6693,
+                  "expected_detail_count": 6694,
+                  "infeasible_labels": [],
+                  "objective_from_details": 332087.2988758405,
+                  "observed_detail_count": 6694,
+                  "observed_physical_shard_detail_count": 6740,
+                  "observed_unique_detail_count": 6694,
+                  "parallel_mode": "overlapped_serial_shards",
+                  "parallel_processes": 12,
+                  "repaired_vendor_mpi_bookkeeping_fields": [],
+                  "reported_infeasibility": 0.0,
+                  "reported_objective": 332087.2988758405,
+                  "schema_version": 2
+                },
+                "base_detail_sha256": "ad0b4d3ba9d04871b95603e87bf9eb7836fc6cf754e23acf9ef37e764cef361f",
+                "completed_before_tail_wait": 36,
+                "completion_order_tail_shard_sizes": [
+                  96,
+                  64,
+                  48,
+                  32,
+                  16
+                ],
+                "evaluator_below_normal_priority": false,
+                "evaluator_linear_algebra_threads": 1,
+                "incremental_shard_validation": true,
+                "initial_maximum_parallel_processes": 3,
+                "maximum_parallel_processes": 12,
+                "mode": "overlapped_serial_shards",
+                "overlap_span_seconds": 178.4651201000015,
+                "persistent_evaluator_pool_prepared_early": true,
+                "persistent_evaluator_process_count": 12,
+                "persistent_evaluator_processes": true,
+                "persistent_evaluator_startup": [
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1084113999968395,
+                    "tasks": 4,
+                    "worker_id": 0
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.168039800002589,
+                    "tasks": 4,
+                    "worker_id": 1
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1276379999981145,
+                    "tasks": 4,
+                    "worker_id": 2
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1025169999993523,
+                    "tasks": 4,
+                    "worker_id": 3
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1065996999968775,
+                    "tasks": 4,
+                    "worker_id": 4
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.0990973000007216,
+                    "tasks": 4,
+                    "worker_id": 5
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.0966748999999254,
+                    "tasks": 4,
+                    "worker_id": 6
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1410145000045304,
+                    "tasks": 4,
+                    "worker_id": 7
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.098673400003463,
+                    "tasks": 4,
+                    "worker_id": 8
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.090938699999242,
+                    "tasks": 4,
+                    "worker_id": 9
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1918131999991601,
+                    "tasks": 4,
+                    "worker_id": 10
+                  },
+                  {
+                    "ready": true,
+                    "startup_seconds": 1.1523922000051243,
+                    "tasks": 3,
+                    "worker_id": 11
+                  }
+                ],
+                "persistent_evaluator_startup_mode": "nonblocking_handshake",
+                "persistent_evaluator_task_counts": {
+                  "0": 4,
+                  "1": 4,
+                  "10": 4,
+                  "11": 3,
+                  "2": 4,
+                  "3": 4,
+                  "4": 4,
+                  "5": 4,
+                  "6": 4,
+                  "7": 4,
+                  "8": 4,
+                  "9": 4
+                },
+                "post_screen_maximum_parallel_processes": 12,
+                "pre_tail_maximum_parallel_processes": 12,
+                "requested_shards": 47,
+                "screen_idle_promotion_events": [
+                  {
+                    "maximum_processes": 4,
+                    "remaining_screen_groups": 23
+                  },
+                  {
+                    "maximum_processes": 5,
+                    "remaining_screen_groups": 22
+                  },
+                  {
+                    "maximum_processes": 6,
+                    "remaining_screen_groups": 21
+                  },
+                  {
+                    "maximum_processes": 7,
+                    "remaining_screen_groups": 20
+                  },
+                  {
+                    "maximum_processes": 8,
+                    "remaining_screen_groups": 19
+                  },
+                  {
+                    "maximum_processes": 9,
+                    "remaining_screen_groups": 18
+                  },
+                  {
+                    "maximum_processes": 10,
+                    "remaining_screen_groups": 17
+                  },
+                  {
+                    "maximum_processes": 11,
+                    "remaining_screen_groups": 16
+                  },
+                  {
+                    "maximum_processes": 12,
+                    "remaining_screen_groups": 15
+                  }
+                ],
+                "shard_grouping": "solution_completion_order",
+                "shard_validation_workers": 8,
+                "shards": [
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 13.61517730000196,
+                    "finalization_wall_seconds": 0.027715999996871687,
+                    "first_label": "CTG_000474",
+                    "last_label": "CTG_000381",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 0,
+                    "returncode": 0,
+                    "shard_index": 0,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 13.62069799999881
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 13.330484400001296,
+                    "finalization_wall_seconds": 0.0292907999973977,
+                    "first_label": "CTG_001082",
+                    "last_label": "CTG_002365",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 1,
+                    "returncode": 0,
+                    "shard_index": 1,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 13.347758700001577
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 13.15203950000432,
+                    "finalization_wall_seconds": 0.27766089999931864,
+                    "first_label": "CTG_000533",
+                    "last_label": "CTG_002543",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 2,
+                    "returncode": 0,
+                    "shard_index": 2,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 13.212342500002705
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.726664699999674,
+                    "finalization_wall_seconds": 0.02974539999559056,
+                    "first_label": "CTG_004797",
+                    "last_label": "CTG_006550",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 3,
+                    "returncode": 0,
+                    "shard_index": 3,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.736868199994205
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.873840599997493,
+                    "finalization_wall_seconds": 0.02885739999328507,
+                    "first_label": "CTG_000754",
+                    "last_label": "CTG_001590",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 4,
+                    "returncode": 0,
+                    "shard_index": 4,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.886978099995758
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.252694100003282,
+                    "finalization_wall_seconds": 0.03090130000055069,
+                    "first_label": "CTG_002576",
+                    "last_label": "CTG_001825",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 5,
+                    "returncode": 0,
+                    "shard_index": 5,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.286406200000783
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.596626999998989,
+                    "finalization_wall_seconds": 0.026160400004300755,
+                    "first_label": "CTG_000133",
+                    "last_label": "CTG_006106",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 6,
+                    "returncode": 0,
+                    "shard_index": 6,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.643967799995153
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.375170499995875,
+                    "finalization_wall_seconds": 0.028728099998261314,
+                    "first_label": "CTG_001409",
+                    "last_label": "CTG_000529",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 7,
+                    "returncode": 0,
+                    "shard_index": 7,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.397625199999311
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.085726900004374,
+                    "finalization_wall_seconds": 0.02733339999394957,
+                    "first_label": "CTG_000851",
+                    "last_label": "CTG_003030",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 8,
+                    "returncode": 0,
+                    "shard_index": 8,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.086767800006783
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.16207299999951,
+                    "finalization_wall_seconds": 0.03228999999555526,
+                    "first_label": "CTG_005817",
+                    "last_label": "CTG_004557",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 9,
+                    "returncode": 0,
+                    "shard_index": 9,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.198578800001997
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 154,
+                    "evaluator_reported_wall_seconds": 12.232450499999686,
+                    "finalization_wall_seconds": 0.02337439999973867,
+                    "first_label": "CTG_004754",
+                    "last_label": "CTG_005247",
+                    "observed_detail_count": 155,
+                    "persistent_evaluator_worker_id": 10,
+                    "returncode": 0,
+                    "shard_index": 10,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.260577900000499
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 12.308001299999887,
+                    "finalization_wall_seconds": 0.029217299997981172,
+                    "first_label": "CTG_006139",
+                    "last_label": "CTG_002192",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 11,
+                    "returncode": 0,
+                    "shard_index": 11,
+                    "static_case_cache": {
+                      "raw_hits": 0,
+                      "raw_misses": 1,
+                      "supplemental_hits": 0,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 12.379212100000586
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.09808239999984,
+                    "finalization_wall_seconds": 0.030294700001832098,
+                    "first_label": "CTG_003346",
+                    "last_label": "CTG_005310",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 0,
+                    "returncode": 0,
+                    "shard_index": 12,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.155653499998152
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.403087800004869,
+                    "finalization_wall_seconds": 0.03188159999990603,
+                    "first_label": "CTG_003749",
+                    "last_label": "CTG_000030",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 1,
+                    "returncode": 0,
+                    "shard_index": 13,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.413101400001324
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.131710399997246,
+                    "finalization_wall_seconds": 0.027355699996405747,
+                    "first_label": "CTG_005469",
+                    "last_label": "CTG_001831",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 2,
+                    "returncode": 0,
+                    "shard_index": 14,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.205053500001668
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.169174900001963,
+                    "finalization_wall_seconds": 0.03419510000094306,
+                    "first_label": "CTG_003293",
+                    "last_label": "CTG_005567",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 3,
+                    "returncode": 0,
+                    "shard_index": 15,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.276655200003006
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.012696799996775,
+                    "finalization_wall_seconds": 0.02543129999685334,
+                    "first_label": "CTG_004826",
+                    "last_label": "CTG_005364",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 4,
+                    "returncode": 0,
+                    "shard_index": 16,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.067791900000884
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.123110300002736,
+                    "finalization_wall_seconds": 0.029955399993923493,
+                    "first_label": "CTG_003078",
+                    "last_label": "CTG_005490",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 5,
+                    "returncode": 0,
+                    "shard_index": 17,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.135793099994771
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.257504299996071,
+                    "finalization_wall_seconds": 0.02762320000329055,
+                    "first_label": "CTG_000548",
+                    "last_label": "CTG_002781",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 6,
+                    "returncode": 0,
+                    "shard_index": 18,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.282985600002576
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.112947099994926,
+                    "finalization_wall_seconds": 0.03143450000061421,
+                    "first_label": "CTG_003083",
+                    "last_label": "CTG_002563",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 7,
+                    "returncode": 0,
+                    "shard_index": 19,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.261879799996677
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.178349699999671,
+                    "finalization_wall_seconds": 0.030593400006182492,
+                    "first_label": "CTG_003043",
+                    "last_label": "CTG_003163",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 8,
+                    "returncode": 0,
+                    "shard_index": 20,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.26418030000059
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.749577099995804,
+                    "finalization_wall_seconds": 0.03134690000297269,
+                    "first_label": "CTG_006286",
+                    "last_label": "CTG_001000",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 9,
+                    "returncode": 0,
+                    "shard_index": 21,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.778870000001916
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.18809930000134,
+                    "finalization_wall_seconds": 0.02594669999962207,
+                    "first_label": "CTG_000599",
+                    "last_label": "CTG_005489",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 10,
+                    "returncode": 0,
+                    "shard_index": 22,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.202238800004125
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.862126200001512,
+                    "finalization_wall_seconds": 0.03174419999413658,
+                    "first_label": "CTG_004069",
+                    "last_label": "CTG_000523",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 11,
+                    "returncode": 0,
+                    "shard_index": 23,
+                    "static_case_cache": {
+                      "raw_hits": 1,
+                      "raw_misses": 1,
+                      "supplemental_hits": 1,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.869685600002413
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.022578500000236,
+                    "finalization_wall_seconds": 0.025386000001162756,
+                    "first_label": "CTG_003975",
+                    "last_label": "CTG_006048",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 0,
+                    "returncode": 0,
+                    "shard_index": 24,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.139031599996088
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.774308199994266,
+                    "finalization_wall_seconds": 0.028662699995038565,
+                    "first_label": "CTG_006027",
+                    "last_label": "CTG_004562",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 1,
+                    "returncode": 0,
+                    "shard_index": 25,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.807747700004256
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.89379920000647,
+                    "finalization_wall_seconds": 0.03301449999707984,
+                    "first_label": "CTG_005183",
+                    "last_label": "CTG_002150",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 2,
+                    "returncode": 0,
+                    "shard_index": 26,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.905629400003818
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 11.132011499998043,
+                    "finalization_wall_seconds": 0.026166099996771663,
+                    "first_label": "CTG_003091",
+                    "last_label": "CTG_005082",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 3,
+                    "returncode": 0,
+                    "shard_index": 27,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.201209099999687
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.9330534000037,
+                    "finalization_wall_seconds": 0.04023420000157785,
+                    "first_label": "CTG_003978",
+                    "last_label": "CTG_002483",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 4,
+                    "returncode": 0,
+                    "shard_index": 28,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.98524329999782
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.933808100002352,
+                    "finalization_wall_seconds": 0.03035490000183927,
+                    "first_label": "CTG_000959",
+                    "last_label": "CTG_003559",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 5,
+                    "returncode": 0,
+                    "shard_index": 29,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.94458940000186
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.938577900000382,
+                    "finalization_wall_seconds": 0.037187700007052626,
+                    "first_label": "CTG_004576",
+                    "last_label": "CTG_001040",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 6,
+                    "returncode": 0,
+                    "shard_index": 30,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 11.002015699996264
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.886908100001165,
+                    "finalization_wall_seconds": 0.027513300003192853,
+                    "first_label": "CTG_005983",
+                    "last_label": "CTG_001417",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 7,
+                    "returncode": 0,
+                    "shard_index": 31,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.900702599996293
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.795280799997272,
+                    "finalization_wall_seconds": 0.026679199996578973,
+                    "first_label": "CTG_000990",
+                    "last_label": "CTG_006070",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 8,
+                    "returncode": 0,
+                    "shard_index": 32,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.801422199998342
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.721179500003927,
+                    "finalization_wall_seconds": 0.029243600001791492,
+                    "first_label": "CTG_005669",
+                    "last_label": "CTG_006518",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 9,
+                    "returncode": 0,
+                    "shard_index": 33,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.86413430000539
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.863531599999988,
+                    "finalization_wall_seconds": 0.028771100005542394,
+                    "first_label": "CTG_006006",
+                    "last_label": "CTG_002072",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 10,
+                    "returncode": 0,
+                    "shard_index": 34,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.899566100000811
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.85740629999782,
+                    "finalization_wall_seconds": 0.030474299994239118,
+                    "first_label": "CTG_006508",
+                    "last_label": "CTG_001439",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 11,
+                    "returncode": 0,
+                    "shard_index": 35,
+                    "static_case_cache": {
+                      "raw_hits": 2,
+                      "raw_misses": 1,
+                      "supplemental_hits": 2,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.886501400003908
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 10.653782800000045,
+                    "finalization_wall_seconds": 0.01967069999955129,
+                    "first_label": "CTG_006675",
+                    "last_label": "CTG_002206",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 0,
+                    "returncode": 0,
+                    "shard_index": 36,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 10.954204000001482
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 9.037205799999356,
+                    "finalization_wall_seconds": 0.01951030000054743,
+                    "first_label": "CTG_005109",
+                    "last_label": "CTG_000605",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 1,
+                    "returncode": 0,
+                    "shard_index": 37,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 9.072244399998453
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 7.668350200001441,
+                    "finalization_wall_seconds": 0.017737699999997858,
+                    "first_label": "CTG_002197",
+                    "last_label": "CTG_002993",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 2,
+                    "returncode": 0,
+                    "shard_index": 38,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 7.713014900000417
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 6.424525900001754,
+                    "finalization_wall_seconds": 0.017097099997045007,
+                    "first_label": "CTG_004573",
+                    "last_label": "CTG_006019",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 3,
+                    "returncode": 0,
+                    "shard_index": 39,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 6.460396400005266
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 6.4777424999992945,
+                    "finalization_wall_seconds": 0.01514820000011241,
+                    "first_label": "CTG_002774",
+                    "last_label": "CTG_005682",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 4,
+                    "returncode": 0,
+                    "shard_index": 40,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 6.511022899998352
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 153,
+                    "evaluator_reported_wall_seconds": 6.345127999993565,
+                    "finalization_wall_seconds": 0.018784299994877074,
+                    "first_label": "CTG_005996",
+                    "last_label": "CTG_004349",
+                    "observed_detail_count": 154,
+                    "persistent_evaluator_worker_id": 5,
+                    "returncode": 0,
+                    "shard_index": 41,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 6.359275400005572
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 96,
+                    "evaluator_reported_wall_seconds": 4.852640699995391,
+                    "finalization_wall_seconds": 0.01571179999882588,
+                    "first_label": "CTG_002618",
+                    "last_label": "CTG_003846",
+                    "observed_detail_count": 97,
+                    "persistent_evaluator_worker_id": 6,
+                    "returncode": 0,
+                    "shard_index": 42,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 4.889611099999456
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 64,
+                    "evaluator_reported_wall_seconds": 3.986418299995421,
+                    "finalization_wall_seconds": 0.015464699994481634,
+                    "first_label": "CTG_005746",
+                    "last_label": "CTG_006690",
+                    "observed_detail_count": 65,
+                    "persistent_evaluator_worker_id": 7,
+                    "returncode": 0,
+                    "shard_index": 43,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 4.018768999994791
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 48,
+                    "evaluator_reported_wall_seconds": 3.646284000002197,
+                    "finalization_wall_seconds": 0.01606990000436781,
+                    "first_label": "CTG_003799",
+                    "last_label": "CTG_006022",
+                    "observed_detail_count": 49,
+                    "persistent_evaluator_worker_id": 8,
+                    "returncode": 0,
+                    "shard_index": 44,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 3.6619590999980574
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 32,
+                    "evaluator_reported_wall_seconds": 3.0309054000026663,
+                    "finalization_wall_seconds": 0.016243400001258124,
+                    "first_label": "CTG_004490",
+                    "last_label": "CTG_006003",
+                    "observed_detail_count": 33,
+                    "persistent_evaluator_worker_id": 9,
+                    "returncode": 0,
+                    "shard_index": 45,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 3.067475399999239
+                  },
+                  {
+                    "complete_label_set": true,
+                    "contingency_count": 16,
+                    "evaluator_reported_wall_seconds": 2.57644949999667,
+                    "finalization_wall_seconds": 0.01446600000053877,
+                    "first_label": "CTG_002523",
+                    "last_label": "CTG_003372",
+                    "observed_detail_count": 17,
+                    "persistent_evaluator_worker_id": 10,
+                    "returncode": 0,
+                    "shard_index": 46,
+                    "static_case_cache": {
+                      "raw_hits": 3,
+                      "raw_misses": 1,
+                      "supplemental_hits": 3,
+                      "supplemental_misses": 1
+                    },
+                    "wall_seconds": 2.6035458000042127
+                  }
+                ],
+                "tail_wait_seconds": 5.368399600003613,
+                "top_level_details_materialized": false
+              },
+              "streaming_evaluation": true,
+              "vendor_evaluator_reference": "C:\\Users\\thoma\\Documents\\goc2-dc-scopf-cpu\\vendor\\C2DataUtilities\\data_utilities\\evaluation.py",
+              "vendor_evaluator_reference_sha256": "3e98ca0e5dda571fc90c2b16bc4000d652f50c02acc0c9a203d99d132aeb603e"
+            },
+            "post_screen_streaming_evaluation_processes": 12,
+            "prepare_evaluator_pool_early": true,
+            "requested_fast_workers": 24,
+            "requested_workers": 4,
+            "resident_contingency_model": false,
+            "robust_contingency_base": false,
+            "serial_evaluation_shards": 1,
+            "source_status_base": false,
+            "started_at_utc": "2026-09-16T13:57:00.848879+00:00",
+            "streaming_evaluation_completion_order_shards": true,
+            "streaming_evaluation_idle_screen_ramp": true,
+            "streaming_evaluation_processes": 3,
+            "streaming_evaluation_tail_shard_sizes": [
+              96,
+              64,
+              48,
+              32,
+              16
+            ],
+            "streaming_evaluator_below_normal_priority": false,
+            "streaming_persistent_evaluator_processes": true,
+            "streaming_serial_evaluation_shards": 47,
+            "total_wall_seconds": 264.9913063000058,
+            "two_stage_contingency_screen": true,
+            "validated_source_base": true,
+            "vendor_evaluator_reference": "C:\\Users\\thoma\\Documents\\goc2-dc-scopf-cpu\\vendor\\C2DataUtilities\\data_utilities\\evaluation.py",
+            "vendor_evaluator_reference_sha256": "3e98ca0e5dda571fc90c2b16bc4000d652f50c02acc0c9a203d99d132aeb603e",
+            "workers": 4
+          },
+          "name": "run_summary.json",
+          "sha256": "bd68bf57858511db1df9263e5b2f50b5ef8a92935042dfd244b2ac4b168b438c"
+        }
+      ],
+      "inventory": {
+        "file_count": 27244,
+        "logical_bytes": 25795310745,
+        "solution_file_entries": 13434
+      },
+      "relative_run_root": "v32_s006/C2FEN19402_s006_cold",
+      "root_log_tails": [],
+      "run_status": {
+        "accepted_feasible_nonconverged_count": 0,
+        "active_post_screen_corrective_worker_count": 4,
+        "base_algorithm_wall_seconds": 51.580673753,
+        "base_economic_refinement_seconds": 0.0,
+        "base_effective_timeout_seconds": 110.0,
+        "base_exact_executable": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\.build-native\\gravityx_go2",
+        "base_exact_executable_sha256": "bbf9f3f8ce1c8259a79b8fbfba8868847e455de312bd4925387589f468ee138f",
+        "base_exact_hessian": true,
+        "base_process_wall_seconds": 58.213887600002636,
+        "base_pwl_epigraph": true,
+        "base_sparse_ac_economic_refinement_seconds": 40.0,
+        "base_sparse_economic_refinement_seconds": 10.0,
+        "base_success": true,
+        "cached_economic_contingency_polish": true,
+        "code1_within_limit": true,
+        "code2_within_limit": true,
+        "common_corrective_reference_seconds": 0.0,
+        "competition_timing": {
+          "code1_time_limit_seconds": 300.0,
+          "code2_seconds_per_contingency": 2.0,
+          "code2_time_limit_seconds": 13386.0,
+          "contingency_count": 6693,
+          "division": 1,
+          "timing_semantics": "Code1 and Code2 are separate wall-clock stages"
+        },
+        "completed_contingency_count": 6693,
+        "completed_worker_count": 28,
+        "contingency_parallel_wall_seconds": 199.56362889999582,
+        "contingency_schedule": {
+          "count": 6693,
+          "json_bytes": 2658515,
+          "omitted": true,
+          "sha256": "905708c1c01fe9facda31cbbb2dc4bff11da2efa785266d4230abe52642bb37e",
+          "type": "list"
+        },
+        "contingency_schedule_mode": "dynamic affinity groups with low-disturbance seed first within globally difficult-first groups, then fallback- or drained-bulk-triggered parallel group splitting, then descending timing-profiled heavy group work, then 4-worker heavy lane, then deterministic label order",
+        "cpp_solution_writer": true,
+        "defer_fallback_until_screen_complete": false,
+        "economic_contingency_polish": false,
+        "end_to_end_timing": {
+          "evaluation_reserve_seconds": 3.0,
+          "finalization_reserve_seconds": 2.0,
+          "measurement_boundary": "normalized-case loading through referenced official evaluator equations and result serialization",
+          "time_limit_seconds": 300.0
+        },
+        "end_to_end_within_limit": true,
+        "evaluation_processes": 1,
+        "evaluator": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\scripts\\fast_official_evaluator.py",
+        "evaluator_linear_algebra_threads": 1,
+        "evaluator_parser_mode": "canonical_binary_numeric_with_line_and_string_fallback_and_in_memory_summary_with_referenced_vendor_equations",
+        "evaluator_sha256": "08d9f9933ef91ca3565a9f49cdaa9d1b0747ec2bf2ba38dc93735ed7b3df5b54",
+        "exact_parallel_outage_reuse": true,
+        "fallback_schedule_profile": null,
+        "fast_power_flow_screen": true,
+        "fast_screen_affinity_split_contingency_count": 0,
+        "fast_screen_affinity_split_group_count": 0,
+        "fast_screen_easy_first": false,
+        "fast_screen_executable": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\.build-native\\gravityx_go2",
+        "fast_screen_executable_sha256": "bbf9f3f8ce1c8259a79b8fbfba8868847e455de312bd4925387589f468ee138f",
+        "fast_screen_fallback_count": 0,
+        "fast_screen_feasible_count": 6693,
+        "fast_screen_heavy_profile": {
+          "dispatch_semantics": "timing-only heavy-lane classification and descending predicted group-work ordering, with explicit opt-in predictor handoff budgets; no primal, dual, commitment, network, or solver state",
+          "heavy_threshold_seconds": 30.0,
+          "measured_solver_seconds_sum": 400.78455514899997,
+          "path": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\config\\C2FEN19402_s006_reliability_queue.json",
+          "profiled_contingency_count": 9,
+          "profiled_heavy_contingency_count": 12,
+          "schema_version": 3,
+          "screen_handoff_seconds": {},
+          "sha256": "2322dd82642985ee5dbdd8107e6264e35812a2c66f0ada8d2a1697e606a7df3d",
+          "unfinished_priority_labels": [
+            "CTG_000179",
+            "CTG_000262",
+            "CTG_000263"
+          ],
+          "unfinished_priority_ordering_weight": 69.56051283,
+          "uses_prior_solution_state": false
+        },
+        "fast_screen_heavy_worker_count": 4,
+        "fast_screen_profiled_heavy_group_count": 10,
+        "finished_at_utc": "2026-09-16T14:01:25.706721+00:00",
+        "git_revision": "234b8adf39f8464b6796ccf4af0eed8b5e874221",
+        "initial_corrective_worker_count": 4,
+        "initial_free_space_gb": 48.99870300292969,
+        "ipopt_acceptable_termination": false,
+        "last_completed_contingency": "CTG_003372",
+        "last_completed_worker": 3,
+        "linearized_contingency_fallback": true,
+        "linearized_contingency_only": false,
+        "longest_first_schedule": false,
+        "minimum_free_space_gb": 30.0,
+        "mixed_build_fast_screen": false,
+        "official_infeasibility": 0.0,
+        "official_objective": 332087.2988758405,
+        "post_screen_corrective_worker_count": 8,
+        "post_screen_streaming_evaluation_processes": 12,
+        "prepare_evaluator_pool_early": true,
+        "profiled_fallback_global_priority": false,
+        "progress_checkpoint_interval_seconds": 5.0,
+        "progress_log_initial_count": 10,
+        "progress_log_interval": 100,
+        "resident_contingency_model": false,
+        "robust_contingency_base": false,
+        "screened_contingency_count": 6693,
+        "serial_evaluation_shards": 1,
+        "source_status_base": false,
+        "stage": "complete",
+        "started_at_utc": "2026-09-16T13:57:00.848879+00:00",
+        "streaming_evaluation_completion_order_shards": true,
+        "streaming_evaluation_idle_screen_ramp": true,
+        "streaming_evaluation_prepared": true,
+        "streaming_evaluation_processes": 3,
+        "streaming_evaluation_tail_shard_sizes": [
+          96,
+          64,
+          48,
+          32,
+          16
+        ],
+        "streaming_evaluator_below_normal_priority": false,
+        "streaming_fallback_overlap": true,
+        "streaming_persistent_evaluator_processes": true,
+        "streaming_serial_evaluation_shards": 47,
+        "success": true,
+        "total_wall_seconds": 264.9913063000058,
+        "two_stage_contingency_screen": true,
+        "validated_source_base": true,
+        "vendor_evaluator_reference": "C:\\Users\\thoma\\Documents\\goc2-dc-scopf-cpu\\vendor\\C2DataUtilities\\data_utilities\\evaluation.py",
+        "vendor_evaluator_reference_sha256": "3e98ca0e5dda571fc90c2b16bc4000d652f50c02acc0c9a203d99d132aeb603e",
+        "worker_input_staging": {
+          "cleanup": "registered_with_atexit",
+          "destinations": {
+            "base": "/dev/shm/gravityx_go2_17ac_18d5d1c70d1f3c24_base.json",
+            "case": "/dev/shm/gravityx_go2_17ac_18d5d1c70d1f3c24_case.json"
+          },
+          "mode": "single_copy_to_wsl_tmpfs_with_sha256_verification",
+          "sha256": {
+            "base": "d87018232d6724dc8290237e46324efe6ea764209d4bc31131874ec01c8fcb2b",
+            "case": "66504eaef8cbed2d6f85a9621ee6aaf0a9c8ecbb52ecf090df33c66cc7af5b22"
+          },
+          "wall_seconds": 0.33554679999360815
+        },
+        "wsl_fast_screen_scratch": true,
+        "wsl_stage_worker_inputs": true
+      },
+      "run_status_bytes": 3374442,
+      "run_status_sha256": "341dbb061064586a73e53224d85598f557fae489c7ee51f4d2ce2e60656f70ad"
+    }
+  ],
+  "runs_root": "C:\\Users\\thoma\\Documents\\gravityx-go2-cpp\\runs\\top5_cold_20260915",
+  "schema_version": 1
+}

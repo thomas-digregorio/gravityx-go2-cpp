@@ -1583,15 +1583,50 @@ int run_parallel_circuit_regression() {
             gravityx::ModelMode::ContingencySoft, refreshed.solve.state, {1}, context);
         if (!refreshed.feasible || independent.max_residual > 1e-5 ||
             refreshed.adaptive_jacobian_refresh_attempts != 1 ||
+            refreshed.adaptive_jacobian_refresh_selected != 1 ||
             refreshed.adaptive_jacobian_refresh_best_after > refreshed.adaptive_jacobian_refresh_best_before ||
             frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
             throw std::runtime_error("adaptive refresh tiny outage failed: " + refreshed.to_json().dump());
         }
+        auto second_outage = branch_contingency;
+        second_outage.component = 1;
+        second_outage.source_index = 2;
+        second_outage.label = "parallel-second-outage";
+        const auto reused_refresh = refresh_solver.solve(second_outage);
+        context.outaged_branch = second_outage.component;
+        const auto second_independent = gravityx::validate_state(refresh_data,
+            gravityx::ModelMode::ContingencySoft, reused_refresh.solve.state, {1}, context);
+        if (!reused_refresh.feasible || second_independent.max_residual > 1e-5 ||
+            reused_refresh.adaptive_jacobian_refresh_attempts != 1 ||
+            reused_refresh.adaptive_jacobian_refresh_selected != 1 ||
+            std::abs(reused_refresh.solve.state.pf[1]) > 1e-12 ||
+            std::abs(reused_refresh.solve.state.pf[0]) < 1e-4 ||
+            frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
+            throw std::runtime_error("adaptive cache contaminated the next tiny outage");
+        }
+        refresh_options.max_adaptive_jacobian_refreshes = 0;
+        gravityx::FastContingencyPowerFlow zero_budget_solver(
+            refresh_data, refresh_base.solve.state, {1}, refresh_options);
+        if (zero_budget_solver.solve(branch_contingency).adaptive_jacobian_refresh_attempts != 0) {
+            throw std::runtime_error("zero adaptive refresh budget was ignored");
+        }
+        refresh_options.max_adaptive_jacobian_refreshes = 1;
         refresh_options.adaptive_jacobian_refresh = false;
         gravityx::FastContingencyPowerFlow disabled_solver(
             refresh_data, refresh_base.solve.state, {1}, refresh_options);
         if (disabled_solver.solve(branch_contingency).adaptive_jacobian_refresh_attempts != 0) {
             throw std::runtime_error("disabled adaptive refresh was attempted");
+        }
+        for (bool invalid_window : {false, true}) {
+            auto invalid_refresh = refresh_options;
+            if (invalid_window) invalid_refresh.adaptive_jacobian_refresh_window = -1;
+            else invalid_refresh.max_adaptive_jacobian_refreshes = -1;
+            bool rejected = false;
+            try {
+                gravityx::FastContingencyPowerFlow invalid_solver(
+                    refresh_data, refresh_base.solve.state, {1}, invalid_refresh);
+            } catch (const std::runtime_error&) { rejected = true; }
+            if (!rejected) throw std::runtime_error("negative adaptive work limit was accepted");
         }
     }
     gravityx::FastContingencyPowerFlow fast_screen(

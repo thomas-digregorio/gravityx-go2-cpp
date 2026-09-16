@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -1103,9 +1104,13 @@ def install_static_case_read_cache(module: ModuleType) -> dict[str, int]:
     """Reuse immutable RAW and supplemental parses in a persistent process.
 
     Evaluation instances continue to be constructed from scratch for every
-    shard.  Only the parsed state of hard-linked, byte-identical ``case.raw``
-    and ``case.json`` inputs is shared.  Contingency files are always parsed
-    anew because each shard has a different exact label subset.
+    shard. Only pristine parsed state for byte-identical ``case.raw`` and
+    ``case.json`` inputs is shared. Identity is checked from file CONTENTS,
+    not inode/path: staging can fall back from a hard link to a copy (for
+    example when a long campaign exhausts the source file's hard-link limit).
+    Every read hashes the current bytes, so in-place source changes cannot
+    reuse stale state. Contingency files are always parsed anew because each
+    shard has a different exact label subset.
     """
 
     statistics = {
@@ -1115,41 +1120,48 @@ def install_static_case_read_cache(module: ModuleType) -> dict[str, int]:
         "supplemental_misses": 0,
     }
 
-    def patch_reader(reader_class: type[Any], name: str) -> None:
-        original_read = reader_class.read
-        cached_states: list[tuple[Path, dict[str, Any]]] = []
+    def patch_reader(reader_class: type[Any], name: str, original_read: Any) -> None:
+        cached_states: dict[str, dict[str, Any]] = {}
+
+        def content_digest(path: Path) -> str:
+            with path.open("rb") as stream:
+                return hashlib.file_digest(stream, "sha256").hexdigest()
 
         def cached_read(
             self: Any,
             file_name: str | os.PathLike[str],
         ) -> Any:
             candidate = Path(file_name).resolve()
-            for source, state in cached_states:
-                try:
-                    identical_file = os.path.samefile(candidate, source)
-                except OSError:
-                    identical_file = False
-                if identical_file:
-                    # Vendor cost/setup routines normalize some nested case
-                    # structures in place.  Restore an independent copy of
-                    # the pristine parsed state for every shard so reuse can
-                    # never carry mutated model data across evaluations.
-                    self.__dict__.update(copy.deepcopy(state))
-                    statistics[f"{name}_hits"] += 1
-                    return None
+            digest = content_digest(candidate)
+            if digest in cached_states:
+                # Vendor cost/setup routines normalize some nested case
+                # structures in place. Restore an independent copy of the
+                # pristine parsed state for every shard, never a previously
+                # evaluated or normalized object.
+                self.__dict__.update(copy.deepcopy(cached_states[digest]))
+                statistics[f"{name}_hits"] += 1
+                return None
             result = original_read(self, file_name)
+            if content_digest(candidate) != digest:
+                raise RuntimeError(
+                    f"static {name} input changed while the vendor parsed it"
+                )
             # Capture an immutable baseline before the returned objects are
             # handed to Evaluation, whose cost setup mutates nested values.
-            cached_states.append(
-                (candidate, copy.deepcopy(self.__dict__))
-            )
+            cached_states[digest] = copy.deepcopy(self.__dict__)
             statistics[f"{name}_misses"] += 1
             return result
 
         reader_class.read = cached_read
 
-    patch_reader(module.data.Raw, "raw")
-    patch_reader(module.data.Sup, "supplemental")
+    # Capture both originals before replacing either method, including for
+    # small test readers that share an inherited implementation.
+    readers = (
+        (module.data.Raw, "raw", module.data.Raw.read),
+        (module.data.Sup, "supplemental", module.data.Sup.read),
+    )
+    for reader_class, name, original_read in readers:
+        patch_reader(reader_class, name, original_read)
     module._gravityx_static_case_cache_statistics = statistics
     return statistics
 

@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import json
+import os
 import numpy as np
 import queue
 import subprocess
@@ -1119,6 +1120,79 @@ i, xst1, xst2, xst3, xst4, xst5, xst6, xst7, xst8
             self.assertIsNot(first.nested, second.nested)
             self.assertEqual(statistics["raw_misses"], 1)
             self.assertEqual(statistics["raw_hits"], 1)
+
+    def test_static_case_cache_accepts_equal_copies_and_rechecks_changed_bytes(self):
+        class FakeReader:
+            read_count = 0
+
+            def read(self, file_name):
+                type(self).read_count += 1
+                self.nested = {"values": [Path(file_name).read_text(encoding="utf-8")]}
+
+        class FakeSupplemental(FakeReader):
+            read_count = 0
+
+        module = SimpleNamespace(data=SimpleNamespace(Raw=FakeReader, Sup=FakeSupplemental))
+        statistics = install_static_case_read_cache(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for reader, kind in ((module.data.Raw, "raw"), (module.data.Sup, "supplemental")):
+                source = root / f"source.{kind}"
+                copied = root / f"copied.{kind}"
+                source.write_text("old\n", encoding="utf-8")
+                copied.write_bytes(source.read_bytes())
+                self.assertFalse(os.path.samefile(source, copied))
+                first = reader(); first.read(source)
+                first.nested["values"][0] = "mutated by previous evaluation"
+                second = reader(); second.read(copied)
+                self.assertEqual(second.nested, {"values": ["old\n"]})
+                self.assertIsNot(first.nested, second.nested)
+                self.assertEqual(reader.read_count, 1)
+
+                # Same path, inode, size AND restored mtime must not admit
+                # a stale source. Content identity, not metadata, decides.
+                before = source.stat()
+                source.write_text("new\n", encoding="utf-8")
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+                changed = reader(); changed.read(source)
+                self.assertEqual(changed.nested, {"values": ["new\n"]})
+                self.assertEqual(reader.read_count, 2)
+                unchanged_copy = reader(); unchanged_copy.read(copied)
+                self.assertEqual(unchanged_copy.nested, {"values": ["old\n"]})
+                self.assertEqual(statistics[f"{kind}_misses"], 2)
+                self.assertEqual(statistics[f"{kind}_hits"], 2)
+
+    def test_static_case_cache_rejects_source_mutated_during_parse(self):
+        class ChangingReader:
+            mutate = True
+            read_count = 0
+
+            def read(self, file_name):
+                type(self).read_count += 1
+                self.value = Path(file_name).read_text(encoding="utf-8")
+                if type(self).mutate:
+                    Path(file_name).write_text("new\n", encoding="utf-8")
+
+        class FakeSupplemental(ChangingReader):
+            pass
+
+        module = SimpleNamespace(data=SimpleNamespace(Raw=ChangingReader, Sup=FakeSupplemental))
+        statistics = install_static_case_read_cache(module)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "case.raw"
+            source.write_text("old\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed while the vendor parsed"):
+                module.data.Raw().read(source)
+            self.assertEqual(statistics["raw_misses"], 0)
+            self.assertEqual(statistics["raw_hits"], 0)
+            ChangingReader.mutate = False
+            source.write_text("old\n", encoding="utf-8")
+            clean = module.data.Raw(); clean.read(source)
+            self.assertEqual(clean.value, "old\n")
+            self.assertEqual(ChangingReader.read_count, 2)
+            source.unlink()
+            with self.assertRaises(FileNotFoundError):
+                module.data.Raw().read(source)
 
     def test_compact_evaluator_output_keeps_vendor_summary_calculation(self):
         class FakeEvaluation:

@@ -506,6 +506,7 @@ int run_component_tests() {
     gravityx::run_outage_inverse_row_cache_regression();
     gravityx::run_adaptive_jacobian_policy_regression();
     gravityx::run_voltage_extrapolation_policy_regression();
+    gravityx::run_corrective_trial_copy_regression();
     {
         gravityx::Branch a;
         a.from = 0; a.to = 1; a.x = 0.1; a.tap = 1.0;
@@ -1155,6 +1156,23 @@ int run_parallel_circuit_regression() {
         data, {1}, source_base.solve.state);
     gravityx::run_economic_polish_trial_regression(
         data, {1}, source_base.solve.state);
+    {
+        auto with_shunt = data;
+        gravityx::Shunt shunt;
+        shunt.source_key = "copy-test-shunt";
+        shunt.index = 1;
+        shunt.bus = 1;
+        shunt.dispatchable = true;
+        shunt.steps = {0};
+        shunt.block_maximum_steps = {2};
+        shunt.block_susceptance = {0.01};
+        with_shunt.shunts.push_back(shunt);
+        with_shunt.buses[1].shunts.push_back(0);
+        const auto shunt_base = gravityx::build_validated_source_base(with_shunt, {1});
+        if (!shunt_base.feasible) throw std::runtime_error("copy-test shunt base is invalid");
+        gravityx::run_economic_polish_trial_regression(
+            with_shunt, {1}, shunt_base.solve.state);
+    }
     const auto sparse_ac_economic =
         gravityx::solve_sparse_fixed_commitment_ac_economic(
             data, {1}, source_base.solve, sparse_ac_options);
@@ -1640,6 +1658,25 @@ int run_parallel_circuit_regression() {
         gravityx::FastContingencyPowerFlow refresh_solver(
             refresh_data, refresh_base.solve.state, {1}, refresh_options);
         const auto refreshed = refresh_solver.solve(branch_contingency);
+        auto full_copy_options = refresh_options;
+        full_copy_options.controls_only_trial_copy = false;
+        gravityx::FastContingencyPowerFlow full_copy_solver(
+            refresh_data, refresh_base.solve.state, {1}, full_copy_options);
+        const auto full_copy = full_copy_solver.solve(branch_contingency);
+        if (!full_copy.feasible ||
+            refreshed.corrective_trial_copy_count == 0 ||
+            refreshed.corrective_trial_copy_count != full_copy.corrective_trial_copy_count ||
+            refreshed.corrective_trial_copy_count != refreshed.corrective_trial_control_copy_count ||
+            full_copy.corrective_trial_control_copy_count != 0 ||
+            full_copy.corrective_trial_copy_avoided_bytes != 0 ||
+            refreshed.corrective_trial_copy_avoided_bytes == 0 ||
+            refreshed.fixed_jacobian_predictor_iterations != full_copy.fixed_jacobian_predictor_iterations ||
+            refreshed.economic_balance_polish_trial_count != full_copy.economic_balance_polish_trial_count ||
+            refreshed.solve.objective != full_copy.solve.objective ||
+            refreshed.validation.to_json() != full_copy.validation.to_json() ||
+            gravityx::ac_state_to_json(refreshed.solve.state) != gravityx::ac_state_to_json(full_copy.solve.state)) {
+            throw std::runtime_error("controls-only copy changed a complete tiny corrective solve");
+        }
         gravityx::ContingencyContext context;
         context.borrow_base_state(refresh_base.solve.state);
         context.outaged_branch = branch_contingency.component;
@@ -5391,6 +5428,8 @@ int run_contingency_worker(
                          "outage_update_basis_cache_bytes", "outage_update_seconds",
                          "outage_update_rhs_seconds", "economic_balance_polish_seconds",
                          "economic_balance_polish_correction_seconds",
+                         "corrective_trial_copy_count", "corrective_trial_control_copy_count",
+                         "corrective_trial_copy_avoided_bytes", "corrective_trial_copy_seconds",
                          "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",
                          "adaptive_jacobian_refresh_seconds", "adaptive_jacobian_refresh_best_before",
                          "adaptive_jacobian_refresh_best_after",

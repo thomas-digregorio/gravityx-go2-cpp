@@ -45,6 +45,35 @@ private:
     std::chrono::steady_clock::time_point start_;
 };
 
+// Only use for candidates whose derived fields are rebuilt before checking.
+// Preserve every control, including nested shunt steps and commitment metadata.
+// The original complete-copy path remains an equivalence oracle for tiny tests.
+AcState copy_corrective_trial(
+    const AcState& source, bool controls_only, FastPowerFlowResult* profile = nullptr) {
+    AccumulateSeconds timer(profile ? &profile->corrective_trial_copy_seconds : nullptr);
+    if (profile) ++profile->corrective_trial_copy_count;
+    if (!controls_only) return source;
+    if (profile) {
+        ++profile->corrective_trial_control_copy_count;
+        profile->corrective_trial_copy_avoided_bytes += sizeof(double) *
+            (source.pf.size() + source.qf.size() + source.pt.size() + source.qt.size() +
+             source.sm_slack.size() + source.p_delta.size() + source.q_delta.size() +
+             source.gen_lambda.size() + source.load_lambda.size());
+    }
+    AcState trial;
+    trial.vm = source.vm;
+    trial.va = source.va;
+    trial.pg = source.pg;
+    trial.qg = source.qg;
+    trial.demand_factor = source.demand_factor;
+    trial.shunt_bs = source.shunt_bs;
+    trial.shunt_steps = source.shunt_steps;
+    trial.commitment = source.commitment;
+    trial.startup = source.startup;
+    trial.shutdown = source.shutdown;
+    return trial;
+}
+
 bool needs_adaptive_jacobian_refresh(
     const FastPowerFlowOptions& options, bool branch_outage,
     int iteration, int last_preparation_iteration, int attempts,
@@ -76,7 +105,8 @@ struct VoltageExtrapolationSearch {
 template <typename Validator>
 VoltageExtrapolationSearch try_voltage_extrapolation(
     const CaseData& data, const AcState& reference, AcState& selected,
-    ValidationReport& selected_validation, double tolerance, Validator&& validate) {
+    ValidationReport& selected_validation, double tolerance, Validator&& validate,
+    bool controls_only_copy = false, FastPowerFlowResult* profile = nullptr) {
     VoltageExtrapolationSearch result;
     const std::size_t nb = data.buses.size();
     if (reference.vm.size() != nb || reference.va.size() != nb ||
@@ -98,7 +128,7 @@ VoltageExtrapolationSearch try_voltage_extrapolation(
     // complete physical fields against the immutable original base anchor.
     const AcState ray_point = selected;
     for (double scale : std::array<double, 3>{2.0, 4.0, 8.0}) {
-        AcState trial = ray_point;
+        AcState trial = copy_corrective_trial(ray_point, controls_only_copy, profile);
         bool finite = true;
         for (std::size_t bus = 0; bus < nb; ++bus) {
             const double vm = reference.vm[bus] + scale * (ray_point.vm[bus] - reference.vm[bus]);
@@ -1346,6 +1376,53 @@ void run_adaptive_jacobian_policy_regression() {
     }
 }
 
+void run_corrective_trial_copy_regression() {
+    AcState source;
+    int value = 1;
+    for (auto field : {&AcState::vm, &AcState::va, &AcState::pg, &AcState::qg,
+            &AcState::demand_factor, &AcState::shunt_bs, &AcState::commitment,
+            &AcState::startup, &AcState::shutdown, &AcState::pf, &AcState::qf,
+            &AcState::pt, &AcState::qt, &AcState::sm_slack, &AcState::p_delta,
+            &AcState::q_delta, &AcState::gen_lambda, &AcState::load_lambda}) {
+        source.*field = {static_cast<double>(value++)};
+    }
+    source.shunt_steps = {{1, 2}, {}, {3}};
+    const auto original = ac_state_to_json(source);
+    FastPowerFlowResult profile;
+    auto light = copy_corrective_trial(source, true, &profile);
+    const auto full = copy_corrective_trial(source, false, &profile);
+    for (auto field : {&AcState::vm, &AcState::va, &AcState::pg, &AcState::qg,
+            &AcState::demand_factor, &AcState::shunt_bs, &AcState::commitment,
+            &AcState::startup, &AcState::shutdown}) {
+        if (light.*field != source.*field) throw std::runtime_error("trial copy lost a control");
+    }
+    for (auto field : {&AcState::pf, &AcState::qf, &AcState::pt, &AcState::qt,
+            &AcState::sm_slack, &AcState::p_delta, &AcState::q_delta,
+            &AcState::gen_lambda, &AcState::load_lambda}) {
+        if (!(light.*field).empty()) throw std::runtime_error("trial copy retained derived fields");
+    }
+    if (light.shunt_steps != source.shunt_steps || ac_state_to_json(full) != original ||
+        profile.corrective_trial_copy_count != 2 || profile.corrective_trial_control_copy_count != 1 ||
+        profile.corrective_trial_copy_avoided_bytes != 9 * sizeof(double) ||
+        !std::isfinite(profile.corrective_trial_copy_seconds) || profile.corrective_trial_copy_seconds < 0) {
+        throw std::runtime_error("trial copy accounting or complete-copy oracle failed");
+    }
+    light.shunt_steps[0][0] = 99; light.vm[0] = -1;
+    if (ac_state_to_json(source) != original) throw std::runtime_error("trial copy aliased its source");
+    source.pg[0] = std::numeric_limits<double>::quiet_NaN();
+    if (!std::isnan(copy_corrective_trial(source, true).pg[0])) {
+        throw std::runtime_error("trial copy silently repaired a nonfinite control");
+    }
+    for (const auto& encoded : {profile.to_json(), profile.economic_summary_json(), profile.runtime_profile_json()}) {
+        for (const char* key : {"corrective_trial_copy_count", "corrective_trial_control_copy_count",
+                "corrective_trial_copy_avoided_bytes", "corrective_trial_copy_seconds"}) {
+            if (encoded.at(key) != profile.runtime_profile_json().at(key)) {
+                throw std::runtime_error("trial-copy metric missing from serializer");
+            }
+        }
+    }
+}
+
 void run_voltage_extrapolation_policy_regression() {
     FastPowerFlowOptions options;
     options.bounded_voltage_extrapolation = true;
@@ -1459,11 +1536,26 @@ void run_voltage_extrapolation_physics_regression(
     rebuild_contingency_state_derived_fields(data, original_base, commitment, contingency, selected);
     auto validation = validate_state(data, ModelMode::ContingencySoft, selected, commitment, context);
     if (validation.max_residual <= 1e-5) throw std::runtime_error("tiny ray fixture is not violated");
+    auto light_selected = selected;
+    auto light_validation = validation;
     const auto result = try_voltage_extrapolation(data, reference, selected, validation, 1e-5,
         [&](AcState& trial) {
             rebuild_contingency_state_derived_fields(data, original_base, commitment, contingency, trial);
             return validate_state(data, ModelMode::ContingencySoft, trial, commitment, context);
         });
+    FastPowerFlowResult copy_profile;
+    const auto light_result = try_voltage_extrapolation(data, reference,
+        light_selected, light_validation, 1e-5,
+        [&](AcState& trial) {
+            rebuild_contingency_state_derived_fields(data, original_base, commitment, contingency, trial);
+            return validate_state(data, ModelMode::ContingencySoft, trial, commitment, context);
+        }, true, &copy_profile);
+    if (light_result.trials != result.trials || light_result.selected_scale != result.selected_scale ||
+        ac_state_to_json(light_selected) != ac_state_to_json(selected) ||
+        light_validation.to_json() != validation.to_json() ||
+        copy_profile.corrective_trial_control_copy_count != static_cast<std::size_t>(result.trials)) {
+        throw std::runtime_error("controls-only voltage ray differs from complete-copy oracle");
+    }
     const auto independent = validate_state(data, ModelMode::ContingencySoft, selected, commitment, context);
     if (result.selected_scale != 2.0 || result.trials != 1 || independent.max_residual > 1e-5 ||
         selected.commitment != known_feasible_state.commitment ||
@@ -2749,6 +2841,10 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"outage_update_rhs_seconds", outage_update_rhs_seconds},
         {"economic_balance_polish_seconds", economic_balance_polish_seconds},
         {"economic_balance_polish_correction_seconds", economic_balance_polish_correction_seconds},
+        {"corrective_trial_copy_count", corrective_trial_copy_count},
+        {"corrective_trial_control_copy_count", corrective_trial_control_copy_count},
+        {"corrective_trial_copy_avoided_bytes", corrective_trial_copy_avoided_bytes},
+        {"corrective_trial_copy_seconds", corrective_trial_copy_seconds},
         {"adaptive_jacobian_refresh_attempts", adaptive_jacobian_refresh_attempts},
         {"adaptive_jacobian_refresh_selected", adaptive_jacobian_refresh_selected},
         {"adaptive_jacobian_refresh_seconds", adaptive_jacobian_refresh_seconds},
@@ -3185,10 +3281,13 @@ void run_economic_polish_trial_regression(
         context.borrow_base_state(original_base);
         context.outaged_branch = type == ContingencyType::Branch ? 0 : -1;
         context.outaged_generator = type == ContingencyType::Generator ? 0 : -1;
-        for (int mutation = 0; mutation < 7; ++mutation) {
+        for (int mutation = 0; mutation < 10; ++mutation) {
             auto fixture = data;
             fixture.generators[0].pmin = 0.1;
             auto trial = original_base;
+            // Valid source states may represent unchanged shunts implicitly.
+            // Materialize those controls before deliberately mutating a step.
+            ensure_shunt_control_state(fixture, trial);
             if (mutation == 1) trial.vm[0] = fixture.buses[0].vmax + 0.1;
             if (mutation == 2) trial.pg[0] = fixture.generators[0].pmax + 0.1;
             if (mutation == 3) trial.demand_factor[0] = fixture.loads[0].tmax + 0.1;
@@ -3197,11 +3296,41 @@ void run_economic_polish_trial_regression(
             }
             if (mutation == 5) trial.vm[0] = fixture.buses[0].vmax + 0.5e-5;
             if (mutation == 6) trial.qg[0] = fixture.generators[0].qmax + 0.1;
+            if (mutation == 7) trial.pg[0] = fixture.generators[0].pmin - 0.01;
+            if ((mutation == 8 || mutation == 9) && !fixture.shunts.empty()) {
+                const auto& shunt = fixture.shunts.front();
+                if (!shunt.block_maximum_steps.empty()) {
+                    const int step = mutation == 8 ? 1 : shunt.block_maximum_steps[0] + 1;
+                    trial.shunt_steps.at(0).at(0) = step;
+                    trial.shunt_bs.at(0) = step * shunt.block_susceptance.at(0);
+                }
+            }
             auto full_state = trial, staged_state = trial;
+            auto control_state = copy_corrective_trial(trial, true);
             const auto full = evaluate_economic_polish_trial(fixture, original_base,
                 commitment, outage, context, full_state, 1e-5, false);
             const auto staged = evaluate_economic_polish_trial(fixture, original_base,
                 commitment, outage, context, staged_state, 1e-5, true);
+            const auto control = evaluate_economic_polish_trial(fixture, original_base,
+                commitment, outage, context, control_state, 1e-5, true);
+            require(control.validation.to_json() == staged.validation.to_json() &&
+                    control.economics_checked == staged.economics_checked,
+                    "controls-only copy changed a physical decision");
+            if (control.economics_checked) {
+                require(control.objective == staged.objective &&
+                        ac_state_to_json(control_state) == ac_state_to_json(staged_state),
+                        "controls-only copy changed complete economic output");
+            } else {
+                require(!std::isfinite(control.objective),
+                        "controls-only rejected trial acquired an objective");
+            }
+            const double rebuilt_control_objective = rebuild_contingency_state_derived_fields(
+                fixture, original_base, commitment, outage, control_state);
+            require(rebuilt_control_objective == full.objective &&
+                    ac_state_to_json(control_state) == ac_state_to_json(full_state) &&
+                    validate_state(fixture, ModelMode::ContingencySoft, control_state,
+                        commitment, context).to_json() == full.validation.to_json(),
+                    "controls-only copy changed full acceptance or rejection evidence");
             const bool full_pass = full.validation.max_residual <= 1e-5;
             const bool staged_pass = staged.validation.max_residual <= 1e-5;
             require(full_pass == staged_pass, "staging changed feasibility decision");
@@ -3233,6 +3362,16 @@ void run_economic_polish_trial_regression(
                 require(!full_pass && !std::isfinite(staged.objective),
                         "incomplete physical trial could be accepted");
             }
+        }
+        for (bool controls_only : {false, true}) {
+            auto nonfinite = original_base;
+            nonfinite.vm[0] = std::numeric_limits<double>::quiet_NaN();
+            auto copied = copy_corrective_trial(nonfinite, controls_only);
+            bool rejected = false;
+            try { evaluate_economic_polish_trial(data, original_base, commitment,
+                    outage, context, copied, 1e-5, true); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "nonfinite control escaped the physical checker");
         }
     }
     require(physically_rejected > 0 && completely_checked > 0 && accepted > 0,
@@ -3469,6 +3608,9 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
     const auto wall_start = std::chrono::steady_clock::now();
     FastPowerFlowResult output;
     const int nb = static_cast<int>(data_.buses.size());
+    const auto make_trial = [&](const AcState& source) {
+        return copy_corrective_trial(source, options_.controls_only_trial_copy, &output);
+    };
     const int ng = static_cast<int>(data_.generators.size());
     const bool base_mode = contingency == nullptr;
     output.effective_predictor_time_limit_seconds =
@@ -4318,7 +4460,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                  ++polish_iteration) {
                                 output.economic_balance_polish_iterations =
                                     polish_iteration;
-                                AcState raw_trial = polished_state;
+                                AcState raw_trial = make_trial(polished_state);
                                 std::vector<double> polish_p_network;
                                 std::vector<double> polish_q_network;
                                 network_injections(
@@ -4478,7 +4620,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         ++output
                                             .economic_balance_polish_backtracking_attempts;
                                     }
-                                    AcState candidate = polished_state;
+                                    AcState candidate = make_trial(polished_state);
                                     for (int bus = 0; bus < nb; ++bus) {
                                         candidate.vm[bus] += step *
                                             (raw_trial.vm[bus] -
@@ -4596,7 +4738,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     ++output
                                         .economic_balance_polish_backtracking_attempts;
                                 }
-                                AcState candidate = polished_state;
+                                AcState candidate = make_trial(polished_state);
                                 for (int bus = 0; bus < nb; ++bus) {
                                     candidate.vm[bus] += step *
                                         (repair.state.vm[bus] -
@@ -4725,7 +4867,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     ++output
                                         .economic_balance_polish_backtracking_attempts;
                                 }
-                                AcState candidate = polished_state;
+                                AcState candidate = make_trial(polished_state);
                                 for (int bus = 0; bus < nb; ++bus) {
                                     candidate.vm[bus] += step *
                                         (phase_two.state.vm[bus] -
@@ -5384,7 +5526,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     (FixedJacobianPredictorCache& cache) {
                     const auto try_local_reactive =
                         [&](double damping) {
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         if (!cache.apply_local_reactive_least_squares(
                                 data_, q_balance_by_bus,
                                 trial.vm, damping,
@@ -5406,7 +5548,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     };
                     const auto try_local_reactive_then_active =
                         [&](double damping) {
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         if (!cache.apply_local_reactive_least_squares(
                                 data_, q_balance_by_bus,
                                 trial.vm, damping,
@@ -5460,7 +5602,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     const auto try_reactive_band =
                         [&](double damping,
                             bool require_continuation_decrease) {
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         if (!cache.apply_reactive_band_correction(
                                 data_, q_balance_by_bus,
                                 trial.vm, damping)) {
@@ -5487,7 +5629,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     };
                     const auto try_reactive_voltage_then_active = [&]() {
                         for (const double damping : kDampingCandidates) {
-                            auto trial = correction_reference;
+                            auto trial = make_trial(correction_reference);
                             if (!cache.apply_reactive_correction(
                                     data_, q_spec, q_network,
                                     trial.vm, damping)) {
@@ -5681,7 +5823,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 -0.05, 0.05);
                             for (const double damping :
                                  kDampingCandidates) {
-                                auto trial = correction_reference;
+                                auto trial = make_trial(correction_reference);
                                 const double angle_change =
                                     damping * raw_angle_change;
                                 if (slack[from]) {
@@ -5729,7 +5871,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 full_redispatch_p_spec)) {
                             for (const double damping :
                                  kDampingCandidates) {
-                                auto trial = correction_reference;
+                                auto trial = make_trial(correction_reference);
                                 auto trial_p_spec = p_spec;
                                 for (int generator = 0;
                                      generator < ng; ++generator) {
@@ -5812,7 +5954,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     distributed_p_spec)) {
                                 for (const double damping :
                                      kDampingCandidates) {
-                                    auto trial = correction_reference;
+                                    auto trial = make_trial(correction_reference);
                                     auto trial_p_spec = p_spec;
                                     for (int generator = 0;
                                          generator < ng; ++generator) {
@@ -5900,7 +6042,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (!active_block_dominant) {
                             break;
                         }
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         if (!cache.apply_active_correction(
                                 data_, p_spec, p_network,
                                 trial.va, damping)) {
@@ -5962,7 +6104,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (active_block_dominant) {
                             break;
                         }
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         if (!cache.apply_reactive_correction(
                                 data_, q_spec, q_network,
                                 trial.vm, damping)) {
@@ -5989,7 +6131,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         if (active_block_dominant) {
                             break;
                         }
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         if (!cache.apply_correction(
                                 data_, p_spec, q_spec, p_network, q_network,
                                 trial.vm, trial.va, damping)) {
@@ -6035,7 +6177,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 data_.buses[candidate_bus].vmax + 1e-12) {
                             continue;
                         }
-                        auto trial = correction_reference;
+                        auto trial = make_trial(correction_reference);
                         trial.vm[candidate_bus] = proposed_voltage;
                         const auto trial_validation =
                             project_trial_reactive_and_validate(trial);
@@ -6100,7 +6242,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         // Existing coordinate/history choices remain incumbents;
                         // only a strictly better physical residual replaces one.
                         for (double damping : kDampingCandidates) {
-                            auto trial = correction_reference;
+                            auto trial = make_trial(correction_reference);
                             if (!fresh_cache->apply_correction(
                                     data_, p_spec, q_spec, p_network, q_network,
                                     trial.vm, trial.va, damping)) continue;
@@ -6260,7 +6402,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     data_.buses[candidate_bus].vmax + 1e-12) {
                                 continue;
                             }
-                            auto trial = correction_reference;
+                            auto trial = make_trial(correction_reference);
                             trial.vm[candidate_bus] = proposed_voltage;
                             const auto trial_validation =
                                 project_trial_reactive_and_validate(trial);
@@ -6534,7 +6676,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             1e-12) {
                                         continue;
                                     }
-                                    auto trial = correction_reference;
+                                    auto trial = make_trial(correction_reference);
                                     trial.vm[from] = proposed_from;
                                     trial.vm[to] = proposed_to;
                                     const auto trial_validation =
@@ -6598,7 +6740,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     std::abs(proposed_to - vt) <= 1e-12) {
                                     continue;
                                 }
-                                auto trial = correction_reference;
+                                auto trial = make_trial(correction_reference);
                                 trial.vm[from] = proposed_from;
                                 trial.vm[to] = proposed_to;
                                 const auto trial_validation =
@@ -6659,7 +6801,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             1e-12) {
                                     continue;
                                 }
-                                auto trial = correction_reference;
+                                auto trial = make_trial(correction_reference);
                                 trial.vm[candidate_bus] = proposed_voltage;
                                 const auto trial_validation =
                                     project_trial_reactive_and_validate(
@@ -6706,7 +6848,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 0.03125, 0.015625};
                         for (double direction : {1.0, -1.0}) {
                         for (double damping : kLocalReactiveDamping) {
-                            auto trial = correction_reference;
+                            auto trial = make_trial(correction_reference);
                             if (!shunt_correction_cache->
                                     apply_local_reactive_correction(
                                         data_, worst_q_bus,
@@ -6760,7 +6902,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     data_.buses[candidate_bus].vmax + 1e-12) {
                                 continue;
                             }
-                            auto trial = correction_reference;
+                            auto trial = make_trial(correction_reference);
                             trial.vm[candidate_bus] = proposed_voltage;
                             const auto trial_validation =
                                 project_trial_reactive_and_validate(trial);
@@ -6866,7 +7008,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     }
                                     continue;
                                 }
-                                auto trial = correction_reference;
+                                auto trial = make_trial(correction_reference);
                                 trial.shunt_steps[shunt_index][block] =
                                     proposed_step;
                                 double trial_bs = 0.0;
@@ -6985,7 +7127,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 }
                                 for (double damping :
                                      kShuntCorrectionDamping) {
-                                    auto corrected_trial = trial;
+                                    auto corrected_trial = make_trial(trial);
                                     if (!shunt_correction_cache->
                                             apply_reactive_correction(
                                                 data_, trial_q_spec,
@@ -7064,7 +7206,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                                     1e-12) {
                                             continue;
                                         }
-                                        auto trial = correction_reference;
+                                        auto trial = make_trial(correction_reference);
                                         trial.vm[first_bus] = first_voltage;
                                         trial.vm[second_bus] = second_voltage;
                                         const auto trial_validation =
@@ -7301,7 +7443,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     output.voltage_extrapolation_best_before = selected_validation.max_residual;
                     const auto extrapolated = try_voltage_extrapolation(
                         data_, correction_reference, selected_correction, selected_validation,
-                        options_.validation_tolerance, project_trial_reactive_and_validate);
+                        options_.validation_tolerance, project_trial_reactive_and_validate,
+                        options_.controls_only_trial_copy, &output);
                     output.voltage_extrapolation_trials += extrapolated.trials;
                     if (extrapolated.selected_scale > 1.0) {
                         ++output.voltage_extrapolation_selected;

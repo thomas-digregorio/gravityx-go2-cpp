@@ -25,6 +25,9 @@ struct FastPowerFlowOptions {
     int adaptive_jacobian_refresh_window{4};
     int max_adaptive_jacobian_refreshes{2};
     bool bounded_voltage_extrapolation{false};
+    // Candidate controls only; flows, slacks and PWL fields are rebuilt before
+    // their respective physical/final checks. False retains the copy oracle.
+    bool controls_only_trial_copy{false};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -65,6 +68,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.economic_balance_polish = true;
     options.adaptive_jacobian_refresh = true;
     options.bounded_voltage_extrapolation = true;
+    options.controls_only_trial_copy = true;
     options.max_economic_balance_polish_iterations = 3;
     options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
@@ -109,6 +113,10 @@ struct FastPowerFlowResult {
     double outage_update_rhs_seconds{};
     double economic_balance_polish_seconds{};
     double economic_balance_polish_correction_seconds{};
+    std::size_t corrective_trial_copy_count{};
+    std::size_t corrective_trial_control_copy_count{};
+    std::size_t corrective_trial_copy_avoided_bytes{};
+    double corrective_trial_copy_seconds{};
     int adaptive_jacobian_refresh_attempts{};
     int adaptive_jacobian_refresh_selected{};
     double adaptive_jacobian_refresh_seconds{};
@@ -207,6 +215,7 @@ void run_fast_power_flow_topology_cache_regression();
 void run_outage_inverse_row_cache_regression();
 void run_adaptive_jacobian_policy_regression();
 void run_voltage_extrapolation_policy_regression();
+void run_corrective_trial_copy_regression();
 void run_voltage_extrapolation_physics_regression(
     const CaseData& data, const std::vector<int>& commitment,
     const AcState& original_base, const Contingency& contingency,

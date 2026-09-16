@@ -65,3 +65,26 @@ end-to-end deadline, 30 GiB pre-run floor, source constraints, tolerances,
 full contingency set and official evaluation. No prior solution initializes
 this run. This documentation/archive milestone changes no solver code or
 configuration. No result is claimed until the experiment is complete.
+
+## Superseded V19 payload cleanup after V20
+
+V19 completed all native tasks but failed during worker shutdown before a
+complete official evaluation. V20 later retained a complete independently
+evaluated candidate set (audited after its own finalization timeout). V19's
+solution-text payloads were therefore pruned after checking its compact
+archive/status hashes, exact target/ancestor/subtree paths, no active related
+processes, timeout evidence, and all 6,580 retained V20 root solutions.
+
+Exact target:
+`runs/top5_cold_20260915/v19_s095/C2FEN19402_s095_cold`.
+Only 13,206 `solution_*.txt` entries were deleted. V19's status, worker logs,
+partial official detail files, attribution and committed compact archive
+remain. No V19 solution-text file remains; those exact text outputs cannot
+be re-evaluated without recreation. V16 and V20 vectors remain intact.
+
+C: free bytes changed from 56,074,645,504 to 67,826,470,912 during this cleanup:
+a net gain of 10.945 GiB, leaving 63.168 GiB free. Across the two authorized
+cleanup operations, 79,008 file entries were removed and measured net gains
+totaled approximately 65.93 GiB. The new experiments and their working data
+consumed some space in between; total reclaimed bytes should not be confused
+with the change from the beginning-of-turn free-space reading.

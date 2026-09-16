@@ -705,6 +705,8 @@ int run_component_tests() {
     gravityx::enable_cached_economic_polish(cached_economic_options);
     if (!cached_economic_options.economic_balance_polish ||
         !cached_economic_options.early_reject_economic_trials ||
+        !cached_economic_options.reuse_feasibility_jacobian_for_polish ||
+        gravityx::FastPowerFlowOptions{}.reuse_feasibility_jacobian_for_polish ||
         gravityx::FastPowerFlowOptions{}.early_reject_economic_trials ||
         !std::isinf(cached_economic_options.economic_balance_polish_objective_threshold) ||
         cached_economic_options.max_economic_linearized_polish_rounds != 0 ||
@@ -1108,6 +1110,7 @@ int run_parallel_circuit_regression() {
     budget_result.outage_update_seconds = 0.2;
     budget_result.outage_update_rhs_seconds = 0.1;
     budget_result.economic_balance_polish_seconds = 0.6;
+    budget_result.economic_polish_reused_feasibility_jacobian = true;
     budget_result.economic_balance_polish_correction_seconds = 0.12;
     budget_result.economic_balance_polish_flow_reuses = 5;
     budget_result.economic_balance_polish_ybus_builds = 1;
@@ -1139,6 +1142,11 @@ int run_parallel_circuit_regression() {
     budget_result.voltage_extrapolation_best_after = 0.1;
     const auto compact_economic = budget_result.economic_summary_json();
     const auto full_economic = budget_result.to_json();
+    if (!compact_economic.at("economic_polish_reused_feasibility_jacobian").get<bool>() ||
+        compact_economic.at("economic_polish_reused_feasibility_jacobian") !=
+            full_economic.at("economic_polish_reused_feasibility_jacobian")) {
+        throw std::runtime_error("compact worker log omitted factor-reuse identity");
+    }
     if (compact_economic.at("economic_balance_polish_rejection_witnesses") !=
             full_economic.at("economic_balance_polish_rejection_witnesses") ||
         compact_economic.at("economic_balance_polish_rejection_witnesses").at("flow_limit") != 2 ||
@@ -1694,6 +1702,7 @@ int run_parallel_circuit_regression() {
         // This existing group is the V14/V16 copy/injection/decoupled oracle.
         // A separate comparison below exercises the new local economic pass.
         refresh_options.local_bus_dispatch_polish = false;
+        refresh_options.reuse_feasibility_jacobian_for_polish = false;
         refresh_options.fixed_jacobian_minimum_bus_count = 0;
         refresh_options.fixed_jacobian_screen_only = true;
         // Force one probe on this tiny fixture instead of constructing a slow
@@ -1830,6 +1839,61 @@ int run_parallel_circuit_regression() {
             refreshed.adaptive_jacobian_refresh_best_after > refreshed.adaptive_jacobian_refresh_best_before ||
             frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
             throw std::runtime_error("adaptive refresh tiny outage failed: " + refreshed.to_json().dump());
+        }
+        // The tiny branch fixture actually refreshes and selects a new
+        // post-outage factorization. Exercise reuse rather than just testing
+        // a flag on an easy outage that never reaches the new path.
+        auto reuse_options = refresh_options;
+        reuse_options.reuse_feasibility_jacobian_for_polish = true;
+        gravityx::FastContingencyPowerFlow reuse_solver(
+            refresh_data, refresh_base.solve.state, {1}, reuse_options);
+        const auto reused_polish = reuse_solver.solve(branch_contingency);
+        const auto reuse_check = gravityx::validate_state(refresh_data,
+            gravityx::ModelMode::ContingencySoft, reused_polish.solve.state, {1}, context);
+        if (!reused_polish.feasible || !std::isfinite(reuse_check.max_residual) ||
+            reuse_check.max_residual > 1e-5 ||
+            !reused_polish.economic_polish_reused_feasibility_jacobian ||
+            refreshed.economic_polish_reused_feasibility_jacobian ||
+            reused_polish.adaptive_jacobian_refresh_attempts != refreshed.adaptive_jacobian_refresh_attempts ||
+            reused_polish.adaptive_jacobian_refresh_selected != refreshed.adaptive_jacobian_refresh_selected ||
+            reused_polish.fixed_jacobian_predictor_iterations != refreshed.fixed_jacobian_predictor_iterations ||
+            reused_polish.outage_update_requests + 1 != refreshed.outage_update_requests ||
+            !std::isfinite(reused_polish.solve.objective) ||
+            reused_polish.solve.objective + 1e-6 < reused_polish.economic_balance_polish_objective_before ||
+            frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
+            throw std::runtime_error("reused feasibility factor failed tiny economic validation: " +
+                reused_polish.runtime_profile_json().dump());
+        }
+        auto rebuilt_reuse = reused_polish.solve.state;
+        const double reuse_objective = gravityx::rebuild_contingency_state_derived_fields(
+            refresh_data, refresh_base.solve.state, {1}, branch_contingency, rebuilt_reuse);
+        if (std::abs(reuse_objective - reused_polish.solve.objective) > 1e-6 ||
+            gravityx::validate_state(refresh_data, gravityx::ModelMode::ContingencySoft,
+                rebuilt_reuse, {1}, context).max_residual > 1e-5) {
+            throw std::runtime_error("reused feasibility factor disagrees with full AC reconstruction");
+        }
+        const auto direct_reuse_check = reuse_solver.screen_candidate(
+            branch_contingency, reused_polish.solve.state);
+        if (!direct_reuse_check.feasible ||
+            direct_reuse_check.economic_polish_reused_feasibility_jacobian ||
+            direct_reuse_check.economic_balance_polish_attempted) {
+            throw std::runtime_error("direct-only verification must not invoke economic factor reuse");
+        }
+        auto other_reuse_outage = branch_contingency;
+        other_reuse_outage.component = 1;
+        other_reuse_outage.label = "second-reused-factor-outage";
+        auto other_context = context;
+        other_context.outaged_branch = other_reuse_outage.component;
+        const auto other_reused = reuse_solver.solve(other_reuse_outage);
+        gravityx::FastContingencyPowerFlow independent_reuse_solver(
+            refresh_data, refresh_base.solve.state, {1}, reuse_options);
+        const auto independent_reused = independent_reuse_solver.solve(other_reuse_outage);
+        if (!other_reused.feasible ||
+            gravityx::validate_state(refresh_data, gravityx::ModelMode::ContingencySoft,
+                other_reused.solve.state, {1}, other_context).max_residual > 1e-5 ||
+            gravityx::ac_state_to_json(other_reused.solve.state) !=
+                gravityx::ac_state_to_json(independent_reused.solve.state)) {
+            throw std::runtime_error("economic factor reuse leaked a preceding outage into another task");
         }
         auto local_options = refresh_options;
         local_options.local_bus_dispatch_polish = true;
@@ -5619,6 +5683,7 @@ int run_contingency_worker(
                          "outage_update_basis_cache_misses", "outage_update_rhs_columns",
                          "outage_update_basis_cache_bytes", "outage_update_seconds",
                          "outage_update_rhs_seconds", "economic_balance_polish_seconds",
+                         "economic_polish_reused_feasibility_jacobian",
                          "economic_balance_polish_correction_seconds",
                          "local_dispatch_attempted", "local_dispatch_selected",
                          "local_dispatch_pg_changes", "local_dispatch_qg_changes", "local_dispatch_load_changes",

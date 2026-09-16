@@ -1707,6 +1707,7 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
 
     bool valid{};
     double preparation_seconds{};
+    const int factorized_outaged_branch;
     std::vector<int> angle_index;
     std::vector<int> voltage_index;
     int angle_count{};
@@ -1734,7 +1735,9 @@ struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
         const AcState& reference_state,
         const std::vector<int>& commitment,
         int outaged_branch = -1,
-        bool use_inverse_row_cache = true) : cache_inverse_rows(use_inverse_row_cache) {
+        bool use_inverse_row_cache = true)
+        : factorized_outaged_branch(outaged_branch),
+          cache_inverse_rows(use_inverse_row_cache) {
         const auto started = std::chrono::steady_clock::now();
         const int nb = static_cast<int>(data.buses.size());
         std::vector<bool> slack(static_cast<std::size_t>(nb), false);
@@ -2985,6 +2988,7 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"local_dispatch_predicted_gain", local_dispatch_predicted_gain},
         {"local_dispatch_rejection_category", local_dispatch_rejection_category},
         {"economic_balance_polish_seconds", economic_balance_polish_seconds},
+        {"economic_polish_reused_feasibility_jacobian", economic_polish_reused_feasibility_jacobian},
         {"economic_balance_polish_correction_seconds", economic_balance_polish_correction_seconds},
         {"economic_balance_polish_flow_reuses", economic_balance_polish_flow_reuses},
         {"economic_balance_polish_ybus_builds", economic_balance_polish_ybus_builds},
@@ -4603,10 +4607,26 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         double polished_objective = predictor_objective;
                         ValidationReport polished_validation =
                             predictor_validation;
+                        // Feasibility may already have paid for a local,
+                        // post-outage factorization. Do not revert to the
+                        // older base linearization for economic correction.
+                        // A local matrix already excludes this branch: it
+                        // must NOT receive another branch-removal update.
+                        auto* polish_cache = predictor_cache_.get();
+                        if (options_.reuse_feasibility_jacobian_for_polish &&
+                            contingency_predictor_cache &&
+                            contingency_predictor_cache->valid &&
+                            contingency_predictor_cache->active_valid &&
+                            contingency_predictor_cache->reactive_valid &&
+                            contingency_predictor_cache->factorized_outaged_branch == outaged_branch) {
+                            polish_cache = contingency_predictor_cache.get();
+                            output.economic_polish_reused_feasibility_jacobian = true;
+                        }
                         bool outage_update_ready = true;
-                        if (outaged_branch >= 0) {
+                        if (outaged_branch >= 0 &&
+                            !output.economic_polish_reused_feasibility_jacobian) {
                             outage_update_ready =
-                                predictor_cache_->configure_branch_outage_update(
+                                polish_cache->configure_branch_outage_update(
                                     data_, polished_state, outaged_branch, &output);
                         }
                         if (!outage_update_ready) {
@@ -4755,7 +4775,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 const auto correction_started = std::chrono::steady_clock::now();
                                 bool corrected =
                                     options_.coupled_polish_correction &&
-                                    predictor_cache_->apply_correction(
+                                    polish_cache->apply_correction(
                                         data_, p_spec, q_spec,
                                         polish_p_network, polish_q_network,
                                         raw_trial.vm, raw_trial.va);
@@ -4765,7 +4785,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 // the exact nonlinear rebuild and validator.
                                 if (!corrected) {
                                     const bool active_corrected =
-                                        predictor_cache_
+                                        polish_cache
                                             ->apply_active_correction(
                                                 data_, p_spec,
                                                 polish_p_network,
@@ -4776,7 +4796,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             polish_p_network, polish_q_network);
                                     }
                                     const bool reactive_corrected =
-                                        predictor_cache_
+                                        polish_cache
                                             ->apply_reactive_correction(
                                                 data_, q_spec,
                                                 polish_q_network,

@@ -39,6 +39,9 @@ struct FastPowerFlowOptions {
     // Reject a physically infeasible economic trial at its first proven
     // violation; all potentially accepted trials still complete every check.
     bool early_reject_economic_trials{false};
+    // Reuse a matching outage factorization already built by feasibility
+    // repair. This performs no additional factorization or cross-run reuse.
+    bool reuse_feasibility_jacobian_for_polish{false};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -83,6 +86,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.reuse_polish_branch_flows = true;
     options.local_bus_dispatch_polish = true;
     options.early_reject_economic_trials = true;
+    options.reuse_feasibility_jacobian_for_polish = true;
     options.max_economic_balance_polish_iterations = 3;
     options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
@@ -138,6 +142,7 @@ struct FastPowerFlowResult {
     double outage_update_seconds{};
     double outage_update_rhs_seconds{};
     double economic_balance_polish_seconds{};
+    bool economic_polish_reused_feasibility_jacobian{};
     double economic_balance_polish_correction_seconds{};
     int economic_balance_polish_flow_reuses{};
     int economic_balance_polish_ybus_builds{};

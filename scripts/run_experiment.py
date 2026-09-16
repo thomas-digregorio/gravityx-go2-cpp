@@ -1217,6 +1217,7 @@ class PersistentEvaluatorProcess:
         environment: dict[str, str],
         log_path: Path,
         below_normal_priority: bool = False,
+        wait_for_ready: bool = True,
     ) -> None:
         self.worker_id = worker_id
         self.log_path = log_path
@@ -1233,11 +1234,15 @@ class PersistentEvaluatorProcess:
             **evaluator_priority_popen_options(below_normal_priority),
         )
         self.task_count = 0
-        try:
-            self._wait_until_ready()
-        except Exception:
-            self.terminate()
-            raise
+        self.ready = False
+        self.startup_seconds: float | None = None
+        self.startup_started = time.perf_counter()
+        if wait_for_ready:
+            try:
+                self._wait_until_ready()
+            except Exception:
+                self.terminate()
+                raise
 
     def _wait_until_ready(self) -> None:
         assert self.process.stdout is not None
@@ -1252,6 +1257,12 @@ class PersistentEvaluatorProcess:
             self.log_handle.write(line)
             self.log_handle.flush()
             if line.rstrip("\r\n") == "GRAVITYX_EVALUATOR_READY":
+                self.ready = True
+                self.startup_seconds = time.perf_counter() - self.startup_started
+                self.log_handle.write("GRAVITYX_EVALUATOR_STARTUP " + json.dumps({
+                    "worker_id": self.worker_id, "seconds": self.startup_seconds,
+                }, separators=(",", ":")) + "\n")
+                self.log_handle.flush()
                 return
 
     def _read_result(self, request_id: int) -> dict[str, Any]:
@@ -1284,6 +1295,8 @@ class PersistentEvaluatorProcess:
         record: dict[str, Any],
         deadline: float,
     ) -> dict[str, Any]:
+        if not self.ready:
+            raise RuntimeError("persistent evaluator has not completed its ready handshake")
         if time.perf_counter() >= deadline:
             raise CompetitionTimeout(
                 "persistent official evaluation reached its deadline"
@@ -1464,6 +1477,7 @@ class StreamingSerialEvaluation:
         self.evaluator_executor_shutdown = False
         self.persistent_workers: list[PersistentEvaluatorProcess] = []
         self.available_persistent_workers: list[PersistentEvaluatorProcess] = []
+        self.persistent_startup_futures: dict[int, concurrent.futures.Future] = {}
         self.lock = threading.RLock()
         self.aborted = False
         self.first_process_started: float | None = None
@@ -1473,6 +1487,8 @@ class StreamingSerialEvaluation:
     def _abort_locked(self) -> None:
         self.aborted = True
         if self.persistent_evaluator_processes:
+            for future in self.persistent_startup_futures.values():
+                future.cancel()
             for record in list(self.running_records.values()):
                 future = record.get("evaluation_future")
                 if future is not None:
@@ -1511,8 +1527,12 @@ class StreamingSerialEvaluation:
             return
         self.evaluator_executor_shutdown = True
         if self.persistent_evaluator_processes:
+            for future in self.persistent_startup_futures.values():
+                future.cancel()
             for worker in self.persistent_workers:
-                if self.aborted:
+                # A startup reader owns stdout until the ready handshake.
+                # Never race it by reading the shutdown response on this thread.
+                if self.aborted or not worker.ready:
                     worker.terminate()
                 else:
                     worker.stop()
@@ -1531,7 +1551,16 @@ class StreamingSerialEvaluation:
     def _ensure_persistent_workers_locked(self) -> None:
         if not self.persistent_evaluator_processes:
             return
-        while len(self.persistent_workers) < self.maximum_processes:
+        # Preserve the initial pool, but do not import extra evaluators merely
+        # because the concurrency cap rose when no shards need those workers.
+        target = min(self.maximum_processes, max(
+            self.initial_maximum_processes,
+            len(self.running_records) + len(self.ready_records),
+        ))
+        while len(self.persistent_workers) < target:
+            if time.perf_counter() >= self.deadline:
+                self._abort_locked()
+                raise CompetitionTimeout("persistent evaluator startup reached its deadline")
             worker_id = len(self.persistent_workers)
             worker = PersistentEvaluatorProcess(
                 worker_id,
@@ -1542,9 +1571,35 @@ class StreamingSerialEvaluation:
                 / "persistent_streaming_evaluator_workers"
                 / f"persistent_worker_{worker_id:03d}.log",
                 self.evaluator_below_normal_priority,
+                wait_for_ready=False,
             )
             self.persistent_workers.append(worker)
+            # Module imports and the ready handshake must not hold the lock
+            # used by every screen worker to report its completed solution.
+            # The process is registered before the asynchronous wait, so abort
+            # can terminate even a worker that never becomes ready.
+            assert self.evaluator_executor is not None
+            self.persistent_startup_futures[worker_id] = self.evaluator_executor.submit(
+                worker._wait_until_ready
+            )
+
+    def _collect_persistent_startups_locked(self) -> None:
+        for worker_id, future in list(self.persistent_startup_futures.items()):
+            if not future.done():
+                continue
+            try:
+                future.result()
+            except Exception as error:
+                self._abort_locked()
+                raise RuntimeError(
+                    f"persistent official evaluator startup failed: worker={worker_id}"
+                ) from error
+            worker = self.persistent_workers[worker_id]
+            if not worker.ready:
+                self._abort_locked()
+                raise RuntimeError("persistent evaluator startup returned without a ready handshake")
             self.available_persistent_workers.append(worker)
+            del self.persistent_startup_futures[worker_id]
 
     def _collect_finished_locked(self) -> None:
         for shard_index, record in list(self.running_records.items()):
@@ -1622,6 +1677,7 @@ class StreamingSerialEvaluation:
                 ) from future.exception()
 
     def _launch_ready_locked(self) -> None:
+        self._collect_persistent_startups_locked()
         self._collect_finished_locked()
         self._ensure_persistent_workers_locked()
         while (
@@ -1879,6 +1935,13 @@ class StreamingSerialEvaluation:
                         str(worker.worker_id): worker.task_count
                         for worker in self.persistent_workers
                     },
+                    "persistent_evaluator_startup": [
+                        {"worker_id": worker.worker_id, "ready": worker.ready,
+                         "startup_seconds": worker.startup_seconds,
+                         "tasks": worker.task_count}
+                        for worker in self.persistent_workers
+                    ],
+                    "persistent_evaluator_startup_mode": "nonblocking_handshake",
                 }
             )
             write_json(
@@ -4043,7 +4106,13 @@ def main() -> int:
                         )
                         split_count = 0
                         if result.get("success", False):
+                            handoff_started = time.perf_counter()
                             save_secure_result(item, result, worker_id, "fast_screen")
+                            output_lines.append("GRAVITYX_RESULT_HANDOFF " + json.dumps({
+                                "label": label,
+                                "seconds": time.perf_counter() - handoff_started,
+                                "seconds_remaining": contingency_deadline - time.perf_counter(),
+                            }, separators=(",", ":")) + "\n")
                             if (screen_work.should_split_heavy_group(work_source) and
                                     not retain_exact_parallel_group(group)):
                                 split_count = (

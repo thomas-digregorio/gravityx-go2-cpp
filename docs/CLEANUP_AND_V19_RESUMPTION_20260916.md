@@ -88,3 +88,24 @@ cleanup operations, 79,008 file entries were removed and measured net gains
 totaled approximately 65.93 GiB. The new experiments and their working data
 consumed some space in between; total reclaimed bytes should not be confused
 with the change from the beginning-of-turn free-space reading.
+
+## Superseded V16 payload cleanup after accepted V21
+
+V21 now replaces V16 as the accepted on-time scenario-095 study incumbent:
+375925.97863455745 versus 356907.86098102527, with full source-label coverage,
+zero official infeasibility and unchanged residual/deadline gates. V21's
+6,580 root vectors remain intact, as does the V20 candidate set.
+
+After verifying the V16/V21 archive and status hashes, exact local target,
+ancestor/subtree reparse checks and absence of active related workers, only
+`runs/top5_cold_20260915/v16_s095/C2FEN19402_s095_cold/**/solution_*.txt`
+was pruned. All 13,206 text-file entries were removed; no matching file remains.
+Their summed apparent size was 21.950 GiB, which double-counts hard links and
+is NOT a physical-space recovery measurement. The subsequent C: free-space
+reading was 82,313,555,968 bytes (about 76.66 GiB).
+
+V16 certificates, logs, evaluator details and committed compact audit survive;
+they cannot recreate the deleted exact solution vectors. Source data, source
+code, Git history, unrelated files, V18/V20/V21 vectors and other scenarios'
+retained solutions were not removed. This supersedes earlier V16 retention
+statements in this report.

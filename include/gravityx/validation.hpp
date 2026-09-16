@@ -61,6 +61,10 @@ struct RebuiltTrialFeasibility {
     ValidationReport report;
     // A partial report is a rejection witness, never an acceptance certificate.
     bool rejected_early{};
+    // Index of the branch whose unchanged physical checks proved rejection;
+    // -1 when rejection occurred elsewhere. Diagnostic/candidate generation
+    // only, never a substitute for the full acceptance report.
+    int rejected_branch{-1};
 };
 
 // Stop only at a STRICT violation > tolerance, without the merit-ranking

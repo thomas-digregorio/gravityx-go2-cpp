@@ -40,6 +40,7 @@ struct FastPowerFlowOptions {
     // Qg has no corrective ramp or production-cost term in this formulation.
     // Reconcile it at the trial's NEW voltages before testing that trial.
     bool rebalance_trial_reactive_generation{false};
+    bool branch_aware_economic_backtracking{false};
     // Reject a physically infeasible economic trial at its first proven
     // violation; all potentially accepted trials still complete every check.
     bool early_reject_economic_trials{false};
@@ -90,7 +91,10 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.reuse_polish_branch_flows = true;
     options.local_bus_dispatch_polish = true;
     options.local_discrete_shunt_polish = true;
-    options.rebalance_trial_reactive_generation = true;
+    // V26 showed little matched quality gain and missed the deadline. Keep
+    // Q recourse testable but restore the faster V25 production behavior.
+    options.rebalance_trial_reactive_generation = false;
+    options.branch_aware_economic_backtracking = true;
     options.early_reject_economic_trials = true;
     options.reuse_feasibility_jacobian_for_polish = true;
     options.max_economic_balance_polish_iterations = 3;
@@ -153,6 +157,9 @@ struct FastPowerFlowResult {
     int economic_trial_qg_recourse_calls{};
     int economic_trial_qg_changes{};
     double economic_trial_qg_seconds{};
+    int economic_branch_aware_steps{};
+    int economic_branch_steps_above_half{};
+    std::map<std::string, int> economic_branch_step_witnesses;
     bool economic_polish_reused_feasibility_jacobian{};
     double economic_balance_polish_correction_seconds{};
     int economic_balance_polish_flow_reuses{};

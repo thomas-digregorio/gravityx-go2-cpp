@@ -2985,6 +2985,9 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"economic_trial_qg_recourse_calls", economic_trial_qg_recourse_calls},
         {"economic_trial_qg_changes", economic_trial_qg_changes},
         {"economic_trial_qg_seconds", economic_trial_qg_seconds},
+        {"economic_branch_aware_steps", economic_branch_aware_steps},
+        {"economic_branch_steps_above_half", economic_branch_steps_above_half},
+        {"economic_branch_step_witnesses", economic_branch_step_witnesses},
         {"local_dispatch_seconds", local_dispatch_seconds},
         {"local_dispatch_preparation_seconds", local_dispatch_preparation_seconds},
         {"local_dispatch_cache_hit", local_dispatch_cache_hit},
@@ -3391,7 +3394,60 @@ struct EconomicPolishTrial {
     double economic_seconds{};
     int qg_changes{};
     double qg_seconds{};
+    int rejected_branch{-1};
 };
+
+struct EconomicBacktrackProposal {
+    double step{};
+    const char* witness{};
+};
+
+// A safeguarded secant estimate of the next step from the branch bound that
+// actually rejected this trial. This is NOT a feasibility proof: AC flows
+// are nonlinear in the interpolated controls and other constraints may bind.
+// Every proposed point still receives the unchanged complete nonlinear gate.
+static EconomicBacktrackProposal propose_branch_aware_backtrack(
+    const CaseData& data, int branch_index, const AcState& reference,
+    const AcState& rejected, double current_step) {
+    if (!std::isfinite(current_step) || current_step <= 0.0 || current_step > 1.0)
+        throw std::runtime_error("invalid economic backtracking step");
+    EconomicBacktrackProposal result{0.5 * current_step, nullptr};
+    const auto nl = data.branches.size();
+    if (branch_index < 0 || branch_index >= static_cast<int>(nl)) return result;
+    const auto& branch = data.branches[branch_index];
+    if (branch.status == 0 || branch.rate_c <= 0.0 || !std::isfinite(branch.rate_c) ||
+        !std::isfinite(data.sm_vio_limit) || data.sm_vio_limit < 0.0) return result;
+    for (const auto* state : {&reference, &rejected})
+        if (state->pf.size() != nl || state->qf.size() != nl || state->pt.size() != nl ||
+            state->qt.size() != nl || state->sm_slack.size() != nl)
+            throw std::runtime_error("invalid branch backtracking state dimensions");
+    double fraction = 1.0;
+    const char* witness = nullptr;
+    const auto consider = [&](double start, double trial, double lower, double upper, const char* name) {
+        if (!std::isfinite(start) || !std::isfinite(trial) || !std::isfinite(lower) || !std::isfinite(upper))
+            return;
+        double margin = 0.0, change = 0.0;
+        if (trial > upper && start <= upper) { margin = upper - start; change = trial - start; }
+        else if (trial < lower && start >= lower) { margin = start - lower; change = start - trial; }
+        else return;
+        if (margin <= 0.0 || change <= 0.0) return;
+        const double candidate = margin / change;
+        if (candidate > 0.0 && candidate < fraction) { fraction = candidate; witness = name; }
+    };
+    const auto i = static_cast<std::size_t>(branch_index);
+    const double from_bound = branch_terminal_component_bound(data, branch, branch.rate_c, true);
+    const double to_bound = branch_terminal_component_bound(data, branch, branch.rate_c, false);
+    consider(reference.pf[i], rejected.pf[i], -from_bound, from_bound, "pf");
+    consider(reference.qf[i], rejected.qf[i], -from_bound, from_bound, "qf");
+    consider(reference.pt[i], rejected.pt[i], -to_bound, to_bound, "pt");
+    consider(reference.qt[i], rejected.qt[i], -to_bound, to_bound, "qt");
+    consider(reference.sm_slack[i], rejected.sm_slack[i], 0.0, data.sm_vio_limit, "sm_slack");
+    if (witness) {
+        result.step = current_step * std::clamp(0.9 * fraction, 0.05, 0.9);
+        result.witness = witness;
+    }
+    return result;
+}
 
 // Fixed-voltage Q recourse is separable by bus: minimize absolute reactive
 // mismatch over the sum of the committed, available generators' EXACT Q
@@ -3507,6 +3563,59 @@ static void run_trial_reactive_recourse_regression() {
     }
 }
 
+static void run_branch_aware_backtrack_regression() {
+    const auto require = [](bool passed, const char* text) {
+        if (!passed) throw std::runtime_error(std::string("branch-aware backtracking: ") + text);
+    };
+    CaseData data; data.buses.resize(2); data.branches.resize(1); data.sm_vio_limit = 0.5;
+    data.buses[0].vmax = data.buses[1].vmax = 1.1;
+    auto& branch = data.branches[0]; branch.from = 0; branch.to = 1; branch.rate_c = 1.0;
+    AcState reference; reference.pf = reference.qf = reference.pt = reference.qt = {0.0};
+    reference.sm_slack = {0.3};
+    auto rejected = reference; rejected.sm_slack[0] = 0.6;
+    const auto initial = ac_state_to_json(reference), failed = ac_state_to_json(rejected);
+    const auto less_conservative = propose_branch_aware_backtrack(data, 0, reference, rejected, 0.5);
+    require(std::abs(less_conservative.step - 0.3) < 1e-12 &&
+        std::string(less_conservative.witness) == "sm_slack", "lost fractional thermal headroom");
+    rejected.sm_slack[0] = 4.0;
+    const auto severe = propose_branch_aware_backtrack(data, 0, reference, rejected, 1.0);
+    require(severe.step >= 0.05 && severe.step < 0.5, "did not safeguard severe bound rejection");
+    const double limit = branch_terminal_component_bound(data, branch, branch.rate_c, true);
+    for (double sign : {-1.0, 1.0}) {
+        rejected = reference; reference.pf[0] = -sign * 0.4 * limit;
+        rejected.pf[0] = sign * 2.0 * limit; rejected.sm_slack[0] = reference.sm_slack[0];
+        const auto step = propose_branch_aware_backtrack(data, 0, reference, rejected, 1.0);
+        require(std::abs(step.step - 0.9 * 1.4 / 2.4) < 1e-12 &&
+            std::string(step.witness) == "pf", "wrong signed component-bound secant");
+    }
+    reference.pf[0] = 0.0; rejected = reference;
+    for (int index : {-1, 1}) {
+        double step = 1.0;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            require(step == std::ldexp(1.0, -attempt), "changed fallback halving sequence");
+            const auto next = propose_branch_aware_backtrack(data, index, reference, rejected, step);
+            require(!next.witness, "invented an unsupported rejection witness"); step = next.step;
+        }
+    }
+    rejected.sm_slack[0] = std::numeric_limits<double>::quiet_NaN();
+    require(!propose_branch_aware_backtrack(data, 0, reference, rejected, 1.0).witness,
+        "used a nonfinite bound witness");
+    rejected = reference; rejected.pf.clear(); bool bad_dimensions = false;
+    try { propose_branch_aware_backtrack(data, 0, reference, rejected, 1.0); }
+    catch (const std::runtime_error&) { bad_dimensions = true; }
+    require(bad_dimensions, "did not reject malformed candidate dimensions");
+    for (double step : {0.0, -1.0, 2.0, std::numeric_limits<double>::quiet_NaN()}) {
+        bool bad_step = false;
+        try { propose_branch_aware_backtrack(data, -1, reference, reference, step); }
+        catch (const std::runtime_error&) { bad_step = true; }
+        require(bad_step, "invalid step escaped rejection");
+    }
+    rejected = reference; rejected.sm_slack[0] = 0.6;
+    propose_branch_aware_backtrack(data, 0, reference, rejected, 0.5);
+    require(ac_state_to_json(reference) == initial && ac_state_to_json(rejected) == failed,
+        "proposal changed source controls or its immutable endpoints");
+}
+
 static EconomicPolishTrial evaluate_economic_polish_trial(
     const CaseData& data, const AcState& original_base,
     const std::vector<int>& commitment, const Contingency& contingency,
@@ -3541,6 +3650,7 @@ static EconomicPolishTrial evaluate_economic_polish_trial(
             data, candidate, commitment, context, validation_tolerance);
         result.validation = std::move(physical.report);
         result.rejected_early = physical.rejected_early;
+        result.rejected_branch = physical.rejected_branch;
     } else {
         result.validation = validate_rebuilt_contingency_trial(
             data, candidate, commitment, context);
@@ -3572,6 +3682,7 @@ void run_economic_polish_trial_regression(
     require(!data.branches.empty() && !data.generators.empty() && !data.loads.empty(),
             "fixture lacks required components");
     const auto frozen_base = ac_state_to_json(original_base);
+    run_branch_aware_backtrack_regression();
     run_trial_reactive_recourse_regression();
     int physically_rejected = 0, completely_checked = 0, accepted = 0, rejected_early = 0;
     for (auto type : {ContingencyType::Branch, ContingencyType::Generator}) {
@@ -4826,10 +4937,6 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                         active_at_bus[bus].end());
                                 }
                             }
-                            const std::array<double, 10> backtracking_steps{
-                                1.0, 0.5, 0.25, 0.125, 0.0625,
-                                0.03125, 0.015625, 0.0078125,
-                                0.00390625, 0.001953125};
                             for (int polish_iteration = 1;
                                  polish_iteration <=
                                      options_.max_economic_balance_polish_iterations;
@@ -5001,7 +5108,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                     slack_sum(polished_state.p_delta);
                                 double trial_reactive_slack =
                                     slack_sum(polished_state.q_delta);
-                                for (double step : backtracking_steps) {
+                                double step = 1.0;
+                                for (int trial_attempt = 0; trial_attempt < 10; ++trial_attempt) {
                                     if (step < 1.0) {
                                         ++output
                                             .economic_balance_polish_backtracking_attempts;
@@ -5063,6 +5171,19 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                             candidate_validation;
                                         break;
                                     }
+                                    if (trial_attempt == 9) break;
+                                    EconomicBacktrackProposal next{0.5 * step, nullptr};
+                                    if (options_.branch_aware_economic_backtracking &&
+                                        trial_check.validation.worst_category == "variable_bound") {
+                                        next = propose_branch_aware_backtrack(data_, trial_check.rejected_branch,
+                                            polished_state, candidate, step);
+                                    }
+                                    if (next.witness) {
+                                        ++output.economic_branch_aware_steps;
+                                        output.economic_branch_steps_above_half += next.step > 0.5 * step;
+                                        ++output.economic_branch_step_witnesses[next.witness];
+                                    }
+                                    step = next.step;
                                 }
                                 output.economic_balance_polish_trace.push_back({
                                     {"iteration", polish_iteration},

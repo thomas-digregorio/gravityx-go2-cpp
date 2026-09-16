@@ -285,7 +285,8 @@ static ValidationReport validate_state_impl(
     int preferred_balance_bus = -1,
     int preferred_branch = -1,
     TrialRejectionRule rejection_rule = TrialRejectionRule::CannotImproveMerit,
-    bool* rejected_early = nullptr) {
+    bool* rejected_early = nullptr,
+    int* rejected_branch = nullptr) {
     const std::size_t nb = data.buses.size();
     const std::size_t ng = data.generators.size();
     const std::size_t nd = data.loads.size();
@@ -484,6 +485,7 @@ static ValidationReport validate_state_impl(
     if (preferred_branch >= 0 && preferred_branch < static_cast<int>(nl)) {
         validate_branch(static_cast<std::size_t>(preferred_branch));
         if (rejection_proven()) {
+            if (rejected_branch) *rejected_branch = preferred_branch;
             return report;
         }
     }
@@ -709,6 +711,7 @@ static ValidationReport validate_state_impl(
         }
         validate_branch(i);
         if (rejection_proven()) {
+            if (rejected_branch) *rejected_branch = static_cast<int>(i);
             return report;
         }
     }
@@ -773,7 +776,7 @@ RebuiltTrialFeasibility validate_rebuilt_contingency_feasibility(
     result.report = validate_state_impl(
         data, ModelMode::ContingencySoft, state, fixed_status,
         contingency, true, false, tolerance, -1, -1,
-        TrialRejectionRule::StrictlyInfeasible, &result.rejected_early);
+        TrialRejectionRule::StrictlyInfeasible, &result.rejected_early, &result.rejected_branch);
     return result;
 }
 
@@ -923,6 +926,31 @@ void run_strict_trial_rejection_regression() {
     catch (const std::runtime_error&) { rejected = true; }
     require(rejected, "early rejection bypassed a dimension guard");
     require(base.va == std::vector<double>({0.0, 0.0}), "strict checker changed its original base");
+    {
+        auto fixture = data; fixture.sm_vio_limit = 0.5; fixture.branches.resize(1);
+        auto& branch = fixture.branches[0]; branch.source_key = "witness-only";
+        branch.from = 0; branch.to = 1; branch.rate_c = 1.0;
+        branch.angmin = -3.0; branch.angmax = 3.0;
+        fixture.buses[0].branches_from = {0}; fixture.buses[1].branches_to = {0};
+        auto state = base; state.pf = state.qf = state.pt = state.qt = {0.0};
+        state.sm_slack = {0.6};
+        ContingencyContext branch_context; branch_context.borrow_base_state(state);
+        const auto branch_rejection = validate_rebuilt_contingency_feasibility(
+            fixture, state, {}, branch_context, tolerance);
+        require(branch_rejection.rejected_early && branch_rejection.rejected_branch == 0 &&
+            branch_rejection.report.worst_category == "variable_bound",
+            "strict branch rejection omitted its exact source index");
+        state.va[0] = 2.0 * tolerance;
+        const auto earlier_rejection = validate_rebuilt_contingency_feasibility(
+            fixture, state, {}, branch_context, tolerance);
+        require(earlier_rejection.rejected_early && earlier_rejection.rejected_branch == -1,
+            "nonbranch rejection incorrectly acquired a branch witness");
+        state.va[0] = 0.0; state.sm_slack[0] = 0.4;
+        const auto full = validate_rebuilt_contingency_trial(fixture, state, {}, branch_context);
+        const auto passing = validate_rebuilt_contingency_feasibility(fixture, state, {}, branch_context, tolerance);
+        require(!passing.rejected_early && passing.rejected_branch == -1 &&
+            passing.report.to_json() == full.to_json(), "branch metadata changed a complete acceptance check");
+    }
 }
 
 }  // namespace gravityx

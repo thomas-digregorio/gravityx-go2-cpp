@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "experiment": "v16_s095",
+  "algorithm_revision": "9ebc66343d2c939ff7c72026de15232dccc4cbbe",
+  "cold_source_start": true,
+  "full_run_repetitions": 1,
+  "source_hashes_match_manifest": true,
+  "executable_hash_matches_manifest": true,
+  "source_contingencies": 6579,
+  "retained_root_solution_files": 6580,
+  "independently_checked_unique_official_details": 6580,
+  "physical_shard_details_including_repeated_base": 6626,
+  "official_label_set_matches_source_con": true,
+  "duplicate_base_details_equal": true,
+  "official_infeasibility": 0,
+  "independently_reconstructed_objective": 356907.86098102527,
+  "objective_matches_reported_within": 0.000001,
+  "base_max_residual": 8.881784197001252e-16,
+  "max_independent_contingency_residual": 9.993580626088683e-6,
+  "total_wall_seconds": 297.7028850999923,
+  "base_algorithm_wall_seconds": 50.90847848,
+  "deadline_seconds": 300,
+  "published_fifth_best_target": 434319.522756719,
+  "gap_to_target": 77411.6617756937,
+  "gain_over_verified_v4": 15372.960626688786,
+  "top_five_gate_passed": false,
+  "base_components": {
+    "objective": 214720.19378388234,
+    "load_benefit": 336344.13570910395,
+    "generator_cost": 119373.36617976693,
+    "bus_cost": 500.72340337534996,
+    "active_bus_cost": 302.6598917746719,
+    "reactive_bus_cost": 198.06351160067797,
+    "line_cost": 1749.852342079358,
+    "transformer_cost": 0.0
+  },
+  "mean_contingency_components": {
+    "objective": 142187.66719714296,
+    "load_benefit": 336341.33899225324,
+    "generator_cost": 119380.35398616751,
+    "bus_cost": 73644.4383239012,
+    "active_bus_cost": 30044.382454333965,
+    "reactive_bus_cost": 43600.05586956722,
+    "line_cost": 1128.87948504156,
+    "transformer_cost": 0.0
+  },
+  "zero_penalty_fixed_controls_counterfactual": {
+    "value": 433931.7545354227,
+    "not_a_feasible_solution_or_global_bound": true
+  },
+  "native_terminal_records": 6579,
+  "method_counts": {
+    "resident_fixed_jacobian_economic_balance_polish": 5879,
+    "exact_parallel_peer_direct_screen": 664,
+    "resident_fixed_jacobian_predictor": 32,
+    "bounded_fast_newton_rescue": 4
+  },
+  "parallel_nested_phase_aggregates_not_additive_wall_times": {
+    "polish_seconds": 1192.351667995,
+    "correction_seconds": 194.177659862,
+    "injection_seconds": 19.746578682,
+    "ybus_seconds": 0.0,
+    "physical_check_seconds": 611.849160367,
+    "economic_check_seconds": 112.104251405,
+    "trial_copy_seconds": 56.768237306,
+    "predictor_preparation_seconds": 561.940502108
+  },
+  "polish_counts": {
+    "flow_reuses": 11678,
+    "ybus_builds": 0,
+    "iterations": 11678,
+    "trials": 33653,
+    "physical_rejections": 19422,
+    "economic_checks": 14231,
+    "tasks_by_iteration_count": {"0": 668, "1": 2635, "2": 785, "3": 2491}
+  },
+  "three_iteration_group": {
+    "tasks": 2491,
+    "mean_bus_cost": 152928.0767375701,
+    "contribution_to_all_contingencies_mean_bus_cost": 57903.000327297035,
+    "mean_polish_seconds": 0.3322597832051385
+  },
+  "matched_v14_comparison_not_controlled_speedup": {
+    "labels": 6567,
+    "v14_summed_worker_seconds": 5339.880551487,
+    "v16_summed_worker_seconds": 5140.734593703
+  },
+  "archive_sha256": "4bcd23cb20a3d2d42cdc4a86b49f20616da407a378f0e8e867b9f47d94d3b0aa",
+  "run_status_sha256": "3663703dcc2f08b95c06d858433ef5a0362628d2c4e2e50dc8085a417920698b",
+  "audit_method": "Read raw CON labels, hash source and executable against frozen manifest, match retained solution filenames, parse every official shard detail, reject infeasible or inconsistent duplicate details, recompute base objective plus mean source-contingency objective, and aggregate unique terminal worker logs. No new solve or prior-run initialization."
+}

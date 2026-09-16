@@ -303,6 +303,35 @@ void network_injections(
     }
 }
 
+// Read only a point whose branch flows were just rebuilt and checked. This
+// uses the identical nodal injection equation without constructing another
+// admittance map or recomputing trigonometry. It is not a feasibility check.
+void network_injections_from_branch_flows(
+    const CaseData& data, int outaged_branch, const AcState& state,
+    std::vector<double>& p, std::vector<double>& q) {
+    const auto nb = data.buses.size(), nl = data.branches.size();
+    if (state.vm.size() != nb || state.pf.size() != nl || state.pt.size() != nl ||
+        state.qf.size() != nl || state.qt.size() != nl ||
+        outaged_branch < -1 || outaged_branch >= static_cast<int>(nl) ||
+        (!state.shunt_bs.empty() && state.shunt_bs.size() != data.shunts.size()) ||
+        (!state.shunt_steps.empty() && state.shunt_steps.size() != data.shunts.size())) {
+        throw std::runtime_error("polish flow-injection input dimensions do not match case");
+    }
+    p.assign(nb, 0.0); q.assign(nb, 0.0);
+    for (std::size_t i = 0; i < nl; ++i) {
+        if (static_cast<int>(i) == outaged_branch || data.branches[i].status == 0) continue;
+        const auto& branch = data.branches[i];
+        p[branch.from] += state.pf[i]; p[branch.to] += state.pt[i];
+        q[branch.from] += state.qf[i]; q[branch.to] += state.qt[i];
+    }
+    for (std::size_t i = 0; i < data.shunts.size(); ++i) {
+        const auto& shunt = data.shunts[i];
+        const double vm2 = state.vm[shunt.bus] * state.vm[shunt.bus];
+        p[shunt.bus] += shunt.gs * vm2;
+        q[shunt.bus] -= effective_shunt_susceptance(data, state, static_cast<int>(i)) * vm2;
+    }
+}
+
 double mismatch_norm(
     const std::vector<double>& p_spec,
     const std::vector<double>& q_spec,
@@ -1420,6 +1449,67 @@ void run_corrective_trial_copy_regression() {
                 throw std::runtime_error("trial-copy metric missing from serializer");
             }
         }
+    }
+}
+
+void run_polish_flow_injection_regression(const CaseData& data, const AcState& original_base) {
+    if (data.buses.size() != 2 || data.branches.size() != 2) {
+        throw std::runtime_error("flow-injection oracle needs the two-bus parallel fixture");
+    }
+    const auto frozen_base = ac_state_to_json(original_base);
+    for (int variant = 0; variant < 5; ++variant) {
+        auto fixture = data;
+        auto state = original_base;
+        state.vm = {0.98, 1.04}; state.va = {0.0, -0.07};
+        // Explicit and implicit source shunt representations are both tested.
+        Shunt shunt;
+        shunt.bus = 1; shunt.gs = 0.013; shunt.bs = 0.01;
+        shunt.dispatchable = true; shunt.steps = {1};
+        shunt.block_maximum_steps = {4}; shunt.block_susceptance = {0.01};
+        fixture.shunts = {shunt};
+        for (auto& bus : fixture.buses) bus.shunts.clear();
+        fixture.buses[1].shunts = {0};
+        state.shunt_bs.clear(); state.shunt_steps.clear();
+        if (variant > 0) {
+            fixture.branches[0].transformer = true;
+            fixture.branches[0].tap = 1.17; fixture.branches[0].shift = 0.08;
+            fixture.branches[0].g_fr = 0.012; fixture.branches[0].b_fr = -0.025;
+            fixture.branches[0].g_to = 0.006; fixture.branches[0].b_to = 0.009;
+        }
+        if (variant > 1) {
+            fixture.branches[1].tap = 0.97; fixture.branches[1].shift = -0.06;
+            fixture.branches[1].g_fr = 0.008; fixture.branches[1].b_fr = 0.03;
+            fixture.branches[1].g_to = 0.015; fixture.branches[1].b_to = -0.02;
+        }
+        if (variant == 3) fixture.branches[1].status = 0;
+        if (variant == 4) {
+            state.shunt_bs = {0.03}; state.shunt_steps = {{3}};
+        }
+        for (auto& branch : fixture.branches) branch.flow_coefficients_valid = false;
+        for (int outage : {-1, 0, 1}) {
+            compute_branch_flows(fixture, outage, true, state);
+            std::vector<double> expected_p, expected_q, actual_p, actual_q;
+            network_injections(build_ybus(fixture, outage, &state), state.vm, state.va,
+                expected_p, expected_q);
+            network_injections_from_branch_flows(fixture, outage, state, actual_p, actual_q);
+            for (std::size_t bus = 0; bus < fixture.buses.size(); ++bus) {
+                if (!std::isfinite(actual_p[bus]) || !std::isfinite(actual_q[bus]) ||
+                    std::abs(expected_p[bus] - actual_p[bus]) > 1e-11 ||
+                    std::abs(expected_q[bus] - actual_q[bus]) > 1e-11) {
+                    throw std::runtime_error("branch-flow injection differs from complex-admittance oracle");
+                }
+            }
+        }
+        state.pf.clear();
+        bool rejected = false;
+        try {
+            std::vector<double> p, q;
+            network_injections_from_branch_flows(fixture, 0, state, p, q);
+        } catch (const std::runtime_error&) { rejected = true; }
+        if (!rejected) throw std::runtime_error("malformed polish flow state was accepted");
+    }
+    if (ac_state_to_json(original_base) != frozen_base) {
+        throw std::runtime_error("flow-injection oracle mutated its source base");
     }
 }
 
@@ -2841,6 +2931,10 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"outage_update_rhs_seconds", outage_update_rhs_seconds},
         {"economic_balance_polish_seconds", economic_balance_polish_seconds},
         {"economic_balance_polish_correction_seconds", economic_balance_polish_correction_seconds},
+        {"economic_balance_polish_flow_reuses", economic_balance_polish_flow_reuses},
+        {"economic_balance_polish_ybus_builds", economic_balance_polish_ybus_builds},
+        {"economic_balance_polish_injection_seconds", economic_balance_polish_injection_seconds},
+        {"economic_balance_polish_ybus_seconds", economic_balance_polish_ybus_seconds},
         {"corrective_trial_copy_count", corrective_trial_copy_count},
         {"corrective_trial_control_copy_count", corrective_trial_control_copy_count},
         {"corrective_trial_copy_avoided_bytes", corrective_trial_copy_avoided_bytes},
@@ -4436,8 +4530,12 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 {"reason", "branch outage low-rank update unavailable"},
                             });
                         } else {
-                            const YRows polish_ybus = build_ybus(
-                                data_, outaged_branch, &polished_state);
+                            YRows polish_ybus;
+                            if (!options_.reuse_polish_branch_flows) {
+                                AccumulateSeconds ybus_timer(&output.economic_balance_polish_ybus_seconds);
+                                polish_ybus = build_ybus(data_, outaged_branch, &polished_state);
+                                ++output.economic_balance_polish_ybus_builds;
+                            }
                             std::vector<std::vector<int>>
                                 component_generators(components.size());
                             for (int component = 0;
@@ -4463,9 +4561,19 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 AcState raw_trial = make_trial(polished_state);
                                 std::vector<double> polish_p_network;
                                 std::vector<double> polish_q_network;
-                                network_injections(
-                                    polish_ybus, raw_trial.vm, raw_trial.va,
-                                    polish_p_network, polish_q_network);
+                                {
+                                    AccumulateSeconds injection_timer(&output.economic_balance_polish_injection_seconds);
+                                    if (options_.reuse_polish_branch_flows) {
+                                        // raw_trial has identical controls here; use the
+                                        // complete accepted point, not its controls-only copy.
+                                        network_injections_from_branch_flows(data_, outaged_branch,
+                                            polished_state, polish_p_network, polish_q_network);
+                                        ++output.economic_balance_polish_flow_reuses;
+                                    } else {
+                                        network_injections(polish_ybus, raw_trial.vm, raw_trial.va,
+                                            polish_p_network, polish_q_network);
+                                    }
+                                }
                                 std::vector<double> p_spec(nb, 0.0);
                                 std::vector<double> q_spec(nb, 0.0);
                                 const auto rebuild_specs = [&]() {

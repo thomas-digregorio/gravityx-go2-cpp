@@ -28,6 +28,9 @@ struct FastPowerFlowOptions {
     // Candidate controls only; flows, slacks and PWL fields are rebuilt before
     // their respective physical/final checks. False retains the copy oracle.
     bool controls_only_trial_copy{false};
+    // Sum freshly validated terminal flows for polish injections. False keeps
+    // the complex-admittance oracle; neither path is an acceptance check.
+    bool reuse_polish_branch_flows{false};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -69,6 +72,7 @@ inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.adaptive_jacobian_refresh = true;
     options.bounded_voltage_extrapolation = true;
     options.controls_only_trial_copy = true;
+    options.reuse_polish_branch_flows = true;
     options.max_economic_balance_polish_iterations = 3;
     options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
@@ -113,6 +117,10 @@ struct FastPowerFlowResult {
     double outage_update_rhs_seconds{};
     double economic_balance_polish_seconds{};
     double economic_balance_polish_correction_seconds{};
+    int economic_balance_polish_flow_reuses{};
+    int economic_balance_polish_ybus_builds{};
+    double economic_balance_polish_injection_seconds{};
+    double economic_balance_polish_ybus_seconds{};
     std::size_t corrective_trial_copy_count{};
     std::size_t corrective_trial_control_copy_count{};
     std::size_t corrective_trial_copy_avoided_bytes{};
@@ -216,6 +224,8 @@ void run_outage_inverse_row_cache_regression();
 void run_adaptive_jacobian_policy_regression();
 void run_voltage_extrapolation_policy_regression();
 void run_corrective_trial_copy_regression();
+void run_polish_flow_injection_regression(
+    const CaseData& data, const AcState& original_base);
 void run_voltage_extrapolation_physics_regression(
     const CaseData& data, const std::vector<int>& commitment,
     const AcState& original_base, const Contingency& contingency,

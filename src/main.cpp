@@ -1102,6 +1102,10 @@ int run_parallel_circuit_regression() {
     budget_result.outage_update_rhs_seconds = 0.1;
     budget_result.economic_balance_polish_seconds = 0.6;
     budget_result.economic_balance_polish_correction_seconds = 0.12;
+    budget_result.economic_balance_polish_flow_reuses = 5;
+    budget_result.economic_balance_polish_ybus_builds = 1;
+    budget_result.economic_balance_polish_injection_seconds = 0.02;
+    budget_result.economic_balance_polish_ybus_seconds = 0.04;
     budget_result.adaptive_jacobian_refresh_attempts = 2;
     budget_result.adaptive_jacobian_refresh_selected = 1;
     budget_result.adaptive_jacobian_refresh_seconds = 0.3;
@@ -1127,6 +1131,8 @@ int run_parallel_circuit_regression() {
                            "outage_update_basis_cache_bytes", "outage_update_seconds",
                            "outage_update_rhs_seconds", "economic_balance_polish_seconds",
                            "economic_balance_polish_correction_seconds",
+                           "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
+                           "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",
                            "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",
                            "adaptive_jacobian_refresh_seconds", "adaptive_jacobian_refresh_best_before",
                            "adaptive_jacobian_refresh_best_after",
@@ -1156,6 +1162,7 @@ int run_parallel_circuit_regression() {
         data, {1}, source_base.solve.state);
     gravityx::run_economic_polish_trial_regression(
         data, {1}, source_base.solve.state);
+    gravityx::run_polish_flow_injection_regression(data, source_base.solve.state);
     {
         auto with_shunt = data;
         gravityx::Shunt shunt;
@@ -1663,6 +1670,34 @@ int run_parallel_circuit_regression() {
         gravityx::FastContingencyPowerFlow full_copy_solver(
             refresh_data, refresh_base.solve.state, {1}, full_copy_options);
         const auto full_copy = full_copy_solver.solve(branch_contingency);
+        auto complex_injection_options = refresh_options;
+        complex_injection_options.reuse_polish_branch_flows = false;
+        gravityx::FastContingencyPowerFlow complex_injection_solver(
+            refresh_data, refresh_base.solve.state, {1}, complex_injection_options);
+        const auto complex_injection = complex_injection_solver.solve(branch_contingency);
+        if (!complex_injection.feasible ||
+            refreshed.economic_balance_polish_flow_reuses <= 0 ||
+            refreshed.economic_balance_polish_ybus_builds != 0 ||
+            complex_injection.economic_balance_polish_flow_reuses != 0 ||
+            complex_injection.economic_balance_polish_ybus_builds != 1 ||
+            std::abs(refreshed.solve.objective - complex_injection.solve.objective) > 1e-6) {
+            throw std::runtime_error("polish flow reuse changed tiny objective or routing");
+        }
+        for (auto field : {&gravityx::AcState::vm, &gravityx::AcState::va,
+                &gravityx::AcState::pg, &gravityx::AcState::qg, &gravityx::AcState::demand_factor,
+                &gravityx::AcState::pf, &gravityx::AcState::pt, &gravityx::AcState::qf,
+                &gravityx::AcState::qt, &gravityx::AcState::sm_slack, &gravityx::AcState::p_delta,
+                &gravityx::AcState::q_delta, &gravityx::AcState::gen_lambda, &gravityx::AcState::load_lambda}) {
+            const auto& fresh = refreshed.solve.state.*field;
+            const auto& oracle = complex_injection.solve.state.*field;
+            if (fresh.size() != oracle.size()) throw std::runtime_error("polish reuse changed state dimensions");
+            for (std::size_t i = 0; i < fresh.size(); ++i) {
+                if (!std::isfinite(fresh[i]) || !std::isfinite(oracle[i]) ||
+                    std::abs(fresh[i] - oracle[i]) > 1e-10) {
+                    throw std::runtime_error("polish reuse changed tiny reconstructed state");
+                }
+            }
+        }
         if (!full_copy.feasible ||
             refreshed.corrective_trial_copy_count == 0 ||
             refreshed.corrective_trial_copy_count != full_copy.corrective_trial_copy_count ||
@@ -1682,6 +1717,17 @@ int run_parallel_circuit_regression() {
         context.outaged_branch = branch_contingency.component;
         const auto independent = gravityx::validate_state(refresh_data,
             gravityx::ModelMode::ContingencySoft, refreshed.solve.state, {1}, context);
+        const auto complex_independent = gravityx::validate_state(refresh_data,
+            gravityx::ModelMode::ContingencySoft, complex_injection.solve.state, {1}, context);
+        if (!std::isfinite(complex_independent.max_residual) ||
+            complex_independent.max_residual > 1e-5 ||
+            refreshed.solve.state.shunt_steps != complex_injection.solve.state.shunt_steps ||
+            refreshed.solve.state.shunt_bs != complex_injection.solve.state.shunt_bs ||
+            refreshed.solve.state.commitment != complex_injection.solve.state.commitment ||
+            refreshed.solve.state.startup != complex_injection.solve.state.startup ||
+            refreshed.solve.state.shutdown != complex_injection.solve.state.shutdown) {
+            throw std::runtime_error("polish injection oracle failed independent checks or changed discrete controls");
+        }
         if (!refreshed.feasible || independent.max_residual > 1e-5 ||
             refreshed.adaptive_jacobian_refresh_attempts != 1 ||
             refreshed.adaptive_jacobian_refresh_selected != 1 ||
@@ -5428,6 +5474,8 @@ int run_contingency_worker(
                          "outage_update_basis_cache_bytes", "outage_update_seconds",
                          "outage_update_rhs_seconds", "economic_balance_polish_seconds",
                          "economic_balance_polish_correction_seconds",
+                         "economic_balance_polish_flow_reuses", "economic_balance_polish_ybus_builds",
+                         "economic_balance_polish_injection_seconds", "economic_balance_polish_ybus_seconds",
                          "corrective_trial_copy_count", "corrective_trial_control_copy_count",
                          "corrective_trial_copy_avoided_bytes", "corrective_trial_copy_seconds",
                          "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",

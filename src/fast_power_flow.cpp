@@ -8,6 +8,7 @@
 #include "gravityx/state_io.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -55,6 +56,69 @@ bool needs_adaptive_jacobian_refresh(
         std::isfinite(current_residual) && std::isfinite(window_start_residual) &&
         current_residual > 10.0 * options.validation_tolerance &&
         current_residual > 0.7 * window_start_residual;
+}
+
+bool needs_voltage_extrapolation(
+    const FastPowerFlowOptions& options, bool branch_outage, int iteration,
+    double current_residual, double selected_residual) {
+    return options.bounded_voltage_extrapolation && branch_outage && iteration >= 2 &&
+        std::isfinite(current_residual) && std::isfinite(selected_residual) &&
+        selected_residual > options.validation_tolerance &&
+        selected_residual + 1e-10 < current_residual &&
+        selected_residual > 0.5 * current_residual;
+}
+
+struct VoltageExtrapolationSearch {
+    int trials{};
+    double selected_scale{};
+};
+
+template <typename Validator>
+VoltageExtrapolationSearch try_voltage_extrapolation(
+    const CaseData& data, const AcState& reference, AcState& selected,
+    ValidationReport& selected_validation, double tolerance, Validator&& validate) {
+    VoltageExtrapolationSearch result;
+    const std::size_t nb = data.buses.size();
+    if (reference.vm.size() != nb || reference.va.size() != nb ||
+        selected.vm.size() != nb || selected.va.size() != nb) {
+        throw std::runtime_error("invalid voltage-extrapolation state dimensions");
+    }
+    bool nonzero_direction = false;
+    for (std::size_t bus = 0; bus < nb; ++bus) {
+        if (!std::isfinite(reference.vm[bus]) || !std::isfinite(reference.va[bus]) ||
+            !std::isfinite(selected.vm[bus]) || !std::isfinite(selected.va[bus])) return result;
+        nonzero_direction = nonzero_direction ||
+            std::abs(selected.vm[bus] - reference.vm[bus]) > 1e-12 ||
+            std::abs(selected.va[bus] - reference.va[bus]) > 1e-12;
+    }
+    if (!nonzero_direction) return result;
+    // Every trial is measured from the same original ray, not from a newly
+    // selected trial. Generator/load/discrete controls are copied, never
+    // extrapolated; the supplied production validator rebuilds and checks
+    // complete physical fields against the immutable original base anchor.
+    const AcState ray_point = selected;
+    for (double scale : std::array<double, 3>{2.0, 4.0, 8.0}) {
+        AcState trial = ray_point;
+        bool finite = true;
+        for (std::size_t bus = 0; bus < nb; ++bus) {
+            const double vm = reference.vm[bus] + scale * (ray_point.vm[bus] - reference.vm[bus]);
+            const double va = reference.va[bus] + scale * (ray_point.va[bus] - reference.va[bus]);
+            if (!std::isfinite(vm) || !std::isfinite(va)) { finite = false; break; }
+            trial.vm[bus] = std::clamp(vm, data.buses[bus].vmin, data.buses[bus].vmax);
+            trial.va[bus] = va;
+        }
+        if (!finite) continue;
+        ++result.trials;
+        const auto checked = validate(trial);
+        if (std::isfinite(checked.max_residual) &&
+            checked.max_residual + 1e-10 < selected_validation.max_residual) {
+            selected = std::move(trial);
+            selected_validation = checked;
+            result.selected_scale = scale;
+            if (selected_validation.max_residual <= tolerance) break;
+        }
+    }
+    return result;
 }
 
 // J^{-1}E depends only on this immutable factorization and selector rows, not
@@ -1279,6 +1343,133 @@ void run_adaptive_jacobian_policy_regression() {
     options.adaptive_jacobian_refresh = false;
     if (needs(true, 4, 0, 0, 0.18, 0.2)) {
         throw std::runtime_error("disabled adaptive Jacobian policy triggered");
+    }
+}
+
+void run_voltage_extrapolation_policy_regression() {
+    FastPowerFlowOptions options;
+    options.bounded_voltage_extrapolation = true;
+    if (!needs_voltage_extrapolation(options, true, 2, 0.2, 0.18) ||
+        needs_voltage_extrapolation(options, false, 2, 0.2, 0.18) ||
+        needs_voltage_extrapolation(options, true, 1, 0.2, 0.18) ||
+        needs_voltage_extrapolation(options, true, 2, 0.2, 0.2) ||
+        needs_voltage_extrapolation(options, true, 2, 0.2, 0.05) ||
+        needs_voltage_extrapolation(options, true, 2, 0.2, 1e-6) ||
+        needs_voltage_extrapolation(options, true, 2,
+            std::numeric_limits<double>::infinity(), 0.18)) {
+        throw std::runtime_error("voltage-extrapolation trigger regression failed");
+    }
+    options.bounded_voltage_extrapolation = false;
+    if (needs_voltage_extrapolation(options, true, 2, 0.2, 0.18)) {
+        throw std::runtime_error("disabled voltage extrapolation triggered");
+    }
+    // Arithmetic/selection oracle only; the separate tiny physics regression
+    // below uses the complete source checker, not this scalar merit function.
+    CaseData data;
+    data.buses = {{"tiny", 1, 1, 3, 0.9, 1.1, 1.0, 0.0}};
+    AcState reference;
+    reference.vm = {1.0}; reference.va = {0.0};
+    reference.pg = {0.4}; reference.qg = {0.1}; reference.demand_factor = {1.0};
+    reference.shunt_bs = {0.01}; reference.shunt_steps = {{1, 0}};
+    reference.commitment = {1.0}; reference.startup = {0.0}; reference.shutdown = {0.0};
+    auto selected = reference;
+    selected.vm[0] = 1.005;
+    const auto seed = selected;
+    ValidationReport validation;
+    validation.max_residual = std::abs(1.04 - selected.vm[0]);
+    const auto merit = [&](AcState& trial) {
+        if (trial.pg != seed.pg || trial.qg != seed.qg ||
+            trial.demand_factor != seed.demand_factor || trial.shunt_bs != seed.shunt_bs ||
+            trial.shunt_steps != seed.shunt_steps || trial.commitment != seed.commitment ||
+            trial.startup != seed.startup || trial.shutdown != seed.shutdown ||
+            trial.vm[0] < 0.9 || trial.vm[0] > 1.1) {
+            throw std::runtime_error("voltage extrapolation corrupted another control or bound");
+        }
+        ValidationReport report;
+        report.max_residual = std::abs(1.04 - trial.vm[0]);
+        return report;
+    };
+    const auto improved = try_voltage_extrapolation(data, reference, selected, validation, 1e-12, merit);
+    if (improved.trials != 3 || improved.selected_scale != 8.0 || validation.max_residual > 1e-12) {
+        throw std::runtime_error("voltage extrapolation did not retain the best fixed-ray trial");
+    }
+    for (bool nonfinite : {false, true}) {
+        selected = seed; validation.max_residual = 0.035;
+        const auto rejected = try_voltage_extrapolation(data, reference, selected, validation, 1e-5,
+            [nonfinite](AcState&) {
+                ValidationReport report;
+                report.max_residual = nonfinite ? std::numeric_limits<double>::quiet_NaN() : 0.5;
+                return report;
+            });
+        if (rejected.trials != 3 || rejected.selected_scale != 0.0 ||
+            ac_state_to_json(selected) != ac_state_to_json(seed) || validation.max_residual != 0.035) {
+            throw std::runtime_error("rejected extrapolation lost the original candidate");
+        }
+    }
+    selected = reference; validation.max_residual = 1.0;
+    const auto empty = try_voltage_extrapolation(data, reference, selected, validation, 1e-5,
+        [](AcState&) -> ValidationReport { throw std::runtime_error("zero ray was evaluated"); });
+    if (empty.trials != 0) throw std::runtime_error("zero voltage ray consumed trials");
+    selected = seed; selected.vm[0] = 1.04; validation.max_residual = 0.06;
+    const auto clipped = try_voltage_extrapolation(data, reference, selected, validation, 1e-12,
+        [](AcState& trial) {
+            if (trial.vm[0] > 1.1) throw std::runtime_error("source voltage bound was exceeded");
+            ValidationReport report; report.max_residual = std::abs(1.1 - trial.vm[0]); return report;
+        });
+    if (clipped.trials != 2 || clipped.selected_scale != 4.0 || validation.max_residual > 1e-12) {
+        throw std::runtime_error("bounded voltage ray did not clip correctly");
+    }
+    selected = reference; selected.va[0] = -0.005; validation.max_residual = 0.035;
+    const auto angle = try_voltage_extrapolation(data, reference, selected, validation, 1e-12,
+        [](AcState& trial) {
+            ValidationReport report; report.max_residual = std::abs(-0.04 - trial.va[0]); return report;
+        });
+    if (angle.trials != 3 || angle.selected_scale != 8.0 || validation.max_residual > 1e-12 ||
+        selected.vm != reference.vm) {
+        throw std::runtime_error("negative angle ray changed voltage magnitude or direction");
+    }
+    selected = reference; selected.vm.clear();
+    bool invalid_dimensions_rejected = false;
+    try { try_voltage_extrapolation(data, reference, selected, validation, 1e-5, merit); }
+    catch (const std::runtime_error&) { invalid_dimensions_rejected = true; }
+    if (!invalid_dimensions_rejected) throw std::runtime_error("invalid voltage ray dimensions accepted");
+}
+
+void run_voltage_extrapolation_physics_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& original_base, const Contingency& contingency,
+    const AcState& known_feasible_state) {
+    ContingencyContext context;
+    context.borrow_base_state(original_base);
+    context.outaged_branch = contingency.component;
+    if (validate_state(data, ModelMode::ContingencySoft, known_feasible_state,
+                       commitment, context).max_residual > 1e-5) {
+        throw std::runtime_error("voltage ray physics oracle must begin with a verified state");
+    }
+    const auto base_snapshot = ac_state_to_json(original_base);
+    auto reference = known_feasible_state;
+    auto selected = known_feasible_state;
+    // Deliberately invalid tiny state, not altered source limits: the 2x ray
+    // returns exactly to a known fully feasible outage state. This exercises
+    // acceptance with the actual independent checker and original base anchor.
+    reference.vm.back() += 0.4;
+    selected.vm.back() += 0.2;
+    reference.va.back() -= 0.04;
+    selected.va.back() -= 0.02;
+    rebuild_contingency_state_derived_fields(data, original_base, commitment, contingency, selected);
+    auto validation = validate_state(data, ModelMode::ContingencySoft, selected, commitment, context);
+    if (validation.max_residual <= 1e-5) throw std::runtime_error("tiny ray fixture is not violated");
+    const auto result = try_voltage_extrapolation(data, reference, selected, validation, 1e-5,
+        [&](AcState& trial) {
+            rebuild_contingency_state_derived_fields(data, original_base, commitment, contingency, trial);
+            return validate_state(data, ModelMode::ContingencySoft, trial, commitment, context);
+        });
+    const auto independent = validate_state(data, ModelMode::ContingencySoft, selected, commitment, context);
+    if (result.selected_scale != 2.0 || result.trials != 1 || independent.max_residual > 1e-5 ||
+        selected.commitment != known_feasible_state.commitment ||
+        selected.shunt_steps != known_feasible_state.shunt_steps ||
+        base_snapshot != ac_state_to_json(original_base)) {
+        throw std::runtime_error("tiny extrapolated outage failed independent full validation");
     }
 }
 
@@ -2563,6 +2754,13 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"adaptive_jacobian_refresh_seconds", adaptive_jacobian_refresh_seconds},
         {"adaptive_jacobian_refresh_best_before", adaptive_jacobian_refresh_best_before},
         {"adaptive_jacobian_refresh_best_after", adaptive_jacobian_refresh_best_after},
+        {"voltage_extrapolation_searches", voltage_extrapolation_searches},
+        {"voltage_extrapolation_trials", voltage_extrapolation_trials},
+        {"voltage_extrapolation_selected", voltage_extrapolation_selected},
+        {"voltage_extrapolation_seconds", voltage_extrapolation_seconds},
+        {"voltage_extrapolation_largest_scale", voltage_extrapolation_largest_scale},
+        {"voltage_extrapolation_best_before", voltage_extrapolation_best_before},
+        {"voltage_extrapolation_best_after", voltage_extrapolation_best_after},
     };
 }
 
@@ -7092,6 +7290,37 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                             selected_correction_mode;
                         output.fixed_jacobian_predictor_trace.back()[
                             "selected_next_validation"] =
+                            selected_validation.to_json();
+                    }
+                }
+                if (selected_damping != 0.0 && needs_voltage_extrapolation(
+                        options_, outaged_branch >= 0, predictor_iteration,
+                        predictor_validation.max_residual, selected_validation.max_residual)) {
+                    AccumulateSeconds extrapolation_timer(&output.voltage_extrapolation_seconds);
+                    ++output.voltage_extrapolation_searches;
+                    output.voltage_extrapolation_best_before = selected_validation.max_residual;
+                    const auto extrapolated = try_voltage_extrapolation(
+                        data_, correction_reference, selected_correction, selected_validation,
+                        options_.validation_tolerance, project_trial_reactive_and_validate);
+                    output.voltage_extrapolation_trials += extrapolated.trials;
+                    if (extrapolated.selected_scale > 1.0) {
+                        ++output.voltage_extrapolation_selected;
+                        output.voltage_extrapolation_largest_scale = std::max(
+                            output.voltage_extrapolation_largest_scale, extrapolated.selected_scale);
+                        selected_correction_mode = "bounded_voltage_extrapolation";
+                        selected_damping = extrapolated.selected_scale;
+                        selected_coordinate_bus = -1;
+                    }
+                    output.voltage_extrapolation_best_after = selected_validation.max_residual;
+                    if (output.voltage_extrapolation_best_after > output.voltage_extrapolation_best_before) {
+                        throw std::runtime_error("voltage extrapolation lost a better candidate");
+                    }
+                    if (options_.capture_diagnostics) {
+                        output.fixed_jacobian_predictor_trace.back()["voltage_extrapolation_scale"] =
+                            extrapolated.selected_scale;
+                        output.fixed_jacobian_predictor_trace.back()["selected_correction_mode"] =
+                            selected_correction_mode;
+                        output.fixed_jacobian_predictor_trace.back()["selected_next_validation"] =
                             selected_validation.to_json();
                     }
                 }

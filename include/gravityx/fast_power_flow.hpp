@@ -24,6 +24,7 @@ struct FastPowerFlowOptions {
     bool adaptive_jacobian_refresh{false};
     int adaptive_jacobian_refresh_window{4};
     int max_adaptive_jacobian_refreshes{2};
+    bool bounded_voltage_extrapolation{false};
     // Size routing policy. Tiny tests can exercise the identical predictor
     // and economic-incumbent path without manufacturing a large network.
     std::size_t fixed_jacobian_minimum_bus_count{16000};
@@ -58,11 +59,12 @@ struct FastPowerFlowOptions {
     double validation_tolerance{1e-5};
 };
 
-// Opt-in economic cleanup using only the resident Jacobian factors. This
-// never invokes either of the optional per-contingency LP polish stages.
+// Opt-in cached economic cleanup plus bounded corrective-feasibility probes.
+// This never invokes either optional per-contingency LP polish stage.
 inline void enable_cached_economic_polish(FastPowerFlowOptions& options) {
     options.economic_balance_polish = true;
     options.adaptive_jacobian_refresh = true;
+    options.bounded_voltage_extrapolation = true;
     options.max_economic_balance_polish_iterations = 3;
     options.economic_balance_polish_stop_slack = 0.025;
     options.economic_balance_polish_objective_threshold =
@@ -112,6 +114,13 @@ struct FastPowerFlowResult {
     double adaptive_jacobian_refresh_seconds{};
     double adaptive_jacobian_refresh_best_before{};
     double adaptive_jacobian_refresh_best_after{};
+    int voltage_extrapolation_searches{};
+    int voltage_extrapolation_trials{};
+    int voltage_extrapolation_selected{};
+    double voltage_extrapolation_seconds{};
+    double voltage_extrapolation_largest_scale{};
+    double voltage_extrapolation_best_before{};
+    double voltage_extrapolation_best_after{};
     ValidationReport fixed_jacobian_predictor_validation;
     nlohmann::json fixed_jacobian_predictor_trace = nlohmann::json::array();
     bool economic_balance_polish_attempted{};
@@ -197,6 +206,11 @@ ValidatedSourceBaseResult build_validated_source_base(
 void run_fast_power_flow_topology_cache_regression();
 void run_outage_inverse_row_cache_regression();
 void run_adaptive_jacobian_policy_regression();
+void run_voltage_extrapolation_policy_regression();
+void run_voltage_extrapolation_physics_regression(
+    const CaseData& data, const std::vector<int>& commitment,
+    const AcState& original_base, const Contingency& contingency,
+    const AcState& known_feasible_state);
 
 void run_economic_polish_trial_regression(
     const CaseData& data, const std::vector<int>& commitment,

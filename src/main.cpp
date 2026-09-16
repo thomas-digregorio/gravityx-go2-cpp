@@ -499,6 +499,7 @@ int run_component_tests() {
     gravityx::run_fast_power_flow_topology_cache_regression();
     gravityx::run_outage_inverse_row_cache_regression();
     gravityx::run_adaptive_jacobian_policy_regression();
+    gravityx::run_voltage_extrapolation_policy_regression();
     {
         gravityx::Branch branch;
         branch.from = 0;
@@ -1053,6 +1054,13 @@ int run_parallel_circuit_regression() {
     budget_result.adaptive_jacobian_refresh_seconds = 0.3;
     budget_result.adaptive_jacobian_refresh_best_before = 0.2;
     budget_result.adaptive_jacobian_refresh_best_after = 0.1;
+    budget_result.voltage_extrapolation_searches = 2;
+    budget_result.voltage_extrapolation_trials = 5;
+    budget_result.voltage_extrapolation_selected = 1;
+    budget_result.voltage_extrapolation_seconds = 0.1;
+    budget_result.voltage_extrapolation_largest_scale = 4.0;
+    budget_result.voltage_extrapolation_best_before = 0.2;
+    budget_result.voltage_extrapolation_best_after = 0.1;
     const auto compact_economic = budget_result.economic_summary_json();
     const auto full_economic = budget_result.to_json();
     for (const auto* key : {"economic_balance_polish_trial_count",
@@ -1068,7 +1076,11 @@ int run_parallel_circuit_regression() {
                            "economic_balance_polish_correction_seconds",
                            "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",
                            "adaptive_jacobian_refresh_seconds", "adaptive_jacobian_refresh_best_before",
-                           "adaptive_jacobian_refresh_best_after"}) {
+                           "adaptive_jacobian_refresh_best_after",
+                           "voltage_extrapolation_searches", "voltage_extrapolation_trials",
+                           "voltage_extrapolation_selected", "voltage_extrapolation_seconds",
+                           "voltage_extrapolation_largest_scale", "voltage_extrapolation_best_before",
+                           "voltage_extrapolation_best_after"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key) ||
             compact_economic.at(key).get<double>() <= 0.0) {
             throw std::runtime_error("compact worker log omitted economic timing evidence");
@@ -1588,6 +1600,8 @@ int run_parallel_circuit_regression() {
             frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
             throw std::runtime_error("adaptive refresh tiny outage failed: " + refreshed.to_json().dump());
         }
+        gravityx::run_voltage_extrapolation_physics_regression(
+            refresh_data, {1}, refresh_base.solve.state, branch_contingency, refreshed.solve.state);
         auto second_outage = branch_contingency;
         second_outage.component = 1;
         second_outage.source_index = 2;
@@ -5186,6 +5200,10 @@ int run_contingency_worker(
                          "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",
                          "adaptive_jacobian_refresh_seconds", "adaptive_jacobian_refresh_best_before",
                          "adaptive_jacobian_refresh_best_after",
+                         "voltage_extrapolation_searches", "voltage_extrapolation_trials",
+                         "voltage_extrapolation_selected", "voltage_extrapolation_seconds",
+                         "voltage_extrapolation_largest_scale", "voltage_extrapolation_best_before",
+                         "voltage_extrapolation_best_after",
                          "economic_balance_polish_objective_before",
                          "economic_balance_polish_objective_after",
                          "economic_balance_polish_active_slack_before",

@@ -44,6 +44,19 @@ private:
     std::chrono::steady_clock::time_point start_;
 };
 
+bool needs_adaptive_jacobian_refresh(
+    const FastPowerFlowOptions& options, bool branch_outage,
+    int iteration, int last_preparation_iteration, int attempts,
+    double current_residual, double window_start_residual) {
+    return options.adaptive_jacobian_refresh && branch_outage &&
+        attempts < options.max_adaptive_jacobian_refreshes &&
+        iteration >= options.adaptive_jacobian_refresh_window &&
+        iteration - last_preparation_iteration >= options.adaptive_jacobian_refresh_window &&
+        std::isfinite(current_residual) && std::isfinite(window_start_residual) &&
+        current_residual > 10.0 * options.validation_tolerance &&
+        current_residual > 0.7 * window_start_residual;
+}
+
 // J^{-1}E depends only on this immutable factorization and selector rows, not
 // on the branch coefficients or candidate operating point. Each fixed-Jacobian
 // object owns separate bounded caches for its full/P/Q factorizations.
@@ -1243,6 +1256,30 @@ void run_outage_inverse_row_cache_regression() {
     catch (const std::runtime_error&) { invalid_rejected = true; }
     require(invalid_rejected && diagnostics.outage_update_basis_cache_hits == 1,
             "invalid selector or cache-hit accounting failed");
+}
+
+void run_adaptive_jacobian_policy_regression() {
+    FastPowerFlowOptions options;
+    options.adaptive_jacobian_refresh = true;
+    const auto needs = [&](bool branch, int iteration, int last, int attempts,
+                           double current, double earlier) {
+        return needs_adaptive_jacobian_refresh(options, branch, iteration, last,
+                                              attempts, current, earlier);
+    };
+    if (!needs(true, 4, 0, 0, 0.18, 0.2) ||
+        needs(false, 4, 0, 0, 0.18, 0.2) ||
+        needs(true, 3, -1000, 0, 0.18, 0.2) ||
+        needs(true, 4, 1, 0, 0.18, 0.2) ||
+        needs(true, 4, 0, 2, 0.18, 0.2) ||
+        needs(true, 4, 0, 0, 0.05, 0.2) ||
+        needs(true, 4, 0, 0, 1e-6, 1e-6) ||
+        needs(true, 4, 0, 0, std::numeric_limits<double>::quiet_NaN(), 0.2)) {
+        throw std::runtime_error("adaptive Jacobian policy regression failed");
+    }
+    options.adaptive_jacobian_refresh = false;
+    if (needs(true, 4, 0, 0, 0.18, 0.2)) {
+        throw std::runtime_error("disabled adaptive Jacobian policy triggered");
+    }
 }
 
 struct FastContingencyPowerFlow::FixedJacobianPredictorCache {
@@ -2521,6 +2558,11 @@ nlohmann::json FastPowerFlowResult::runtime_profile_json() const {
         {"outage_update_rhs_seconds", outage_update_rhs_seconds},
         {"economic_balance_polish_seconds", economic_balance_polish_seconds},
         {"economic_balance_polish_correction_seconds", economic_balance_polish_correction_seconds},
+        {"adaptive_jacobian_refresh_attempts", adaptive_jacobian_refresh_attempts},
+        {"adaptive_jacobian_refresh_selected", adaptive_jacobian_refresh_selected},
+        {"adaptive_jacobian_refresh_seconds", adaptive_jacobian_refresh_seconds},
+        {"adaptive_jacobian_refresh_best_before", adaptive_jacobian_refresh_best_before},
+        {"adaptive_jacobian_refresh_best_after", adaptive_jacobian_refresh_best_after},
     };
 }
 
@@ -3169,6 +3211,10 @@ FastContingencyPowerFlow::FastContingencyPowerFlow(
         options_.economic_balance_polish_stop_slack < 0.0) {
         throw std::runtime_error("economic work target must be finite and nonnegative");
     }
+    if (options_.adaptive_jacobian_refresh_window < 0 ||
+        options_.max_adaptive_jacobian_refreshes < 0) {
+        throw std::runtime_error("invalid adaptive Jacobian work limits");
+    }
 }
 
 FastContingencyPowerFlow::~FastContingencyPowerFlow() = default;
@@ -3666,6 +3712,8 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
             std::vector<std::pair<int, double>> coordinate_history;
             double initial_predictor_validation_residual =
                 std::numeric_limits<double>::infinity();
+            std::vector<double> predictor_residual_history;
+            int last_specific_jacobian_iteration = -100000;
             // These work vectors are reused across predictor iterations and
             // candidate line-search trials. On large cases, allocating and
             // zero-initializing fresh case-sized vectors for every candidate
@@ -3975,6 +4023,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     initial_predictor_validation_residual =
                         predictor_validation.max_residual;
                 }
+                predictor_residual_history.push_back(predictor_validation.max_residual);
                 const double projection_validation_seconds =
                     std::chrono::duration<double>(
                         std::chrono::steady_clock::now() -
@@ -5831,6 +5880,56 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                     }
                 }
 
+                const int refresh_window = options_.adaptive_jacobian_refresh_window;
+                const double previous_window_residual = predictor_iteration >= refresh_window
+                    ? predictor_residual_history[predictor_iteration - refresh_window]
+                    : std::numeric_limits<double>::infinity();
+                if (needs_adaptive_jacobian_refresh(
+                        options_, outaged_branch >= 0, predictor_iteration,
+                        last_specific_jacobian_iteration, output.adaptive_jacobian_refresh_attempts,
+                        predictor_validation.max_residual, previous_window_residual)) {
+                    AccumulateSeconds refresh_timer(&output.adaptive_jacobian_refresh_seconds);
+                    ++output.adaptive_jacobian_refresh_attempts;
+                    last_specific_jacobian_iteration = predictor_iteration;
+                    output.adaptive_jacobian_refresh_best_before = selected_validation.max_residual;
+                    auto fresh_cache = std::make_unique<FixedJacobianPredictorCache>(
+                        data_, correction_reference, commitment_, outaged_branch,
+                        options_.cache_outage_inverse_rows);
+                    output.fixed_jacobian_predictor_preparation_seconds += fresh_cache->preparation_seconds;
+                    bool fresh_selected = false;
+                    if (fresh_cache->valid && fresh_cache->active_valid && fresh_cache->reactive_valid) {
+                        // Explicitly probe the refreshed coupled Newton direction.
+                        // Existing coordinate/history choices remain incumbents;
+                        // only a strictly better physical residual replaces one.
+                        for (double damping : kDampingCandidates) {
+                            auto trial = correction_reference;
+                            if (!fresh_cache->apply_correction(
+                                    data_, p_spec, q_spec, p_network, q_network,
+                                    trial.vm, trial.va, damping)) continue;
+                            const auto trial_validation = project_trial_reactive_and_validate(trial);
+                            if (trial_validation.max_residual + 1e-10 < selected_validation.max_residual) {
+                                selected_correction = std::move(trial);
+                                selected_validation = trial_validation;
+                                selected_damping = damping;
+                                selected_correction_mode = "adaptive_fresh_coupled";
+                                selected_coordinate_bus = -1;
+                                fresh_selected = true;
+                                if (selected_validation.max_residual <= options_.validation_tolerance ||
+                                    strongly_improving_full_damping(damping, selected_validation, 0.5)) break;
+                            }
+                        }
+                    }
+                    if (fresh_selected) {
+                        ++output.adaptive_jacobian_refresh_selected;
+                        contingency_predictor_cache = std::move(fresh_cache);
+                    }
+                    output.adaptive_jacobian_refresh_best_after = selected_validation.max_residual;
+                    if (output.adaptive_jacobian_refresh_best_after >
+                            output.adaptive_jacobian_refresh_best_before) {
+                        throw std::runtime_error("adaptive refresh lost a better feasibility candidate");
+                    }
+                }
+
                 // The resident base-case Jacobian is intentionally cheap and
                 // handles most outages.  A low-impedance branch outage can,
                 // however, remove a dominant Jacobian term while the stale
@@ -5849,6 +5948,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                         std::make_unique<FixedJacobianPredictorCache>(
                             data_, correction_reference, commitment_,
                             outaged_branch, options_.cache_outage_inverse_rows);
+                    last_specific_jacobian_iteration = predictor_iteration;
                     output.fixed_jacobian_predictor_preparation_seconds +=
                         contingency_predictor_cache->preparation_seconds;
                     if (options_.capture_diagnostics) {
@@ -5869,6 +5969,7 @@ FastPowerFlowResult FastContingencyPowerFlow::solve_impl(
                                 std::make_unique<FixedJacobianPredictorCache>(
                                     data_, correction_reference, commitment_,
                                     outaged_branch, options_.cache_outage_inverse_rows);
+                            last_specific_jacobian_iteration = predictor_iteration;
                             output.fixed_jacobian_predictor_preparation_seconds +=
                                 contingency_predictor_cache->preparation_seconds;
                             if (options_.capture_diagnostics) {

@@ -498,6 +498,7 @@ std::optional<PassivePocketRepair> try_passive_outage_pocket_repair(
 int run_component_tests() {
     gravityx::run_fast_power_flow_topology_cache_regression();
     gravityx::run_outage_inverse_row_cache_regression();
+    gravityx::run_adaptive_jacobian_policy_regression();
     {
         gravityx::Branch branch;
         branch.from = 0;
@@ -1047,6 +1048,11 @@ int run_parallel_circuit_regression() {
     budget_result.outage_update_rhs_seconds = 0.1;
     budget_result.economic_balance_polish_seconds = 0.6;
     budget_result.economic_balance_polish_correction_seconds = 0.12;
+    budget_result.adaptive_jacobian_refresh_attempts = 2;
+    budget_result.adaptive_jacobian_refresh_selected = 1;
+    budget_result.adaptive_jacobian_refresh_seconds = 0.3;
+    budget_result.adaptive_jacobian_refresh_best_before = 0.2;
+    budget_result.adaptive_jacobian_refresh_best_after = 0.1;
     const auto compact_economic = budget_result.economic_summary_json();
     const auto full_economic = budget_result.to_json();
     for (const auto* key : {"economic_balance_polish_trial_count",
@@ -1059,7 +1065,10 @@ int run_parallel_circuit_regression() {
                            "outage_update_basis_cache_misses", "outage_update_rhs_columns",
                            "outage_update_basis_cache_bytes", "outage_update_seconds",
                            "outage_update_rhs_seconds", "economic_balance_polish_seconds",
-                           "economic_balance_polish_correction_seconds"}) {
+                           "economic_balance_polish_correction_seconds",
+                           "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",
+                           "adaptive_jacobian_refresh_seconds", "adaptive_jacobian_refresh_best_before",
+                           "adaptive_jacobian_refresh_best_after"}) {
         if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key) ||
             compact_economic.at(key).get<double>() <= 0.0) {
             throw std::runtime_error("compact worker log omitted economic timing evidence");
@@ -1541,6 +1550,48 @@ int run_parallel_circuit_regression() {
             reused.validation.max_residual > 1e-5) {
             throw std::runtime_error("resident outage cache changed a tiny cold result: " +
                 cached.runtime_profile_json().dump() + " reused=" + reused.runtime_profile_json().dump());
+        }
+    }
+    {
+        auto refresh_data = data;
+        refresh_data.generators[0].pg_prev = refresh_data.generators[0].pg_start = 1.4;
+        refresh_data.generators[0].pmin = 0.1;
+        refresh_data.generators[0].pmax = 3.0;
+        refresh_data.generators[0].prumax = refresh_data.generators[0].prdmax = 5.0;
+        refresh_data.generators[0].prumaxctg = refresh_data.generators[0].prdmaxctg = 5.0;
+        refresh_data.loads[0].pd_nominal = refresh_data.loads[0].pd_prev = 1.4;
+        refresh_data.loads[0].qd_nominal = refresh_data.loads[0].qd_prev = 0.28;
+        refresh_data.loads[0].pd_max = 2.0;
+        const auto refresh_base = gravityx::build_validated_source_base(refresh_data, {1});
+        if (!refresh_base.feasible) throw std::runtime_error("adaptive tiny base is invalid");
+        const auto frozen_base = gravityx::ac_state_to_json(refresh_base.solve.state);
+        gravityx::FastPowerFlowOptions refresh_options;
+        gravityx::enable_cached_economic_polish(refresh_options);
+        refresh_options.fixed_jacobian_minimum_bus_count = 0;
+        refresh_options.fixed_jacobian_screen_only = true;
+        // Force one probe on this tiny fixture instead of constructing a slow
+        // production-sized case merely to reach the normal four-step trigger.
+        refresh_options.adaptive_jacobian_refresh_window = 0;
+        refresh_options.max_adaptive_jacobian_refreshes = 1;
+        gravityx::FastContingencyPowerFlow refresh_solver(
+            refresh_data, refresh_base.solve.state, {1}, refresh_options);
+        const auto refreshed = refresh_solver.solve(branch_contingency);
+        gravityx::ContingencyContext context;
+        context.borrow_base_state(refresh_base.solve.state);
+        context.outaged_branch = branch_contingency.component;
+        const auto independent = gravityx::validate_state(refresh_data,
+            gravityx::ModelMode::ContingencySoft, refreshed.solve.state, {1}, context);
+        if (!refreshed.feasible || independent.max_residual > 1e-5 ||
+            refreshed.adaptive_jacobian_refresh_attempts != 1 ||
+            refreshed.adaptive_jacobian_refresh_best_after > refreshed.adaptive_jacobian_refresh_best_before ||
+            frozen_base != gravityx::ac_state_to_json(refresh_base.solve.state)) {
+            throw std::runtime_error("adaptive refresh tiny outage failed: " + refreshed.to_json().dump());
+        }
+        refresh_options.adaptive_jacobian_refresh = false;
+        gravityx::FastContingencyPowerFlow disabled_solver(
+            refresh_data, refresh_base.solve.state, {1}, refresh_options);
+        if (disabled_solver.solve(branch_contingency).adaptive_jacobian_refresh_attempts != 0) {
+            throw std::runtime_error("disabled adaptive refresh was attempted");
         }
     }
     gravityx::FastContingencyPowerFlow fast_screen(
@@ -5097,6 +5148,9 @@ int run_contingency_worker(
                          "outage_update_basis_cache_bytes", "outage_update_seconds",
                          "outage_update_rhs_seconds", "economic_balance_polish_seconds",
                          "economic_balance_polish_correction_seconds",
+                         "adaptive_jacobian_refresh_attempts", "adaptive_jacobian_refresh_selected",
+                         "adaptive_jacobian_refresh_seconds", "adaptive_jacobian_refresh_best_before",
+                         "adaptive_jacobian_refresh_best_after",
                          "economic_balance_polish_objective_before",
                          "economic_balance_polish_objective_after",
                          "economic_balance_polish_active_slack_before",

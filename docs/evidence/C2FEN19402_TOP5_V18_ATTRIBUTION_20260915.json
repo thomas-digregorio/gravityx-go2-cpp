@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "algorithm_revision": "3c3dc5d5884f31a7df1e569d13098ac8a77faad5",
+  "experiment": "v18_s095",
+  "cold_source_start": true,
+  "full_run_repetitions": 1,
+  "source_model_binary_config_hashes_match_manifest": true,
+  "completed_contingencies": 6578,
+  "required_contingencies": 6579,
+  "missing_native_labels": ["CTG_004230"],
+  "total_wall_seconds": 298.08779429999413,
+  "base_algorithm_wall_seconds": 50.936386104,
+  "error": "[Errno 22] Invalid argument",
+  "error_location": "scripts/run_experiment.py:3912 process.stdin.write",
+  "recorded_code2_timed_out": false,
+  "worker_exit_code_at_failure": null,
+  "deadline_race_is_plausible_but_not_proven": true,
+  "complete_official_score": null,
+  "qualified": false,
+  "native_terminal_records": 6578,
+  "root_solution_file_entries_before_prune": 6579,
+  "max_native_residual": 9.993593390100752e-6,
+  "method_counts": {
+    "resident_fixed_jacobian_economic_balance_polish": 5910,
+    "exact_parallel_peer_direct_screen": 664,
+    "bounded_fast_newton_rescue": 4
+  },
+  "local_dispatch": {
+    "attempted": 5910,
+    "selected": 5910,
+    "cache_hits": 5886,
+    "cache_misses": 24,
+    "parallel_nested_seconds_not_wall_time": 157.336205196,
+    "source_preparation_seconds": 0.048990192,
+    "pg_changes": 2259937,
+    "qg_changes": 2205305,
+    "load_factor_changes": 72064796,
+    "summed_predicted_native_gain": 119349536.13815272,
+    "summed_rebuilt_native_gain": 119349536.13805433,
+    "reported_rejections": 0
+  },
+  "other_parallel_nested_phase_aggregates": {
+    "polish_seconds_including_local_dispatch": 1345.62695255,
+    "polish_trials": 33651,
+    "physical_rejections": 19421,
+    "physical_check_seconds": 609.030432062,
+    "economic_check_seconds": 111.866526043,
+    "predictor_preparation_seconds": 563.583414232,
+    "tasks_by_polish_iteration_count": {"0": 668, "1": 2634, "2": 785, "3": 2491}
+  },
+  "matched_native_diagnostics_not_controlled_timing_samples": {
+    "v16": {
+      "labels": 6578,
+      "old_mean_objective": 145528.358336857,
+      "v18_mean_objective": 164683.15610404455,
+      "old_summed_worker_seconds": 5141.77962887,
+      "v18_summed_worker_seconds": 5265.986489364
+    },
+    "v17": {
+      "labels": 6477,
+      "old_mean_objective": 161049.494131731,
+      "v18_mean_objective": 163966.05992509198,
+      "old_summed_worker_seconds": 5413.003530535,
+      "v18_summed_worker_seconds": 5235.711649117
+    }
+  },
+  "partial_official_evidence_not_a_complete_score": {
+    "physical_detail_files": 5900,
+    "valid_unique_labels_including_base": 5857,
+    "equal_duplicate_base_records": 42,
+    "infeasible_valid_details": 0,
+    "invalid_details": [{"shard": "040", "label": "CTG_004828", "bytes": 0}],
+    "matched_contingency_labels": 5856,
+    "v18_base_objective": 214720.19390553056,
+    "v16_matched_mean_objective": 133997.32464488051,
+    "v18_matched_mean_objective": 155278.8061974332,
+    "v16_matched_mean_bus_cost": 81834.6216637575,
+    "v18_matched_mean_bus_cost": 60559.238199599706,
+    "v18_matched_mean_active_bus_cost": 17004.74553161621,
+    "v18_matched_mean_reactive_bus_cost": 43554.492667983504,
+    "v18_matched_mean_line_cost": 1127.8756506917198,
+    "v18_matched_mean_load_benefit": 336335.65155361465,
+    "v18_matched_mean_generator_cost": 119369.73150589006,
+    "nonrandom_incomplete_set_do_not_extrapolate": true
+  },
+  "archive_sha256": "c8f6dc296c9d182eea1d8a0c19947d08d4733c439b21b75945d9f6e137ff12a7",
+  "status_sha256": "a5fe89ab854b2ea2134de38115ce7911d3428f21245bf586390f6edccaa28afa",
+  "best_complete_study_incumbent_remains": "v16_s095",
+  "all_five_top_five_gates_still_open": true
+}

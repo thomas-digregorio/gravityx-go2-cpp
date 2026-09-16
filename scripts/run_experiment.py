@@ -60,6 +60,76 @@ class CompetitionTimeout(RuntimeError):
     """Raised when a GO Competition stage exhausts its wall-clock allowance."""
 
 
+def send_worker_message(
+    process: subprocess.Popen,
+    message: dict[str, Any],
+    *,
+    worker_name: str,
+    deadline: float,
+    deadline_name: str,
+    log_path: Path,
+    output_lines: list[str],
+    enforce_deadline: bool = True,
+) -> None:
+    """Send once, preserving evidence if a worker exits around a pipe write.
+
+    Windows may report EINVAL rather than BrokenPipeError when WSL's timeout
+    closes the pipe. Never retry: an unsuccessful write/flush may already
+    have delivered some or all of the message. A known non-timeout exit or
+    an unresolved early pipe failure must not be relabeled as a timeout.
+    """
+    if not enforce_deadline and message != {"stop": True}:
+        raise ValueError("only a stop message may use the finalization reserve")
+
+    def fail(return_code: int | None, error: OSError | None = None) -> None:
+        remaining = deadline - time.perf_counter()
+        evidence = {
+            "worker": worker_name,
+            "label": message.get("label"),
+            "stop": bool(message.get("stop", False)),
+            "returncode": return_code,
+            "deadline_name": deadline_name,
+            "seconds_remaining": remaining,
+            "error_type": type(error).__name__ if error is not None else None,
+            "errno": error.errno if error is not None else None,
+            "error": str(error) if error is not None else None,
+        }
+        output_lines.append(
+            "GRAVITYX_WORKER_INPUT_FAILURE "
+            + json.dumps(evidence, separators=(",", ":")) + "\n"
+        )
+        detail = (f"{worker_name} input failed for "
+                  f"{message.get('label', 'stop')}; returncode={return_code}; "
+                  f"seconds remaining={remaining:.6f}; error={error}; see {log_path}")
+        if return_code == 124 or (return_code is None and remaining <= 0.0):
+            raise CompetitionTimeout(
+                f"{detail}; {deadline_name} exhausted"
+            ) from error
+        raise RuntimeError(detail) from error
+
+    if enforce_deadline and time.perf_counter() >= deadline:
+        fail(process.poll())
+    return_code = process.poll()
+    if return_code is not None:
+        fail(return_code)
+    if process.stdin is None:
+        raise RuntimeError(f"{worker_name} has no input pipe")
+    try:
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+    except OSError as error:
+        return_code = process.poll()
+        # Bound exit-code collection by the still-available work allowance.
+        # No additional work or acceptance can result from this observation.
+        observation_budget = min(0.05, max(0.0, deadline - time.perf_counter()))
+        if return_code is None and observation_budget > 0.0:
+            try:
+                return_code = process.wait(timeout=observation_budget)
+            except subprocess.TimeoutExpired:
+                pass
+        fail(return_code, error)
+
+
 def evaluator_subprocess_environment(
     linear_algebra_threads: int,
     vendor_evaluator_reference: Path | None = None,
@@ -3909,10 +3979,12 @@ def main() -> int:
                                 args.output_dir / f"solution_{label}.txt"
                             )
                         task_started = time.perf_counter()
-                        process.stdin.write(
-                            json.dumps(task, separators=(",", ":")) + "\n"
+                        send_worker_message(
+                            process, task, worker_name=f"fast-screen worker {worker_id}",
+                            deadline=contingency_deadline,
+                            deadline_name=contingency_deadline_name,
+                            log_path=log_path, output_lines=output_lines,
                         )
-                        process.stdin.flush()
                         acknowledgement = json.loads(
                             read_until("GRAVITYX_TASK_RESULT ")
                         )
@@ -4067,13 +4139,23 @@ def main() -> int:
                         )
                 if process.poll() is None:
                     assert process.stdin is not None
-                    process.stdin.write('{"stop":true}\n')
-                    process.stdin.flush()
+                    send_worker_message(
+                        process, {"stop": True}, worker_name=f"fast-screen worker {worker_id}",
+                        deadline=contingency_deadline,
+                        deadline_name=contingency_deadline_name,
+                        log_path=log_path, output_lines=output_lines,
+                        enforce_deadline=False,
+                    )
                     process.stdin.close()
                     assert process.stdout is not None
                     output_lines.extend(process.stdout.readlines())
                 return_code = process.wait(timeout=10.0)
                 if return_code != 0:
+                    if return_code == 124:
+                        raise CompetitionTimeout(
+                            f"fast-screen worker {worker_id} reached the "
+                            f"{contingency_deadline_name}"
+                        )
                     raise RuntimeError(
                         f"fast-screen worker {worker_id} exited with status "
                         f"{return_code}; see {log_path}"
@@ -4101,6 +4183,11 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+                output_lines.append("GRAVITYX_WORKER_EXIT " + json.dumps({
+                    "worker": f"fast-screen worker {worker_id}",
+                    "returncode": process.poll(),
+                    "seconds_remaining": contingency_deadline - time.perf_counter(),
+                }, separators=(",", ":")) + "\n")
                 log_path.write_text("".join(output_lines), encoding="utf-8")
 
         fast_pool = concurrent.futures.ThreadPoolExecutor(
@@ -4238,14 +4325,12 @@ def main() -> int:
                 if args.two_stage_contingency_screen:
                     task["fast_screen_path"] = to_wsl(result_path)
                 assert process.stdin is not None
-                process.stdin.write(
-                    json.dumps(
-                        task,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
+                send_worker_message(
+                    process, task, worker_name=f"contingency worker {worker_id}",
+                    deadline=contingency_deadline,
+                    deadline_name=contingency_deadline_name,
+                    log_path=log_path, output_lines=output_lines,
                 )
-                process.stdin.flush()
                 print(
                     f"started fallback: {label} on corrective worker "
                     f"{worker_id}",
@@ -4301,8 +4386,13 @@ def main() -> int:
                 item = None
             if process.poll() is None:
                 assert process.stdin is not None
-                process.stdin.write('{"stop":true}\n')
-                process.stdin.flush()
+                send_worker_message(
+                    process, {"stop": True}, worker_name=f"contingency worker {worker_id}",
+                    deadline=contingency_deadline,
+                    deadline_name=contingency_deadline_name,
+                    log_path=log_path, output_lines=output_lines,
+                    enforce_deadline=False,
+                )
                 process.stdin.close()
                 assert process.stdout is not None
                 output_lines.extend(process.stdout.readlines())
@@ -4349,6 +4439,11 @@ def main() -> int:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+            output_lines.append("GRAVITYX_WORKER_EXIT " + json.dumps({
+                "worker": f"contingency worker {worker_id}",
+                "returncode": process.poll(),
+                "seconds_remaining": contingency_deadline - time.perf_counter(),
+            }, separators=(",", ":")) + "\n")
             log_path.write_text("".join(output_lines), encoding="utf-8")
 
     pool = concurrent.futures.ThreadPoolExecutor(

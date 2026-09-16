@@ -4,9 +4,29 @@
 #include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace gravityx {
+
+bool identical_parallel_outage_model(const Branch& left, const Branch& right) {
+    if (left.status != 1 || right.status != 1 || !left.present || !right.present ||
+        left.from == left.to || right.from == right.to) return false;
+    const auto model_fields = [](const Branch& b) {
+        return std::tie(b.status, b.from, b.to, b.transformer,
+            b.r, b.x, b.g_fr, b.b_fr, b.g_to, b.b_to, b.tap, b.shift,
+            b.flow_coefficients_valid, b.flow_from_g_self, b.flow_from_b_self,
+            b.flow_to_g_self, b.flow_to_b_self, b.flow_from_cross_cos,
+            b.flow_from_cross_sin, b.flow_to_cross_cos, b.flow_to_cross_sin,
+            b.angmin, b.angmax, b.rate_a, b.rate_b, b.rate_c, b.present,
+            b.source_from, b.source_to, b.control_mode, b.tm_step, b.ta_step);
+    };
+    // source_key, index and source_id identify the circuit being removed.
+    // Every other Branch field, including cached coefficients and controls,
+    // must agree. No tolerance or rounding is used.
+    return model_fields(left) == model_fields(right);
+}
+
 namespace {
 
 using json = nlohmann::json;

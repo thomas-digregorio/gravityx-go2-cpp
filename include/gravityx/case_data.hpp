@@ -140,6 +140,10 @@ struct Branch {
     int ta_step{};
 };
 
+// Exact same oriented, in-service branch model; only circuit identity may
+// differ. This is a reuse eligibility test, never a feasibility certificate.
+bool identical_parallel_outage_model(const Branch& left, const Branch& right);
+
 enum class ContingencyType {
     Generator,
     Branch,

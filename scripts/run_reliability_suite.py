@@ -107,6 +107,10 @@ def arguments(config: dict, family: str, scenario: str, output: Path) -> list[st
         command.append("--native-repair-log")
     if config.get("cached_economic_contingency_polish", False):
         command.append("--cached-economic-contingency-polish")
+    if config.get("exact_parallel_outage_reuse", False):
+        if not config.get("cached_economic_contingency_polish", False):
+            raise ValueError("exact parallel reuse requires cached economic polish")
+        command.append("--exact-parallel-outage-reuse")
     if config.get("base_pwl_epigraph", False):
         command.append("--base-pwl-epigraph")
     if config.get("base_exact_hessian", False):

@@ -25,11 +25,17 @@
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace gravity;
 
 namespace {
+
+void run_exact_parallel_peer_regression(
+    const gravityx::CaseData& data, const gravityx::AcState& base_state,
+    const std::vector<int>& commitment, const gravityx::Contingency& first_outage,
+    const gravityx::AcState& first_verified_state);
 
 void reject_onedrive(const std::string& path) {
     std::string normalized = path;
@@ -500,6 +506,52 @@ int run_component_tests() {
     gravityx::run_outage_inverse_row_cache_regression();
     gravityx::run_adaptive_jacobian_policy_regression();
     gravityx::run_voltage_extrapolation_policy_regression();
+    {
+        gravityx::Branch a;
+        a.from = 0; a.to = 1; a.x = 0.1; a.tap = 1.0;
+        auto b = a;
+        b.index = 2; b.source_key = "peer"; b.source_id = "different-circuit";
+        if (!gravityx::identical_parallel_outage_model(a, b)) {
+            throw std::runtime_error("circuit identity incorrectly prevents exact parallel reuse");
+        }
+        for (double gravityx::Branch::* field : {
+                &gravityx::Branch::r, &gravityx::Branch::x,
+                &gravityx::Branch::g_fr, &gravityx::Branch::b_fr,
+                &gravityx::Branch::g_to, &gravityx::Branch::b_to,
+                &gravityx::Branch::tap, &gravityx::Branch::shift,
+                &gravityx::Branch::flow_from_g_self, &gravityx::Branch::flow_from_b_self,
+                &gravityx::Branch::flow_to_g_self, &gravityx::Branch::flow_to_b_self,
+                &gravityx::Branch::flow_from_cross_cos, &gravityx::Branch::flow_from_cross_sin,
+                &gravityx::Branch::flow_to_cross_cos, &gravityx::Branch::flow_to_cross_sin,
+                &gravityx::Branch::angmin, &gravityx::Branch::angmax,
+                &gravityx::Branch::rate_a, &gravityx::Branch::rate_b, &gravityx::Branch::rate_c}) {
+            auto changed = b; changed.*field += 1e-6;
+            if (gravityx::identical_parallel_outage_model(a, changed)) {
+                throw std::runtime_error("parallel matcher ignored a numerical model field");
+            }
+        }
+        for (int gravityx::Branch::* field : {
+                &gravityx::Branch::status, &gravityx::Branch::from, &gravityx::Branch::to,
+                &gravityx::Branch::source_from, &gravityx::Branch::source_to,
+                &gravityx::Branch::control_mode, &gravityx::Branch::tm_step, &gravityx::Branch::ta_step}) {
+            auto changed = b; ++(changed.*field);
+            if (gravityx::identical_parallel_outage_model(a, changed)) {
+                throw std::runtime_error("parallel matcher ignored an integer model field");
+            }
+        }
+        for (bool gravityx::Branch::* field : {
+                &gravityx::Branch::transformer, &gravityx::Branch::present,
+                &gravityx::Branch::flow_coefficients_valid}) {
+            auto changed = b; changed.*field = !(changed.*field);
+            if (gravityx::identical_parallel_outage_model(a, changed)) {
+                throw std::runtime_error("parallel matcher ignored a model flag");
+            }
+        }
+        b.x = std::numeric_limits<double>::quiet_NaN();
+        if (gravityx::identical_parallel_outage_model(b, b)) {
+            throw std::runtime_error("nonfinite parallel data matched itself");
+        }
+    }
     {
         gravityx::Branch branch;
         branch.from = 0;
@@ -1602,6 +1654,8 @@ int run_parallel_circuit_regression() {
         }
         gravityx::run_voltage_extrapolation_physics_regression(
             refresh_data, {1}, refresh_base.solve.state, branch_contingency, refreshed.solve.state);
+        run_exact_parallel_peer_regression(
+            refresh_data, refresh_base.solve.state, {1}, branch_contingency, refreshed.solve.state);
         auto second_outage = branch_contingency;
         second_outage.component = 1;
         second_outage.source_index = 2;
@@ -3350,6 +3404,21 @@ struct CorrectiveSeed {
     gravityx::AcState state;
 };
 
+const CorrectiveSeed* find_exact_parallel_seed(
+    const gravityx::CaseData& data,
+    const std::unordered_map<std::string, int>& branch_outages,
+    const std::string& label, const std::vector<CorrectiveSeed>& bank) {
+    const auto target = branch_outages.find(label);
+    if (target == branch_outages.end()) return nullptr;
+    for (const auto& seed : bank) {
+        if (seed.label == label) continue;
+        const auto prior = branch_outages.find(seed.label);
+        if (prior != branch_outages.end() && gravityx::identical_parallel_outage_model(
+                data.branches.at(target->second), data.branches.at(prior->second))) return &seed;
+    }
+    return nullptr;
+}
+
 struct ContingencyComputation {
     nlohmann::json result;
     gravityx::AcState state;
@@ -3520,7 +3589,8 @@ bool solve_loaded_contingency(
     const std::string* rolling_corrective_seed_label = nullptr,
     const std::vector<CorrectiveSeed>* corrective_seed_bank = nullptr,
     std::optional<ContingencyComputation>* completed_computation = nullptr,
-    bool persist_result = true) {
+    bool persist_result = true,
+    bool exact_parallel_seed = false) {
     reject_onedrive(output_path);
     const auto match = std::find_if(
         data.contingencies.begin(), data.contingencies.end(),
@@ -3550,10 +3620,20 @@ bool solve_loaded_contingency(
     };
 
     nlohmann::json first_screen_diagnostics = nullptr;
+    bool exact_parallel_model_match = false;
+    bool exact_parallel_seed_attempted = false;
+    bool exact_parallel_seed_accepted = false;
+    double exact_parallel_seed_screen_seconds = 0.0;
     auto complete = [&](nlohmann::json output,
                         gravityx::AcState state,
                         bool persist_full_state = false) {
         output["first_screen"] = first_screen_diagnostics;
+        output["exact_parallel_model_match"] = exact_parallel_model_match;
+        output["exact_parallel_seed_attempted"] = exact_parallel_seed_attempted;
+        output["exact_parallel_seed_accepted"] = exact_parallel_seed_accepted;
+        output["exact_parallel_seed_screen_seconds"] = exact_parallel_seed_screen_seconds;
+        output["exact_parallel_seed_label"] = exact_parallel_seed && rolling_corrective_seed_label
+            ? nlohmann::json(*rolling_corrective_seed_label) : nlohmann::json(nullptr);
         if (persist_result) {
             output["solve"]["state"] = persist_full_state
                 ? gravityx::ac_state_to_json(state)
@@ -3595,7 +3675,16 @@ bool solve_loaded_contingency(
             rolling_corrective_seed->pg.size() == data.generators.size() &&
             rolling_corrective_seed->qg.size() == data.generators.size() &&
             rolling_corrective_seed->demand_factor.size() == data.loads.size();
-        if (rolling_seed_dimensions_match) {
+        if (exact_parallel_seed && rolling_corrective_seed_label &&
+            match->type == gravityx::ContingencyType::Branch) {
+            const auto prior = std::find_if(data.contingencies.begin(), data.contingencies.end(),
+                [&](const gravityx::Contingency& item) { return item.label == *rolling_corrective_seed_label; });
+            exact_parallel_model_match = prior != data.contingencies.end() &&
+                prior->type == gravityx::ContingencyType::Branch &&
+                gravityx::identical_parallel_outage_model(
+                    data.branches.at(match->component), data.branches.at(prior->component));
+        }
+        if (rolling_seed_dimensions_match && (!exact_parallel_seed || exact_parallel_model_match)) {
             auto translated_rolling_seed = *rolling_corrective_seed;
             if (rolling_corrective_seed_label != nullptr &&
                 match->type == gravityx::ContingencyType::Generator) {
@@ -3621,6 +3710,11 @@ bool solve_loaded_contingency(
             }
             fast_result = fast_power_flow->screen_candidate(
                 *match, translated_rolling_seed);
+            if (exact_parallel_seed) {
+                exact_parallel_seed_attempted = true;
+                exact_parallel_seed_accepted = fast_result->feasible;
+                exact_parallel_seed_screen_seconds = fast_result->wall_seconds;
+            }
             rolling_seed_fast_screen_selected = fast_result->feasible;
             if (rolling_seed_fast_screen_selected &&
                 rolling_corrective_seed_label != nullptr) {
@@ -3957,7 +4051,9 @@ bool solve_loaded_contingency(
         }
         if (fast_result->feasible) {
             const std::string solution_method =
-                fast_result->economic_balance_polish_selected
+                exact_parallel_seed_accepted
+                ? "exact_parallel_peer_direct_screen"
+                : fast_result->economic_balance_polish_selected
                 ? "resident_fixed_jacobian_economic_balance_polish"
                 : bounded_fast_postlinear_newton_selected
                 ? "bounded_fast_linearized_repair_plus_newton"
@@ -4855,6 +4951,84 @@ int solve_contingency_batch(
     return 0;
 }
 
+void run_exact_parallel_peer_regression(
+    const gravityx::CaseData& source_data, const gravityx::AcState& base_state,
+    const std::vector<int>& commitment, const gravityx::Contingency& first_outage,
+    const gravityx::AcState& first_verified_state) {
+    auto data = source_data;
+    auto second = first_outage;
+    second.component = 1;
+    second.source_index = data.branches[1].index;
+    second.label = "exact-peer-second";
+    data.contingencies = {first_outage, second};
+    BasePoint base{commitment, base_state, std::nullopt};
+    const auto frozen_base = gravityx::ac_state_to_json(base.state);
+    std::vector<CorrectiveSeed> bank{{first_outage.label, first_verified_state}};
+    std::unordered_map<std::string, int> components{
+        {first_outage.label, first_outage.component}, {second.label, second.component}};
+    if (find_exact_parallel_seed(data, components, second.label, bank) != &bank.front() ||
+        find_exact_parallel_seed(data, components, first_outage.label, bank) != nullptr ||
+        find_exact_parallel_seed(data, components, "unknown-or-generator", bank) != nullptr) {
+        throw std::runtime_error("exact parallel seed selection is inconsistent");
+    }
+    const auto evaluate = [&](const gravityx::CaseData& model, const gravityx::AcState& candidate) {
+        gravityx::FastPowerFlowOptions options;
+        gravityx::enable_cached_economic_polish(options);
+        options.fixed_jacobian_minimum_bus_count = 0;
+        options.fixed_jacobian_screen_only = true;
+        gravityx::FastContingencyPowerFlow fast(model, base.state, commitment, options);
+        std::optional<ContingencyComputation> completed;
+        const bool success = solve_loaded_contingency(model, base, second.label,
+            "component-exact-peer-no-write.json", 0, nullptr, false, &fast,
+            true, false, false, nullptr, &candidate, &first_outage.label,
+            nullptr, &completed, false, true);
+        if (!success || !completed || !completed->result.value("success", false)) {
+            throw std::runtime_error("tiny exact-peer worker path did not return a solution");
+        }
+        gravityx::ContingencyContext context;
+        context.borrow_base_state(base.state); context.outaged_branch = second.component;
+        if (gravityx::validate_state(model, gravityx::ModelMode::ContingencySoft,
+                completed->state, commitment, context).max_residual > 1e-5 ||
+            gravityx::ac_state_to_json(base.state) != frozen_base) {
+            throw std::runtime_error("exact peer failed independent checking or changed the base");
+        }
+        return std::move(*completed);
+    };
+    const auto reused = evaluate(data, first_verified_state);
+    auto prior = first_verified_state;
+    const double prior_objective = gravityx::rebuild_contingency_state_derived_fields(
+        data, base.state, commitment, first_outage, prior);
+    if (!reused.result.value("exact_parallel_model_match", false) ||
+        !reused.result.value("exact_parallel_seed_attempted", false) ||
+        !reused.result.value("exact_parallel_seed_accepted", false) ||
+        reused.result.at("solution_method") != "exact_parallel_peer_direct_screen" ||
+        reused.result.at("source_index") != second.source_index ||
+        std::abs(reused.state.pf[second.component]) > 1e-12 ||
+        std::abs(reused.state.pf[first_outage.component] - first_verified_state.pf[second.component]) > 1e-10 ||
+        std::abs(reused.result.at("solve").at("objective").get<double>() - prior_objective) > 1e-6) {
+        throw std::runtime_error("parallel peer did not preserve the rebuilt identity, flows, or cost");
+    }
+    auto broken = first_verified_state;
+    broken.va.back() += 3.141592653589793;
+    const auto fallback = evaluate(data, broken);
+    if (!fallback.result.value("exact_parallel_seed_attempted", false) ||
+        fallback.result.value("exact_parallel_seed_accepted", true) ||
+        fallback.result.at("solution_method") == "exact_parallel_peer_direct_screen") {
+        throw std::runtime_error("invalid exact peer bypassed normal corrective solving");
+    }
+    auto different = data;
+    different.branches[second.component].rate_c += 0.01;
+    if (find_exact_parallel_seed(different, components, second.label, bank) != nullptr) {
+        throw std::runtime_error("changed peer rating retained equivalence");
+    }
+    const auto nonmatch = evaluate(different, first_verified_state);
+    if (nonmatch.result.value("exact_parallel_model_match", true) ||
+        nonmatch.result.value("exact_parallel_seed_attempted", true) ||
+        nonmatch.result.value("exact_parallel_seed_accepted", true)) {
+        throw std::runtime_error("unmatched branch was treated as an exact peer");
+    }
+}
+
 int run_contingency_worker(
     const std::string& case_path,
     const std::string& base_result_path,
@@ -4939,6 +5113,12 @@ int run_contingency_worker(
             data, base.state, base.commitment, fast_options);
     }
     std::vector<CorrectiveSeed> corrective_seed_bank;
+    std::unordered_map<std::string, int> branch_outage_components;
+    for (const auto& contingency : data.contingencies) {
+        if (contingency.type == gravityx::ContingencyType::Branch) {
+            branch_outage_components.emplace(contingency.label, contingency.component);
+        }
+    }
     if (base.common_corrective_reference) {
         corrective_seed_bank.push_back({
             "within_run_common_corrective_reference", *base.common_corrective_reference});
@@ -4992,14 +5172,23 @@ int run_contingency_worker(
         std::optional<ContingencyComputation> completed_computation;
         // A previously secure corrective point is a useful feasibility
         // fallback, but it can carry very large paid imbalance into an
-        // unrelated outage.  Economic mode therefore starts every task from
-        // the common optimized base and consults the seed bank only after the
-        // fresh predictor fails.
-        const CorrectiveSeed* rolling_corrective_seed =
-            fast_options.economic_balance_polish || corrective_seed_bank.empty()
-            ? nullptr : &corrective_seed_bank.front();
-        std::unique_ptr<gravityx::FastContingencyPowerFlow> budgeted_fast_power_flow;
+        // unrelated outage. Economic mode starts from the optimized base and
+        // consults the seed bank after a fresh predictor fails, except for an
+        // explicitly requested exact equivalent parallel outage below. That
+        // exception still rebuilds and fully verifies the requested outage.
         const auto solve_call_start = std::chrono::steady_clock::now();
+        const bool exact_parallel_seed_requested = task.value("allow_exact_parallel_seed", false);
+        if (exact_parallel_seed_requested && (!fast_only || !cached_economic_contingency_polish)) {
+            throw std::runtime_error("exact parallel seed requires cached-economic fast-only mode");
+        }
+        const CorrectiveSeed* exact_seed = exact_parallel_seed_requested
+            ? find_exact_parallel_seed(data, branch_outage_components, label, corrective_seed_bank)
+            : nullptr;
+        const bool exact_parallel_seed_found = exact_seed != nullptr;
+        const CorrectiveSeed* rolling_corrective_seed = exact_seed ? exact_seed :
+            (fast_options.economic_balance_polish || corrective_seed_bank.empty()
+                ? nullptr : &corrective_seed_bank.front());
+        std::unique_ptr<gravityx::FastContingencyPowerFlow> budgeted_fast_power_flow;
         if (task.contains("screen_handoff_seconds")) {
             if (!fast_only || !task.at("screen_handoff_seconds").is_number()) {
                 throw std::runtime_error("screen handoff budget requires a numeric fast-only task");
@@ -5030,7 +5219,7 @@ int run_contingency_worker(
                 ? &rolling_corrective_seed->label : nullptr,
             (linearized_fallback || fast_only)
                 ? &corrective_seed_bank : nullptr,
-            &completed_computation, !remove_output_after_result);
+            &completed_computation, !remove_output_after_result, exact_parallel_seed_found);
         const double solve_call_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - solve_call_start).count();
         double result_read_seconds = 0.0;
@@ -5173,6 +5362,11 @@ int run_contingency_worker(
             result_summary["first_screen"] = completed_computation->result.value(
                 "first_screen", nlohmann::json(nullptr));
             const auto& details = completed_computation->result;
+            for (const char* key : {"exact_parallel_model_match", "exact_parallel_seed_attempted",
+                    "exact_parallel_seed_accepted", "exact_parallel_seed_screen_seconds",
+                    "exact_parallel_seed_label"}) {
+                if (details.contains(key)) result_summary[key] = details.at(key);
+            }
             if (details.contains("fast_screen") && details.at("fast_screen").is_object()) {
                 const auto& screen = details.at("fast_screen");
                 for (const char* key : {
@@ -5250,6 +5444,8 @@ int run_contingency_worker(
                  ? nlohmann::json(corrective_seed_bank.front().label)
                  : nlohmann::json(nullptr)},
             {"corrective_seed_bank_size", corrective_seed_bank.size()},
+            {"exact_parallel_seed_requested", exact_parallel_seed_requested},
+            {"exact_parallel_seed_found", exact_parallel_seed_found},
             {"solution_written", solution_written},
             {"result_read_seconds", result_read_seconds},
             {"solution_write_seconds", solution_write_seconds},

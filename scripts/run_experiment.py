@@ -2503,6 +2503,7 @@ def fast_screen_affinity_groups(
     base_state: dict[str, Any],
     records: list[dict[str, Any]],
     difficult_groups_first: bool = True,
+    exact_parallel_outage_reuse: bool = False,
 ) -> list[list[dict[str, Any]]]:
     """Group related outages for rolling corrective-state reuse.
 
@@ -2520,6 +2521,28 @@ def fast_screen_affinity_groups(
     branch_position = {
         int(item["index"]): position for position, item in enumerate(branches)
     }
+    parallel_representative: dict[int, int] = {}
+    if exact_parallel_outage_reuse:
+        signatures: dict[str, list[int]] = {}
+        for record in records:
+            if record["type"] == "gen":
+                continue
+            component = int(record["idx"])
+            branch = branches[branch_position[component]]
+            if branch.get("br_status", 1) != 1 or not branch.get("present", True):
+                continue
+            # Deliberately stricter than electrical approximation: retain all
+            # normalized raw attributes except the circuit identity/index.
+            signature = json.dumps(
+                {key: value for key, value in branch.items()
+                 if key not in {"source_id", "index"}},
+                sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )
+            signatures.setdefault(signature, []).append(component)
+        for members in signatures.values():
+            if len(members) > 1:
+                for component in members:
+                    parallel_representative[component] = min(members)
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for source in records:
         item = dict(source)
@@ -2536,6 +2559,8 @@ def fast_screen_affinity_groups(
             position = branch_position[component]
             component_data = branches[position]
             affinity_key = ("branch_from_bus", int(component_data["f_bus"]))
+            if component in parallel_representative:
+                affinity_key = ("exact_parallel_branch", parallel_representative[component])
             score = max(
                 math.hypot(
                     float(base_state["pf"][position]),
@@ -2584,6 +2609,15 @@ def fast_screen_affinity_groups(
         for item in group:
             item["fast_screen_affinity_group_rank"] = rank
     return groups
+
+
+def retain_exact_parallel_group(group: list[dict[str, Any]]) -> bool:
+    """Keep successful exact peers on their resident worker; never drop labels."""
+    return bool(group) and all(
+        item.get("fast_screen_affinity_type") == "exact_parallel_branch" and
+        item.get("fast_screen_affinity_value") == group[0].get("fast_screen_affinity_value")
+        for item in group
+    )
 
 
 def load_fast_screen_heavy_profile(
@@ -2835,6 +2869,7 @@ def main() -> int:
     parser.add_argument("--fast-power-flow-screen", action="store_true")
     parser.add_argument("--economic-contingency-polish", action="store_true")
     parser.add_argument("--cached-economic-contingency-polish", action="store_true")
+    parser.add_argument("--exact-parallel-outage-reuse", action="store_true")
     parser.add_argument("--cpp-solution-writer", action="store_true")
     parser.add_argument("--fast-screen-affinity-schedule", action="store_true")
     parser.add_argument("--fast-screen-easy-first", action="store_true")
@@ -2891,6 +2926,9 @@ def main() -> int:
         )
     if (args.economic_contingency_polish and args.cached_economic_contingency_polish):
         parser.error("Choose only one contingency economic polish mode")
+    if args.exact_parallel_outage_reuse and not (
+            args.cached_economic_contingency_polish and args.fast_screen_affinity_schedule):
+        parser.error("--exact-parallel-outage-reuse requires cached economic polish and affinity scheduling")
     if ((args.economic_contingency_polish or args.cached_economic_contingency_polish) and
             not args.fast_power_flow_screen):
         parser.error(
@@ -3220,6 +3258,7 @@ def main() -> int:
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "economic_contingency_polish": args.economic_contingency_polish,
         "cached_economic_contingency_polish": args.cached_economic_contingency_polish,
+        "exact_parallel_outage_reuse": args.exact_parallel_outage_reuse,
         "cpp_solution_writer": args.cpp_solution_writer,
         "fast_screen_easy_first": args.fast_screen_easy_first,
         "fast_screen_heavy_profile": fast_screen_heavy_profile_metadata,
@@ -3465,6 +3504,7 @@ def main() -> int:
             base_state,
             contingencies,
             difficult_groups_first=not args.fast_screen_easy_first,
+            exact_parallel_outage_reuse=args.exact_parallel_outage_reuse,
         )
         contingencies = [
             item for group in fast_screen_groups for item in group
@@ -3853,6 +3893,8 @@ def main() -> int:
                                 else to_wsl(result_path)
                             ),
                         }
+                        if args.exact_parallel_outage_reuse and retain_exact_parallel_group(group):
+                            task["allow_exact_parallel_seed"] = True
                         if args.wsl_fast_screen_scratch:
                             task["fallback_output_path"] = to_wsl(
                                 result_path
@@ -3930,7 +3972,8 @@ def main() -> int:
                         split_count = 0
                         if result.get("success", False):
                             save_secure_result(item, result, worker_id, "fast_screen")
-                            if screen_work.should_split_heavy_group(work_source):
+                            if (screen_work.should_split_heavy_group(work_source) and
+                                    not retain_exact_parallel_group(group)):
                                 split_count = (
                                     screen_work.requeue_remaining_as_singletons(
                                         group,
@@ -4785,6 +4828,7 @@ def main() -> int:
         "fast_power_flow_screen": args.fast_power_flow_screen,
         "economic_contingency_polish": args.economic_contingency_polish,
         "cached_economic_contingency_polish": args.cached_economic_contingency_polish,
+        "exact_parallel_outage_reuse": args.exact_parallel_outage_reuse,
         "fast_screen_affinity_schedule": args.fast_screen_affinity_schedule,
         "source_status_base": args.source_status_base,
         "validated_source_base": args.validated_source_base,

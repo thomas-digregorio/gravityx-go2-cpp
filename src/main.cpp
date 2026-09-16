@@ -1031,6 +1031,23 @@ int run_parallel_circuit_regression() {
         }
     }
     gravityx::FastPowerFlowResult budget_result;
+    budget_result.economic_balance_polish_trial_count = 7;
+    budget_result.economic_balance_polish_physical_rejections = 3;
+    budget_result.economic_balance_polish_economic_checks = 4;
+    budget_result.economic_balance_polish_physical_check_seconds = 0.125;
+    budget_result.economic_balance_polish_economic_check_seconds = 0.5;
+    const auto compact_economic = budget_result.economic_summary_json();
+    const auto full_economic = budget_result.to_json();
+    for (const auto* key : {"economic_balance_polish_trial_count",
+                           "economic_balance_polish_physical_rejections",
+                           "economic_balance_polish_economic_checks",
+                           "economic_balance_polish_physical_check_seconds",
+                           "economic_balance_polish_economic_check_seconds"}) {
+        if (!compact_economic.contains(key) || compact_economic.at(key) != full_economic.at(key) ||
+            compact_economic.at(key).get<double>() <= 0.0) {
+            throw std::runtime_error("compact worker log omitted economic timing evidence");
+        }
+    }
     budget_result.fixed_jacobian_budget_exhausted = true;
     if (!budget_result.to_json().at("fixed_jacobian_budget_exhausted").get<bool>() ||
         budget_result.to_json().at("feasible").get<bool>()) {

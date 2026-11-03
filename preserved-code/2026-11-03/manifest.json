@@ -1,0 +1,36 @@
+{
+  "purpose": "Source-only preservation before local generated-data cleanup",
+  "files": [
+    {
+      "retained_path": "preserved-code/2026-11-03/original-paths/.tmp/score-workbook-inspect/inspect_scores.mjs",
+      "sha256": "f11693093ca38e00ef62c69b86826e636d96f3e6a691e4d284759eccc5bded3e",
+      "bytes": 720,
+      "origin": ".tmp/score-workbook-inspect/inspect_scores.mjs"
+    },
+    {
+      "retained_path": "preserved-code/2026-11-03/original-paths/paper/build_tables.py",
+      "sha256": "439494a39740d1e863bd953698233dc2989ba41b0f06ac3ec9a51c9176366af6",
+      "bytes": 6180,
+      "origin": "paper/build_tables.py"
+    },
+    {
+      "retained_path": "preserved-code/2026-11-03/original-paths/paper/finalize_artifacts.py",
+      "sha256": "4b95a2465442679a5a0ab2549880d53fec4954b4be7c45fcfe96e832414eddf8",
+      "bytes": 4000,
+      "origin": "paper/finalize_artifacts.py"
+    },
+    {
+      "retained_path": "preserved-code/2026-11-03/original-paths/paper/inspect_evidence.py",
+      "sha256": "d747326b0d28ba9cc46a815066fbbfe48f122fbd74b318bf022d9757651c46cd",
+      "bytes": 10008,
+      "origin": "paper/inspect_evidence.py"
+    },
+    {
+      "retained_path": "preserved-code/2026-11-03/original-paths/runs/cleanup_receipts/paper_only_cleanup_20260916.ps1",
+      "sha256": "3ec341d1c5d7293863765989e9f768bd49e960fcf0991fbc5c03d479cd4627be",
+      "bytes": 16417,
+      "origin": "runs/cleanup_receipts/paper_only_cleanup_20260916.ps1"
+    }
+  ],
+  "notebook_outputs_included": false
+}
